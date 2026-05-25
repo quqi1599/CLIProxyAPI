@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 const (
@@ -145,13 +145,26 @@ type monitorRequestGroupStats struct {
 
 // usageSnapshot returns usage snapshot with database+memory data when available.
 func (h *Handler) usageSnapshot() usage.StatisticsSnapshot {
-	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+	if !h.canUseDatabaseMonitorQueries() && h != nil && h.usageStats != nil {
+		return h.usageStats.Snapshot()
+	}
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		return dbPlugin.GetCombinedSnapshot()
 	}
 	if h != nil && h.usageStats != nil {
 		return h.usageStats.Snapshot()
 	}
 	return usage.StatisticsSnapshot{}
+}
+
+func (h *Handler) canUseDatabaseMonitorQueries() bool {
+	if h == nil || h.usageStats == nil {
+		return true
+	}
+	if h.usageStats == usage.GetRequestStatistics() {
+		return true
+	}
+	return h.usageStats.Snapshot().TotalRequests == 0
 }
 
 // GetMonitorRequestLogs returns request logs filtered by time and paginated on server side.
@@ -175,7 +188,7 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 	sourceResolver := newMonitorSourceResolver(h.cfg, h.authManager)
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 1)
 	}
 
@@ -208,7 +221,7 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 		}
 	}
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		queryResult, queryErr := dbPlugin.QueryMonitorRequestLogs(c.Request.Context(), toUsageMonitorFilter(filter), page, pageSize, monitorRecentLimit)
 		if queryErr == nil {
 			items := make([]monitorRequestLogItem, 0, len(queryResult.Items))
@@ -347,7 +360,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 	}
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 7)
 	}
 
@@ -360,7 +373,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 	}
 	modelFilter := firstQuery(c, "model")
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		sourceResolver := newMonitorSourceResolver(h.cfg, h.authManager)
 		usageFilter := toUsageMonitorFilter(filter)
 		usageFilter.Model = strings.TrimSpace(modelFilter)
@@ -669,7 +682,7 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 	}
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 7)
 	}
 
@@ -682,7 +695,7 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 	}
 	modelFilter := firstQuery(c, "model")
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		sourceResolver := newMonitorSourceResolver(h.cfg, h.authManager)
 		usageFilter := toUsageMonitorFilter(filter)
 		usageFilter.Model = strings.TrimSpace(modelFilter)
@@ -1360,7 +1373,7 @@ func (h *Handler) GetMonitorKpi(c *gin.Context) {
 	}
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 7)
 	}
 
@@ -1374,7 +1387,7 @@ func (h *Handler) GetMonitorKpi(c *gin.Context) {
 		End:         end,
 	}
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		result, queryErr := dbPlugin.QueryMonitorKpi(c.Request.Context(), toUsageMonitorFilter(filter))
 		if queryErr == nil {
 			resp := monitorKpiResponse{
@@ -1467,7 +1480,7 @@ func (h *Handler) GetMonitorModelDistribution(c *gin.Context) {
 	}
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 7)
 	}
 
@@ -1480,7 +1493,7 @@ func (h *Handler) GetMonitorModelDistribution(c *gin.Context) {
 		End:         end,
 	}
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		sortByTokens := strings.ToLower(firstQuery(c, "sort")) == "tokens"
 		result, queryErr := dbPlugin.QueryMonitorModelDistribution(c.Request.Context(), toUsageMonitorFilter(filter), limit, sortByTokens)
 		if queryErr == nil {
@@ -1564,7 +1577,7 @@ func (h *Handler) GetMonitorDailyTrend(c *gin.Context) {
 	}
 
 	dbPlugin := usage.GetDatabasePlugin()
-	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() && !isExplicitAllTimeRange(c) {
 		start, end = applyDefaultTimeRange(start, end, 30)
 	}
 
@@ -1577,7 +1590,7 @@ func (h *Handler) GetMonitorDailyTrend(c *gin.Context) {
 		End:         end,
 	}
 
-	if dbPlugin != nil {
+	if dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		result, queryErr := dbPlugin.QueryMonitorDailyTrend(c.Request.Context(), toUsageMonitorFilter(filter))
 		if queryErr == nil {
 			items := make([]monitorDailyTrendItem, 0, len(result))
@@ -1698,7 +1711,7 @@ func (h *Handler) GetMonitorHourlyModels(c *gin.Context) {
 	}
 	slotCount := len(hourSlots)
 
-	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		slots, queryErr := dbPlugin.QueryMonitorHourlySlots(c.Request.Context(), toUsageMonitorFilter(filter), cutoff.Unix(), now.Unix(), 3600)
 		if queryErr == nil {
 			modelTotals := make(map[string]int64)
@@ -1873,7 +1886,7 @@ func (h *Handler) GetMonitorHourlyTokens(c *gin.Context) {
 	}
 	slotCount := len(hourSlots)
 
-	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		tokenSlots, queryErr := dbPlugin.QueryMonitorHourlyTokenSlots(c.Request.Context(), toUsageMonitorFilter(filter), cutoff.Unix(), now.Unix(), 3600)
 		if queryErr == nil {
 			totalTokens := make([]int64, slotCount)
@@ -1979,7 +1992,7 @@ func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 		Failure int64 `json:"failure"`
 	}
 
-	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		healthBlocks, queryErr := dbPlugin.QueryMonitorHealthBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()))
 		if queryErr == nil {
 			blocks := make([]healthBlock, totalBlocks)
@@ -2088,7 +2101,7 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 		return ref.Disabled
 	}
 
-	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil && h.canUseDatabaseMonitorQueries() {
 		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()))
 		if queryErr == nil {
 			for _, row := range rows {
