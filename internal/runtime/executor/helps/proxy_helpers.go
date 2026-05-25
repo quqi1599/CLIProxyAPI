@@ -15,6 +15,40 @@ import (
 
 var proxyTransportCache sync.Map
 
+type transportErrorWrappingRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (t *transportErrorWrappingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := http.RoundTripper(http.DefaultTransport)
+	if t != nil && t.base != nil {
+		base = t.base
+	}
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return nil, cliproxyauth.WrapTransportError(err)
+	}
+	return resp, nil
+}
+
+// WrapTransportErrorsRoundTripper decorates a round-tripper so transport-level
+// failures are normalized into retryable cliproxy auth errors.
+func WrapTransportErrorsRoundTripper(rt http.RoundTripper) http.RoundTripper {
+	if wrapped, ok := rt.(*transportErrorWrappingRoundTripper); ok && wrapped != nil {
+		return wrapped
+	}
+	return &transportErrorWrappingRoundTripper{base: rt}
+}
+
+// UnwrapTransportErrorsRoundTripper removes the transport error wrapper when
+// callers need direct access to the underlying transport implementation.
+func UnwrapTransportErrorsRoundTripper(rt http.RoundTripper) http.RoundTripper {
+	if wrapped, ok := rt.(*transportErrorWrappingRoundTripper); ok && wrapped != nil {
+		return wrapped.base
+	}
+	return rt
+}
+
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
@@ -49,7 +83,7 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
-			httpClient.Transport = transport
+			httpClient.Transport = WrapTransportErrorsRoundTripper(transport)
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
@@ -58,9 +92,11 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+		httpClient.Transport = WrapTransportErrorsRoundTripper(rt)
+		return httpClient
 	}
 
+	httpClient.Transport = WrapTransportErrorsRoundTripper(http.DefaultTransport)
 	return httpClient
 }
 

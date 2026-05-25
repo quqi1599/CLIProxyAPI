@@ -30,3 +30,11 @@ func (e *Error) StatusCode() int {
 	}
 	return e.HTTPStatus
 }
+
+// ErrorCode returns the machine-readable error code when present.
+func (e *Error) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}

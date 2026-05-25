@@ -227,16 +227,16 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	antigravityTransportOnce.Do(initAntigravityTransport)
 
 	client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
-	if client.Transport == nil {
-		client.Transport = antigravityTransport
+	baseTransport := helps.UnwrapTransportErrorsRoundTripper(client.Transport)
+	if baseTransport == nil {
+		client.Transport = helps.WrapTransportErrorsRoundTripper(antigravityTransport)
 		return client
 	}
-
-	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
+	if transport, ok := baseTransport.(*http.Transport); ok && transport != nil {
+		client.Transport = helps.WrapTransportErrorsRoundTripper(cloneTransportWithHTTP11(transport))
+		return client
 	}
+	client.Transport = helps.WrapTransportErrorsRoundTripper(baseTransport)
 	return client
 }
 
