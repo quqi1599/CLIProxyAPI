@@ -1514,7 +1514,7 @@ func isUnsupportedClaudeContentPartForCompat(compatKind, partType string) bool {
 
 func requiresClaudeContentBlockDowngradeForCompat(compatKind string) bool {
 	switch compatKind {
-	case "deepseek", "minimax", "xiaomi":
+	case "deepseek", "minimax", "xiaomi", "qianfan":
 		return true
 	default:
 		return false
@@ -1788,7 +1788,7 @@ func repairMiniMaxClaudeToolAdjacencyForCompat(compatKind string, body []byte) (
 
 func requiresClaudeToolAdjacencyRepair(compatKind string) bool {
 	switch strings.ToLower(strings.TrimSpace(compatKind)) {
-	case "minimax", "deepseek":
+	case "minimax", "deepseek", "qianfan":
 		return true
 	default:
 		return false

@@ -480,6 +480,46 @@ func TestRepairClaudeToolAdjacencyForDeepSeekCompat(t *testing.T) {
 	}
 }
 
+func TestRepairClaudeToolAdjacencyForQianfanCompat(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type":"tool_use","id":"read_file:1","name":"read_file","input":{"path":"README.md"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type":"text","text":"next user instruction"},
+					{"type":"tool_result","tool_use_id":"read_file:1","content":"ok"}
+				]
+			}
+		]
+	}`)
+
+	out, err := repairMiniMaxClaudeToolAdjacencyForCompat("qianfan", body)
+	if err != nil {
+		t.Fatalf("repairMiniMaxClaudeToolAdjacencyForCompat() error = %v", err)
+	}
+	if err := validateMiniMaxToolResultAdjacency(out); err != nil {
+		t.Fatalf("expected repaired Qianfan sequence to pass shared adjacency rules, got %v\nbody: %s", err, out)
+	}
+	msgs := gjson.GetBytes(out, "messages").Array()
+	if len(msgs) != 3 {
+		t.Fatalf("messages length = %d, want 3: %s", len(msgs), gjson.GetBytes(out, "messages").Raw)
+	}
+	if got := msgs[1].Get("content.0.type").String(); got != "tool_result" {
+		t.Fatalf("message 1 content type = %q, want tool_result: %s", got, msgs[1].Raw)
+	}
+	if got := msgs[2].Get("content.0.type").String(); got != "text" {
+		t.Fatalf("message 2 content type = %q, want text: %s", got, msgs[2].Raw)
+	}
+}
+
 func TestRepairMiniMaxToolResultAdjacencyMovesAssistantToolUseLast(t *testing.T) {
 	t.Parallel()
 
@@ -3116,6 +3156,76 @@ func TestDowngradeClaudeToolSearchForCompatKind_DeepSeekRemovesUnsupportedBlocks
 	}
 	if !hasClaudePartType(assistantContent, "thinking") || !hasClaudePartType(assistantContent, "tool_use") {
 		t.Fatalf("supported thinking/tool_use blocks should be preserved: %s", string(out))
+	}
+
+	toolResultContent := gjson.GetBytes(out, "messages.2.content.0.content").Array()
+	if hasClaudePartType(toolResultContent, "image") {
+		t.Fatalf("unsupported image inside tool_result should be removed: %s", string(out))
+	}
+	if !hasClaudeText(toolResultContent, "tool ok") {
+		t.Fatalf("tool_result text should be preserved: %s", string(out))
+	}
+}
+
+func TestDowngradeClaudeToolSearchForCompatKind_QianfanRemovesUnsupportedBlocks(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"qianfan-code-latest",
+		"tools":[
+			{"type":"web_search_20250305","name":"web_search"},
+			{"name":"read_file","description":"Read file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}
+		],
+		"tool_choice":{"type":"tool","name":"web_search"},
+		"messages":[
+			{"role":"user","content":[
+				{"type":"text","text":"hi"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}},
+				{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"CCCC"}},
+				{"type":"search_result","content":[{"type":"text","text":"search ok"}]},
+				{"type":"mcp_tool_result","content":[{"type":"text","text":"mcp ok"}]}
+			]},
+			{"role":"assistant","content":[
+				{"type":"redacted_thinking","data":"secret"},
+				{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"README.md"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_1","content":[
+					{"type":"text","text":"tool ok"},
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"DDDD"}}
+				]}
+			]}
+		]
+	}`)
+
+	out := downgradeClaudeToolSearchForCompatKind("qianfan", "https://qianfan.baidubce.com/anthropic/coding", payload)
+
+	if got := len(gjson.GetBytes(out, "tools").Array()); got != 1 {
+		t.Fatalf("tools count = %d, want 1: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "read_file" {
+		t.Fatalf("kept tool name = %q, want read_file: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice for removed server tool should be removed: %s", string(out))
+	}
+
+	userContent := gjson.GetBytes(out, "messages.0.content").Array()
+	if hasClaudePartType(userContent, "image_url") || hasClaudePartType(userContent, "document") || hasClaudePartType(userContent, "search_result") || hasClaudePartType(userContent, "mcp_tool_result") {
+		t.Fatalf("Qianfan unsupported user content block remained: %s", string(out))
+	}
+	for _, wantText := range []string{"hi", "search ok", "mcp ok"} {
+		if !hasClaudeText(userContent, wantText) {
+			t.Fatalf("expected text %q in downgraded content: %s", wantText, string(out))
+		}
+	}
+
+	assistantContent := gjson.GetBytes(out, "messages.1.content").Array()
+	if hasClaudePartType(assistantContent, "redacted_thinking") {
+		t.Fatalf("redacted_thinking should be removed for Qianfan: %s", string(out))
+	}
+	if !hasClaudePartType(assistantContent, "tool_use") {
+		t.Fatalf("tool_use blocks should be preserved: %s", string(out))
 	}
 
 	toolResultContent := gjson.GetBytes(out, "messages.2.content.0.content").Array()

@@ -689,6 +689,36 @@ func TestOpenAICompatPayloadKimiRepairsMissingAssistantToolCallReasoning(t *test
 	}
 }
 
+func TestOpenAICompatPayloadKimiClampsLowTemperatureN(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k2.6",
+		"messages":[{"role":"user","content":"hi"}],
+		"temperature":0,
+		"n":3
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.6", "https://api.kimi.com/coding/v1")
+
+	if got := gjson.GetBytes(out, "n").Int(); got != 1 {
+		t.Fatalf("n = %d, want 1 when Kimi temperature is near zero: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadKimiKeepsNWhenTemperatureAllowsMultipleChoices(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k2.6",
+		"messages":[{"role":"user","content":"hi"}],
+		"temperature":0.7,
+		"n":3
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.6", "https://api.kimi.com/coding/v1")
+
+	if got := gjson.GetBytes(out, "n").Int(); got != 3 {
+		t.Fatalf("n = %d, want preserved 3 when Kimi temperature is normal: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadXiaomiScrubsUnsupportedOpenAIExtras(t *testing.T) {
 	payload := []byte(`{
 		"model":"mimo-v2.5",

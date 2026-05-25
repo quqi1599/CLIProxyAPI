@@ -75,6 +75,24 @@ func TestSanitizeKimiOpenAICompatibleRequestBodyDropsOrphanReplyToolCall(t *test
 	}
 }
 
+func TestSanitizeKimiOpenAICompatibleRequestBodyClampsLowTemperatureN(t *testing.T) {
+	body := []byte(`{
+		"model":"kimi-k2.6",
+		"messages":[{"role":"user","content":"hi"}],
+		"temperature":0,
+		"n":4
+	}`)
+
+	out, err := sanitizeKimiOpenAICompatibleRequestBody(body)
+	if err != nil {
+		t.Fatalf("sanitizeKimiOpenAICompatibleRequestBody() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(out, "n").Int(); got != 1 {
+		t.Fatalf("n = %d, want 1 when Kimi temperature is near zero: %s", got, string(out))
+	}
+}
+
 func TestKimiExecutorHttpRequestSanitizesDirectChatBody(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

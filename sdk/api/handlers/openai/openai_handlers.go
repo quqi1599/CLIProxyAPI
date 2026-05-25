@@ -206,7 +206,10 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 	// Set the prompt as user message content
 	out, _ = sjson.SetBytes(out, "messages.0.content", prompt)
 
-	// Copy other parameters from completions to chat completions
+	// Copy only parameters that have a meaningful chat-completions equivalent.
+	// Legacy completions-only fields such as echo/logprobs/top_logprobs are
+	// intentionally dropped because this endpoint is implemented on top of chat
+	// completions, and forwarding them to stricter upstreams can trigger 400s.
 	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
@@ -233,18 +236,6 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 
 	if stream := root.Get("stream"); stream.Exists() {
 		out, _ = sjson.SetBytes(out, "stream", stream.Bool())
-	}
-
-	if logprobs := root.Get("logprobs"); logprobs.Exists() {
-		out, _ = sjson.SetBytes(out, "logprobs", logprobs.Bool())
-	}
-
-	if topLogprobs := root.Get("top_logprobs"); topLogprobs.Exists() {
-		out, _ = sjson.SetBytes(out, "top_logprobs", topLogprobs.Int())
-	}
-
-	if echo := root.Get("echo"); echo.Exists() {
-		out, _ = sjson.SetBytes(out, "echo", echo.Bool())
 	}
 
 	return out

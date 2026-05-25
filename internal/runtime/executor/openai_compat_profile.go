@@ -243,6 +243,7 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = sanitizeOpenAICompatToolSchemas(payload)
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "kimi" {
+		payload = scrubKimiSamplingConstraints(payload)
 		if normalized, err := normalizeKimiToolMessageLinks(payload); err == nil {
 			payload = normalized
 		} else {
@@ -258,6 +259,28 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 		payload = scrubDeepSeekToolPayload(payload, baseURL)
 	}
 	return payload
+}
+
+func scrubKimiSamplingConstraints(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	nValue := gjson.GetBytes(payload, "n")
+	if !nValue.Exists() || nValue.Int() <= 1 {
+		return payload
+	}
+
+	temperatureValue, ok := compatNumericValue(gjson.GetBytes(payload, "temperature"))
+	if !ok || temperatureValue > 0.001 {
+		return payload
+	}
+
+	updated, err := sjson.SetBytes(payload, "n", 1)
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL string, compatKind string) []byte {
@@ -351,6 +374,25 @@ func deepSeekThinkingBudgetValue(value gjson.Result) (int, bool) {
 			return 0, false
 		}
 		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func compatNumericValue(value gjson.Result) (float64, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return value.Float(), true
+	case gjson.String:
+		raw := strings.TrimSpace(value.String())
+		if raw == "" {
+			return 0, false
+		}
+		parsed, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
 			return 0, false
 		}
