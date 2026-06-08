@@ -171,6 +171,45 @@ func TestMiniMaxHighspeedNarrativeGuardQueueDepthLimit(t *testing.T) {
 	}
 }
 
+func TestMiniMaxHighspeedNarrativeGuardQueueWaitTimeoutDoesNotLeakSlot(t *testing.T) {
+	cfg := miniMaxHighspeedNarrativeTestConfigWithQueueAndWait(1, 2, 1, 4096)
+	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
+	limiter := &miniMaxHighspeedNarrativeLimiter{}
+
+	first := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if first.release == nil {
+		t.Fatal("first matching request should be admitted")
+	}
+
+	waitDone := make(chan miniMaxHighspeedNarrativeGuardDecision, 1)
+	go func() {
+		waitDone <- prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	}()
+	waitForMiniMaxHighspeedNarrativeQueueDepth(t, limiter, 1)
+
+	select {
+	case timedOut := <-waitDone:
+		if !timedOut.waitTimedOut {
+			t.Fatal("queued request should report queue wait timeout")
+		}
+		if timedOut.release != nil {
+			t.Fatal("timed-out request must not hold a slot")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued request did not time out")
+	}
+
+	first.release()
+	next := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if next.waitErr != nil {
+		t.Fatalf("next request wait error: %v", next.waitErr)
+	}
+	if next.release == nil {
+		t.Fatal("slot should be available after queue wait timeout and release")
+	}
+	next.release()
+}
+
 func TestMiniMaxHighspeedNarrativeGuardIgnoresLongCodeContext(t *testing.T) {
 	cfg := miniMaxHighspeedNarrativeTestConfig(2, 4096)
 	codePrompt := strings.Repeat("package main\nfunc handler() error { return nil }\n", 3000)
@@ -202,12 +241,17 @@ func miniMaxHighspeedNarrativeTestConfig(maxConcurrent, maxOutputTokens int) *sd
 }
 
 func miniMaxHighspeedNarrativeTestConfigWithQueue(maxConcurrent, maxQueue, maxOutputTokens int) *sdkconfig.SDKConfig {
+	return miniMaxHighspeedNarrativeTestConfigWithQueueAndWait(maxConcurrent, maxQueue, 0, maxOutputTokens)
+}
+
+func miniMaxHighspeedNarrativeTestConfigWithQueueAndWait(maxConcurrent, maxQueue, maxWaitSeconds, maxOutputTokens int) *sdkconfig.SDKConfig {
 	return &sdkconfig.SDKConfig{
 		RequestGuards: sdkconfig.RequestGuardsConfig{
 			MiniMaxHighspeedNarrative: sdkconfig.MiniMaxHighspeedNarrativeGuardConfig{
 				Enabled:           true,
 				MaxConcurrent:     maxConcurrent,
 				MaxQueue:          maxQueue,
+				MaxWaitSeconds:    maxWaitSeconds,
 				MaxOutputTokens:   maxOutputTokens,
 				RetryAfterSeconds: 30,
 			},

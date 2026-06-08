@@ -3,8 +3,10 @@ package openai
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -56,6 +58,7 @@ type miniMaxHighspeedNarrativeGuardSettings struct {
 	enabled         bool
 	maxConcurrent   int
 	maxQueue        int
+	maxWaitSeconds  int
 	maxOutputTokens int
 }
 
@@ -72,6 +75,7 @@ type miniMaxHighspeedNarrativeGuardDecision struct {
 	release        func()
 	waitErr        error
 	queueFull      bool
+	waitTimedOut   bool
 	bodyBytes      int
 	maxTokens      int64
 	structuralHits int
@@ -80,6 +84,7 @@ type miniMaxHighspeedNarrativeGuardDecision struct {
 	queued         int
 	maxConcurrent  int
 	maxQueue       int
+	maxWaitSeconds int
 	cappedOutput   bool
 }
 
@@ -93,25 +98,25 @@ type miniMaxHighspeedNarrativeWaiter struct {
 	ready chan struct{}
 }
 
-func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcurrent, maxQueue int) (func(), int, int, bool, error) {
+func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcurrent, maxQueue, maxWaitSeconds int) (func(), int, int, bool, bool, error) {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMiniMaxHighspeedNarrativeMaxConcurrent
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, 0, 0, false, err
+		return nil, 0, 0, false, false, err
 	}
 	l.mu.Lock()
 	if l.active < maxConcurrent && len(l.waiters) == 0 {
 		l.active++
 		active := l.active
 		l.mu.Unlock()
-		return l.releaseFunc(maxConcurrent), active, 0, false, nil
+		return l.releaseFunc(maxConcurrent), active, 0, false, false, nil
 	}
 	if maxQueue > 0 && len(l.waiters) >= maxQueue {
 		active := l.active
 		queued := len(l.waiters)
 		l.mu.Unlock()
-		return nil, active, queued, true, nil
+		return nil, active, queued, true, false, nil
 	}
 
 	waiter := &miniMaxHighspeedNarrativeWaiter{ready: make(chan struct{})}
@@ -119,24 +124,36 @@ func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcu
 	queued := len(l.waiters)
 	l.mu.Unlock()
 
+	waitCtx := ctx
+	cancelWait := func() {}
+	if maxWaitSeconds > 0 {
+		waitCtx, cancelWait = context.WithTimeout(ctx, time.Duration(maxWaitSeconds)*time.Second)
+	}
+	defer cancelWait()
+
 	select {
 	case <-waiter.ready:
 		release := l.releaseFunc(maxConcurrent)
-		if err := ctx.Err(); err != nil {
+		if err := waitCtx.Err(); err != nil {
 			release()
-			return nil, 0, queued, false, err
+			return nil, 0, queued, false, miniMaxHighspeedNarrativeWaitTimedOut(ctx, err), err
 		}
 		active := l.activeSnapshot()
-		return release, active, queued, false, nil
-	case <-ctx.Done():
+		return release, active, queued, false, false, nil
+	case <-waitCtx.Done():
 		l.mu.Lock()
 		removed := l.removeWaiterLocked(waiter)
 		if !removed {
 			l.releaseAssignedSlotLocked(maxConcurrent)
 		}
 		l.mu.Unlock()
-		return nil, 0, queued, false, ctx.Err()
+		err := waitCtx.Err()
+		return nil, 0, queued, false, miniMaxHighspeedNarrativeWaitTimedOut(ctx, err), err
 	}
+}
+
+func miniMaxHighspeedNarrativeWaitTimedOut(parent context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil
 }
 
 func (l *miniMaxHighspeedNarrativeLimiter) activeSnapshot() int {
@@ -207,11 +224,13 @@ func prepareMiniMaxHighspeedNarrativeGuard(ctx context.Context, rawJSON []byte, 
 	decision.narrativeHits = match.narrativeHits
 	decision.maxConcurrent = settings.maxConcurrent
 	decision.maxQueue = settings.maxQueue
+	decision.maxWaitSeconds = settings.maxWaitSeconds
 
-	release, active, queued, queueFull, err := limiter.acquire(ctx, settings.maxConcurrent, settings.maxQueue)
+	release, active, queued, queueFull, waitTimedOut, err := limiter.acquire(ctx, settings.maxConcurrent, settings.maxQueue, settings.maxWaitSeconds)
 	decision.active = active
 	decision.queued = queued
 	decision.queueFull = queueFull
+	decision.waitTimedOut = waitTimedOut
 	if err != nil {
 		decision.waitErr = err
 		return decision
@@ -239,6 +258,9 @@ func miniMaxHighspeedNarrativeSettings(cfg *sdkconfig.SDKConfig) miniMaxHighspee
 	}
 	if guard.MaxQueue > 0 {
 		settings.maxQueue = guard.MaxQueue
+	}
+	if guard.MaxWaitSeconds > 0 {
+		settings.maxWaitSeconds = guard.MaxWaitSeconds
 	}
 	if guard.MaxOutputTokens > 0 {
 		settings.maxOutputTokens = guard.MaxOutputTokens

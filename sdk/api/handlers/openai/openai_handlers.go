@@ -126,7 +126,7 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	guardDecision := h.prepareMiniMaxHighspeedNarrativeGuard(c.Request.Context(), rawJSON)
-	if guardDecision.queueFull {
+	if guardDecision.queueFull || guardDecision.waitTimedOut {
 		writeMiniMaxHighspeedNarrativeGuardQueueFull(c, guardDecision)
 		return
 	}
