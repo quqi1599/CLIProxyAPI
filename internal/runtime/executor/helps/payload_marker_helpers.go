@@ -14,11 +14,17 @@ var (
 	claudeToolSearchAlt    = []byte(`"tool-search"`)
 )
 
+// HasClaudeToolUseMarker reports whether a payload might contain a Claude
+// tool_use block.
+func HasClaudeToolUseMarker(body []byte) bool {
+	return bytes.Contains(body, claudeToolUseMarker)
+}
+
 // HasClaudeToolUseOrResultMarkers reports whether a payload might contain Claude
 // tool_use/tool_result blocks. It intentionally uses a cheap byte scan so
 // callers can skip expensive JSON repair work on obviously unrelated requests.
 func HasClaudeToolUseOrResultMarkers(body []byte) bool {
-	return bytes.Contains(body, claudeToolUseMarker) || bytes.Contains(body, claudeToolResultMarker)
+	return HasClaudeToolUseMarker(body) || bytes.Contains(body, claudeToolResultMarker)
 }
 
 // HasClaudeToolResultMarker reports whether a payload might contain a Claude

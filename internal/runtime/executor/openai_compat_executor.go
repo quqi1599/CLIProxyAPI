@@ -491,9 +491,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if responseLog != nil {
+			responseLog.AppendChunk(b)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
@@ -512,7 +515,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if responseLog != nil {
+				responseLog.AppendChunk(line)
+			}
 			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -553,7 +558,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			if requestCtx.Err() != nil {
 				return
 			}
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			if responseLog != nil {
+				responseLog.RecordError(errScan)
+			}
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
@@ -645,6 +652,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		body, errRead := io.ReadAll(httpResp.Body)
@@ -656,7 +664,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			return nil, errRead
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+		if responseLog != nil {
+			responseLog.AppendChunk(body)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
 		return nil, newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), body)
 	}
@@ -672,7 +682,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			n, errRead := httpResp.Body.Read(buffer)
 			if n > 0 {
 				chunk := bytes.Clone(buffer[:n])
-				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
+				if responseLog != nil {
+					responseLog.AppendChunk(chunk)
+				}
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
 				case <-requestCtx.Done():
@@ -684,7 +696,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 					return
 				}
 				if errRead != io.EOF {
-					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+					if responseLog != nil {
+						responseLog.RecordError(errRead)
+					}
 					reporter.PublishFailure(ctx, errRead)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
@@ -712,10 +726,13 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	modelForCounting := baseModel
 
 	thinkingProviderKey := profile.KindOrFallback(auth)
-	translated = normalizeOpenAICompatRouteReasoningEffort(translated, opts, modelForCounting, thinkingProviderKey, baseURL, profile.Kind)
-	translated, err := thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), thinkingProviderKey)
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
+	var err error
+	if openAICompatCountTokensNeedsThinking(req, opts, translated, baseModel) {
+		translated = normalizeOpenAICompatRouteReasoningEffort(translated, opts, modelForCounting, thinkingProviderKey, baseURL, profile.Kind)
+		translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), thinkingProviderKey)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
 	}
 	translated = e.overrideModel(translated, modelForCounting)
 	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
@@ -734,6 +751,18 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	logCountTokensSummary(ctx, newCountTokensSummaryLogMeta(opts, requestedModel, modelForCounting, e.Identifier(), "OpenAICompatExecutor", translated), count, time.Since(started))
 	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
+}
+
+func openAICompatCountTokensNeedsThinking(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, payload []byte, baseModel string) bool {
+	if strings.TrimSpace(req.Model) != strings.TrimSpace(baseModel) {
+		return true
+	}
+	if openAICompatMetadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortOriginalMetadataKey) != "" {
+		return true
+	}
+	return bytes.Contains(payload, []byte(`"reasoning"`)) ||
+		bytes.Contains(payload, []byte(`"reasoning_effort"`)) ||
+		bytes.Contains(payload, []byte(`"thinking"`))
 }
 
 // Refresh is a no-op for API-key based compatibility providers.

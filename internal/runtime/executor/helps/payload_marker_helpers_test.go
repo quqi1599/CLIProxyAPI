@@ -2,6 +2,15 @@ package helps
 
 import "testing"
 
+func TestHasClaudeToolUseMarker(t *testing.T) {
+	if HasClaudeToolUseMarker([]byte(`{"content":[{"type":"text"}]}`)) {
+		t.Fatal("expected false without tool_use")
+	}
+	if !HasClaudeToolUseMarker([]byte(`{"content":[{"type":"tool_use"}]}`)) {
+		t.Fatal("expected true with tool_use")
+	}
+}
+
 func TestHasClaudeToolUseOrResultMarkers(t *testing.T) {
 	tests := []struct {
 		name string

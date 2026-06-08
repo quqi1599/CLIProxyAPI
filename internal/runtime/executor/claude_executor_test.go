@@ -669,6 +669,51 @@ func TestRepairMiniMaxToolResultAdjacencyPreservesPendingAcrossPureToolResultMes
 	}
 }
 
+func TestRepairMiniMaxClaudeToolAdjacencyForCompatWithLogSkipsWhenNoToolResultMarker(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type":"text","text":"before"},
+					{"type":"tool_use","id":"call_1","name":"read","input":{}},
+					{"type":"text","text":"after"}
+				]
+			}
+		]
+	}`)
+	meta := compatRepairLogMeta{compatKind: "minimax"}
+
+	out, err := repairMiniMaxClaudeToolAdjacencyForCompatWithLog(context.Background(), body, meta)
+	if err != nil {
+		t.Fatalf("repairMiniMaxClaudeToolAdjacencyForCompatWithLog() error = %v", err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("body changed without tool_result marker:\n got: %s\nwant: %s", out, body)
+	}
+}
+
+func TestRepairClaudeToolUseHistoryWithCompatLogSkipsWhenNoToolUseMarker(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages": [
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"orphan"}]}
+		]
+	}`)
+	meta := compatRepairLogMeta{compatKind: "minimax"}
+
+	out, err := repairClaudeToolUseHistoryWithCompatLog(context.Background(), body, meta)
+	if err != nil {
+		t.Fatalf("repairClaudeToolUseHistoryWithCompatLog() error = %v", err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("body changed without tool_use marker:\n got: %s\nwant: %s", out, body)
+	}
+}
+
 func TestApplyClaudeHeaders_LearnsOfficialFingerprintAfterCustomBaselineFallback(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -2430,6 +2475,85 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	}
 	if hasTTLOrderingViolation(seenBody) {
 		t.Fatalf("count_tokens body still has ttl ordering violations: %s", string(seenBody))
+	}
+}
+
+func TestClaudeExecutor_Execute_SkipsCachePipelineWithoutCacheMarkers(t *testing.T) {
+	testClaudeExecutorSkipsCachePipelineWithoutCacheMarkers(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) ([]byte, error) {
+		var seenBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			seenBody = bytes.Clone(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet-20241022","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		defer server.Close()
+		auth.Attributes["base_url"] = server.URL
+
+		_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "claude-3-5-sonnet-20241022",
+			Payload: payload,
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+		return seenBody, err
+	})
+}
+
+func TestClaudeExecutor_ExecuteStream_SkipsCachePipelineWithoutCacheMarkers(t *testing.T) {
+	testClaudeExecutorSkipsCachePipelineWithoutCacheMarkers(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) ([]byte, error) {
+		var seenBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			seenBody = bytes.Clone(body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+		}))
+		defer server.Close()
+		auth.Attributes["base_url"] = server.URL
+
+		result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "claude-3-5-sonnet-20241022",
+			Payload: payload,
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+		if err != nil {
+			return nil, err
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				return seenBody, chunk.Err
+			}
+		}
+		return seenBody, nil
+	})
+}
+
+func testClaudeExecutorSkipsCachePipelineWithoutCacheMarkers(
+	t *testing.T,
+	invoke func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) ([]byte, error),
+) {
+	t.Helper()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key": "key-123",
+	}}
+	payload := []byte(`{
+		"tools":[{"name":"t1","input_schema":{"type":"object"}}],
+		"system":[{"type":"text","text":"system prompt"}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"turn 1"}]},
+			{"role":"user","content":[{"type":"text","text":"turn 2"}]}
+		]
+	}`)
+
+	seenBody, err := invoke(executor, auth, payload)
+	if err != nil {
+		t.Fatalf("invoke error: %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if bytes.Contains(seenBody, []byte(`"cache_control"`)) {
+		t.Fatalf("compat preflight should skip cache pipeline without cache markers: %s", seenBody)
 	}
 }
 

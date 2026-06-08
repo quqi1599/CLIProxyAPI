@@ -44,6 +44,16 @@ type ClaudeExecutor struct {
 	cfg *config.Config
 }
 
+type claudeCompatPreflight struct {
+	hasToolUse    bool
+	hasToolResult bool
+	hasCache      bool
+	hasSystemRole bool
+	hasTools      bool
+	hasToolSearch bool
+	hasBetas      bool
+}
+
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
@@ -195,7 +205,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
-	body = normalizeClaudeSystemRoleMessages(body)
+	preflight := newClaudeCompatPreflight(body)
+	if preflight.hasSystemRole {
+		body = normalizeClaudeSystemRoleMessages(body)
+	}
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -204,42 +217,49 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
-	if err != nil {
-		return resp, err
+	if preflight.hasToolUse {
+		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
+		if err != nil {
+			return resp, err
+		}
 	}
-	body, _, err = normalizeClaudeEmptyToolResults(body)
-	if err != nil {
-		return resp, err
+	if preflight.hasToolResult {
+		body, _, err = normalizeClaudeEmptyToolResults(body)
+		if err != nil {
+			return resp, err
+		}
 	}
-	body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
+	if preflight.hasTools || preflight.hasToolSearch {
+		body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
+	}
 
-	// Apply cache_control phases sharing a single payload scan (byte-equivalent
-	// to the legacy inject → enforce → normalize sequence):
-	//   1. Auto-inject cache_control if missing (ClawdBot/clients without caching support).
-	//   2. Enforce Anthropic's max-4-breakpoint limit. Cloaking and injection may
-	//      push the total over 4 when the client (e.g. Amp CLI) already sends blocks.
-	//   3. Normalize TTL ordering under prompt-caching-scope-2026-01-05: a 1h block
-	//      must not appear after a 5m block in evaluation order (tools→system→messages).
-	body = applyCacheControlPipeline(body, 4, true)
-	body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
-	if err != nil {
-		return resp, err
+	if preflight.hasCache {
+		body = applyCacheControlPipeline(body, 4, true)
+	}
+	if preflight.hasToolResult {
+		body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
+		if err != nil {
+			return resp, err
+		}
 	}
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
+	if preflight.hasBetas {
+		extraBetas, body = extractAndRemoveBetas(body)
+	}
 	bodyForTranslation := body
 	bodyForUpstream := body
 	bodyForUpstream = downgradeClaudeStructuredOutputForCompat(baseURL, bodyForUpstream)
 	oauthToken := isClaudeOAuthToken(apiKey)
 	var oauthToolNamesReverseMap map[string]string
-	if oauthToken {
+	if preflight.hasTools && oauthToken {
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	var toolNameSanitization *claudeToolNameSanitization
-	bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
+	if preflight.hasTools {
+		bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
+	}
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
@@ -298,7 +318,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.LogWithRequestID(ctx).Warn(msg)
 			b = []byte(msg)
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg); responseLog != nil {
+			responseLog.AppendChunk(b)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		if errClose := errBody.Close(); errClose != nil {
@@ -306,6 +328,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		return resp, err
 	}
+	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -324,7 +347,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if responseLog != nil {
+		responseLog.AppendChunk(data)
+	}
 	if stream {
 		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
@@ -412,7 +437,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
 	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, true)
-	body = normalizeClaudeSystemRoleMessages(body)
+	preflight := newClaudeCompatPreflight(body)
+	if preflight.hasSystemRole {
+		body = normalizeClaudeSystemRoleMessages(body)
+	}
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -421,39 +449,53 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
-	if err != nil {
-		return nil, err
+	if preflight.hasToolUse {
+		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
+		if err != nil {
+			return nil, err
+		}
 	}
-	body, _, err = normalizeClaudeEmptyToolResults(body)
-	if err != nil {
-		return nil, err
+	if preflight.hasToolResult {
+		body, _, err = normalizeClaudeEmptyToolResults(body)
+		if err != nil {
+			return nil, err
+		}
 	}
-	body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
+	if preflight.hasTools || preflight.hasToolSearch {
+		body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
+	}
 
 	// Apply cache_control phases sharing a single payload scan (byte-equivalent
 	// to the legacy inject → enforce → normalize sequence): auto-inject when
 	// missing, enforce the max-4-breakpoint limit, then normalize TTL ordering
 	// under prompt-caching-scope-2026-01-05.
-	body = applyCacheControlPipeline(body, 4, true)
-	body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
-	if err != nil {
-		return nil, err
+	if preflight.hasCache {
+		body = applyCacheControlPipeline(body, 4, true)
+	}
+	if preflight.hasToolResult {
+		body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
+	if preflight.hasBetas {
+		extraBetas, body = extractAndRemoveBetas(body)
+	}
 	bodyForTranslation := body
 	bodyForUpstream := body
 	bodyForUpstream = downgradeClaudeStructuredOutputForCompat(baseURL, bodyForUpstream)
 	oauthToken := isClaudeOAuthToken(apiKey)
 	var oauthToolNamesReverseMap map[string]string
-	if oauthToken {
+	if preflight.hasTools && oauthToken {
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	var toolNameSanitization *claudeToolNameSanitization
-	bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
+	if preflight.hasTools {
+		bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
+	}
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
@@ -497,6 +539,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
@@ -515,7 +558,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.LogWithRequestID(ctx).Warn(msg)
 			b = []byte(msg)
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if responseLog != nil {
+			responseLog.AppendChunk(b)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
@@ -546,7 +591,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
-				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				if responseLog != nil {
+					responseLog.AppendChunk(line)
+				}
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
@@ -568,7 +615,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 			if errScan := scanner.Err(); errScan != nil {
-				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+				if responseLog != nil {
+					responseLog.RecordError(errScan)
+				}
 				reporter.PublishFailure(ctx, errScan)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
@@ -584,7 +633,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if responseLog != nil {
+				responseLog.AppendChunk(line)
+			}
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -611,7 +662,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			if responseLog != nil {
+				responseLog.RecordError(errScan)
+			}
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
@@ -2003,7 +2056,7 @@ func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstr
 }
 
 func repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx context.Context, body []byte, meta compatRepairLogMeta) ([]byte, error) {
-	if !requiresClaudeToolAdjacencyRepair(meta.compatKind) {
+	if !requiresClaudeToolAdjacencyRepair(meta.compatKind) || !helps.HasClaudeToolResultMarker(body) {
 		return body, nil
 	}
 	started := time.Now()
@@ -2020,6 +2073,9 @@ func repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx context.Context, body 
 }
 
 func repairClaudeToolUseHistoryWithCompatLog(ctx context.Context, body []byte, meta compatRepairLogMeta) ([]byte, error) {
+	if !helps.HasClaudeToolUseMarker(body) {
+		return body, nil
+	}
 	started := time.Now()
 	beforeBytes := len(body)
 	repaired, stats, err := repairClaudeToolUseHistoryWithStats(body)
@@ -2105,6 +2161,18 @@ func executorIntMetadataValue(raw any) int {
 		}
 	}
 	return 0
+}
+
+func newClaudeCompatPreflight(body []byte) claudeCompatPreflight {
+	return claudeCompatPreflight{
+		hasToolUse:    helps.HasClaudeToolUseMarker(body),
+		hasToolResult: helps.HasClaudeToolResultMarker(body),
+		hasCache:      helps.HasClaudeCacheControlMarker(body),
+		hasSystemRole: helps.HasClaudeSystemRoleMarker(body),
+		hasTools:      helps.HasClaudeToolsMarker(body),
+		hasToolSearch: helps.HasClaudeToolSearchMarker(body),
+		hasBetas:      helps.HasClaudeBetasMarker(body),
+	}
 }
 
 func repairMiniMaxClaudeToolAdjacencyForCompat(compatKind string, body []byte) ([]byte, error) {

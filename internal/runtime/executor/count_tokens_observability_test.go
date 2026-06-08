@@ -118,6 +118,39 @@ func TestOpenAICompatExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatCountTokensNeedsThinking(t *testing.T) {
+	t.Parallel()
+
+	if openAICompatCountTokensNeedsThinking(
+		cliproxyexecutor.Request{Model: "gpt-4o-mini"},
+		cliproxyexecutor.Options{},
+		[]byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		"gpt-4o-mini",
+	) {
+		t.Fatal("expected plain payload to skip thinking transforms")
+	}
+
+	if !openAICompatCountTokensNeedsThinking(
+		cliproxyexecutor.Request{Model: "gpt-4o-mini[1m]"},
+		cliproxyexecutor.Options{},
+		[]byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		"gpt-4o-mini",
+	) {
+		t.Fatal("expected suffixed model to require thinking transforms")
+	}
+
+	if !openAICompatCountTokensNeedsThinking(
+		cliproxyexecutor.Request{Model: "gpt-4o-mini"},
+		cliproxyexecutor.Options{Metadata: map[string]any{
+			cliproxyexecutor.ReasoningEffortOriginalMetadataKey: "max",
+		}},
+		[]byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		"gpt-4o-mini",
+	) {
+		t.Fatal("expected reasoning metadata to require thinking transforms")
+	}
+}
+
 func findCountTokensSummaryEntry(t *testing.T, entries []*log.Entry, executorName string) *log.Entry {
 	t.Helper()
 	for i := len(entries) - 1; i >= 0; i-- {

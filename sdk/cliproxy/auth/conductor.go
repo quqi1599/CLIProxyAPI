@@ -2069,6 +2069,77 @@ type streamExecutionLogMeta struct {
 	requestPath    string
 }
 
+type streamRuntimeStats struct {
+	summaryFields streamSummaryFields
+	chunksCount   int
+	bytesOut      int
+}
+
+func (s *streamRuntimeStats) observe(payload []byte) {
+	if s == nil || len(payload) == 0 {
+		return
+	}
+	s.chunksCount++
+	s.bytesOut += len(payload)
+	s.summaryFields.observePayload(payload)
+}
+
+type streamRequestRuntime struct {
+	meta               streamExecutionLogMeta
+	responseModelAlias string
+	logger             *log.Entry
+	trace              *requestAttemptTrace
+	attempt            coreusage.RequestAttempt
+	done               <-chan struct{}
+	trackerID          uint64
+	stats              streamRuntimeStats
+}
+
+func newStreamRequestRuntime(ctx context.Context, meta streamExecutionLogMeta, responseModelAlias string, trackerID uint64) streamRequestRuntime {
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	return streamRequestRuntime{
+		meta:               meta,
+		responseModelAlias: responseModelAlias,
+		logger:             logEntryWithRequestID(ctx),
+		trace:              requestAttemptTraceFromContext(ctx),
+		attempt:            coreusage.RequestAttemptFromContext(ctx),
+		done:               done,
+		trackerID:          trackerID,
+	}
+}
+
+func (r *streamRequestRuntime) rewritePayload(payload []byte) []byte {
+	if r == nil || len(payload) == 0 || r.responseModelAlias == "" {
+		return payload
+	}
+	return rewriteResponsePayloadModelAlias(payload, r.responseModelAlias)
+}
+
+func (r *streamRequestRuntime) recordFinalStatus(status int) {
+	if r == nil || r.trace == nil {
+		return
+	}
+	r.trace.recordFinalStatus(status)
+}
+
+func (r *streamRequestRuntime) addLogFields(fields log.Fields) {
+	if r == nil || len(fields) == 0 {
+		return
+	}
+	if r.attempt.RequestID != "" {
+		fields["request_id"] = r.attempt.RequestID
+	}
+	if r.attempt.AttemptNo > 0 {
+		fields["attempt_no"] = r.attempt.AttemptNo
+	}
+	if r.attempt.RetryReason != "" {
+		fields["retry_reason"] = r.attempt.RetryReason
+	}
+}
+
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamExecutionLogMeta, responseModelAlias string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, cancelUpstream func(), startedAt time.Time, firstPayloadDelay time.Duration, releaseSlot func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	var cancelOnce sync.Once
@@ -2083,26 +2154,24 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 	if m != nil && m.activeStreams != nil {
 		trackerID = m.activeStreams.start(meta.provider, meta.upstreamModel, meta.requestPath, startedAt)
 	}
+	runtime := newStreamRequestRuntime(ctx, meta, responseModelAlias, trackerID)
 	go func() {
 		defer close(out)
 		if releaseSlot != nil {
 			defer releaseSlot()
 		}
 		if m != nil && m.activeStreams != nil {
-			defer m.activeStreams.stop(trackerID)
+			defer m.activeStreams.stop(runtime.trackerID)
 		}
 		var failed bool
 		var clientGone bool
-		chunksCount := 0
-		bytesOut := 0
-		summaryFields := streamSummaryFields{}
 		defer func() {
 			totalDuration := time.Since(startedAt)
 			streamDuration := totalDuration - firstPayloadDelay
 			if streamDuration < 0 {
 				streamDuration = 0
 			}
-			finishReason := summaryFields.finishReason
+			finishReason := runtime.stats.summaryFields.finishReason
 			if finishReason == "" {
 				finishReason = "done"
 				if failed {
@@ -2121,22 +2190,22 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				"time_to_first_chunk_ms": firstPayloadDelay.Milliseconds(),
 				"stream_duration_ms":     streamDuration.Milliseconds(),
 				"total_duration_ms":      totalDuration.Milliseconds(),
-				"chunks_count":           chunksCount,
-				"bytes_out":              bytesOut,
-				"output_tokens":          summaryFields.outputTokens,
-				"tokens_per_second":      streamTokensPerSecond(summaryFields.outputTokens, streamDuration),
+				"chunks_count":           runtime.stats.chunksCount,
+				"bytes_out":              runtime.stats.bytesOut,
+				"output_tokens":          runtime.stats.summaryFields.outputTokens,
+				"tokens_per_second":      streamTokensPerSecond(runtime.stats.summaryFields.outputTokens, streamDuration),
 				"client_gone":            clientGone && !failed,
 				"finish_reason":          finishReason,
 			}
-			addRequestAttemptLogFields(ctx, fields)
-			logEntryWithRequestID(ctx).WithFields(fields).Info("stream execution summary")
+			runtime.addLogFields(fields)
+			runtime.logger.WithFields(fields).Info("stream execution summary")
 			if dbPlugin := internalusage.GetDatabasePlugin(); dbPlugin != nil {
 				dbPlugin.HandleStreamSummary(ctx, internalusage.StreamSummaryRecord{
 					TimeToFirstChunkMs: firstPayloadDelay.Milliseconds(),
 					StreamDurationMs:   streamDuration.Milliseconds(),
 					TotalDurationMs:    totalDuration.Milliseconds(),
-					ChunksCount:        chunksCount,
-					BytesOut:           int64(bytesOut),
+					ChunksCount:        runtime.stats.chunksCount,
+					BytesOut:           int64(runtime.stats.bytesOut),
 					ClientGone:         clientGone && !failed,
 					FinishReason:       finishReason,
 				})
@@ -2148,32 +2217,26 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				failed = true
 				rerr := resultErrorFromCause(chunk.Err)
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: chunk.Err})
-				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-					trace.recordFinalStatus(statusCodeFromError(chunk.Err))
-				}
+				runtime.recordFinalStatus(statusCodeFromError(chunk.Err))
 				if shouldEvictUnauthorizedResult(rerr) {
 					if errEvict := m.evictUnauthorizedAuth(ctx, auth, meta.provider, meta.upstreamModel); errEvict != nil {
-						logEntryWithRequestID(ctx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+						runtime.logger.Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
 					}
 				}
 			}
 			if !forward {
 				return false
 			}
-			if len(chunk.Payload) > 0 && responseModelAlias != "" {
-				chunk.Payload = rewriteResponsePayloadModelAlias(chunk.Payload, responseModelAlias)
-			}
 			if len(chunk.Payload) > 0 {
-				chunksCount++
-				bytesOut += len(chunk.Payload)
-				summaryFields.observePayload(chunk.Payload)
+				chunk.Payload = runtime.rewritePayload(chunk.Payload)
+				runtime.stats.observe(chunk.Payload)
 			}
 			if ctx == nil {
 				out <- chunk
 				return true
 			}
 			select {
-			case <-ctx.Done():
+			case <-runtime.done:
 				if !failed {
 					clientGone = true
 				}

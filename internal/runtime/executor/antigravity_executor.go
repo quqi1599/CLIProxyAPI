@@ -878,6 +878,7 @@ attemptLoop:
 			if useCredits {
 				clearAntigravityCreditsFailureState(auth)
 			}
+			responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(resp *http.Response) {
 				defer close(out)
@@ -890,7 +891,9 @@ attemptLoop:
 				scanner.Buffer(nil, streamScannerBuffer)
 				for scanner.Scan() {
 					line := scanner.Bytes()
-					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+					if responseLog != nil {
+						responseLog.AppendChunk(line)
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
@@ -908,7 +911,9 @@ attemptLoop:
 					out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(payload)}
 				}
 				if errScan := scanner.Err(); errScan != nil {
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					if responseLog != nil {
+						responseLog.RecordError(errScan)
+					}
 					reporter.PublishFailure(ctx, errScan)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				} else {
@@ -1346,6 +1351,7 @@ attemptLoop:
 				clearAntigravityCreditsFailureState(auth)
 			}
 			out := make(chan cliproxyexecutor.StreamChunk)
+			responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 			go func(resp *http.Response) {
 				defer close(out)
 				defer func() {
@@ -1358,7 +1364,9 @@ attemptLoop:
 				var param any
 				for scanner.Scan() {
 					line := scanner.Bytes()
-					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+					if responseLog != nil {
+						responseLog.AppendChunk(line)
+					}
 
 					// Filter usage metadata for all models
 					// Only retain usage statistics in the terminal chunk
@@ -1391,7 +1399,9 @@ attemptLoop:
 					}
 				}
 				if errScan := scanner.Err(); errScan != nil {
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					if responseLog != nil {
+						responseLog.RecordError(errScan)
+					}
 					reporter.PublishFailure(ctx, errScan)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:

@@ -68,6 +68,15 @@ type boundedAPIResponseBodyCapture struct {
 	digest     hash.Hash
 }
 
+// APIResponseLogRuntime caches the latest request-log attempt state so stream
+// loops can append chunks without repeatedly resolving gin/request-log state
+// from context on every payload.
+type APIResponseLogRuntime struct {
+	ginCtx   *gin.Context
+	attempts []*upstreamAttempt
+	attempt  *upstreamAttempt
+}
+
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
 	if cfg == nil || !cfg.RequestLog {
@@ -147,11 +156,38 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	if cfg == nil || !cfg.RequestLog || err == nil {
 		return
 	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
+	runtime := NewAPIResponseLogRuntime(ctx, cfg)
+	if runtime == nil {
 		return
 	}
+	runtime.RecordError(err)
+}
+
+// NewAPIResponseLogRuntime resolves and caches the latest request-log attempt
+// for a response. Callers should acquire it once per upstream response and
+// reuse it inside per-chunk streaming loops.
+func NewAPIResponseLogRuntime(ctx context.Context, cfg *config.Config) *APIResponseLogRuntime {
+	if cfg == nil || !cfg.RequestLog {
+		return nil
+	}
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
+		return nil
+	}
 	attempts, attempt := ensureAttempt(ginCtx)
+	return &APIResponseLogRuntime{
+		ginCtx:   ginCtx,
+		attempts: attempts,
+		attempt:  attempt,
+	}
+}
+
+// RecordError appends an upstream response error to the cached attempt.
+func (r *APIResponseLogRuntime) RecordError(err error) {
+	if r == nil || err == nil || r.ginCtx == nil || r.attempt == nil {
+		return
+	}
+	attempt := r.attempt
 	ensureResponseIntro(attempt)
 
 	if attempt.bodyStarted && !attempt.bodyHasContent {
@@ -172,23 +208,28 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	target.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
 	attempt.errorWritten = true
 
-	updateAggregatedResponse(ginCtx, attempts)
+	updateAggregatedResponse(r.ginCtx, r.attempts)
 }
 
 // AppendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
-	if cfg == nil || !cfg.RequestLog {
+	runtime := NewAPIResponseLogRuntime(ctx, cfg)
+	if runtime == nil {
+		return
+	}
+	runtime.AppendChunk(chunk)
+}
+
+// AppendChunk appends an upstream response chunk to the cached attempt.
+func (r *APIResponseLogRuntime) AppendChunk(chunk []byte) {
+	if r == nil || r.ginCtx == nil || r.attempt == nil {
 		return
 	}
 	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
 	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
-		return
-	}
-	attempts, attempt := ensureAttempt(ginCtx)
+	attempt := r.attempt
 	ensureResponseIntro(attempt)
 
 	if !attempt.headersWritten {
@@ -216,7 +257,7 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	attempt.bodyHasContent = true
 	attempt.prevWasSSEEvent = currentChunkIsSSEEvent
 
-	updateAggregatedResponse(ginCtx, attempts)
+	updateAggregatedResponse(r.ginCtx, r.attempts)
 }
 
 // RecordAPIWebsocketRequest stores an upstream websocket request event in Gin context.
