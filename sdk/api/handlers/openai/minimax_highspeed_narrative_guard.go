@@ -1,9 +1,9 @@
 package openai
 
 import (
+	"bytes"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -30,27 +30,27 @@ const (
 
 var defaultMiniMaxHighspeedNarrativeLimiter = &miniMaxHighspeedNarrativeLimiter{}
 
-var miniMaxHighspeedNarrativeStructuralMarkers = []string{
-	"lastRules",
-	"FICTIONAL CONTEXT LOCK",
-	"OUTPUT FORMAT",
-	"statebar",
-	"plot_choices",
-	"content_key_summary",
-	"Mandatory language requirement",
+var miniMaxHighspeedNarrativeStructuralMarkers = [][]byte{
+	[]byte("lastRules"),
+	[]byte("FICTIONAL CONTEXT LOCK"),
+	[]byte("OUTPUT FORMAT"),
+	[]byte("statebar"),
+	[]byte("plot_choices"),
+	[]byte("content_key_summary"),
+	[]byte("Mandatory language requirement"),
 }
 
-var miniMaxHighspeedNarrativeMarkers = []string{
-	"<scenario>",
-	"<narration>",
-	"<action>",
-	"<message>",
-	"novel-style storytelling",
-	"roleplay",
-	"relationship_identity",
-	"story_phase_goal",
-	"output_tone_constraint",
-	"censy",
+var miniMaxHighspeedNarrativeMarkers = [][]byte{
+	[]byte("<scenario>"),
+	[]byte("<narration>"),
+	[]byte("<action>"),
+	[]byte("<message>"),
+	[]byte("novel-style storytelling"),
+	[]byte("roleplay"),
+	[]byte("relationship_identity"),
+	[]byte("story_phase_goal"),
+	[]byte("output_tone_constraint"),
+	[]byte("censy"),
 }
 
 type miniMaxHighspeedNarrativeGuardSettings struct {
@@ -132,39 +132,17 @@ func prepareMiniMaxHighspeedNarrativeGuard(rawJSON []byte, cfg *sdkconfig.SDKCon
 	decision.retryAfterSeconds = settings.retryAfterSeconds
 	decision.maxConcurrent = settings.maxConcurrent
 
-	updated, capped := capMiniMaxHighspeedNarrativeOutput(rawJSON, settings.maxOutputTokens)
-	decision.rawJSON = updated
-	decision.cappedOutput = capped
-
 	release, active, ok := limiter.acquire(settings.maxConcurrent)
 	decision.active = active
 	if !ok {
 		decision.blocked = true
-		log.WithFields(log.Fields{
-			"model":             miniMaxHighspeedNarrativeModel,
-			"body_bytes":        decision.bodyBytes,
-			"max_tokens":        decision.maxTokens,
-			"structural_hits":   decision.structuralHits,
-			"narrative_hits":    decision.narrativeHits,
-			"active":            decision.active,
-			"max_concurrent":    decision.maxConcurrent,
-			"retry_after_secs":  decision.retryAfterSeconds,
-			"max_output_tokens": settings.maxOutputTokens,
-		}).Warn("minimax highspeed narrative guard rejected request")
 		return decision
 	}
+
+	updated, capped := capMiniMaxHighspeedNarrativeOutput(rawJSON, settings.maxOutputTokens)
+	decision.rawJSON = updated
+	decision.cappedOutput = capped
 	decision.release = release
-	log.WithFields(log.Fields{
-		"model":             miniMaxHighspeedNarrativeModel,
-		"body_bytes":        decision.bodyBytes,
-		"max_tokens":        decision.maxTokens,
-		"structural_hits":   decision.structuralHits,
-		"narrative_hits":    decision.narrativeHits,
-		"active":            decision.active,
-		"max_concurrent":    decision.maxConcurrent,
-		"capped_output":     decision.cappedOutput,
-		"max_output_tokens": settings.maxOutputTokens,
-	}).Info("minimax highspeed narrative guard admitted request")
 	return decision
 }
 
@@ -203,9 +181,8 @@ func matchMiniMaxHighspeedNarrative(rawJSON []byte) miniMaxHighspeedNarrativeMat
 	if match.maxTokens < miniMaxHighspeedNarrativeMinOutputTokens {
 		return match
 	}
-	body := string(rawJSON)
-	match.structuralHits = countContainedMarkers(body, miniMaxHighspeedNarrativeStructuralMarkers)
-	match.narrativeHits = countContainedMarkers(body, miniMaxHighspeedNarrativeMarkers)
+	match.structuralHits = countContainedMarkers(rawJSON, miniMaxHighspeedNarrativeStructuralMarkers)
+	match.narrativeHits = countContainedMarkers(rawJSON, miniMaxHighspeedNarrativeMarkers)
 	totalHits := match.structuralHits + match.narrativeHits
 	match.matched = match.structuralHits >= miniMaxHighspeedNarrativeMinStructuralHits &&
 		match.narrativeHits >= miniMaxHighspeedNarrativeMinNarrativeHits &&
@@ -227,10 +204,10 @@ func maxRequestedOutputTokens(rawJSON []byte) int64 {
 	return maxTokens
 }
 
-func countContainedMarkers(body string, markers []string) int {
+func countContainedMarkers(body []byte, markers [][]byte) int {
 	count := 0
 	for _, marker := range markers {
-		if strings.Contains(body, marker) {
+		if bytes.Contains(body, marker) {
 			count++
 		}
 	}
