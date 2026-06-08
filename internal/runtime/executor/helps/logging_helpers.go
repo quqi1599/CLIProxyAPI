@@ -26,6 +26,7 @@ const (
 	apiAttemptsKey          = "API_UPSTREAM_ATTEMPTS"
 	apiRequestKey           = "API_REQUEST"
 	apiResponseKey          = "API_RESPONSE"
+	apiResponseDirtyKey     = "API_RESPONSE_DIRTY"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
 	creditsUsedKey          = "__antigravity_credits_used__"
 	apiResponseHeadLimit    = 32 << 10
@@ -257,7 +258,7 @@ func (r *APIResponseLogRuntime) AppendChunk(chunk []byte) {
 	attempt.bodyHasContent = true
 	attempt.prevWasSSEEvent = currentChunkIsSSEEvent
 
-	updateAggregatedResponse(r.ginCtx, r.attempts)
+	r.ginCtx.Set(apiResponseDirtyKey, true)
 }
 
 // RecordAPIWebsocketRequest stores an upstream websocket request event in Gin context.
@@ -469,6 +470,29 @@ func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) 
 		}
 	}
 	ginCtx.Set(apiResponseKey, []byte(builder.String()))
+	ginCtx.Set(apiResponseDirtyKey, false)
+}
+
+// MaterializeAPIResponse returns the latest aggregated API response text,
+// rendering deferred request-log body updates on demand when needed.
+func MaterializeAPIResponse(ginCtx *gin.Context) []byte {
+	if ginCtx == nil {
+		return nil
+	}
+	if value, exists := ginCtx.Get(apiResponseDirtyKey); exists {
+		if dirty, ok := value.(bool); ok && dirty {
+			updateAggregatedResponse(ginCtx, getAttempts(ginCtx))
+		}
+	}
+	apiResponse, exists := ginCtx.Get(apiResponseKey)
+	if !exists {
+		return nil
+	}
+	data, ok := apiResponse.([]byte)
+	if !ok || len(data) == 0 {
+		return nil
+	}
+	return data
 }
 
 func newBoundedAPIResponseBodyCapture() *boundedAPIResponseBodyCapture {

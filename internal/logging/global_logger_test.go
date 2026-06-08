@@ -175,3 +175,50 @@ func TestLogFormatterIncludesCompatAndStreamObservabilityFields(t *testing.T) {
 		}
 	}
 }
+
+func TestLogFormatterIncludesCountTokensSummaryFields(t *testing.T) {
+	entry := &log.Entry{
+		Time:    time.Date(2026, 6, 8, 9, 33, 34, 0, time.UTC),
+		Level:   log.InfoLevel,
+		Message: "count tokens summary",
+		Data: log.Fields{
+			"request_id":      "req-count",
+			"event":           "count_tokens_summary",
+			"provider":        "claude",
+			"executor":        "ClaudeExecutor",
+			"requested_model": "claude-sonnet-4-6",
+			"upstream_model":  "MiniMax-M3",
+			"request_path":    "/v1/messages/count_tokens",
+			"client_profile":  "claude_code",
+			"payload_bytes":   2048,
+			"message_count":   1,
+			"tool_count":      0,
+			"duration_ms":     392,
+			"input_tokens":    1413,
+		},
+	}
+
+	raw, err := (&LogFormatter{}).Format(entry)
+	if err != nil {
+		t.Fatalf("format log entry: %v", err)
+	}
+	line := string(raw)
+	for _, want := range []string{
+		"event=count_tokens_summary",
+		"provider=claude",
+		"executor=ClaudeExecutor",
+		"requested_model=claude-sonnet-4-6",
+		"upstream_model=MiniMax-M3",
+		"request_path=/v1/messages/count_tokens",
+		"client_profile=claude_code",
+		"payload_bytes=2048",
+		"message_count=1",
+		"tool_count=0",
+		"duration_ms=392",
+		"input_tokens=1413",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted log missing %q: %s", want, line)
+		}
+	}
+}

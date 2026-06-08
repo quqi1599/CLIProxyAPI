@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -347,15 +348,7 @@ func (w *ResponseWriterWrapper) extractAPIRequest(c *gin.Context) []byte {
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
-	apiResponse, isExist := c.Get("API_RESPONSE")
-	if !isExist {
-		return nil
-	}
-	data, ok := apiResponse.([]byte)
-	if !ok || len(data) == 0 {
-		return nil
-	}
-	return data
+	return helps.MaterializeAPIResponse(c)
 }
 
 func (w *ResponseWriterWrapper) extractAPIWebsocketTimeline(c *gin.Context) []byte {

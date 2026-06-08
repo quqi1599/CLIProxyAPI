@@ -87,15 +87,40 @@ func TestAppendAPIResponseChunkBoundsLargeBodyCapture(t *testing.T) {
 	}
 }
 
-func testAPIResponseText(t *testing.T, ginCtx *gin.Context) string {
-	t.Helper()
+func TestAppendAPIResponseChunkDefersAggregateRenderUntilMaterialized(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	cfg := &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}
+
+	RecordAPIResponseMetadata(ctx, cfg, http.StatusOK, nil)
+	AppendAPIResponseChunk(ctx, cfg, []byte("event: message"))
+	AppendAPIResponseChunk(ctx, cfg, []byte("data: {\"ok\":true}"))
+
 	value, exists := ginCtx.Get(apiResponseKey)
 	if !exists {
-		t.Fatal("API_RESPONSE payload missing from gin context")
+		t.Fatal("API_RESPONSE payload missing from gin context before materialization")
 	}
-	raw, ok := value.([]byte)
+	rawBefore, ok := value.([]byte)
 	if !ok {
-		t.Fatalf("API_RESPONSE type = %T, want []byte", value)
+		t.Fatalf("API_RESPONSE type = %T, want []byte before materialization", value)
+	}
+	if strings.Contains(string(rawBefore), "data: {\"ok\":true}") {
+		t.Fatalf("expected chunk body to remain deferred before materialization: %s", rawBefore)
+	}
+
+	got := string(MaterializeAPIResponse(ginCtx))
+	if !strings.Contains(got, "Body:\nevent: message\ndata: {\"ok\":true}") {
+		t.Fatalf("materialized body missing deferred chunks: %s", got)
+	}
+}
+
+func testAPIResponseText(t *testing.T, ginCtx *gin.Context) string {
+	t.Helper()
+	raw := MaterializeAPIResponse(ginCtx)
+	if len(raw) == 0 {
+		t.Fatal("API_RESPONSE payload missing from gin context")
 	}
 	return string(raw)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -602,13 +603,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
 		}
 		if h.Cfg.RequestLog && len(params) == 1 {
-			if existing, exists := c.Get("API_RESPONSE"); exists {
-				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
-					switch params[0].(type) {
-					case error, string:
-						cancel()
-						return
-					}
+			if existingBytes := currentAPIResponse(c); len(bytes.TrimSpace(existingBytes)) > 0 {
+				switch params[0].(type) {
+				case error, string:
+					cancel()
+					return
 				}
 			}
 
@@ -624,13 +623,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 				payload = []byte(data)
 			}
 			if len(payload) > 0 {
-				if existing, exists := c.Get("API_RESPONSE"); exists {
-					if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-						trimmedPayload := bytes.TrimSpace(payload)
-						if len(trimmedPayload) > 0 && bytes.Contains(existingBytes, trimmedPayload) {
-							cancel()
-							return
-						}
+				if existingBytes := currentAPIResponse(c); len(existingBytes) > 0 {
+					trimmedPayload := bytes.TrimSpace(payload)
+					if len(trimmedPayload) > 0 && bytes.Contains(existingBytes, trimmedPayload) {
+						cancel()
+						return
 					}
 				}
 				appendAPIResponse(c, payload)
@@ -699,20 +696,22 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 		c.Set("API_RESPONSE_TIMESTAMP", time.Now())
 	}
 
-	if existing, exists := c.Get("API_RESPONSE"); exists {
-		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			combined := make([]byte, 0, len(existingBytes)+len(data)+1)
-			combined = append(combined, existingBytes...)
-			if existingBytes[len(existingBytes)-1] != '\n' {
-				combined = append(combined, '\n')
-			}
-			combined = append(combined, data...)
-			c.Set("API_RESPONSE", combined)
-			return
+	if existingBytes := currentAPIResponse(c); len(existingBytes) > 0 {
+		combined := make([]byte, 0, len(existingBytes)+len(data)+1)
+		combined = append(combined, existingBytes...)
+		if existingBytes[len(existingBytes)-1] != '\n' {
+			combined = append(combined, '\n')
 		}
+		combined = append(combined, data...)
+		c.Set("API_RESPONSE", combined)
+		return
 	}
 
 	c.Set("API_RESPONSE", bytes.Clone(data))
+}
+
+func currentAPIResponse(c *gin.Context) []byte {
+	return helps.MaterializeAPIResponse(c)
 }
 
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
@@ -1309,10 +1308,8 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	body := BuildErrorResponseBody(status, errText)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
-	if existing, exists := c.Get("API_RESPONSE"); exists {
-		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			previous = existingBytes
-		}
+	if existingBytes := currentAPIResponse(c); len(existingBytes) > 0 {
+		previous = existingBytes
 	}
 	appendAPIResponse(c, body)
 	trimmedErrText := strings.TrimSpace(errText)
