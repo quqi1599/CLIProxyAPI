@@ -414,6 +414,54 @@ func TestManagerExecute_MiniMaxM27HighspeedRouteUsesStandardM3(t *testing.T) {
 	}
 }
 
+func TestManagerExecuteStream_MiniMaxM27HighspeedRouteUsesStandardM3(t *testing.T) {
+	model := "MiniMax-M2.7-highspeed"
+	executor := &apiKeyPoolExecutor{id: "claude"}
+	m := newClaudeAPIKeyPoolTestManager(t, model, []internalconfig.ClaudeModel{
+		{Name: "MiniMax-M3"},
+		{Name: model},
+	}, executor)
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":1024}`),
+	}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "MiniMax-M3" {
+		t.Fatalf("payload = %q, want MiniMax-M3", string(payload))
+	}
+	got := executor.StreamModels()
+	if len(got) != 1 || got[0] != "MiniMax-M3" {
+		t.Fatalf("stream models = %v, want only MiniMax-M3", got)
+	}
+}
+
+func TestManagerPrepareExecutionModels_MiniMaxM27DirectFallbackUsesStandardM3(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "direct-minimax-auth",
+		Provider: "claude",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key": "test-key",
+		},
+	}
+
+	got := m.prepareExecutionModels(auth, "MiniMax-M2.7-highspeed")
+	if len(got) != 1 || got[0] != "MiniMax-M3" {
+		t.Fatalf("prepared models = %v, want only MiniMax-M3", got)
+	}
+}
+
 func TestManagerExecute_ClaudeSonnetMiniMaxContextLimitFallsBackToM3(t *testing.T) {
 	alias := "claude-sonnet-4-6"
 	contextLimitErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "context length exceeded"}

@@ -302,6 +302,30 @@ func TestManagerExecute_OpenAICompatMiniMaxM27HighspeedRouteUsesStandardM3(t *te
 	}
 }
 
+func TestManagerExecuteStream_OpenAICompatMiniMaxM27HighspeedRouteUsesStandardM3(t *testing.T) {
+	model := "MiniMax-M2.7-highspeed"
+	executor := &openAICompatPoolExecutor{id: "pool"}
+	m := newOpenAICompatPoolTestManager(t, model, []internalconfig.OpenAICompatibilityModel{
+		{Name: "MiniMax-M3"},
+		{Name: model},
+	}, executor)
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":1024}`),
+	}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	if payload := readOpenAICompatStreamPayload(t, streamResult); payload != "MiniMax-M3" {
+		t.Fatalf("payload = %q, want MiniMax-M3", payload)
+	}
+	got := executor.StreamModels()
+	if len(got) != 1 || got[0] != "MiniMax-M3" {
+		t.Fatalf("stream models = %v, want only MiniMax-M3", got)
+	}
+}
+
 func TestManagerExecute_OpenAICompatLargeToolHistorySkipsMiniMaxM3Highspeed(t *testing.T) {
 	alias := "agent-large-history"
 	executor := &openAICompatPoolExecutor{id: "pool"}

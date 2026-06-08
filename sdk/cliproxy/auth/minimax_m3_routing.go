@@ -61,15 +61,25 @@ func miniMaxCandidateSetNeedsM3RequestCheck(candidates []string) bool {
 	return false
 }
 
-func rewriteMiniMaxM3HighspeedRouteToStandard(routeModel string, opts cliproxyexecutor.Options, candidates []string) []string {
-	if len(candidates) == 0 {
+func rewriteMiniMaxM3StandardRouteCandidates(routeModel string, candidates []string) []string {
+	if !isMiniMaxM3StandardRouteAlias(routeModel) {
 		return candidates
 	}
+	return rewriteMiniMaxM3StandardCandidates(candidates)
+}
+
+func rewriteMiniMaxM3HighspeedRouteToStandard(routeModel string, opts cliproxyexecutor.Options, candidates []string) []string {
 	if !isMiniMaxM3StandardRouteAlias(routeModel) &&
 		!isMiniMaxM3StandardRouteAlias(requestedModelAliasFromOptions(opts, routeModel)) {
 		return candidates
 	}
+	return rewriteMiniMaxM3StandardCandidates(candidates)
+}
 
+func rewriteMiniMaxM3StandardCandidates(candidates []string) []string {
+	if len(candidates) == 0 {
+		return candidates
+	}
 	out := make([]string, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))
 	changed := false

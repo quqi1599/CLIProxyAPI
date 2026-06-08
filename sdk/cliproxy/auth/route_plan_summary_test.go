@@ -84,6 +84,9 @@ func TestManager_Execute_LogsRoutePlanWithFallback(t *testing.T) {
 	if first.ResolvedModel != model {
 		t.Fatalf("first resolved_model = %q, want %q", first.ResolvedModel, model)
 	}
+	if first.UpstreamModel != model {
+		t.Fatalf("first upstream_model = %q, want %q", first.UpstreamModel, model)
+	}
 	if first.Provider != "kimi" {
 		t.Fatalf("first provider = %q, want kimi", first.Provider)
 	}

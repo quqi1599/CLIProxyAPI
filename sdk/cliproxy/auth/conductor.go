@@ -100,6 +100,7 @@ type requestExecutionSummary struct {
 type routePlanSummary struct {
 	RequestedModel   string `json:"requested_model,omitempty"`
 	ResolvedModel    string `json:"resolved_model,omitempty"`
+	UpstreamModel    string `json:"upstream_model,omitempty"`
 	AuthIndex        string `json:"auth_index,omitempty"`
 	Provider         string `json:"provider,omitempty"`
 	Protocol         string `json:"protocol,omitempty"`
@@ -351,12 +352,12 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
 
-func logRoutePlan(ctx context.Context, auth *Auth, provider, routeModel, resolvedModel string, opts cliproxyexecutor.Options, executor ProviderExecutor, operation string) {
+func logRoutePlan(ctx context.Context, auth *Auth, provider, routeModel, resolvedModel, upstreamModel string, opts cliproxyexecutor.Options, executor ProviderExecutor, operation string) {
 	trace := requestAttemptTraceFromContext(ctx)
 	if trace == nil {
 		return
 	}
-	plan := buildRoutePlanSummary(trace.summary(), auth, provider, routeModel, resolvedModel, opts, executor, operation, coreusage.RequestAttemptFromContext(ctx))
+	plan := buildRoutePlanSummary(trace.summary(), auth, provider, routeModel, resolvedModel, upstreamModel, opts, executor, operation, coreusage.RequestAttemptFromContext(ctx))
 	fields := log.Fields{
 		"event":      "route_plan",
 		"route_plan": plan,
@@ -365,7 +366,7 @@ func logRoutePlan(ctx context.Context, auth *Auth, provider, routeModel, resolve
 	logEntryWithRequestID(ctx).WithFields(fields).Info("route_plan")
 }
 
-func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provider, routeModel, resolvedModel string, opts cliproxyexecutor.Options, executor ProviderExecutor, operation string, attempt coreusage.RequestAttempt) routePlanSummary {
+func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provider, routeModel, resolvedModel, upstreamModel string, opts cliproxyexecutor.Options, executor ProviderExecutor, operation string, attempt coreusage.RequestAttempt) routePlanSummary {
 	requestPath := metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey)
 	sourceFormat := strings.TrimSpace(opts.SourceFormat.String())
 	executorName := providerExecutorName(executor)
@@ -380,6 +381,7 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 	return routePlanSummary{
 		RequestedModel:   requestedModel,
 		ResolvedModel:    strings.TrimSpace(resolvedModel),
+		UpstreamModel:    strings.TrimSpace(upstreamModel),
 		AuthIndex:        authMetricIndex(auth),
 		Provider:         strings.TrimSpace(provider),
 		Protocol:         protocol,
@@ -1203,7 +1205,7 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
 	if auth != nil && auth.Attributes != nil {
 		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {
-			return []string{homeModel}
+			return rewriteMiniMaxM3StandardRouteCandidates(routeModel, []string{homeModel})
 		}
 	}
 	requestedModel := rewriteModelForAuth(routeModel, auth)
@@ -1212,30 +1214,30 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 			requestedModel = pool[0]
 		} else {
 			offset := m.nextModelPoolOffset(oauthModelAliasPoolKey(auth, requestedModel), len(pool))
-			return rotateStrings(pool, offset)
+			return rewriteMiniMaxM3StandardRouteCandidates(routeModel, rotateStrings(pool, offset))
 		}
 	} else {
 		requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
 	}
 	if pool := m.resolveAPIKeyUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
 		if len(pool) == 1 {
-			return pool
+			return rewriteMiniMaxM3StandardRouteCandidates(routeModel, pool)
 		}
 		offset := m.nextModelPoolOffset(apiKeyModelPoolKey(auth, requestedModel), len(pool))
-		return rotateStrings(pool, offset)
+		return rewriteMiniMaxM3StandardRouteCandidates(routeModel, rotateStrings(pool, offset))
 	}
 	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
 		if len(pool) == 1 {
-			return pool
+			return rewriteMiniMaxM3StandardRouteCandidates(routeModel, pool)
 		}
 		offset := m.nextModelPoolOffset(openAICompatModelPoolKey(auth, requestedModel), len(pool))
-		return rotateStrings(pool, offset)
+		return rewriteMiniMaxM3StandardRouteCandidates(routeModel, rotateStrings(pool, offset))
 	}
 	resolved := m.applyAPIKeyModelAlias(auth, requestedModel)
 	if strings.TrimSpace(resolved) == "" {
 		resolved = requestedModel
 	}
-	return []string{resolved}
+	return rewriteMiniMaxM3StandardRouteCandidates(routeModel, []string{resolved})
 }
 
 func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
@@ -2281,7 +2283,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			m.markSelectorLoadDone(auth.ID, resultModel)
 			return nil, errReserve
 		}
-		logRoutePlan(ctx, auth, provider, routeModel, resultModel, opts, executor, "stream")
+		logRoutePlan(ctx, auth, provider, routeModel, resultModel, execModel, opts, executor, "stream")
 		startedAt := time.Now()
 		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
@@ -2422,7 +2424,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		streamMeta := streamExecutionLogMeta{
 			requestedModel: requestedModel,
-			upstreamModel:  resultModel,
+			upstreamModel:  execModel,
 			provider:       provider,
 			executor:       providerExecutorName(executor),
 			requestPath:    metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey),
@@ -2982,7 +2984,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				m.markSelectorLoadDone(auth.ID, resultModel)
 				return cliproxyexecutor.Response{}, errReserve
 			}
-			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, opts, executor, "execute")
+			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, opts, executor, "execute")
 			startedAt := time.Now()
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
@@ -3146,7 +3148,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				m.markSelectorLoadDone(auth.ID, resultModel)
 				return cliproxyexecutor.Response{}, errReserve
 			}
-			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, opts, executor, "count")
+			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, opts, executor, "count")
 			startedAt := time.Now()
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
@@ -7633,7 +7635,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, len(models) > 1)
 			execReq := req
 			execReq.Model = upstreamModel
-			logRoutePlan(creditsCtx, c.auth, c.provider, routeModel, resultModel, creditsOpts, c.executor, "execute")
+			logRoutePlan(creditsCtx, c.auth, c.provider, routeModel, resultModel, upstreamModel, creditsOpts, c.executor, "execute")
 			if trace := requestAttemptTraceFromContext(creditsCtx); trace != nil {
 				trace.recordExecution(c.provider, resultModel, providerExecutorName(c.executor))
 			}
