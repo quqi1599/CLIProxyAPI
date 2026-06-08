@@ -3,7 +3,10 @@ package helps
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"html"
 	"net/http"
 	"net/url"
@@ -25,6 +28,8 @@ const (
 	apiResponseKey          = "API_RESPONSE"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
 	creditsUsedKey          = "__antigravity_credits_used__"
+	apiResponseHeadLimit    = 32 << 10
+	apiResponseTailLimit    = 32 << 10
 )
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
@@ -44,6 +49,8 @@ type upstreamAttempt struct {
 	index                int
 	request              string
 	response             *strings.Builder
+	responseTrailer      *strings.Builder
+	bodyCapture          *boundedAPIResponseBodyCapture
 	responseIntroWritten bool
 	statusWritten        bool
 	headersWritten       bool
@@ -51,6 +58,14 @@ type upstreamAttempt struct {
 	bodyHasContent       bool
 	prevWasSSEEvent      bool
 	errorWritten         bool
+}
+
+type boundedAPIResponseBodyCapture struct {
+	head       bytes.Buffer
+	tail       []byte
+	totalBytes int64
+	chunks     int
+	digest     hash.Hash
 }
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
@@ -142,11 +157,19 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 	if attempt.bodyStarted && !attempt.bodyHasContent {
 		// Ensure body does not stay empty marker if error arrives first.
 		attempt.bodyStarted = false
+		attempt.bodyCapture = nil
+	}
+	target := attempt.response
+	if attempt.bodyStarted {
+		if attempt.responseTrailer == nil {
+			attempt.responseTrailer = &strings.Builder{}
+		}
+		target = attempt.responseTrailer
 	}
 	if attempt.errorWritten {
-		attempt.response.WriteString("\n")
+		target.WriteString("\n")
 	}
-	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	target.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
 	attempt.errorWritten = true
 
 	updateAggregatedResponse(ginCtx, attempts)
@@ -175,8 +198,10 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 		attempt.response.WriteString("\n")
 	}
 	if !attempt.bodyStarted {
-		attempt.response.WriteString("Body:\n")
 		attempt.bodyStarted = true
+		if attempt.bodyCapture == nil {
+			attempt.bodyCapture = newBoundedAPIResponseBodyCapture()
+		}
 	}
 	currentChunkIsSSEEvent := bytes.HasPrefix(data, []byte("event:"))
 	currentChunkIsSSEData := bytes.HasPrefix(data, []byte("data:"))
@@ -185,9 +210,9 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 		if attempt.prevWasSSEEvent && currentChunkIsSSEData {
 			separator = "\n"
 		}
-		attempt.response.WriteString(separator)
+		attempt.bodyCapture.WriteSeparator(separator)
 	}
-	attempt.response.WriteString(string(data))
+	attempt.bodyCapture.Append(data)
 	attempt.bodyHasContent = true
 	attempt.prevWasSSEEvent = currentChunkIsSSEEvent
 
@@ -390,10 +415,7 @@ func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) 
 	}
 	var builder strings.Builder
 	for idx, attempt := range attempts {
-		if attempt == nil || attempt.response == nil {
-			continue
-		}
-		responseText := attempt.response.String()
+		responseText := renderAttemptResponse(attempt)
 		if responseText == "" {
 			continue
 		}
@@ -406,6 +428,130 @@ func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) 
 		}
 	}
 	ginCtx.Set(apiResponseKey, []byte(builder.String()))
+}
+
+func newBoundedAPIResponseBodyCapture() *boundedAPIResponseBodyCapture {
+	return &boundedAPIResponseBodyCapture{
+		digest: sha256.New(),
+	}
+}
+
+func (c *boundedAPIResponseBodyCapture) WriteSeparator(value string) {
+	if c == nil || value == "" {
+		return
+	}
+	c.appendBytes([]byte(value), false)
+}
+
+func (c *boundedAPIResponseBodyCapture) Append(data []byte) {
+	c.appendBytes(data, true)
+}
+
+func (c *boundedAPIResponseBodyCapture) appendBytes(data []byte, countChunk bool) {
+	if c == nil || len(data) == 0 {
+		return
+	}
+	if countChunk {
+		c.chunks++
+	}
+	c.totalBytes += int64(len(data))
+	_, _ = c.digest.Write(data)
+
+	if remaining := apiResponseHeadLimit - c.head.Len(); remaining > 0 {
+		if remaining > len(data) {
+			remaining = len(data)
+		}
+		c.head.Write(data[:remaining])
+	}
+	c.tail = appendTailWindow(c.tail, data, apiResponseTailLimit)
+}
+
+func (c *boundedAPIResponseBodyCapture) Render() string {
+	if c == nil || c.totalBytes == 0 {
+		return "<empty>"
+	}
+	if c.totalBytes <= int64(apiResponseHeadLimit) {
+		return c.head.String()
+	}
+
+	headBytes := c.head.Bytes()
+	digest := hex.EncodeToString(c.digest.Sum(nil))
+
+	var builder strings.Builder
+	builder.Grow(len(headBytes) + len(c.tail) + 256)
+	builder.Write(headBytes)
+	if len(headBytes) > 0 && !bytes.HasSuffix(headBytes, []byte("\n")) {
+		builder.WriteString("\n")
+	}
+	builder.WriteString(fmt.Sprintf(
+		"\n... [truncated upstream response body bytes=%d chunks_count=%d sha256=%s head_bytes=%d tail_bytes=%d] ...\n",
+		c.totalBytes,
+		c.chunks,
+		digest,
+		len(headBytes),
+		len(c.tail),
+	))
+	builder.Write(c.tail)
+	return builder.String()
+}
+
+func appendTailWindow(existing, incoming []byte, limit int) []byte {
+	if limit <= 0 || len(incoming) == 0 {
+		return nil
+	}
+	if len(incoming) >= limit {
+		out := make([]byte, limit)
+		copy(out, incoming[len(incoming)-limit:])
+		return out
+	}
+	if len(existing)+len(incoming) <= limit {
+		out := make([]byte, len(existing)+len(incoming))
+		copy(out, existing)
+		copy(out[len(existing):], incoming)
+		return out
+	}
+	overflow := len(existing) + len(incoming) - limit
+	if overflow >= len(existing) {
+		out := make([]byte, len(incoming))
+		copy(out, incoming)
+		return out
+	}
+	out := make([]byte, len(existing)-overflow+len(incoming))
+	copy(out, existing[overflow:])
+	copy(out[len(existing)-overflow:], incoming)
+	return out
+}
+
+func renderAttemptResponse(attempt *upstreamAttempt) string {
+	if attempt == nil || attempt.response == nil {
+		return ""
+	}
+	prefix := attempt.response.String()
+	trailer := ""
+	if attempt.responseTrailer != nil {
+		trailer = attempt.responseTrailer.String()
+	}
+	if !attempt.bodyStarted {
+		return prefix + trailer
+	}
+
+	body := "<empty>"
+	if attempt.bodyCapture != nil {
+		body = attempt.bodyCapture.Render()
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(prefix) + len(body) + len(trailer) + 16)
+	builder.WriteString(prefix)
+	builder.WriteString("Body:\n")
+	builder.WriteString(body)
+	if trailer != "" {
+		if !strings.HasSuffix(body, "\n") {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(trailer)
+	}
+	return builder.String()
 }
 
 func appendAPIWebsocketTimeline(ginCtx *gin.Context, chunk []byte) {

@@ -1049,7 +1049,10 @@ func acquireAPICallHostSlot(ctx context.Context, parsedURL *url.URL) (func(), bo
 	if key == "" {
 		return func() {}, true
 	}
-	rawLimiter, _ := apiCallHostLimiters.LoadOrStore(key, make(chan struct{}, maxAPICallConcurrentPerHost))
+	rawLimiter, ok := apiCallHostLimiters.Load(key)
+	if !ok {
+		rawLimiter, _ = apiCallHostLimiters.LoadOrStore(key, make(chan struct{}, maxAPICallConcurrentPerHost))
+	}
 	limiter, ok := rawLimiter.(chan struct{})
 	if !ok || limiter == nil {
 		return func() {}, true

@@ -514,6 +514,20 @@ func TestGetMonitorRequestLogs_InvalidTimeRange(t *testing.T) {
 	}
 }
 
+func TestGetMonitorRequestLogs_FutureStartWithoutEndIsInvalid(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := newMonitorTestHandler(testUsageRecord(time.Now(), "api-1", "model-a", "source-a", false))
+	start := url.QueryEscape(time.Now().Add(24 * time.Hour).Format(time.RFC3339))
+	rr := executeMonitorRequest(h.GetMonitorRequestLogs, "/monitor/request-logs?start_time="+start)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "invalid time range") {
+		t.Fatalf("unexpected error response: %s", rr.Body.String())
+	}
+}
+
 func TestGetMonitorRequestLogs_ApiFilterContains(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

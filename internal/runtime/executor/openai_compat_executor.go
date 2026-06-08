@@ -699,7 +699,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 }
 
 func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	profile := e.resolveProfile(auth)
 	baseURL, _ := e.resolveCredentials(auth)
 
@@ -729,6 +731,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	}
 
 	usageJSON := helps.BuildOpenAIUsageJSON(count)
+	logCountTokensSummary(ctx, newCountTokensSummaryLogMeta(opts, requestedModel, modelForCounting, e.Identifier(), "OpenAICompatExecutor", translated), count, time.Since(started))
 	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
 }

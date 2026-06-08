@@ -1065,12 +1065,12 @@ func parseMonitorTimeRange(c *gin.Context) (*time.Time, *time.Time, error) {
 		end = &parsed
 	}
 
-	if start != nil && end != nil && start.After(*end) {
-		return nil, nil, errInvalidTimeRange()
-	}
 	if start != nil && end == nil {
 		now := time.Now()
 		end = &now
+	}
+	if start != nil && end != nil && start.After(*end) {
+		return nil, nil, errInvalidTimeRange()
 	}
 	return start, end, nil
 }

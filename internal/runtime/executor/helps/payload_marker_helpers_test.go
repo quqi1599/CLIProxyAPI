@@ -30,3 +30,27 @@ func TestHasClaudeToolResultMarker(t *testing.T) {
 		t.Fatal("expected true with tool_result")
 	}
 }
+
+func TestHasClaudeCountTokensPreflightMarkers(t *testing.T) {
+	body := []byte(`{
+		"betas":["prompt-caching-2026-01-05"],
+		"tools":[{"type":"tool_search"}],
+		"messages":[{"role":"system","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+
+	if !HasClaudeSystemRoleMarker(body) {
+		t.Fatal("expected system-role marker")
+	}
+	if !HasClaudeCacheControlMarker(body) {
+		t.Fatal("expected cache_control marker")
+	}
+	if !HasClaudeBetasMarker(body) {
+		t.Fatal("expected betas marker")
+	}
+	if !HasClaudeToolsMarker(body) {
+		t.Fatal("expected tools marker")
+	}
+	if !HasClaudeToolSearchMarker(body) {
+		t.Fatal("expected tool_search marker")
+	}
+}

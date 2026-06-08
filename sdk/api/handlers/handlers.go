@@ -1027,7 +1027,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 						}
 					}
 					sentPayload = true
-					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+					if okSendData := sendData(chunk.Payload); !okSendData {
 						return
 					}
 				}
@@ -1225,15 +1225,6 @@ func routeModelBaseName(model string) string {
 		return strings.TrimSpace(model[idx+1:])
 	}
 	return model
-}
-
-func cloneBytes(src []byte) []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make([]byte, len(src))
-	copy(dst, src)
-	return dst
 }
 
 func cloneHeader(src http.Header) http.Header {

@@ -92,6 +92,7 @@ type Response struct {
 // StreamChunk represents a single streaming payload unit emitted by provider executors.
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.
+	// Executors must treat emitted payload bytes as immutable after send.
 	Payload []byte
 	// Err reports any terminal error encountered while producing chunks.
 	Err error

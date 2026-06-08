@@ -681,7 +681,9 @@ func validateClaudeStreamingResponse(data []byte) error {
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 
 	apiKey, baseURL := claudeCreds(auth)
 	if baseURL == "" {
@@ -701,22 +703,32 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
-	body = normalizeClaudeSystemRoleMessages(body)
+	if helps.HasClaudeSystemRoleMarker(body) {
+		body = normalizeClaudeSystemRoleMessages(body)
+	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	body = downgradeClaudeToolSearchForCompat(baseURL, body)
+	if helps.HasClaudeToolsMarker(body) || helps.HasClaudeToolSearchMarker(body) {
+		body = downgradeClaudeToolSearchForCompat(baseURL, body)
+	}
 	// count_tokens does NOT inject cache_control; only enforce the limit and
 	// normalize TTL ordering (shares a single payload scan, byte-equivalent to
 	// the legacy enforce → normalize sequence).
-	body = applyCacheControlPipeline(body, 4, false)
+	if helps.HasClaudeCacheControlMarker(body) {
+		body = applyCacheControlPipeline(body, 4, false)
+	}
 
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
-	if isClaudeOAuthToken(apiKey) {
-		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
+	if helps.HasClaudeBetasMarker(body) {
+		extraBetas, body = extractAndRemoveBetas(body)
 	}
-	body, _ = sanitizeClaudeToolNamesForUpstream(body)
+	if helps.HasClaudeToolsMarker(body) {
+		if isClaudeOAuthToken(apiKey) {
+			body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
+		}
+		body, _ = sanitizeClaudeToolNamesForUpstream(body)
+	}
 	if errValidate := validateClaudeUpstreamPayload(baseURL, body); errValidate != nil {
 		return cliproxyexecutor.Response{}, errValidate
 	}
@@ -796,6 +808,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	count := gjson.GetBytes(data, "input_tokens").Int()
+	logCountTokensSummary(ctx, newCountTokensSummaryLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", body), count, time.Since(started))
 	out := sdktranslator.TranslateTokenCount(ctx, to, from, count, data)
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
 }
@@ -2211,9 +2224,13 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 		}
 
 		toolResultParts, otherParts := splitPendingClaudeToolResultParts(msg, pending)
-		if len(toolResultParts) == 0 || len(otherParts) == 0 {
+		if len(toolResultParts) == 0 {
 			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
 			pending = map[string]bool{}
+			continue
+		}
+		if len(otherParts) == 0 {
+			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
 			continue
 		}
 
