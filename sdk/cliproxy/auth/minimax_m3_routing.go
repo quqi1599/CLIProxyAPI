@@ -65,8 +65,8 @@ func rewriteMiniMaxM3HighspeedRouteToStandard(routeModel string, opts cliproxyex
 	if len(candidates) == 0 {
 		return candidates
 	}
-	if !isMiniMaxM3HighspeedModel(routeModel) &&
-		!isMiniMaxM3HighspeedModel(requestedModelAliasFromOptions(opts, routeModel)) {
+	if !isMiniMaxM3StandardRouteAlias(routeModel) &&
+		!isMiniMaxM3StandardRouteAlias(requestedModelAliasFromOptions(opts, routeModel)) {
 		return candidates
 	}
 
@@ -75,7 +75,7 @@ func rewriteMiniMaxM3HighspeedRouteToStandard(routeModel string, opts cliproxyex
 	changed := false
 	for _, candidate := range candidates {
 		resolved := candidate
-		if isMiniMaxM3HighspeedModel(candidate) {
+		if isMiniMaxM3StandardRouteAlias(candidate) {
 			resolved = preserveResolvedModelSuffix(miniMaxM3StandardModel, thinking.ParseSuffix(candidate))
 			changed = true
 		}
@@ -405,4 +405,13 @@ func isMiniMaxM3SeriesModel(model string) bool {
 func isMiniMaxM3HighspeedModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
 	return isMiniMaxM3SeriesModel(model) && strings.Contains(model, "highspeed")
+}
+
+func isMiniMaxM27HighspeedModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return model == "minimax-m2.7-highspeed"
+}
+
+func isMiniMaxM3StandardRouteAlias(model string) bool {
+	return isMiniMaxM3HighspeedModel(model) || isMiniMaxM27HighspeedModel(model)
 }
