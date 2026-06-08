@@ -8,16 +8,24 @@ import (
 
 // StreamSummaryRecord stores the final stream timing and completion fields for one upstream attempt.
 type StreamSummaryRecord struct {
-	RequestID          string
-	AttemptNo          int
-	TimeToFirstChunkMs int64
-	StreamDurationMs   int64
-	TotalDurationMs    int64
-	ChunksCount        int
-	BytesOut           int64
-	ClientGone         bool
-	FinishReason       string
-	RecordedAt         time.Time
+	RequestID                  string
+	AttemptNo                  int
+	TimeToFirstChunkMs         int64
+	UpstreamChunkWaitMs        int64
+	UpstreamChunkWaitCount     int
+	StreamDurationMs           int64
+	TotalDurationMs            int64
+	ChunksCount                int
+	BytesOut                   int64
+	DownstreamWriteMs          int64
+	DownstreamWriteCalls       int
+	DownstreamFlushMs          int64
+	DownstreamFlushCalls       int
+	StreamOutputTokens         int64
+	StreamOutputTokensObserved bool
+	ClientGone                 bool
+	FinishReason               string
+	RecordedAt                 time.Time
 }
 
 func normalizeStreamSummaryRecord(record StreamSummaryRecord) (StreamSummaryRecord, bool) {
@@ -32,6 +40,12 @@ func normalizeStreamSummaryRecord(record StreamSummaryRecord) (StreamSummaryReco
 	if record.TimeToFirstChunkMs < 0 {
 		record.TimeToFirstChunkMs = 0
 	}
+	if record.UpstreamChunkWaitMs < 0 {
+		record.UpstreamChunkWaitMs = 0
+	}
+	if record.UpstreamChunkWaitCount < 0 {
+		record.UpstreamChunkWaitCount = 0
+	}
 	if record.StreamDurationMs < 0 {
 		record.StreamDurationMs = 0
 	}
@@ -44,10 +58,29 @@ func normalizeStreamSummaryRecord(record StreamSummaryRecord) (StreamSummaryReco
 	if record.BytesOut < 0 {
 		record.BytesOut = 0
 	}
+	if record.DownstreamWriteMs < 0 {
+		record.DownstreamWriteMs = 0
+	}
+	if record.DownstreamWriteCalls < 0 {
+		record.DownstreamWriteCalls = 0
+	}
+	if record.DownstreamFlushMs < 0 {
+		record.DownstreamFlushMs = 0
+	}
+	if record.DownstreamFlushCalls < 0 {
+		record.DownstreamFlushCalls = 0
+	}
+	if record.StreamOutputTokens < 0 {
+		record.StreamOutputTokens = 0
+	}
 	if record.RecordedAt.IsZero() {
 		record.RecordedAt = time.Now()
 	}
 	return record, true
+}
+
+func NormalizeStreamSummaryRecordForPersistence(record StreamSummaryRecord) (StreamSummaryRecord, bool) {
+	return normalizeStreamSummaryRecord(record)
 }
 
 func computeTokensPerSecond(outputTokens, streamDurationMs int64) float64 {

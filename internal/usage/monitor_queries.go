@@ -153,28 +153,36 @@ type monitorQueryableStore interface {
 
 // MonitorRequestDetail represents a single request detail row for the request-details endpoint.
 type MonitorRequestDetail struct {
-	Timestamp          time.Time
-	Method             string
-	Path               string
-	Model              string
-	Source             string
-	AuthIndex          string
-	RequestID          string
-	AttemptNo          int
-	RetryReason        string
-	FinalSuccess       *bool
-	Failed             bool
-	OutputTokens       int64
-	TimeToFirstChunkMs int64
-	StreamDurationMs   int64
-	TotalDurationMs    int64
-	ChunksCount        int
-	BytesOut           int64
-	TokensPerSecond    float64
-	ClientGone         bool
-	FinishReason       string
-	ProviderStatusCode int
-	ErrorCode          string
+	Timestamp                  time.Time
+	Method                     string
+	Path                       string
+	Model                      string
+	Source                     string
+	AuthIndex                  string
+	RequestID                  string
+	AttemptNo                  int
+	RetryReason                string
+	FinalSuccess               *bool
+	Failed                     bool
+	OutputTokens               int64
+	StreamOutputTokens         int64
+	StreamOutputTokensObserved bool
+	TimeToFirstChunkMs         int64
+	UpstreamChunkWaitMs        int64
+	UpstreamChunkWaitCount     int
+	StreamDurationMs           int64
+	TotalDurationMs            int64
+	DownstreamWriteMs          int64
+	DownstreamWriteCalls       int
+	DownstreamFlushMs          int64
+	DownstreamFlushCalls       int
+	ChunksCount                int
+	BytesOut                   int64
+	TokensPerSecond            float64
+	ClientGone                 bool
+	FinishReason               string
+	ProviderStatusCode         int
+	ErrorCode                  string
 }
 
 // MonitorKpiResult is the SQL-backed result for KPI endpoint.
@@ -2571,9 +2579,17 @@ func (s *sqliteUsageStore) QueryMonitorRequestDetails(ctx context.Context, filte
 			u.provider_status_code, u.error_code,
 			u.request_id, u.attempt_no, u.retry_reason, u.final_success,
 			u.output_tokens,
+			COALESCE(ss.stream_output_tokens, 0),
+			COALESCE(ss.stream_output_tokens_observed, 0),
 			COALESCE(ss.time_to_first_chunk_ms, 0),
+			COALESCE(ss.upstream_chunk_wait_ms, 0),
+			COALESCE(ss.upstream_chunk_wait_count, 0),
 			COALESCE(ss.stream_duration_ms, 0),
 			COALESCE(ss.total_duration_ms, 0),
+			COALESCE(ss.downstream_write_ms, 0),
+			COALESCE(ss.downstream_write_calls, 0),
+			COALESCE(ss.downstream_flush_ms, 0),
+			COALESCE(ss.downstream_flush_calls, 0),
 			COALESCE(ss.chunks_count, 0),
 			COALESCE(ss.bytes_out, 0),
 			COALESCE(ss.client_gone, 0),
@@ -2596,11 +2612,12 @@ func (s *sqliteUsageStore) QueryMonitorRequestDetails(ctx context.Context, filte
 	items := make([]MonitorRequestDetail, 0, filter.Limit)
 	for rows.Next() {
 		var (
-			item       MonitorRequestDetail
-			unixTime   int64
-			failed     int
-			final      int
-			clientGone int
+			item                       MonitorRequestDetail
+			unixTime                   int64
+			failed                     int
+			final                      int
+			streamOutputTokensObserved int
+			clientGone                 int
 		)
 		if err = rows.Scan(
 			&unixTime,
@@ -2617,9 +2634,17 @@ func (s *sqliteUsageStore) QueryMonitorRequestDetails(ctx context.Context, filte
 			&item.RetryReason,
 			&final,
 			&item.OutputTokens,
+			&item.StreamOutputTokens,
+			&streamOutputTokensObserved,
 			&item.TimeToFirstChunkMs,
+			&item.UpstreamChunkWaitMs,
+			&item.UpstreamChunkWaitCount,
 			&item.StreamDurationMs,
 			&item.TotalDurationMs,
+			&item.DownstreamWriteMs,
+			&item.DownstreamWriteCalls,
+			&item.DownstreamFlushMs,
+			&item.DownstreamFlushCalls,
 			&item.ChunksCount,
 			&item.BytesOut,
 			&clientGone,
@@ -2630,8 +2655,13 @@ func (s *sqliteUsageStore) QueryMonitorRequestDetails(ctx context.Context, filte
 		item.Timestamp = time.Unix(unixTime, 0)
 		item.Failed = failed != 0
 		item.FinalSuccess = finalSuccessPtr(final)
+		item.StreamOutputTokensObserved = streamOutputTokensObserved != 0
 		item.ClientGone = clientGone != 0
-		item.TokensPerSecond = computeTokensPerSecond(item.OutputTokens, item.StreamDurationMs)
+		tokensForRate := item.OutputTokens
+		if item.StreamOutputTokensObserved {
+			tokensForRate = item.StreamOutputTokens
+		}
+		item.TokensPerSecond = computeTokensPerSecond(tokensForRate, item.StreamDurationMs)
 		items = append(items, item)
 	}
 	if err = rows.Err(); err != nil {
@@ -2691,9 +2721,17 @@ func (s *pgUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter Mo
 			u.provider_status_code, u.error_code,
 			u.request_id, u.attempt_no, u.retry_reason, u.final_success,
 			u.output_tokens,
+			COALESCE(ss.stream_output_tokens, 0),
+			COALESCE(ss.stream_output_tokens_observed, 0),
 			COALESCE(ss.time_to_first_chunk_ms, 0),
+			COALESCE(ss.upstream_chunk_wait_ms, 0),
+			COALESCE(ss.upstream_chunk_wait_count, 0),
 			COALESCE(ss.stream_duration_ms, 0),
 			COALESCE(ss.total_duration_ms, 0),
+			COALESCE(ss.downstream_write_ms, 0),
+			COALESCE(ss.downstream_write_calls, 0),
+			COALESCE(ss.downstream_flush_ms, 0),
+			COALESCE(ss.downstream_flush_calls, 0),
 			COALESCE(ss.chunks_count, 0),
 			COALESCE(ss.bytes_out, 0),
 			COALESCE(ss.client_gone, 0),
@@ -2716,10 +2754,11 @@ func (s *pgUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter Mo
 	items := make([]MonitorRequestDetail, 0, filter.Limit)
 	for rows.Next() {
 		var (
-			item       MonitorRequestDetail
-			failed     int
-			final      int
-			clientGone int
+			item                       MonitorRequestDetail
+			failed                     int
+			final                      int
+			streamOutputTokensObserved int
+			clientGone                 int
 		)
 		if err = rows.Scan(
 			&item.Timestamp,
@@ -2736,9 +2775,17 @@ func (s *pgUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter Mo
 			&item.RetryReason,
 			&final,
 			&item.OutputTokens,
+			&item.StreamOutputTokens,
+			&streamOutputTokensObserved,
 			&item.TimeToFirstChunkMs,
+			&item.UpstreamChunkWaitMs,
+			&item.UpstreamChunkWaitCount,
 			&item.StreamDurationMs,
 			&item.TotalDurationMs,
+			&item.DownstreamWriteMs,
+			&item.DownstreamWriteCalls,
+			&item.DownstreamFlushMs,
+			&item.DownstreamFlushCalls,
 			&item.ChunksCount,
 			&item.BytesOut,
 			&clientGone,
@@ -2748,8 +2795,13 @@ func (s *pgUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter Mo
 		}
 		item.Failed = failed != 0
 		item.FinalSuccess = finalSuccessPtr(final)
+		item.StreamOutputTokensObserved = streamOutputTokensObserved != 0
 		item.ClientGone = clientGone != 0
-		item.TokensPerSecond = computeTokensPerSecond(item.OutputTokens, item.StreamDurationMs)
+		tokensForRate := item.OutputTokens
+		if item.StreamOutputTokensObserved {
+			tokensForRate = item.StreamOutputTokens
+		}
+		item.TokensPerSecond = computeTokensPerSecond(tokensForRate, item.StreamDurationMs)
 		items = append(items, item)
 	}
 	if err = rows.Err(); err != nil {

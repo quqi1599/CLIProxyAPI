@@ -42,7 +42,7 @@ func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 	body := recorder.Body.String()
 	parts := strings.Split(strings.TrimSpace(body), "\n\n")
 	if len(parts) != 2 {
@@ -71,7 +71,7 @@ func TestForwardResponsesStreamRepairsEmptyCompletedOutputFromDoneItems(t *testi
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 3 {
@@ -102,7 +102,7 @@ func TestForwardResponsesStreamRepairsMixedIndexedAndUnindexedDoneItems(t *testi
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 3 {
@@ -132,7 +132,7 @@ func TestForwardResponsesStreamRepairsMultilineCompletedOutputAsSSEDataLines(t *
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
 	if len(parts) != 2 {
@@ -167,7 +167,7 @@ func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	want := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
@@ -186,7 +186,7 @@ func TestForwardResponsesStreamPreservesValidFullSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	if got != string(chunk) {
@@ -204,7 +204,7 @@ func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	got := recorder.Body.String()
 	want := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n\n"
@@ -231,7 +231,7 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+	h.forwardResponsesStream(c.Request.Context(), c, flusher, func(error) {}, data, errs, nil)
 
 	if got := recorder.Body.String(); got != "\n" {
 		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)

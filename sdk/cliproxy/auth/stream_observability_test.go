@@ -105,7 +105,7 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 	if got := entry.Data["chunks_count"]; got != 2 {
 		t.Fatalf("chunks_count = %#v, want 2", got)
 	}
-	wantBytes := len("chunk-one") + len("chunk-two")
+	wantBytes := int64(len("chunk-one") + len("chunk-two"))
 	if got := entry.Data["bytes_out"]; got != wantBytes {
 		t.Fatalf("bytes_out = %#v, want %d", got, wantBytes)
 	}
@@ -114,6 +114,9 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 	}
 	if got := entry.Data["output_tokens"]; got != int64(0) {
 		t.Fatalf("output_tokens = %#v, want 0", got)
+	}
+	if got := entry.Data["stream_output_tokens_observed"]; got != false {
+		t.Fatalf("stream_output_tokens_observed = %#v, want false", got)
 	}
 	if got := entry.Data["tokens_per_second"]; got != float64(0) {
 		t.Fatalf("tokens_per_second = %#v, want 0", got)
@@ -170,6 +173,12 @@ func TestManager_WrapStreamResult_LogsSemanticFinishReasonAndUsage(t *testing.T)
 	entry := findStreamExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["finish_reason"]; got != "tool_calls" {
 		t.Fatalf("finish_reason = %#v, want tool_calls", got)
+	}
+	if got := entry.Data["stream_output_tokens"]; got != int64(5) {
+		t.Fatalf("stream_output_tokens = %#v, want 5", got)
+	}
+	if got := entry.Data["stream_output_tokens_observed"]; got != true {
+		t.Fatalf("stream_output_tokens_observed = %#v, want true", got)
 	}
 	if got := entry.Data["output_tokens"]; got != int64(5) {
 		t.Fatalf("output_tokens = %#v, want 5", got)

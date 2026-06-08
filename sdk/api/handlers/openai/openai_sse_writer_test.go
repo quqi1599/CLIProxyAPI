@@ -125,7 +125,7 @@ func TestHandleStreamResult_PreservesPreFramedSSEDataLine(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.handleStreamResult(c, flusher, func(error) {}, data, errs)
+	h.handleStreamResult(c.Request.Context(), c, flusher, func(error) {}, data, errs)
 
 	body := recorder.Body.String()
 	if strings.Contains(body, "data: data:") {

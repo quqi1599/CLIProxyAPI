@@ -583,6 +583,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if endpoint != "" {
 		newCtx = logging.WithEndpoint(newCtx, endpoint)
 	}
+	newCtx = coreauth.WithStreamSummaryTracking(newCtx)
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
 
@@ -599,6 +600,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
+		defer coreauth.MarkStreamSummaryDownstreamDone(cancelCtx)
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
 		}

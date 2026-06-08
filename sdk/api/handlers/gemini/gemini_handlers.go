@@ -236,17 +236,18 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk
-			if alt == "" {
-				_, _ = c.Writer.Write([]byte("data: "))
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
-			} else {
-				_, _ = c.Writer.Write(chunk)
-			}
-			flusher.Flush()
+			handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+				if alt == "" {
+					_, _ = w.Write([]byte("data: "))
+					_, _ = w.Write(chunk)
+					_, _ = w.Write([]byte("\n\n"))
+					return
+				}
+				_, _ = w.Write(chunk)
+			})
 
 			// Continue
-			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardGeminiStream(cliCtx, c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
 	}
@@ -301,24 +302,25 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 	cliCancel()
 }
 
-func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *GeminiAPIHandler) forwardGeminiStream(summaryCtx context.Context, c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		SummaryContext:    summaryCtx,
 		KeepAliveInterval: keepAliveInterval,
-		WriteChunk: func(chunk []byte) {
+		WriteChunk: func(w handlers.StreamBodyWriter, chunk []byte) {
 			if alt == "" {
-				_, _ = c.Writer.Write([]byte("data: "))
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				_, _ = w.Write([]byte("data: "))
+				_, _ = w.Write(chunk)
+				_, _ = w.Write([]byte("\n\n"))
 			} else {
-				_, _ = c.Writer.Write(chunk)
+				_, _ = w.Write(chunk)
 			}
 		},
-		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+		WriteTerminalError: func(w handlers.StreamBodyWriter, errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
 				return
 			}
@@ -333,9 +335,9 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 			body := handlers.BuildErrorResponseBody(status, errText)
 			if alt == "" {
-				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+				_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
 			} else {
-				_, _ = c.Writer.Write(body)
+				_, _ = w.Write(body)
 			}
 		},
 	})

@@ -178,7 +178,7 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	h.forwardCLIStream(c, flusher, "", func(err error) { cliCancel(err) }, dataChan, errChan)
+	h.forwardCLIStream(cliCtx, c, flusher, "", func(err error) { cliCancel(err) }, dataChan, errChan)
 	return
 }
 
@@ -201,31 +201,32 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 	cliCancel()
 }
 
-func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *GeminiCLIAPIHandler) forwardCLIStream(summaryCtx context.Context, c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		SummaryContext:    summaryCtx,
 		KeepAliveInterval: keepAliveInterval,
-		WriteChunk: func(chunk []byte) {
+		WriteChunk: func(w handlers.StreamBodyWriter, chunk []byte) {
 			if alt == "" {
 				if bytes.Equal(chunk, []byte("data: [DONE]")) || bytes.Equal(chunk, []byte("[DONE]")) {
 					return
 				}
 
 				if !bytes.HasPrefix(chunk, []byte("data:")) {
-					_, _ = c.Writer.Write([]byte("data: "))
+					_, _ = w.Write([]byte("data: "))
 				}
 
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				_, _ = w.Write(chunk)
+				_, _ = w.Write([]byte("\n\n"))
 			} else {
-				_, _ = c.Writer.Write(chunk)
+				_, _ = w.Write(chunk)
 			}
 		},
-		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+		WriteTerminalError: func(w handlers.StreamBodyWriter, errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
 				return
 			}
@@ -240,9 +241,9 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 			body := handlers.BuildErrorResponseBody(status, errText)
 			if alt == "" {
-				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+				_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
 			} else {
-				_, _ = c.Writer.Write(body)
+				_, _ = w.Write(body)
 			}
 		},
 	})

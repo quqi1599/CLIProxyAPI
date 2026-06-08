@@ -1320,13 +1320,15 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			_, _ = c.Writer.Write(chunk)
-			flusher.Flush()
+			handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+				_, _ = w.Write(chunk)
+			})
 			h.ForwardStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, handlers.StreamForwardOptions{
-				WriteChunk: func(next []byte) {
-					_, _ = c.Writer.Write(next)
+				SummaryContext: cliCtx,
+				WriteChunk: func(w handlers.StreamBodyWriter, next []byte) {
+					_, _ = w.Write(next)
 				},
-				WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+				WriteTerminalError: func(w handlers.StreamBodyWriter, errMsg *interfaces.ErrorMessage) {
 					if errMsg == nil {
 						return
 					}
@@ -1340,7 +1342,7 @@ func (h *OpenAIAPIHandler) streamOpenAICompatImages(c *gin.Context, compatReq []
 					}
 					handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 					body := handlers.BuildErrorResponseBody(status, errText)
-					_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+					_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
 				},
 			})
 			return

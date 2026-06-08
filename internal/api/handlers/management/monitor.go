@@ -2257,55 +2257,71 @@ func (h *Handler) GetMonitorRequestDetails(c *gin.Context) {
 	}
 
 	type requestDetailItem struct {
-		Timestamp          time.Time `json:"timestamp"`
-		Method             string    `json:"method"`
-		Path               string    `json:"path"`
-		Model              string    `json:"model"`
-		Source             string    `json:"source"`
-		AuthIndex          string    `json:"auth_index"`
-		RequestID          string    `json:"request_id,omitempty"`
-		AttemptNo          int       `json:"attempt_no,omitempty"`
-		RetryReason        string    `json:"retry_reason,omitempty"`
-		FinalSuccess       *bool     `json:"final_success,omitempty"`
-		Failed             bool      `json:"failed"`
-		OutputTokens       int64     `json:"output_tokens"`
-		TimeToFirstChunkMs int64     `json:"time_to_first_chunk_ms"`
-		StreamDurationMs   int64     `json:"stream_duration_ms"`
-		TotalDurationMs    int64     `json:"total_duration_ms"`
-		ChunksCount        int       `json:"chunks_count"`
-		BytesOut           int64     `json:"bytes_out"`
-		TokensPerSecond    float64   `json:"tokens_per_second"`
-		ClientGone         bool      `json:"client_gone"`
-		FinishReason       string    `json:"finish_reason,omitempty"`
-		ProviderStatusCode int       `json:"provider_status_code,omitempty"`
-		ErrorCode          string    `json:"error_code,omitempty"`
+		Timestamp                  time.Time `json:"timestamp"`
+		Method                     string    `json:"method"`
+		Path                       string    `json:"path"`
+		Model                      string    `json:"model"`
+		Source                     string    `json:"source"`
+		AuthIndex                  string    `json:"auth_index"`
+		RequestID                  string    `json:"request_id,omitempty"`
+		AttemptNo                  int       `json:"attempt_no,omitempty"`
+		RetryReason                string    `json:"retry_reason,omitempty"`
+		FinalSuccess               *bool     `json:"final_success,omitempty"`
+		Failed                     bool      `json:"failed"`
+		OutputTokens               int64     `json:"output_tokens"`
+		StreamOutputTokens         int64     `json:"stream_output_tokens"`
+		StreamOutputTokensObserved bool      `json:"stream_output_tokens_observed"`
+		TimeToFirstChunkMs         int64     `json:"time_to_first_chunk_ms"`
+		UpstreamChunkWaitMs        int64     `json:"upstream_chunk_wait_ms"`
+		UpstreamChunkWaitCount     int       `json:"upstream_chunk_wait_count"`
+		StreamDurationMs           int64     `json:"stream_duration_ms"`
+		TotalDurationMs            int64     `json:"total_duration_ms"`
+		DownstreamWriteMs          int64     `json:"downstream_write_ms"`
+		DownstreamWriteCalls       int       `json:"downstream_write_calls"`
+		DownstreamFlushMs          int64     `json:"downstream_flush_ms"`
+		DownstreamFlushCalls       int       `json:"downstream_flush_calls"`
+		ChunksCount                int       `json:"chunks_count"`
+		BytesOut                   int64     `json:"bytes_out"`
+		TokensPerSecond            float64   `json:"tokens_per_second"`
+		ClientGone                 bool      `json:"client_gone"`
+		FinishReason               string    `json:"finish_reason,omitempty"`
+		ProviderStatusCode         int       `json:"provider_status_code,omitempty"`
+		ErrorCode                  string    `json:"error_code,omitempty"`
 	}
 
 	items := make([]requestDetailItem, 0, len(results))
 	for _, r := range results {
 		items = append(items, requestDetailItem{
-			Timestamp:          r.Timestamp,
-			Method:             r.Method,
-			Path:               r.Path,
-			Model:              r.Model,
-			Source:             r.Source,
-			AuthIndex:          r.AuthIndex,
-			RequestID:          r.RequestID,
-			AttemptNo:          r.AttemptNo,
-			RetryReason:        r.RetryReason,
-			FinalSuccess:       r.FinalSuccess,
-			Failed:             r.Failed,
-			OutputTokens:       r.OutputTokens,
-			TimeToFirstChunkMs: r.TimeToFirstChunkMs,
-			StreamDurationMs:   r.StreamDurationMs,
-			TotalDurationMs:    r.TotalDurationMs,
-			ChunksCount:        r.ChunksCount,
-			BytesOut:           r.BytesOut,
-			TokensPerSecond:    r.TokensPerSecond,
-			ClientGone:         r.ClientGone,
-			FinishReason:       r.FinishReason,
-			ProviderStatusCode: r.ProviderStatusCode,
-			ErrorCode:          r.ErrorCode,
+			Timestamp:                  r.Timestamp,
+			Method:                     r.Method,
+			Path:                       r.Path,
+			Model:                      r.Model,
+			Source:                     r.Source,
+			AuthIndex:                  r.AuthIndex,
+			RequestID:                  r.RequestID,
+			AttemptNo:                  r.AttemptNo,
+			RetryReason:                r.RetryReason,
+			FinalSuccess:               r.FinalSuccess,
+			Failed:                     r.Failed,
+			OutputTokens:               r.OutputTokens,
+			StreamOutputTokens:         r.StreamOutputTokens,
+			StreamOutputTokensObserved: r.StreamOutputTokensObserved,
+			TimeToFirstChunkMs:         r.TimeToFirstChunkMs,
+			UpstreamChunkWaitMs:        r.UpstreamChunkWaitMs,
+			UpstreamChunkWaitCount:     r.UpstreamChunkWaitCount,
+			StreamDurationMs:           r.StreamDurationMs,
+			TotalDurationMs:            r.TotalDurationMs,
+			DownstreamWriteMs:          r.DownstreamWriteMs,
+			DownstreamWriteCalls:       r.DownstreamWriteCalls,
+			DownstreamFlushMs:          r.DownstreamFlushMs,
+			DownstreamFlushCalls:       r.DownstreamFlushCalls,
+			ChunksCount:                r.ChunksCount,
+			BytesOut:                   r.BytesOut,
+			TokensPerSecond:            r.TokensPerSecond,
+			ClientGone:                 r.ClientGone,
+			FinishReason:               r.FinishReason,
+			ProviderStatusCode:         r.ProviderStatusCode,
+			ErrorCode:                  r.ErrorCode,
 		})
 	}
 

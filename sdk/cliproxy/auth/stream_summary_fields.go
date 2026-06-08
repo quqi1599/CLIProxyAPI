@@ -21,8 +21,9 @@ var (
 )
 
 type streamSummaryFields struct {
-	outputTokens int64
-	finishReason string
+	outputTokens         int64
+	outputTokensObserved bool
+	finishReason         string
 }
 
 func (f *streamSummaryFields) observePayload(payload []byte) {
@@ -58,6 +59,7 @@ func (f *streamSummaryFields) observeJSON(payload []byte) {
 	root := gjson.ParseBytes(payload)
 	if outputTokens, ok := summaryOutputTokens(root); ok {
 		f.outputTokens = outputTokens
+		f.outputTokensObserved = true
 	}
 	if finishReason := summaryFinishReason(root); finishReason != "" {
 		f.finishReason = finishReason

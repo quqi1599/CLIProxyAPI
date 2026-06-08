@@ -2070,9 +2070,11 @@ type streamExecutionLogMeta struct {
 }
 
 type streamRuntimeStats struct {
-	summaryFields streamSummaryFields
-	chunksCount   int
-	bytesOut      int
+	summaryFields          streamSummaryFields
+	chunksCount            int
+	bytesOut               int
+	upstreamChunkWait      time.Duration
+	upstreamChunkWaitCount int
 }
 
 func (s *streamRuntimeStats) observe(payload []byte) {
@@ -2125,21 +2127,6 @@ func (r *streamRequestRuntime) recordFinalStatus(status int) {
 	r.trace.recordFinalStatus(status)
 }
 
-func (r *streamRequestRuntime) addLogFields(fields log.Fields) {
-	if r == nil || len(fields) == 0 {
-		return
-	}
-	if r.attempt.RequestID != "" {
-		fields["request_id"] = r.attempt.RequestID
-	}
-	if r.attempt.AttemptNo > 0 {
-		fields["attempt_no"] = r.attempt.AttemptNo
-	}
-	if r.attempt.RetryReason != "" {
-		fields["retry_reason"] = r.attempt.RetryReason
-	}
-}
-
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamExecutionLogMeta, responseModelAlias string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, cancelUpstream func(), startedAt time.Time, firstPayloadDelay time.Duration, releaseSlot func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	var cancelOnce sync.Once
@@ -2180,36 +2167,23 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 					finishReason = "client_gone"
 				}
 			}
-			fields := log.Fields{
-				"event":                  "stream_execution_summary",
-				"requested_model":        meta.requestedModel,
-				"upstream_model":         meta.upstreamModel,
-				"provider":               meta.provider,
-				"executor":               meta.executor,
-				"request_path":           meta.requestPath,
-				"time_to_first_chunk_ms": firstPayloadDelay.Milliseconds(),
-				"stream_duration_ms":     streamDuration.Milliseconds(),
-				"total_duration_ms":      totalDuration.Milliseconds(),
-				"chunks_count":           runtime.stats.chunksCount,
-				"bytes_out":              runtime.stats.bytesOut,
-				"output_tokens":          runtime.stats.summaryFields.outputTokens,
-				"tokens_per_second":      streamTokensPerSecond(runtime.stats.summaryFields.outputTokens, streamDuration),
-				"client_gone":            clientGone && !failed,
-				"finish_reason":          finishReason,
+			record := internalusage.StreamSummaryRecord{
+				TimeToFirstChunkMs:         firstPayloadDelay.Milliseconds(),
+				UpstreamChunkWaitMs:        runtime.stats.upstreamChunkWait.Milliseconds(),
+				UpstreamChunkWaitCount:     runtime.stats.upstreamChunkWaitCount,
+				StreamDurationMs:           streamDuration.Milliseconds(),
+				TotalDurationMs:            totalDuration.Milliseconds(),
+				ChunksCount:                runtime.stats.chunksCount,
+				BytesOut:                   int64(runtime.stats.bytesOut),
+				StreamOutputTokens:         runtime.stats.summaryFields.outputTokens,
+				StreamOutputTokensObserved: runtime.stats.summaryFields.outputTokensObserved,
+				ClientGone:                 clientGone && !failed,
+				FinishReason:               finishReason,
 			}
-			runtime.addLogFields(fields)
-			runtime.logger.WithFields(fields).Info("stream execution summary")
-			if dbPlugin := internalusage.GetDatabasePlugin(); dbPlugin != nil {
-				dbPlugin.HandleStreamSummary(ctx, internalusage.StreamSummaryRecord{
-					TimeToFirstChunkMs: firstPayloadDelay.Milliseconds(),
-					StreamDurationMs:   streamDuration.Milliseconds(),
-					TotalDurationMs:    totalDuration.Milliseconds(),
-					ChunksCount:        runtime.stats.chunksCount,
-					BytesOut:           int64(runtime.stats.bytesOut),
-					ClientGone:         clientGone && !failed,
-					FinishReason:       finishReason,
-				})
+			if completeStreamSummaryUpstream(ctx, meta, runtime.attempt, record) {
+				return
 			}
+			logAndPersistStreamSummary(ctx, meta, runtime.attempt, record)
 		}()
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
@@ -2258,6 +2232,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				chunk cliproxyexecutor.StreamChunk
 				ok    bool
 			)
+			waitStartedAt := time.Now()
 			if ctx == nil {
 				chunk, ok = <-remaining
 			} else {
@@ -2274,6 +2249,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			if !ok {
 				break
 			}
+			runtime.stats.upstreamChunkWait += time.Since(waitStartedAt)
+			runtime.stats.upstreamChunkWaitCount++
 			if ok := emit(chunk); !ok {
 				cancel()
 				return

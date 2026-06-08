@@ -9,6 +9,9 @@ func TestStreamSummaryFieldsObservePayloadOpenAIUsageAndFinishReason(t *testing.
 	if fields.outputTokens != 7 {
 		t.Fatalf("outputTokens = %d, want 7", fields.outputTokens)
 	}
+	if !fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = false, want true")
+	}
 	if fields.finishReason != "tool_calls" {
 		t.Fatalf("finishReason = %q, want tool_calls", fields.finishReason)
 	}
@@ -20,6 +23,9 @@ func TestStreamSummaryFieldsObservePayloadClaudeStopReason(t *testing.T) {
 
 	if fields.outputTokens != 9 {
 		t.Fatalf("outputTokens = %d, want 9", fields.outputTokens)
+	}
+	if !fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = false, want true")
 	}
 	if fields.finishReason != "end_turn" {
 		t.Fatalf("finishReason = %q, want end_turn", fields.finishReason)
@@ -33,6 +39,9 @@ func TestStreamSummaryFieldsObservePayloadResponsesIncompleteReason(t *testing.T
 	if fields.outputTokens != 3 {
 		t.Fatalf("outputTokens = %d, want 3", fields.outputTokens)
 	}
+	if !fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = false, want true")
+	}
 	if fields.finishReason != "content_filter" {
 		t.Fatalf("finishReason = %q, want content_filter", fields.finishReason)
 	}
@@ -44,6 +53,9 @@ func TestStreamSummaryFieldsObservePayloadSkipsIrrelevantChunk(t *testing.T) {
 
 	if fields.outputTokens != 0 {
 		t.Fatalf("outputTokens = %d, want 0", fields.outputTokens)
+	}
+	if fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = true, want false")
 	}
 	if fields.finishReason != "" {
 		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
@@ -57,6 +69,9 @@ func TestStreamSummaryFieldsObservePayloadSkipsNullFinishReasonChunk(t *testing.
 	if fields.outputTokens != 0 {
 		t.Fatalf("outputTokens = %d, want 0", fields.outputTokens)
 	}
+	if fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = true, want false")
+	}
 	if fields.finishReason != "" {
 		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
 	}
@@ -68,6 +83,9 @@ func TestStreamSummaryFieldsObservePayloadKeepsUsageWhenFinishReasonIsNull(t *te
 
 	if fields.outputTokens != 11 {
 		t.Fatalf("outputTokens = %d, want 11", fields.outputTokens)
+	}
+	if !fields.outputTokensObserved {
+		t.Fatal("outputTokensObserved = false, want true")
 	}
 	if fields.finishReason != "" {
 		t.Fatalf("finishReason = %q, want empty", fields.finishReason)

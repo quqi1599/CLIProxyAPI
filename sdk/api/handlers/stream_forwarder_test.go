@@ -42,7 +42,7 @@ func TestForwardStreamCoalescesChunkFlushesWhenConfigured(t *testing.T) {
 	close(errs)
 
 	handler.ForwardStream(c, flusher, func(error) {}, data, errs, StreamForwardOptions{
-		WriteChunk: func([]byte) {},
+		WriteChunk: func(StreamBodyWriter, []byte) {},
 	})
 
 	if got := flusher.count.Load(); got != 1 {
@@ -65,7 +65,7 @@ func TestForwardStreamFlushesEveryChunkByDefault(t *testing.T) {
 
 	var cancelErr error
 	handler.ForwardStream(c, flusher, func(err error) { cancelErr = err }, data, errs, StreamForwardOptions{
-		WriteChunk: func([]byte) {},
+		WriteChunk: func(StreamBodyWriter, []byte) {},
 	})
 
 	if got := flusher.count.Load(); got != 3 {
@@ -91,8 +91,8 @@ func TestForwardStreamTerminalErrorFlushesImmediatelyWhenCoalescing(t *testing.T
 	close(errs)
 
 	handler.ForwardStream(c, flusher, func(error) {}, data, errs, StreamForwardOptions{
-		WriteChunk:         func([]byte) {},
-		WriteTerminalError: func(*interfaces.ErrorMessage) {},
+		WriteChunk:         func(StreamBodyWriter, []byte) {},
+		WriteTerminalError: func(StreamBodyWriter, *interfaces.ErrorMessage) {},
 	})
 
 	if got := flusher.count.Load(); got != 1 {

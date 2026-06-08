@@ -298,16 +298,24 @@ func TestSQLiteUsageStoreQueryMonitorRequestDetails(t *testing.T) {
 		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", AuthIndex: "2", Method: "POST", Path: "/v1/responses", RequestedAt: base.Add(-30 * time.Minute)},
 	)
 	upsertStreamSummary(t, store, StreamSummaryRecord{
-		RequestID:          "req-a2",
-		AttemptNo:          2,
-		TimeToFirstChunkMs: 120,
-		StreamDurationMs:   800,
-		TotalDurationMs:    920,
-		ChunksCount:        16,
-		BytesOut:           4096,
-		ClientGone:         false,
-		FinishReason:       "tool_calls",
-		RecordedAt:         base,
+		RequestID:                  "req-a2",
+		AttemptNo:                  2,
+		TimeToFirstChunkMs:         120,
+		UpstreamChunkWaitMs:        640,
+		UpstreamChunkWaitCount:     15,
+		StreamDurationMs:           800,
+		TotalDurationMs:            920,
+		DownstreamWriteMs:          12,
+		DownstreamWriteCalls:       18,
+		DownstreamFlushMs:          9,
+		DownstreamFlushCalls:       17,
+		ChunksCount:                16,
+		BytesOut:                   4096,
+		StreamOutputTokens:         5,
+		StreamOutputTokensObserved: true,
+		ClientGone:                 false,
+		FinishReason:               "tool_calls",
+		RecordedAt:                 base,
 	})
 
 	// Test: no filters, returns all ordered by timestamp DESC
@@ -391,8 +399,17 @@ func TestSQLiteUsageStoreQueryMonitorRequestDetails(t *testing.T) {
 	if results[0].TimeToFirstChunkMs != 120 || results[0].StreamDurationMs != 800 || results[0].TotalDurationMs != 920 {
 		t.Fatalf("unexpected stream timing fields: %+v", results[0])
 	}
-	if results[0].TokensPerSecond != 0 {
-		t.Fatalf("tokens_per_second = %v, want 0 without output tokens", results[0].TokensPerSecond)
+	if results[0].UpstreamChunkWaitMs != 640 || results[0].UpstreamChunkWaitCount != 15 {
+		t.Fatalf("unexpected upstream wait fields: %+v", results[0])
+	}
+	if results[0].DownstreamWriteMs != 12 || results[0].DownstreamWriteCalls != 18 || results[0].DownstreamFlushMs != 9 || results[0].DownstreamFlushCalls != 17 {
+		t.Fatalf("unexpected downstream timing fields: %+v", results[0])
+	}
+	if !results[0].StreamOutputTokensObserved || results[0].StreamOutputTokens != 5 {
+		t.Fatalf("unexpected stream output token fields: %+v", results[0])
+	}
+	if results[0].TokensPerSecond <= 0 {
+		t.Fatalf("tokens_per_second = %v, want positive value from stream_output_tokens", results[0].TokensPerSecond)
 	}
 
 	// Test: filter by model

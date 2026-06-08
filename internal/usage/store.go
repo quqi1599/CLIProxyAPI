@@ -561,10 +561,18 @@ func (s *pgUsageStore) EnsureSchema(ctx context.Context) error {
 			request_id              TEXT NOT NULL,
 			attempt_no              INTEGER NOT NULL DEFAULT 0,
 			time_to_first_chunk_ms  BIGINT NOT NULL DEFAULT 0,
+			upstream_chunk_wait_ms  BIGINT NOT NULL DEFAULT 0,
+			upstream_chunk_wait_count INTEGER NOT NULL DEFAULT 0,
 			stream_duration_ms      BIGINT NOT NULL DEFAULT 0,
 			total_duration_ms       BIGINT NOT NULL DEFAULT 0,
+			downstream_write_ms     BIGINT NOT NULL DEFAULT 0,
+			downstream_write_calls  INTEGER NOT NULL DEFAULT 0,
+			downstream_flush_ms     BIGINT NOT NULL DEFAULT 0,
+			downstream_flush_calls  INTEGER NOT NULL DEFAULT 0,
 			chunks_count            INTEGER NOT NULL DEFAULT 0,
 			bytes_out               BIGINT NOT NULL DEFAULT 0,
+			stream_output_tokens    BIGINT NOT NULL DEFAULT 0,
+			stream_output_tokens_observed INTEGER NOT NULL DEFAULT 0,
 			client_gone             INTEGER NOT NULL DEFAULT 0,
 			finish_reason           TEXT NOT NULL DEFAULT '',
 			recorded_at             TIMESTAMPTZ NOT NULL,
@@ -573,6 +581,21 @@ func (s *pgUsageStore) EnsureSchema(ctx context.Context) error {
 	`, streamTable)
 	if _, err := s.db.ExecContext(ctx, createStreamTable); err != nil {
 		return fmt.Errorf("usage store: create stream summary table: %w", err)
+	}
+	streamMigrations := []string{
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS upstream_chunk_wait_ms BIGINT NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS upstream_chunk_wait_count INTEGER NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS downstream_write_ms BIGINT NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS downstream_write_calls INTEGER NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS downstream_flush_ms BIGINT NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS downstream_flush_calls INTEGER NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS stream_output_tokens BIGINT NOT NULL DEFAULT 0", streamTable),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS stream_output_tokens_observed INTEGER NOT NULL DEFAULT 0", streamTable),
+	}
+	for _, m := range streamMigrations {
+		if _, err := s.db.ExecContext(ctx, m); err != nil {
+			return fmt.Errorf("usage store: stream summary migration: %w", err)
+		}
 	}
 	streamIndexes := []string{
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_stream_summary_recorded_at ON %s(recorded_at DESC)", streamTable),
@@ -740,7 +763,10 @@ func (s *pgUsageStore) ListAllStreamSummaries(ctx context.Context) ([]StreamSumm
 	table := s.fullTableName("usage_stream_summaries")
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT request_id, attempt_no, time_to_first_chunk_ms, stream_duration_ms,
-			total_duration_ms, chunks_count, bytes_out, client_gone, finish_reason, recorded_at
+			upstream_chunk_wait_ms, upstream_chunk_wait_count, total_duration_ms,
+			downstream_write_ms, downstream_write_calls, downstream_flush_ms, downstream_flush_calls,
+			chunks_count, bytes_out, stream_output_tokens, stream_output_tokens_observed,
+			client_gone, finish_reason, recorded_at
 		FROM %s
 		ORDER BY recorded_at ASC, request_id ASC, attempt_no ASC
 	`, table))
@@ -752,23 +778,33 @@ func (s *pgUsageStore) ListAllStreamSummaries(ctx context.Context) ([]StreamSumm
 	out := make([]StreamSummaryRecord, 0)
 	for rows.Next() {
 		var (
-			record     StreamSummaryRecord
-			clientGone int
+			record                     StreamSummaryRecord
+			streamOutputTokensObserved int
+			clientGone                 int
 		)
 		if err = rows.Scan(
 			&record.RequestID,
 			&record.AttemptNo,
 			&record.TimeToFirstChunkMs,
 			&record.StreamDurationMs,
+			&record.UpstreamChunkWaitMs,
+			&record.UpstreamChunkWaitCount,
 			&record.TotalDurationMs,
+			&record.DownstreamWriteMs,
+			&record.DownstreamWriteCalls,
+			&record.DownstreamFlushMs,
+			&record.DownstreamFlushCalls,
 			&record.ChunksCount,
 			&record.BytesOut,
+			&record.StreamOutputTokens,
+			&streamOutputTokensObserved,
 			&clientGone,
 			&record.FinishReason,
 			&record.RecordedAt,
 		); err != nil {
 			return nil, fmt.Errorf("usage store: scan stream summary: %w", err)
 		}
+		record.StreamOutputTokensObserved = streamOutputTokensObserved != 0
 		record.ClientGone = clientGone != 0
 		out = append(out, record)
 	}
@@ -787,31 +823,54 @@ func (s *pgUsageStore) UpsertStreamSummary(ctx context.Context, record StreamSum
 	query := fmt.Sprintf(`
 		INSERT INTO %s (
 			request_id, attempt_no, time_to_first_chunk_ms, stream_duration_ms,
-			total_duration_ms, chunks_count, bytes_out, client_gone, finish_reason, recorded_at
+			upstream_chunk_wait_ms, upstream_chunk_wait_count, total_duration_ms,
+			downstream_write_ms, downstream_write_calls, downstream_flush_ms, downstream_flush_calls,
+			chunks_count, bytes_out, stream_output_tokens, stream_output_tokens_observed,
+			client_gone, finish_reason, recorded_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (request_id, attempt_no) DO UPDATE SET
 			time_to_first_chunk_ms = EXCLUDED.time_to_first_chunk_ms,
 			stream_duration_ms = EXCLUDED.stream_duration_ms,
+			upstream_chunk_wait_ms = EXCLUDED.upstream_chunk_wait_ms,
+			upstream_chunk_wait_count = EXCLUDED.upstream_chunk_wait_count,
 			total_duration_ms = EXCLUDED.total_duration_ms,
+			downstream_write_ms = EXCLUDED.downstream_write_ms,
+			downstream_write_calls = EXCLUDED.downstream_write_calls,
+			downstream_flush_ms = EXCLUDED.downstream_flush_ms,
+			downstream_flush_calls = EXCLUDED.downstream_flush_calls,
 			chunks_count = EXCLUDED.chunks_count,
 			bytes_out = EXCLUDED.bytes_out,
+			stream_output_tokens = EXCLUDED.stream_output_tokens,
+			stream_output_tokens_observed = EXCLUDED.stream_output_tokens_observed,
 			client_gone = EXCLUDED.client_gone,
 			finish_reason = EXCLUDED.finish_reason,
 			recorded_at = EXCLUDED.recorded_at
 	`, table)
 	clientGone := 0
+	streamOutputTokensObserved := 0
 	if record.ClientGone {
 		clientGone = 1
+	}
+	if record.StreamOutputTokensObserved {
+		streamOutputTokensObserved = 1
 	}
 	if _, err := s.db.ExecContext(ctx, query,
 		record.RequestID,
 		record.AttemptNo,
 		record.TimeToFirstChunkMs,
 		record.StreamDurationMs,
+		record.UpstreamChunkWaitMs,
+		record.UpstreamChunkWaitCount,
 		record.TotalDurationMs,
+		record.DownstreamWriteMs,
+		record.DownstreamWriteCalls,
+		record.DownstreamFlushMs,
+		record.DownstreamFlushCalls,
 		record.ChunksCount,
 		record.BytesOut,
+		record.StreamOutputTokens,
+		streamOutputTokensObserved,
 		clientGone,
 		record.FinishReason,
 		record.RecordedAt,
@@ -1216,10 +1275,18 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 			request_id             TEXT NOT NULL,
 			attempt_no             INTEGER NOT NULL DEFAULT 0,
 			time_to_first_chunk_ms INTEGER NOT NULL DEFAULT 0,
+			upstream_chunk_wait_ms INTEGER NOT NULL DEFAULT 0,
+			upstream_chunk_wait_count INTEGER NOT NULL DEFAULT 0,
 			stream_duration_ms     INTEGER NOT NULL DEFAULT 0,
 			total_duration_ms      INTEGER NOT NULL DEFAULT 0,
+			downstream_write_ms    INTEGER NOT NULL DEFAULT 0,
+			downstream_write_calls INTEGER NOT NULL DEFAULT 0,
+			downstream_flush_ms    INTEGER NOT NULL DEFAULT 0,
+			downstream_flush_calls INTEGER NOT NULL DEFAULT 0,
 			chunks_count           INTEGER NOT NULL DEFAULT 0,
 			bytes_out              INTEGER NOT NULL DEFAULT 0,
+			stream_output_tokens   INTEGER NOT NULL DEFAULT 0,
+			stream_output_tokens_observed INTEGER NOT NULL DEFAULT 0,
 			client_gone            INTEGER NOT NULL DEFAULT 0,
 			finish_reason          TEXT NOT NULL DEFAULT '',
 			recorded_at            INTEGER NOT NULL,
@@ -1228,6 +1295,19 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 	`
 	if _, err := s.db.ExecContext(ctx, createStreamTable); err != nil {
 		return fmt.Errorf("usage store: create stream summary table: %w", err)
+	}
+	streamMigrations := []string{
+		"ALTER TABLE usage_stream_summaries ADD COLUMN upstream_chunk_wait_ms INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN upstream_chunk_wait_count INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN downstream_write_ms INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN downstream_write_calls INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN downstream_flush_ms INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN downstream_flush_calls INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN stream_output_tokens INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_stream_summaries ADD COLUMN stream_output_tokens_observed INTEGER NOT NULL DEFAULT 0",
+	}
+	for _, m := range streamMigrations {
+		_, _ = s.db.ExecContext(ctx, m)
 	}
 	if _, err := s.db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_stream_summary_recorded_at ON usage_stream_summaries(recorded_at DESC)"); err != nil {
 		return fmt.Errorf("usage store: create stream summary index: %w", err)
@@ -1371,31 +1451,54 @@ func (s *sqliteUsageStore) UpsertStreamSummary(ctx context.Context, record Strea
 	query := `
 		INSERT INTO usage_stream_summaries (
 			request_id, attempt_no, time_to_first_chunk_ms, stream_duration_ms,
-			total_duration_ms, chunks_count, bytes_out, client_gone, finish_reason, recorded_at
+			upstream_chunk_wait_ms, upstream_chunk_wait_count, total_duration_ms,
+			downstream_write_ms, downstream_write_calls, downstream_flush_ms, downstream_flush_calls,
+			chunks_count, bytes_out, stream_output_tokens, stream_output_tokens_observed,
+			client_gone, finish_reason, recorded_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(request_id, attempt_no) DO UPDATE SET
 			time_to_first_chunk_ms = excluded.time_to_first_chunk_ms,
 			stream_duration_ms = excluded.stream_duration_ms,
+			upstream_chunk_wait_ms = excluded.upstream_chunk_wait_ms,
+			upstream_chunk_wait_count = excluded.upstream_chunk_wait_count,
 			total_duration_ms = excluded.total_duration_ms,
+			downstream_write_ms = excluded.downstream_write_ms,
+			downstream_write_calls = excluded.downstream_write_calls,
+			downstream_flush_ms = excluded.downstream_flush_ms,
+			downstream_flush_calls = excluded.downstream_flush_calls,
 			chunks_count = excluded.chunks_count,
 			bytes_out = excluded.bytes_out,
+			stream_output_tokens = excluded.stream_output_tokens,
+			stream_output_tokens_observed = excluded.stream_output_tokens_observed,
 			client_gone = excluded.client_gone,
 			finish_reason = excluded.finish_reason,
 			recorded_at = excluded.recorded_at
 	`
 	clientGone := 0
+	streamOutputTokensObserved := 0
 	if record.ClientGone {
 		clientGone = 1
+	}
+	if record.StreamOutputTokensObserved {
+		streamOutputTokensObserved = 1
 	}
 	if _, err := s.db.ExecContext(ctx, query,
 		record.RequestID,
 		record.AttemptNo,
 		record.TimeToFirstChunkMs,
 		record.StreamDurationMs,
+		record.UpstreamChunkWaitMs,
+		record.UpstreamChunkWaitCount,
 		record.TotalDurationMs,
+		record.DownstreamWriteMs,
+		record.DownstreamWriteCalls,
+		record.DownstreamFlushMs,
+		record.DownstreamFlushCalls,
 		record.ChunksCount,
 		record.BytesOut,
+		record.StreamOutputTokens,
+		streamOutputTokensObserved,
 		clientGone,
 		record.FinishReason,
 		record.RecordedAt.Unix(),
