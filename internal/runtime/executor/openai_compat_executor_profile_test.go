@@ -424,6 +424,7 @@ func TestInferOpenAICompatKindFromBaseURL(t *testing.T) {
 		{name: "xiaomi token plan", baseURL: "https://token-plan-cn.xiaomimimo.com/v1", want: "xiaomi"},
 		{name: "xiaomi token plan singapore", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", want: "xiaomi"},
 		{name: "xiaomi token plan europe anthropic", baseURL: "https://token-plan-ams.xiaomimimo.com/anthropic", want: "xiaomi"},
+		{name: "doubao ark openai", baseURL: "https://ark.cn-beijing.volces.com/api/v3", want: "doubao"},
 		{name: "unknown", baseURL: "https://example.com/v1", want: ""},
 	}
 

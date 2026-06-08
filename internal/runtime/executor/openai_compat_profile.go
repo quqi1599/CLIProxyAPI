@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,8 @@ const openAICompatAccountQuotaRetryWait = 24 * time.Hour
 const openAICompatEmptyUpstreamResponseCode = "empty_upstream_response"
 const deepSeekThinkingBudgetMin = 100
 const deepSeekThinkingBudgetMax = 32768
+const doubaoSeed20MaxTemperature = 1.5
+const doubaoSeed20MaxCompletionTokens = 98304
 
 type openAICompatProfile struct {
 	Kind                     string
@@ -78,6 +81,15 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 	},
 	"zhipu": {
 		Kind:                     "zhipu",
+		SupportsResponses:        false,
+		SupportsStreamUsage:      false,
+		SupportsParallelToolCall: false,
+		SupportsReasoning:        false,
+		SupportsMetadata:         false,
+		SupportsStore:            false,
+	},
+	"doubao": {
+		Kind:                     "doubao",
 		SupportsResponses:        false,
 		SupportsStreamUsage:      false,
 		SupportsParallelToolCall: false,
@@ -181,6 +193,8 @@ func inferOpenAICompatKindFromBaseURL(rawBaseURL string) string {
 		return "deepseek"
 	case "api.xiaomimimo.com":
 		return "xiaomi"
+	case "ark.cn-beijing.volces.com":
+		return "doubao"
 	default:
 		if config.IsXiaomiTokenPlanBaseURLHost(host) {
 			return "xiaomi"
@@ -267,10 +281,451 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "doubao" {
+		payload = scrubDoubaoPayloadForModel(payload, model)
+	}
 	if requiresDeepSeekToolSchemaCompatibility(model) {
 		payload = scrubDeepSeekToolPayload(payload, baseURL)
 	}
 	return payload
+}
+
+func scrubDoubaoPayloadForModel(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	payload = scrubDoubaoUnsupportedOpenAIFields(payload)
+	if !requiresDoubaoSeed20Compatibility(model) {
+		return payload
+	}
+	payload = normalizeDoubaoSeed20Temperature(payload)
+	payload = normalizeDoubaoSeed20TokenFields(payload)
+	payload = normalizeDoubaoChatContentParts(payload)
+	payload = normalizeDoubaoToolCallArguments(payload)
+	return payload
+}
+
+func requiresDoubaoSeed20Compatibility(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return strings.HasPrefix(modelName, "doubao-seed-2.0-")
+}
+
+func scrubDoubaoUnsupportedOpenAIFields(payload []byte) []byte {
+	for _, path := range []string{
+		"user",
+		"response_format",
+		"store",
+		"metadata",
+		"parallel_tool_calls",
+		"stream_options",
+		"service_tier",
+		"reasoning",
+		"reasoning_effort",
+	} {
+		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	payload = deleteMessageReasoningContent(payload)
+	return payload
+}
+
+func normalizeDoubaoSeed20Temperature(payload []byte) []byte {
+	value := gjson.GetBytes(payload, "temperature")
+	if !value.Exists() {
+		return payload
+	}
+	temperature, ok := openAICompatFloatValue(value)
+	if !ok {
+		if updated, err := sjson.DeleteBytes(payload, "temperature"); err == nil {
+			return updated
+		}
+		return payload
+	}
+	if temperature < 0 {
+		temperature = 0
+	} else if temperature > doubaoSeed20MaxTemperature {
+		temperature = doubaoSeed20MaxTemperature
+	}
+	updated, err := sjson.SetBytes(payload, "temperature", temperature)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func normalizeDoubaoSeed20TokenFields(payload []byte) []byte {
+	token, ok := firstOpenAICompatIntegerValue(payload, "max_completion_tokens", "max_tokens", "max_output_tokens")
+	if !ok {
+		for _, path := range []string{"max_completion_tokens", "max_tokens", "max_output_tokens"} {
+			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+				payload = updated
+			}
+		}
+		return payload
+	}
+	if token < 1 {
+		token = 1
+	} else if token > doubaoSeed20MaxCompletionTokens {
+		token = doubaoSeed20MaxCompletionTokens
+	}
+	updated, err := sjson.SetBytes(payload, "max_completion_tokens", token)
+	if err == nil {
+		payload = updated
+	}
+	for _, path := range []string{"max_tokens", "max_output_tokens"} {
+		if updated, errDelete := sjson.DeleteBytes(payload, path); errDelete == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func firstOpenAICompatIntegerValue(payload []byte, paths ...string) (int64, bool) {
+	for _, path := range paths {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		switch value.Type {
+		case gjson.Number:
+			return value.Int(), true
+		case gjson.String:
+			parsed, err := strconv.ParseInt(strings.TrimSpace(value.String()), 10, 64)
+			if err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func openAICompatFloatValue(value gjson.Result) (float64, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return value.Float(), true
+	case gjson.String:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value.String()), 64)
+		if err == nil {
+			return parsed, true
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
+}
+
+func normalizeDoubaoChatContentParts(payload []byte) []byte {
+	if !gjson.GetBytes(payload, "messages").IsArray() {
+		return payload
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return payload
+	}
+
+	changed := false
+	for _, rawMessage := range messages {
+		message, okMessage := rawMessage.(map[string]any)
+		if !okMessage {
+			continue
+		}
+		parts, okParts := message["content"].([]any)
+		if !okParts {
+			continue
+		}
+		for idx, rawPart := range parts {
+			normalized, partChanged := normalizeDoubaoChatContentPart(rawPart)
+			if !partChanged {
+				continue
+			}
+			parts[idx] = normalized
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	root["messages"] = messages
+	out, err := json.Marshal(root)
+	if err != nil || !gjson.ValidBytes(out) {
+		return payload
+	}
+	return out
+}
+
+func normalizeDoubaoChatContentPart(rawPart any) (any, bool) {
+	part, ok := rawPart.(map[string]any)
+	if !ok {
+		return rawPart, false
+	}
+	partType := strings.ToLower(strings.TrimSpace(compatStringValue(part["type"])))
+	switch partType {
+	case "input_text":
+		text := strings.TrimSpace(compatStringValue(part["text"]))
+		if text == "" {
+			text = strings.TrimSpace(compatStringValue(part["content"]))
+		}
+		return map[string]any{"type": "text", "text": text}, true
+	case "image_url":
+		return normalizeDoubaoMediaPart(part, "image_url", "image_url")
+	case "input_image":
+		return normalizeDoubaoMediaPart(part, "image_url", "input_image")
+	case "video_url":
+		return normalizeDoubaoMediaPart(part, "video_url", "video_url")
+	case "input_video":
+		return normalizeDoubaoMediaPart(part, "video_url", "input_video")
+	default:
+		return rawPart, false
+	}
+}
+
+func normalizeDoubaoMediaPart(part map[string]any, targetType string, sourceType string) (any, bool) {
+	urlValue := firstDoubaoMediaURL(part, targetType, sourceType)
+	if urlValue == "" {
+		return part, false
+	}
+	next := map[string]any{
+		"type": targetType,
+		targetType: map[string]any{
+			"url": urlValue,
+		},
+	}
+	if detail := strings.TrimSpace(compatStringValue(part["detail"])); detail != "" && targetType == "image_url" {
+		next[targetType].(map[string]any)["detail"] = detail
+	}
+	if sourceType != targetType {
+		return next, true
+	}
+	if media, ok := part[targetType].(map[string]any); ok {
+		if strings.TrimSpace(compatStringValue(media["url"])) == urlValue {
+			return part, false
+		}
+	}
+	return next, true
+}
+
+func firstDoubaoMediaURL(part map[string]any, targetType string, sourceType string) string {
+	for _, key := range []string{targetType, sourceType, "image_url", "video_url", "url"} {
+		raw, ok := part[key]
+		if !ok {
+			continue
+		}
+		switch typed := raw.(type) {
+		case string:
+			if value := strings.TrimSpace(typed); value != "" {
+				return value
+			}
+		case map[string]any:
+			for _, nestedKey := range []string{"url", "image_url", "video_url"} {
+				if value := strings.TrimSpace(compatStringValue(typed[nestedKey])); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeDoubaoToolCallArguments(payload []byte) []byte {
+	if !gjson.GetBytes(payload, "messages").IsArray() {
+		return payload
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return payload
+	}
+
+	changed := false
+	for _, rawMessage := range messages {
+		message, okMessage := rawMessage.(map[string]any)
+		if !okMessage {
+			continue
+		}
+		toolCalls, okToolCalls := message["tool_calls"].([]any)
+		if !okToolCalls {
+			continue
+		}
+		for _, rawToolCall := range toolCalls {
+			toolCall, okToolCall := rawToolCall.(map[string]any)
+			if !okToolCall {
+				continue
+			}
+			function, okFunction := toolCall["function"].(map[string]any)
+			if !okFunction {
+				continue
+			}
+			arguments, changedArguments := normalizeDoubaoToolArgumentsValue(function["arguments"])
+			if changedArguments {
+				function["arguments"] = arguments
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return payload
+	}
+	root["messages"] = messages
+	out, err := json.Marshal(root)
+	if err != nil || !gjson.ValidBytes(out) {
+		return payload
+	}
+	return out
+}
+
+func normalizeDoubaoToolArgumentsValue(raw any) (string, bool) {
+	switch typed := raw.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return "{}", true
+		}
+		if gjson.Valid(trimmed) {
+			return typed, false
+		}
+		if repaired, ok := helps.RepairInvalidJSONStringEscapes([]byte(trimmed)); ok && gjson.ValidBytes(repaired) {
+			return string(repaired), true
+		}
+		return "{}", true
+	case nil:
+		return "{}", true
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil || !gjson.ValidBytes(encoded) {
+			return "{}", true
+		}
+		return string(encoded), true
+	}
+}
+
+type openAICompatPayloadDiagnostic struct {
+	Model             string
+	CompatKind        string
+	Endpoint          string
+	RequestPath       string
+	Channel           string
+	AuthID            string
+	AuthLabel         string
+	CompatName        string
+	PayloadSize       int
+	PayloadFields     []string
+	AddedFields       []string
+	RemovedFields     []string
+	ModifiedFields    []string
+	UpstreamRequestID string
+}
+
+func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompatProfile, auth *cliproxyauth.Auth, model, endpoint, requestPath string, requestHeaders http.Header, responseHeaders http.Header) openAICompatPayloadDiagnostic {
+	beforeFields := openAICompatTopLevelRawFields(before)
+	afterFields := openAICompatTopLevelRawFields(after)
+	diag := openAICompatPayloadDiagnostic{
+		Model:             strings.TrimSpace(model),
+		CompatKind:        config.NormalizeOpenAICompatibilityKind(profile.Kind),
+		Endpoint:          strings.TrimSpace(endpoint),
+		RequestPath:       strings.TrimSpace(requestPath),
+		Channel:           firstHeaderValue(requestHeaders, "X-Newapi-Channel-Id", "X-New-Api-Channel-Id", "X-Channel-Id", "Channel-Id"),
+		PayloadSize:       len(after),
+		PayloadFields:     sortedMapKeys(afterFields),
+		AddedFields:       sortedFieldDiff(afterFields, beforeFields),
+		RemovedFields:     sortedFieldDiff(beforeFields, afterFields),
+		ModifiedFields:    sortedModifiedFields(beforeFields, afterFields),
+		UpstreamRequestID: firstHeaderValue(responseHeaders, "X-Tt-Logid", "X-Volc-Request-Id", "X-Request-Id", "X-Request-ID", "X-Requestid", "Request-Id"),
+	}
+	if auth != nil {
+		diag.AuthID = strings.TrimSpace(auth.ID)
+		diag.AuthLabel = strings.TrimSpace(auth.Label)
+		if auth.Attributes != nil {
+			diag.CompatName = strings.TrimSpace(auth.Attributes["compat_name"])
+		}
+	}
+	return diag
+}
+
+func (d openAICompatPayloadDiagnostic) relevant() bool {
+	return d.CompatKind == "doubao" || len(d.AddedFields) > 0 || len(d.RemovedFields) > 0 || len(d.ModifiedFields) > 0
+}
+
+func openAICompatTopLevelRawFields(payload []byte) map[string]string {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil
+	}
+	fields := make(map[string]string, len(root))
+	for key, raw := range root {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		fields[key] = string(raw)
+	}
+	return fields
+}
+
+func sortedMapKeys(values map[string]string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedFieldDiff(left, right map[string]string) []string {
+	if len(left) == 0 {
+		return nil
+	}
+	fields := make([]string, 0)
+	for key := range left {
+		if _, ok := right[key]; !ok {
+			fields = append(fields, key)
+		}
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func sortedModifiedFields(before, after map[string]string) []string {
+	if len(before) == 0 || len(after) == 0 {
+		return nil
+	}
+	fields := make([]string, 0)
+	for key, beforeRaw := range before {
+		afterRaw, ok := after[key]
+		if !ok || beforeRaw == afterRaw {
+			continue
+		}
+		fields = append(fields, key)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func firstHeaderValue(headers http.Header, names ...string) string {
+	if headers == nil {
+		return ""
+	}
+	for _, name := range names {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func rewriteOpenAICompatSystemMessagesAsUser(payload []byte) []byte {
@@ -379,13 +834,13 @@ func requiresDeepSeekThinkingBudgetCompatibility(model string, baseURL string, c
 	switch config.NormalizeOpenAICompatibilityKind(compatKind) {
 	case "deepseek":
 		return true
-	case "kimi", "minimax", "xiaomi", "zhipu", "xfyun", "maas", "langengyun", "newapi":
+	case "kimi", "minimax", "xiaomi", "zhipu", "doubao", "xfyun", "maas", "langengyun", "newapi":
 		return false
 	}
 	switch config.InferCompatKindFromBaseURL(baseURL) {
 	case "deepseek":
 		return true
-	case "kimi", "minimax", "xiaomi", "zhipu", "xfyun", "maas", "langengyun", "newapi":
+	case "kimi", "minimax", "xiaomi", "zhipu", "doubao", "xfyun", "maas", "langengyun", "newapi":
 		return false
 	}
 	modelName := strings.ToLower(strings.TrimSpace(model))
@@ -510,7 +965,7 @@ func scrubZhipuImageURLDataURLs(payload []byte) []byte {
 
 func scrubOpenAICompatProviderToolPayload(payload []byte, profile openAICompatProfile) []byte {
 	switch config.NormalizeOpenAICompatibilityKind(profile.Kind) {
-	case "kimi", "minimax", "xiaomi", "zhipu", "xfyun", "maas", "langengyun", "newapi":
+	case "kimi", "minimax", "xiaomi", "zhipu", "doubao", "xfyun", "maas", "langengyun", "newapi":
 		return scrubOpenAICompatFunctionToolPayload(payload, profile)
 	default:
 		return payload

@@ -155,6 +155,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(req.Context(), updated, profile, model); changed {
 		updated = inlined
 	}
+	if errValidate := validateOpenAICompatOutboundJSON(updated); errValidate != nil {
+		return errValidate
+	}
 	req.Body = io.NopCloser(bytes.NewReader(updated))
 	req.ContentLength = int64(len(updated))
 	req.GetBody = func() (io.ReadCloser, error) {
@@ -164,6 +167,66 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 		req.Header.Set("Content-Length", strconv.Itoa(len(updated)))
 	}
 	return nil
+}
+
+func validateOpenAICompatOutboundJSON(payload []byte) error {
+	if gjson.ValidBytes(payload) {
+		return nil
+	}
+	return statusErr{
+		code:      http.StatusBadRequest,
+		msg:       "invalid JSON body after OpenAI-compatible normalization",
+		errorCode: "invalid_json_body",
+	}
+}
+
+func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic openAICompatPayloadDiagnostic, statusCode int, headers http.Header, body []byte) {
+	if statusCode != http.StatusBadRequest || !diagnostic.relevant() {
+		return
+	}
+	if diagnostic.UpstreamRequestID == "" {
+		diagnostic.UpstreamRequestID = firstHeaderValue(headers, "X-Tt-Logid", "X-Volc-Request-Id", "X-Request-Id", "X-Request-ID", "X-Requestid", "Request-Id")
+	}
+	fields := log.Fields{
+		"event":         "compatibility_diagnostic",
+		"provider":      "openai-compatibility",
+		"compat_kind":   diagnostic.CompatKind,
+		"model":         diagnostic.Model,
+		"endpoint":      diagnostic.Endpoint,
+		"payload_bytes": diagnostic.PayloadSize,
+		"status":        statusCode,
+	}
+	if diagnostic.RequestPath != "" {
+		fields["request_path"] = diagnostic.RequestPath
+	}
+	if diagnostic.Channel != "" {
+		fields["channel"] = diagnostic.Channel
+	}
+	if diagnostic.AuthID != "" {
+		fields["auth_id"] = diagnostic.AuthID
+	}
+	if diagnostic.CompatName != "" {
+		fields["compat_name"] = diagnostic.CompatName
+	}
+	if diagnostic.UpstreamRequestID != "" {
+		fields["upstream_request_id"] = diagnostic.UpstreamRequestID
+	}
+	if len(diagnostic.PayloadFields) > 0 {
+		fields["payload_fields"] = diagnostic.PayloadFields
+	}
+	if len(diagnostic.AddedFields) > 0 {
+		fields["added_fields"] = diagnostic.AddedFields
+	}
+	if len(diagnostic.RemovedFields) > 0 {
+		fields["removed_fields"] = diagnostic.RemovedFields
+	}
+	if len(diagnostic.ModifiedFields) > 0 {
+		fields["modified_fields"] = diagnostic.ModifiedFields
+	}
+	if errorCode := firstNonEmptyJSONValue(body, "error.code", "code", "error.type", "type", "error.err_code"); errorCode != "" {
+		fields["upstream_error_code"] = errorCode
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("openai compat compatibility diagnostic")
 }
 
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -223,21 +286,30 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	translated = e.overrideModel(translated, baseModel)
+	compatDiagnosticSource := translated
 	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 	translated = scrubDeepSeekThinkingBudgetForCompat(translated, baseModel, baseURL, profile.Kind)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
 		}
 	}
+	if errValidate := validateOpenAICompatOutboundJSON(translated); errValidate != nil {
+		return resp, errValidate
+	}
+	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
 		requestLogBody = redactOpenAICompatImageDataURLsForLog(translated)
+	}
+	if errValidate := validateOpenAICompatOutboundJSON(translated); errValidate != nil {
+		return resp, errValidate
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -291,6 +363,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, b)
 		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
 		return resp, err
 	}
@@ -448,24 +521,34 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	translated = e.overrideModel(translated, baseModel)
+	compatDiagnosticSource := translated
 	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 	translated = scrubDeepSeekThinkingBudgetForCompat(translated, baseModel, baseURL, profile.Kind)
 	if profile.SupportsStreamUsage {
 		// Request usage data in the final streaming chunk so that token statistics
 		// are captured even when the upstream is an OpenAI-compatible provider.
 		translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	}
+	if errValidate := validateOpenAICompatOutboundJSON(translated); errValidate != nil {
+		return nil, errValidate
+	}
+	endpoint := "/chat/completions"
+	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
 		requestLogBody = redactOpenAICompatImageDataURLsForLog(translated)
 	}
+	if errValidate := validateOpenAICompatOutboundJSON(translated); errValidate != nil {
+		return nil, errValidate
+	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
@@ -519,6 +602,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			responseLog.AppendChunk(b)
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
