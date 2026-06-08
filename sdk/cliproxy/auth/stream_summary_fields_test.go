@@ -49,3 +49,41 @@ func TestStreamSummaryFieldsObservePayloadSkipsIrrelevantChunk(t *testing.T) {
 		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
 	}
 }
+
+func TestStreamSummaryFieldsObservePayloadSkipsNullFinishReasonChunk(t *testing.T) {
+	var fields streamSummaryFields
+	fields.observePayload([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n"))
+
+	if fields.outputTokens != 0 {
+		t.Fatalf("outputTokens = %d, want 0", fields.outputTokens)
+	}
+	if fields.finishReason != "" {
+		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
+	}
+}
+
+func TestStreamSummaryFieldsObservePayloadKeepsUsageWhenFinishReasonIsNull(t *testing.T) {
+	var fields streamSummaryFields
+	fields.observePayload([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],\"usage\":{\"completion_tokens\":11,\"total_tokens\":19,\"prompt_tokens\":8}}\n"))
+
+	if fields.outputTokens != 11 {
+		t.Fatalf("outputTokens = %d, want 11", fields.outputTokens)
+	}
+	if fields.finishReason != "" {
+		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
+	}
+}
+
+func TestShouldObserveSummaryPayloadSkipsNullFinishReasonOnly(t *testing.T) {
+	payload := []byte("{\"choices\":[{\"finish_reason\": null}]}")
+	if shouldObserveSummaryPayload(payload) {
+		t.Fatal("shouldObserveSummaryPayload() = true, want false for null finish_reason only")
+	}
+}
+
+func TestShouldObserveSummaryPayloadObservesNonNullFinishReason(t *testing.T) {
+	payload := []byte("{\"choices\":[{\"finish_reason\":\"stop\"}]}")
+	if !shouldObserveSummaryPayload(payload) {
+		t.Fatal("shouldObserveSummaryPayload() = false, want true for non-null finish_reason")
+	}
+}

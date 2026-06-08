@@ -140,11 +140,58 @@ func shouldObserveSummaryPayload(payload []byte) bool {
 	return bytes.Contains(payload, summaryUsageMarker) ||
 		bytes.Contains(payload, summaryUsageMetadataMarker) ||
 		bytes.Contains(payload, summaryUsageMetadataAltMarker) ||
-		bytes.Contains(payload, summaryFinishReasonMarker) ||
-		bytes.Contains(payload, summaryNativeFinishMarker) ||
 		bytes.Contains(payload, summaryStopReasonMarker) ||
-		bytes.Contains(payload, summaryFinishReasonAltMarker) ||
-		bytes.Contains(payload, summaryIncompleteMarker)
+		bytes.Contains(payload, summaryIncompleteMarker) ||
+		hasNonNullSummaryField(payload, summaryFinishReasonMarker) ||
+		hasNonNullSummaryField(payload, summaryNativeFinishMarker) ||
+		hasNonNullSummaryField(payload, summaryFinishReasonAltMarker)
+}
+
+func hasNonNullSummaryField(payload []byte, marker []byte) bool {
+	for start := 0; start < len(payload); {
+		offset := bytes.Index(payload[start:], marker)
+		if offset < 0 {
+			return false
+		}
+		valueStart := start + offset + len(marker)
+		colon := skipSummaryWhitespace(payload, valueStart)
+		if colon >= len(payload) || payload[colon] != ':' {
+			start = valueStart
+			continue
+		}
+		valueStart = skipSummaryWhitespace(payload, colon+1)
+		if valueStart >= len(payload) {
+			return false
+		}
+		if bytes.HasPrefix(payload[valueStart:], []byte("null")) &&
+			(valueStart+4 == len(payload) || isSummaryValueDelimiter(payload[valueStart+4])) {
+			start = valueStart + 4
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func skipSummaryWhitespace(payload []byte, start int) int {
+	for start < len(payload) {
+		switch payload[start] {
+		case ' ', '\t', '\n', '\r':
+			start++
+		default:
+			return start
+		}
+	}
+	return start
+}
+
+func isSummaryValueDelimiter(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', ',', '}', ']':
+		return true
+	default:
+		return false
+	}
 }
 
 func streamTokensPerSecond(outputTokens int64, streamDuration time.Duration) float64 {
