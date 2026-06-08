@@ -104,6 +104,50 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
+	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"}}]}`)
+	if detail, ok := ParseOpenAIStreamUsage(line); ok {
+		t.Fatalf("ParseOpenAIStreamUsage() = (%+v, true), want false for plain content chunk", detail)
+	}
+}
+
+func TestParseClaudeStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
+	line := []byte(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`)
+	if detail, ok := ParseClaudeStreamUsage(line); ok {
+		t.Fatalf("ParseClaudeStreamUsage() = (%+v, true), want false for plain content chunk", detail)
+	}
+}
+
+func TestParseGeminiCLIStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
+	line := []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}}`)
+	if detail, ok := ParseGeminiCLIStreamUsage(line); ok {
+		t.Fatalf("ParseGeminiCLIStreamUsage() = (%+v, true), want false for plain content chunk", detail)
+	}
+}
+
+func TestShouldParseStreamUsagePayloadMarkers(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    bool
+	}{
+		{name: "usage wrapper", payload: []byte(`{"usage":{"prompt_tokens":1}}`), want: true},
+		{name: "usage metadata camel", payload: []byte(`{"usageMetadata":{"promptTokenCount":1}}`), want: true},
+		{name: "usage metadata snake", payload: []byte(`{"usage_metadata":{"promptTokenCount":1}}`), want: true},
+		{name: "input tokens", payload: []byte(`{"input_tokens":1}`), want: true},
+		{name: "output tokens", payload: []byte(`{"output_tokens":1}`), want: true},
+		{name: "completion tokens", payload: []byte(`{"completion_tokens":1}`), want: true},
+		{name: "plain content", payload: []byte(`{"choices":[{"delta":{"content":"hello"}}]}`), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldParseStreamUsagePayload(tt.payload); got != tt.want {
+				t.Fatalf("shouldParseStreamUsagePayload() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseGeminiCLIUsage_TopLevelUsageMetadata(t *testing.T) {
 	data := []byte(`{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"thoughtsTokenCount":3,"totalTokenCount":21,"cachedContentTokenCount":5}}`)
 	detail := ParseGeminiCLIUsage(data)

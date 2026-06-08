@@ -20,6 +20,15 @@ import (
 
 var failureStatusPattern = regexp.MustCompile(`(?i)(?:status_code|status code|status|http status)[=:\s]+([1-5][0-9]{2})`)
 
+var (
+	streamUsageMarker                 = []byte(`"usage"`)
+	streamUsageMetadataMarker         = []byte(`"usageMetadata"`)
+	streamUsageMetadataAltMarker      = []byte(`"usage_metadata"`)
+	streamUsageInputTokensMarker      = []byte(`"input_tokens"`)
+	streamUsageOutputTokensMarker     = []byte(`"output_tokens"`)
+	streamUsageCompletionTokensMarker = []byte(`"completion_tokens"`)
+)
+
 type UsageReporter struct {
 	provider    string
 	model       string
@@ -518,7 +527,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 
 func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !shouldParseStreamUsagePayload(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
@@ -538,7 +547,7 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !shouldParseStreamUsagePayload(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
@@ -615,7 +624,7 @@ func ParseGeminiUsage(data []byte) usage.Detail {
 
 func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !shouldParseStreamUsagePayload(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	node := gjson.GetBytes(payload, "usageMetadata")
@@ -630,7 +639,7 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 
 func ParseGeminiCLIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !shouldParseStreamUsagePayload(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	root := gjson.ParseBytes(payload)
@@ -676,7 +685,7 @@ func ParseAntigravityUsage(data []byte) usage.Detail {
 
 func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !shouldParseStreamUsagePayload(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	node := gjson.GetBytes(payload, "response.usageMetadata")
@@ -690,6 +699,15 @@ func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
+}
+
+func shouldParseStreamUsagePayload(payload []byte) bool {
+	return bytes.Contains(payload, streamUsageMarker) ||
+		bytes.Contains(payload, streamUsageMetadataMarker) ||
+		bytes.Contains(payload, streamUsageMetadataAltMarker) ||
+		bytes.Contains(payload, streamUsageInputTokensMarker) ||
+		bytes.Contains(payload, streamUsageOutputTokensMarker) ||
+		bytes.Contains(payload, streamUsageCompletionTokensMarker)
 }
 
 var stopChunkWithoutUsage sync.Map
