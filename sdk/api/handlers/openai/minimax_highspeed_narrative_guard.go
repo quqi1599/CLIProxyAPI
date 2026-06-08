@@ -2,12 +2,9 @@ package openai
 
 import (
 	"bytes"
-	"net/http"
-	"strconv"
+	"context"
 	"sync"
 
-	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -17,9 +14,8 @@ import (
 const (
 	miniMaxHighspeedNarrativeModel = "MiniMax-M2.7-highspeed"
 
-	defaultMiniMaxHighspeedNarrativeMaxConcurrent     = 2
-	defaultMiniMaxHighspeedNarrativeMaxOutputTokens   = 4096
-	defaultMiniMaxHighspeedNarrativeRetryAfterSeconds = 30
+	defaultMiniMaxHighspeedNarrativeMaxConcurrent   = 2
+	defaultMiniMaxHighspeedNarrativeMaxOutputTokens = 4096
 
 	miniMaxHighspeedNarrativeMinBodyBytes      = 100 * 1024
 	miniMaxHighspeedNarrativeMinOutputTokens   = 10000
@@ -54,10 +50,9 @@ var miniMaxHighspeedNarrativeMarkers = [][]byte{
 }
 
 type miniMaxHighspeedNarrativeGuardSettings struct {
-	enabled           bool
-	maxConcurrent     int
-	maxOutputTokens   int
-	retryAfterSeconds int
+	enabled         bool
+	maxConcurrent   int
+	maxOutputTokens int
 }
 
 type miniMaxHighspeedNarrativeMatch struct {
@@ -69,52 +64,121 @@ type miniMaxHighspeedNarrativeMatch struct {
 }
 
 type miniMaxHighspeedNarrativeGuardDecision struct {
-	rawJSON           []byte
-	release           func()
-	blocked           bool
-	retryAfterSeconds int
-	bodyBytes         int
-	maxTokens         int64
-	structuralHits    int
-	narrativeHits     int
-	active            int
-	maxConcurrent     int
-	cappedOutput      bool
+	rawJSON        []byte
+	release        func()
+	waitErr        error
+	bodyBytes      int
+	maxTokens      int64
+	structuralHits int
+	narrativeHits  int
+	active         int
+	queued         int
+	maxConcurrent  int
+	cappedOutput   bool
 }
 
 type miniMaxHighspeedNarrativeLimiter struct {
-	mu     sync.Mutex
-	active int
+	mu      sync.Mutex
+	active  int
+	waiters []*miniMaxHighspeedNarrativeWaiter
 }
 
-func (l *miniMaxHighspeedNarrativeLimiter) acquire(maxConcurrent int) (func(), int, bool) {
+type miniMaxHighspeedNarrativeWaiter struct {
+	ready chan struct{}
+}
+
+func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcurrent int) (func(), int, int, error) {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMiniMaxHighspeedNarrativeMaxConcurrent
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, 0, err
+	}
+	l.mu.Lock()
+	if l.active < maxConcurrent && len(l.waiters) == 0 {
+		l.active++
+		active := l.active
+		l.mu.Unlock()
+		return l.releaseFunc(maxConcurrent), active, 0, nil
+	}
+
+	waiter := &miniMaxHighspeedNarrativeWaiter{ready: make(chan struct{})}
+	l.waiters = append(l.waiters, waiter)
+	queued := len(l.waiters)
+	l.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		release := l.releaseFunc(maxConcurrent)
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, 0, queued, err
+		}
+		active := l.activeSnapshot()
+		return release, active, queued, nil
+	case <-ctx.Done():
+		l.mu.Lock()
+		removed := l.removeWaiterLocked(waiter)
+		if !removed {
+			l.releaseAssignedSlotLocked(maxConcurrent)
+		}
+		l.mu.Unlock()
+		return nil, 0, queued, ctx.Err()
+	}
+}
+
+func (l *miniMaxHighspeedNarrativeLimiter) activeSnapshot() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.active >= maxConcurrent {
-		return nil, l.active, false
-	}
-	l.active++
-	active := l.active
+	return l.active
+}
+
+func (l *miniMaxHighspeedNarrativeLimiter) releaseFunc(maxConcurrent int) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			if l.active > 0 {
-				l.active--
-			}
+			l.releaseAssignedSlotLocked(maxConcurrent)
 		})
-	}, active, true
+	}
 }
 
-func (h *OpenAIAPIHandler) prepareMiniMaxHighspeedNarrativeGuard(rawJSON []byte) miniMaxHighspeedNarrativeGuardDecision {
-	return prepareMiniMaxHighspeedNarrativeGuard(rawJSON, h.Cfg, defaultMiniMaxHighspeedNarrativeLimiter)
+func (l *miniMaxHighspeedNarrativeLimiter) releaseAssignedSlotLocked(maxConcurrent int) {
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMiniMaxHighspeedNarrativeMaxConcurrent
+	}
+	if l.active > 0 {
+		l.active--
+	}
+	for l.active < maxConcurrent && len(l.waiters) > 0 {
+		next := l.waiters[0]
+		copy(l.waiters, l.waiters[1:])
+		l.waiters[len(l.waiters)-1] = nil
+		l.waiters = l.waiters[:len(l.waiters)-1]
+		l.active++
+		close(next.ready)
+	}
 }
 
-func prepareMiniMaxHighspeedNarrativeGuard(rawJSON []byte, cfg *sdkconfig.SDKConfig, limiter *miniMaxHighspeedNarrativeLimiter) miniMaxHighspeedNarrativeGuardDecision {
+func (l *miniMaxHighspeedNarrativeLimiter) removeWaiterLocked(waiter *miniMaxHighspeedNarrativeWaiter) bool {
+	for i, existing := range l.waiters {
+		if existing != waiter {
+			continue
+		}
+		copy(l.waiters[i:], l.waiters[i+1:])
+		l.waiters[len(l.waiters)-1] = nil
+		l.waiters = l.waiters[:len(l.waiters)-1]
+		return true
+	}
+	return false
+}
+
+func (h *OpenAIAPIHandler) prepareMiniMaxHighspeedNarrativeGuard(ctx context.Context, rawJSON []byte) miniMaxHighspeedNarrativeGuardDecision {
+	return prepareMiniMaxHighspeedNarrativeGuard(ctx, rawJSON, h.Cfg, defaultMiniMaxHighspeedNarrativeLimiter)
+}
+
+func prepareMiniMaxHighspeedNarrativeGuard(ctx context.Context, rawJSON []byte, cfg *sdkconfig.SDKConfig, limiter *miniMaxHighspeedNarrativeLimiter) miniMaxHighspeedNarrativeGuardDecision {
 	decision := miniMaxHighspeedNarrativeGuardDecision{rawJSON: rawJSON}
 	settings := miniMaxHighspeedNarrativeSettings(cfg)
 	if !settings.enabled {
@@ -129,13 +193,13 @@ func prepareMiniMaxHighspeedNarrativeGuard(rawJSON []byte, cfg *sdkconfig.SDKCon
 	decision.maxTokens = match.maxTokens
 	decision.structuralHits = match.structuralHits
 	decision.narrativeHits = match.narrativeHits
-	decision.retryAfterSeconds = settings.retryAfterSeconds
 	decision.maxConcurrent = settings.maxConcurrent
 
-	release, active, ok := limiter.acquire(settings.maxConcurrent)
+	release, active, queued, err := limiter.acquire(ctx, settings.maxConcurrent)
 	decision.active = active
-	if !ok {
-		decision.blocked = true
+	decision.queued = queued
+	if err != nil {
+		decision.waitErr = err
 		return decision
 	}
 
@@ -148,9 +212,8 @@ func prepareMiniMaxHighspeedNarrativeGuard(rawJSON []byte, cfg *sdkconfig.SDKCon
 
 func miniMaxHighspeedNarrativeSettings(cfg *sdkconfig.SDKConfig) miniMaxHighspeedNarrativeGuardSettings {
 	settings := miniMaxHighspeedNarrativeGuardSettings{
-		maxConcurrent:     defaultMiniMaxHighspeedNarrativeMaxConcurrent,
-		maxOutputTokens:   defaultMiniMaxHighspeedNarrativeMaxOutputTokens,
-		retryAfterSeconds: defaultMiniMaxHighspeedNarrativeRetryAfterSeconds,
+		maxConcurrent:   defaultMiniMaxHighspeedNarrativeMaxConcurrent,
+		maxOutputTokens: defaultMiniMaxHighspeedNarrativeMaxOutputTokens,
 	}
 	if cfg == nil {
 		return settings
@@ -162,9 +225,6 @@ func miniMaxHighspeedNarrativeSettings(cfg *sdkconfig.SDKConfig) miniMaxHighspee
 	}
 	if guard.MaxOutputTokens > 0 {
 		settings.maxOutputTokens = guard.MaxOutputTokens
-	}
-	if guard.RetryAfterSeconds > 0 {
-		settings.retryAfterSeconds = guard.RetryAfterSeconds
 	}
 	return settings
 }
@@ -234,18 +294,4 @@ func capMiniMaxHighspeedNarrativeOutput(rawJSON []byte, maxOutputTokens int) ([]
 		capped = true
 	}
 	return updated, capped
-}
-
-func writeMiniMaxHighspeedNarrativeGuardRateLimit(c *gin.Context, decision miniMaxHighspeedNarrativeGuardDecision) {
-	if decision.retryAfterSeconds <= 0 {
-		decision.retryAfterSeconds = defaultMiniMaxHighspeedNarrativeRetryAfterSeconds
-	}
-	c.Header("Retry-After", strconv.Itoa(decision.retryAfterSeconds))
-	c.JSON(http.StatusTooManyRequests, handlers.ErrorResponse{
-		Error: handlers.ErrorDetail{
-			Message: "Heavy MiniMax-M2.7-highspeed narrative workloads are temporarily limited. Please retry later or reduce max_tokens/context size.",
-			Type:    "rate_limit_error",
-			Code:    "rate_limit_exceeded",
-		},
-	})
 }

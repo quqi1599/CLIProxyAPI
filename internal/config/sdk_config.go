@@ -78,8 +78,9 @@ type RequestGuardsConfig struct {
 // MiniMaxHighspeedNarrativeGuardConfig limits large narrative-roleplay workloads
 // on MiniMax-M2.7-highspeed without affecting normal long-context requests.
 type MiniMaxHighspeedNarrativeGuardConfig struct {
-	Enabled           bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	MaxConcurrent     int  `yaml:"max-concurrent,omitempty" json:"max-concurrent,omitempty"`
-	MaxOutputTokens   int  `yaml:"max-output-tokens,omitempty" json:"max-output-tokens,omitempty"`
-	RetryAfterSeconds int  `yaml:"retry-after-seconds,omitempty" json:"retry-after-seconds,omitempty"`
+	Enabled         bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	MaxConcurrent   int  `yaml:"max-concurrent,omitempty" json:"max-concurrent,omitempty"`
+	MaxOutputTokens int  `yaml:"max-output-tokens,omitempty" json:"max-output-tokens,omitempty"`
+	// Deprecated: matching requests are queued instead of rejected.
+	RetryAfterSeconds int `yaml:"retry-after-seconds,omitempty" json:"retry-after-seconds,omitempty"`
 }

@@ -1,9 +1,11 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -14,10 +16,7 @@ func TestMiniMaxHighspeedNarrativeGuardMatchesAndCaps(t *testing.T) {
 	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
 	limiter := &miniMaxHighspeedNarrativeLimiter{}
 
-	decision := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if decision.blocked {
-		t.Fatal("first matching request should be admitted")
-	}
+	decision := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
 	if decision.release == nil {
 		t.Fatal("matching request should acquire a guard slot")
 	}
@@ -36,37 +35,88 @@ func TestMiniMaxHighspeedNarrativeGuardMatchesAndCaps(t *testing.T) {
 	}
 }
 
-func TestMiniMaxHighspeedNarrativeGuardRejectsAboveConcurrency(t *testing.T) {
+func TestMiniMaxHighspeedNarrativeGuardQueuesAboveConcurrency(t *testing.T) {
 	cfg := miniMaxHighspeedNarrativeTestConfig(2, 4096)
 	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
 	limiter := &miniMaxHighspeedNarrativeLimiter{}
 
-	first := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if first.blocked || first.release == nil {
+	first := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if first.release == nil {
 		t.Fatal("first matching request should be admitted")
 	}
 	defer first.release()
 
-	second := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if second.blocked || second.release == nil {
+	second := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if second.release == nil {
 		t.Fatal("second matching request should be admitted")
 	}
 	defer second.release()
 
-	third := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if !third.blocked {
-		t.Fatal("third concurrent matching request should be rejected")
-	}
-	if third.release != nil {
-		t.Fatal("rejected request must not hold a guard slot")
+	thirdDone := make(chan miniMaxHighspeedNarrativeGuardDecision, 1)
+	go func() {
+		thirdDone <- prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	}()
+
+	select {
+	case third := <-thirdDone:
+		if third.release != nil {
+			third.release()
+		}
+		t.Fatal("third concurrent matching request should wait for a slot")
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	first.release()
-	fourth := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if fourth.blocked || fourth.release == nil {
-		t.Fatal("request should be admitted after a slot is released")
+
+	select {
+	case third := <-thirdDone:
+		if third.waitErr != nil {
+			t.Fatalf("queued request wait error: %v", third.waitErr)
+		}
+		if third.release == nil {
+			t.Fatal("queued request should acquire a slot after release")
+		}
+		third.release()
+	case <-time.After(time.Second):
+		t.Fatal("queued request did not acquire slot after release")
 	}
-	fourth.release()
+}
+
+func TestMiniMaxHighspeedNarrativeGuardQueueCancelDoesNotLeakSlot(t *testing.T) {
+	cfg := miniMaxHighspeedNarrativeTestConfig(1, 4096)
+	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
+	limiter := &miniMaxHighspeedNarrativeLimiter{}
+
+	first := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if first.release == nil {
+		t.Fatal("first matching request should be admitted")
+	}
+	defer first.release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan miniMaxHighspeedNarrativeGuardDecision, 1)
+	go func() {
+		waitDone <- prepareMiniMaxHighspeedNarrativeGuard(ctx, payload, cfg, limiter)
+	}()
+
+	cancel()
+	cancelled := <-waitDone
+	if cancelled.waitErr == nil {
+		t.Fatal("queued request should observe context cancellation")
+	}
+	if cancelled.release != nil {
+		t.Fatal("cancelled queued request must not hold a slot")
+	}
+
+	first.release()
+	next := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if next.waitErr != nil {
+		t.Fatalf("next request wait error: %v", next.waitErr)
+	}
+	if next.release == nil {
+		t.Fatal("slot should be available after cancellation and release")
+	}
+	next.release()
 }
 
 func TestMiniMaxHighspeedNarrativeGuardIgnoresLongCodeContext(t *testing.T) {
@@ -75,10 +125,7 @@ func TestMiniMaxHighspeedNarrativeGuardIgnoresLongCodeContext(t *testing.T) {
 	payload := miniMaxHighspeedNarrativeTestPayload(12000, codePrompt)
 	limiter := &miniMaxHighspeedNarrativeLimiter{}
 
-	decision := prepareMiniMaxHighspeedNarrativeGuard(payload, cfg, limiter)
-	if decision.blocked {
-		t.Fatal("long code context should not be blocked")
-	}
+	decision := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
 	if decision.release != nil {
 		t.Fatal("long code context should not acquire a guard slot")
 	}
@@ -89,10 +136,7 @@ func TestMiniMaxHighspeedNarrativeGuardIgnoresLongCodeContext(t *testing.T) {
 
 func TestMiniMaxHighspeedNarrativeGuardDisabledByDefault(t *testing.T) {
 	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
-	decision := prepareMiniMaxHighspeedNarrativeGuard(payload, &sdkconfig.SDKConfig{}, &miniMaxHighspeedNarrativeLimiter{})
-	if decision.blocked {
-		t.Fatal("disabled guard should not reject requests")
-	}
+	decision := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, &sdkconfig.SDKConfig{}, &miniMaxHighspeedNarrativeLimiter{})
 	if decision.release != nil {
 		t.Fatal("disabled guard should not acquire slots")
 	}
