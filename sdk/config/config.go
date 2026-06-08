@@ -11,6 +11,8 @@ type SDKConfig = internalconfig.SDKConfig
 type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
+type RequestGuardsConfig = internalconfig.RequestGuardsConfig
+type MiniMaxHighspeedNarrativeGuardConfig = internalconfig.MiniMaxHighspeedNarrativeGuardConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type AmpCode = internalconfig.AmpCode

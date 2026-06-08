@@ -48,6 +48,9 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// RequestGuards configures narrow request-shaping guards for abusive traffic patterns.
+	RequestGuards RequestGuardsConfig `yaml:"request-guards" json:"request-guards"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.
@@ -64,4 +67,19 @@ type StreamingConfig struct {
 	// FlushIntervalMilliseconds coalesces stream chunk flushes for this many milliseconds.
 	// <= 0 flushes every chunk immediately. Default is 0.
 	FlushIntervalMilliseconds int `yaml:"flush-interval-ms,omitempty" json:"flush-interval-ms,omitempty"`
+}
+
+// RequestGuardsConfig holds optional request guards for traffic patterns that
+// are too specific for model-wide payload overrides.
+type RequestGuardsConfig struct {
+	MiniMaxHighspeedNarrative MiniMaxHighspeedNarrativeGuardConfig `yaml:"minimax-m27-highspeed-narrative,omitempty" json:"minimax-m27-highspeed-narrative,omitempty"`
+}
+
+// MiniMaxHighspeedNarrativeGuardConfig limits large narrative-roleplay workloads
+// on MiniMax-M2.7-highspeed without affecting normal long-context requests.
+type MiniMaxHighspeedNarrativeGuardConfig struct {
+	Enabled           bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	MaxConcurrent     int  `yaml:"max-concurrent,omitempty" json:"max-concurrent,omitempty"`
+	MaxOutputTokens   int  `yaml:"max-output-tokens,omitempty" json:"max-output-tokens,omitempty"`
+	RetryAfterSeconds int  `yaml:"retry-after-seconds,omitempty" json:"retry-after-seconds,omitempty"`
 }

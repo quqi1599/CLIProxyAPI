@@ -125,6 +125,16 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 	}
 
+	guardDecision := h.prepareMiniMaxHighspeedNarrativeGuard(rawJSON)
+	if guardDecision.blocked {
+		writeMiniMaxHighspeedNarrativeGuardRateLimit(c, guardDecision)
+		return
+	}
+	rawJSON = guardDecision.rawJSON
+	if guardDecision.release != nil {
+		defer guardDecision.release()
+	}
+
 	if stream {
 		h.handleStreamingResponse(c, rawJSON)
 	} else {

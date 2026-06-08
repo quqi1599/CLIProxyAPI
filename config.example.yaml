@@ -167,6 +167,15 @@ nonstream-keepalive-interval: 0
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 #   flush-interval-ms: 25   # Default: 0 (disabled). Coalesces chunk flushes up to this delay.
 
+# Optional narrow guards for abusive traffic patterns that should not affect
+# normal long-context coding or analysis requests.
+# request-guards:
+#   minimax-m27-highspeed-narrative:
+#     enabled: true
+#     max-concurrent: 2
+#     max-output-tokens: 4096
+#     retry-after-seconds: 30
+
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.
 # When false, client signatures are used directly after normalization (bypass mode for testing).
