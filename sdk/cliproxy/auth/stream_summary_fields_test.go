@@ -37,3 +37,15 @@ func TestStreamSummaryFieldsObservePayloadResponsesIncompleteReason(t *testing.T
 		t.Fatalf("finishReason = %q, want content_filter", fields.finishReason)
 	}
 }
+
+func TestStreamSummaryFieldsObservePayloadSkipsIrrelevantChunk(t *testing.T) {
+	var fields streamSummaryFields
+	fields.observePayload([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n"))
+
+	if fields.outputTokens != 0 {
+		t.Fatalf("outputTokens = %d, want 0", fields.outputTokens)
+	}
+	if fields.finishReason != "" {
+		t.Fatalf("finishReason = %q, want empty", fields.finishReason)
+	}
+}

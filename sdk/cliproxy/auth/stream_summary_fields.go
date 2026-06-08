@@ -9,13 +9,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+var (
+	summaryUsageMarker            = []byte(`"usage"`)
+	summaryUsageMetadataMarker    = []byte(`"usageMetadata"`)
+	summaryUsageMetadataAltMarker = []byte(`"usage_metadata"`)
+	summaryFinishReasonMarker     = []byte(`"finish_reason"`)
+	summaryNativeFinishMarker     = []byte(`"native_finish_reason"`)
+	summaryStopReasonMarker       = []byte(`"stop_reason"`)
+	summaryFinishReasonAltMarker  = []byte(`"finishReason"`)
+	summaryIncompleteMarker       = []byte(`"incomplete_details"`)
+)
+
 type streamSummaryFields struct {
 	outputTokens int64
 	finishReason string
 }
 
 func (f *streamSummaryFields) observePayload(payload []byte) {
-	if f == nil || len(payload) == 0 {
+	if f == nil || len(payload) == 0 || !shouldObserveSummaryPayload(payload) {
 		return
 	}
 
@@ -40,7 +51,7 @@ func (f *streamSummaryFields) observePayload(payload []byte) {
 }
 
 func (f *streamSummaryFields) observeJSON(payload []byte) {
-	if f == nil || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+	if f == nil || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !shouldObserveSummaryPayload(payload) || !gjson.ValidBytes(payload) {
 		return
 	}
 
@@ -123,6 +134,17 @@ func cleanSummaryString(value string) string {
 		return ""
 	}
 	return value
+}
+
+func shouldObserveSummaryPayload(payload []byte) bool {
+	return bytes.Contains(payload, summaryUsageMarker) ||
+		bytes.Contains(payload, summaryUsageMetadataMarker) ||
+		bytes.Contains(payload, summaryUsageMetadataAltMarker) ||
+		bytes.Contains(payload, summaryFinishReasonMarker) ||
+		bytes.Contains(payload, summaryNativeFinishMarker) ||
+		bytes.Contains(payload, summaryStopReasonMarker) ||
+		bytes.Contains(payload, summaryFinishReasonAltMarker) ||
+		bytes.Contains(payload, summaryIncompleteMarker)
 }
 
 func streamTokensPerSecond(outputTokens int64, streamDuration time.Duration) float64 {
