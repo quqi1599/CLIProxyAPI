@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -76,6 +78,22 @@ func translateOpenAICompatStreamLine(ctx context.Context, upstreamFormat, downst
 		return [][]byte{rawCopy}
 	}
 	return sdktranslator.TranslateStream(ctx, upstreamFormat, downstreamFormat, model, originalRequestRawJSON, requestRawJSON, rawCopy, param)
+}
+
+func applyOpenAICompatRequestCorrelationHeaders(ctx context.Context, req *http.Request, source http.Header) {
+	if req == nil {
+		return
+	}
+	requestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	if requestID == "" {
+		return
+	}
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	req.Header.Set("X-Cliproxy-Request-Id", requestID)
+	misc.EnsureHeader(req.Header, source, "X-Request-Id", requestID)
+	misc.EnsureHeader(req.Header, source, "X-Client-Request-Id", requestID)
 }
 
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
@@ -232,6 +250,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	applyOpenAICompatRequestCorrelationHeaders(ctx, httpReq, opts.Headers)
 	applyOpenAICompatDefaultHeaders(httpReq, profile)
 	var attrs map[string]string
 	if auth != nil {
@@ -323,6 +342,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	applyOpenAICompatRequestCorrelationHeaders(ctx, httpReq, opts.Headers)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -457,6 +477,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	applyOpenAICompatRequestCorrelationHeaders(ctx, httpReq, opts.Headers)
 	applyOpenAICompatDefaultHeaders(httpReq, profile)
 	var attrs map[string]string
 	if auth != nil {
@@ -621,6 +642,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	applyOpenAICompatRequestCorrelationHeaders(ctx, httpReq, opts.Headers)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

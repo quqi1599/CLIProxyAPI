@@ -734,7 +734,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	}
 	providers = filterProvidersByToolCompatibility(providers, rawJSON)
 	if len(providers) == 0 {
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
+		return nil, nil, toolCompatibilitySelectionError(modelName, rawJSON)
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	recordRequestedModelContext(ctx, modelName)
@@ -791,7 +791,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	providers = filterProvidersByToolCompatibility(providers, rawJSON)
 	if len(providers) == 0 {
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
+		return nil, nil, toolCompatibilitySelectionError(modelName, rawJSON)
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	recordRequestedModelContext(ctx, modelName)
@@ -862,7 +862,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	providers = filterProvidersByToolCompatibility(providers, rawJSON)
 	if len(providers) == 0 {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
+		errChan <- toolCompatibilitySelectionError(modelName, rawJSON)
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1189,6 +1189,17 @@ func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []st
 		return providers
 	}
 
+	if payloadHasBuiltinImageGenerationTool(rawJSON) {
+		filtered := make([]string, 0, len(providers))
+		for _, provider := range providers {
+			if !providerSupportsBuiltinImageGeneration(provider) {
+				continue
+			}
+			filtered = append(filtered, provider)
+		}
+		providers = filtered
+	}
+
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if !tools.IsArray() || len(tools.Array()) == 0 {
 		return providers
@@ -1218,6 +1229,36 @@ func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []st
 		filtered = append(filtered, provider)
 	}
 	return filtered
+}
+
+func payloadHasBuiltinImageGenerationTool(rawJSON []byte) bool {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
+}
+
+func providerSupportsBuiltinImageGeneration(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "codex")
+}
+
+func toolCompatibilitySelectionError(modelName string, rawJSON []byte) *interfaces.ErrorMessage {
+	if payloadHasBuiltinImageGenerationTool(rawJSON) {
+		return &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("the image_generation builtin tool currently requires a codex-compatible channel for model %s", modelName),
+		}
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName),
+	}
 }
 
 func routeModelBaseName(model string) string {

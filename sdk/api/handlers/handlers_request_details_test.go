@@ -193,6 +193,18 @@ func TestFilterProvidersByToolCompatibility(t *testing.T) {
 			payload:   []byte(`{"tools":[{"type":"function","function":{"name":"f"}},{"google_search":{}}]}`),
 			want:      []string{},
 		},
+		{
+			name:      "builtin image generation keeps codex only",
+			providers: []string{"openai-compatibility", "codex", "xai"},
+			payload:   []byte(`{"tools":[{"type":"image_generation"},{"type":"function","function":{"name":"lookup"}}]}`),
+			want:      []string{"codex"},
+		},
+		{
+			name:      "builtin image generation without codex becomes empty",
+			providers: []string{"openai-compatibility", "xai"},
+			payload:   []byte(`{"tools":[{"type":"image_generation"}]}`),
+			want:      []string{},
+		},
 	}
 
 	for _, tt := range tests {
