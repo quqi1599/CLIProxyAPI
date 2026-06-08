@@ -119,6 +119,58 @@ func TestMiniMaxHighspeedNarrativeGuardQueueCancelDoesNotLeakSlot(t *testing.T) 
 	next.release()
 }
 
+func TestMiniMaxHighspeedNarrativeGuardQueueDepthLimit(t *testing.T) {
+	cfg := miniMaxHighspeedNarrativeTestConfigWithQueue(1, 1, 4096)
+	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
+	limiter := &miniMaxHighspeedNarrativeLimiter{}
+
+	first := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if first.release == nil {
+		t.Fatal("first matching request should be admitted")
+	}
+	defer first.release()
+
+	waitDone := make(chan miniMaxHighspeedNarrativeGuardDecision, 1)
+	go func() {
+		waitDone <- prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	}()
+	waitForMiniMaxHighspeedNarrativeQueueDepth(t, limiter, 1)
+
+	third := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+	if !third.queueFull {
+		t.Fatal("third request should trip the queue depth limit")
+	}
+	if third.release != nil {
+		t.Fatal("queue-full request must not hold a slot")
+	}
+	if third.waitErr != nil {
+		t.Fatalf("queue-full request should not report wait error: %v", third.waitErr)
+	}
+	if third.queued != 1 {
+		t.Fatalf("queued = %d, want 1", third.queued)
+	}
+	if third.maxQueue != 1 {
+		t.Fatalf("maxQueue = %d, want 1", third.maxQueue)
+	}
+
+	first.release()
+	select {
+	case second := <-waitDone:
+		if second.queueFull {
+			t.Fatal("queued request should acquire a slot after release, not trip queue limit")
+		}
+		if second.waitErr != nil {
+			t.Fatalf("queued request wait error: %v", second.waitErr)
+		}
+		if second.release == nil {
+			t.Fatal("queued request should acquire a slot")
+		}
+		second.release()
+	case <-time.After(time.Second):
+		t.Fatal("queued request did not acquire slot after release")
+	}
+}
+
 func TestMiniMaxHighspeedNarrativeGuardIgnoresLongCodeContext(t *testing.T) {
 	cfg := miniMaxHighspeedNarrativeTestConfig(2, 4096)
 	codePrompt := strings.Repeat("package main\nfunc handler() error { return nil }\n", 3000)
@@ -146,15 +198,40 @@ func TestMiniMaxHighspeedNarrativeGuardDisabledByDefault(t *testing.T) {
 }
 
 func miniMaxHighspeedNarrativeTestConfig(maxConcurrent, maxOutputTokens int) *sdkconfig.SDKConfig {
+	return miniMaxHighspeedNarrativeTestConfigWithQueue(maxConcurrent, 0, maxOutputTokens)
+}
+
+func miniMaxHighspeedNarrativeTestConfigWithQueue(maxConcurrent, maxQueue, maxOutputTokens int) *sdkconfig.SDKConfig {
 	return &sdkconfig.SDKConfig{
 		RequestGuards: sdkconfig.RequestGuardsConfig{
 			MiniMaxHighspeedNarrative: sdkconfig.MiniMaxHighspeedNarrativeGuardConfig{
 				Enabled:           true,
 				MaxConcurrent:     maxConcurrent,
+				MaxQueue:          maxQueue,
 				MaxOutputTokens:   maxOutputTokens,
 				RetryAfterSeconds: 30,
 			},
 		},
+	}
+}
+
+func waitForMiniMaxHighspeedNarrativeQueueDepth(t *testing.T, limiter *miniMaxHighspeedNarrativeLimiter, depth int) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		limiter.mu.Lock()
+		got := len(limiter.waiters)
+		limiter.mu.Unlock()
+		if got == depth {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("queue depth did not become %d", depth)
+		case <-ticker.C:
+		}
 	}
 }
 

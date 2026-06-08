@@ -3,8 +3,11 @@ package openai
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"sync"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -52,6 +55,7 @@ var miniMaxHighspeedNarrativeMarkers = [][]byte{
 type miniMaxHighspeedNarrativeGuardSettings struct {
 	enabled         bool
 	maxConcurrent   int
+	maxQueue        int
 	maxOutputTokens int
 }
 
@@ -67,6 +71,7 @@ type miniMaxHighspeedNarrativeGuardDecision struct {
 	rawJSON        []byte
 	release        func()
 	waitErr        error
+	queueFull      bool
 	bodyBytes      int
 	maxTokens      int64
 	structuralHits int
@@ -74,6 +79,7 @@ type miniMaxHighspeedNarrativeGuardDecision struct {
 	active         int
 	queued         int
 	maxConcurrent  int
+	maxQueue       int
 	cappedOutput   bool
 }
 
@@ -87,19 +93,25 @@ type miniMaxHighspeedNarrativeWaiter struct {
 	ready chan struct{}
 }
 
-func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcurrent int) (func(), int, int, error) {
+func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcurrent, maxQueue int) (func(), int, int, bool, error) {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMiniMaxHighspeedNarrativeMaxConcurrent
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, false, err
 	}
 	l.mu.Lock()
 	if l.active < maxConcurrent && len(l.waiters) == 0 {
 		l.active++
 		active := l.active
 		l.mu.Unlock()
-		return l.releaseFunc(maxConcurrent), active, 0, nil
+		return l.releaseFunc(maxConcurrent), active, 0, false, nil
+	}
+	if maxQueue > 0 && len(l.waiters) >= maxQueue {
+		active := l.active
+		queued := len(l.waiters)
+		l.mu.Unlock()
+		return nil, active, queued, true, nil
 	}
 
 	waiter := &miniMaxHighspeedNarrativeWaiter{ready: make(chan struct{})}
@@ -112,10 +124,10 @@ func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcu
 		release := l.releaseFunc(maxConcurrent)
 		if err := ctx.Err(); err != nil {
 			release()
-			return nil, 0, queued, err
+			return nil, 0, queued, false, err
 		}
 		active := l.activeSnapshot()
-		return release, active, queued, nil
+		return release, active, queued, false, nil
 	case <-ctx.Done():
 		l.mu.Lock()
 		removed := l.removeWaiterLocked(waiter)
@@ -123,7 +135,7 @@ func (l *miniMaxHighspeedNarrativeLimiter) acquire(ctx context.Context, maxConcu
 			l.releaseAssignedSlotLocked(maxConcurrent)
 		}
 		l.mu.Unlock()
-		return nil, 0, queued, ctx.Err()
+		return nil, 0, queued, false, ctx.Err()
 	}
 }
 
@@ -194,10 +206,12 @@ func prepareMiniMaxHighspeedNarrativeGuard(ctx context.Context, rawJSON []byte, 
 	decision.structuralHits = match.structuralHits
 	decision.narrativeHits = match.narrativeHits
 	decision.maxConcurrent = settings.maxConcurrent
+	decision.maxQueue = settings.maxQueue
 
-	release, active, queued, err := limiter.acquire(ctx, settings.maxConcurrent)
+	release, active, queued, queueFull, err := limiter.acquire(ctx, settings.maxConcurrent, settings.maxQueue)
 	decision.active = active
 	decision.queued = queued
+	decision.queueFull = queueFull
 	if err != nil {
 		decision.waitErr = err
 		return decision
@@ -222,6 +236,9 @@ func miniMaxHighspeedNarrativeSettings(cfg *sdkconfig.SDKConfig) miniMaxHighspee
 	settings.enabled = guard.Enabled
 	if guard.MaxConcurrent > 0 {
 		settings.maxConcurrent = guard.MaxConcurrent
+	}
+	if guard.MaxQueue > 0 {
+		settings.maxQueue = guard.MaxQueue
 	}
 	if guard.MaxOutputTokens > 0 {
 		settings.maxOutputTokens = guard.MaxOutputTokens
@@ -294,4 +311,14 @@ func capMiniMaxHighspeedNarrativeOutput(rawJSON []byte, maxOutputTokens int) ([]
 		capped = true
 	}
 	return updated, capped
+}
+
+func writeMiniMaxHighspeedNarrativeGuardQueueFull(c *gin.Context, decision miniMaxHighspeedNarrativeGuardDecision) {
+	c.JSON(http.StatusServiceUnavailable, handlers.ErrorResponse{
+		Error: handlers.ErrorDetail{
+			Message: "MiniMax-M2.7-highspeed narrative queue is temporarily busy. Please retry later or reduce max_tokens/context size.",
+			Type:    "server_error",
+			Code:    "temporarily_busy",
+		},
+	})
 }

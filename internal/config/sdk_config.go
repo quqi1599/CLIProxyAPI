@@ -80,6 +80,7 @@ type RequestGuardsConfig struct {
 type MiniMaxHighspeedNarrativeGuardConfig struct {
 	Enabled         bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	MaxConcurrent   int  `yaml:"max-concurrent,omitempty" json:"max-concurrent,omitempty"`
+	MaxQueue        int  `yaml:"max-queue,omitempty" json:"max-queue,omitempty"`
 	MaxOutputTokens int  `yaml:"max-output-tokens,omitempty" json:"max-output-tokens,omitempty"`
 	// Deprecated: matching requests are queued instead of rejected.
 	RetryAfterSeconds int `yaml:"retry-after-seconds,omitempty" json:"retry-after-seconds,omitempty"`
