@@ -9,6 +9,7 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/transport/http2pool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -19,10 +20,8 @@ import (
 // utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
 // to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
 type utlsRoundTripper struct {
-	mu          sync.Mutex
-	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
-	dialer      proxy.Dialer
+	dialer proxy.Dialer
+	pool   *http2pool.Pool
 }
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
@@ -35,50 +34,12 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 			dialer = proxyDialer
 		}
 	}
-	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      dialer,
-	}
+	rt := &utlsRoundTripper{dialer: dialer}
+	rt.pool = http2pool.New(http2pool.DefaultMaxConnsPerHost, rt.createConnection)
+	return rt
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
-
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
-	}
-
-	if cond, ok := t.pending[host]; ok {
-		cond.Wait()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
-		}
-	}
-
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
-	}
-
-	t.connections[host] = h2Conn
-	return h2Conn, nil
-}
-
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) createConnection(host, addr string) (http2pool.ClientConn, error) {
 	conn, err := t.dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -110,18 +71,14 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	addr := net.JoinHostPort(hostname, port)
 
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	h2Conn, err := t.pool.Get(hostname, addr)
 	if err != nil {
 		return nil, err
 	}
 
 	resp, err := h2Conn.RoundTrip(req)
 	if err != nil {
-		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
-		}
-		t.mu.Unlock()
+		t.pool.Forget(hostname, h2Conn)
 		return nil, err
 	}
 
