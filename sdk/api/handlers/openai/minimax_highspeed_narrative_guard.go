@@ -19,8 +19,8 @@ import (
 const (
 	miniMaxHighspeedNarrativeModel = "MiniMax-M2.7-highspeed"
 
-	defaultMiniMaxHighspeedNarrativeMaxConcurrent   = 2
-	defaultMiniMaxHighspeedNarrativeMaxOutputTokens = 4096
+	defaultMiniMaxHighspeedNarrativeMaxConcurrent   = 4
+	defaultMiniMaxHighspeedNarrativeMaxOutputTokens = 8192
 
 	miniMaxHighspeedNarrativeMinBodyBytes      = 100 * 1024
 	miniMaxHighspeedNarrativeMinOutputTokens   = 10000

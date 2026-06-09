@@ -1651,7 +1651,7 @@ func (m *Manager) pruneHalfOpenProbeStateLocked(now time.Time) {
 }
 
 func healthRequiresHalfOpenProbe(auth *Auth, model string, now time.Time) bool {
-	if isCodexAuth(auth) {
+	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
 		return false
 	}
 	state := resolveHealthState(auth, model)
@@ -1666,7 +1666,7 @@ func healthRequiresHalfOpenProbe(auth *Auth, model string, now time.Time) bool {
 }
 
 func (m *Manager) healthSelectionBlocked(auth *Auth, model string, now time.Time) (bool, time.Time) {
-	if isCodexAuth(auth) {
+	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
 		return false, time.Time{}
 	}
 	state := resolveHealthState(auth, model)
@@ -4656,9 +4656,6 @@ func applyCodexAPIKeyHealthFailure(health *HealthState, now time.Time, statusCod
 		return
 	}
 	applyHealthFailure(health, now, statusCode)
-	health.BreakerState = HealthBreakerClosed
-	health.OpenUntil = time.Time{}
-	health.HalfOpenSuccesses = 0
 }
 
 func openAICompatAvailabilityAliasForResult(auth *Auth, requestedModelAlias string, result Result) string {

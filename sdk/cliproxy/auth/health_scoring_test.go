@@ -406,6 +406,43 @@ func TestManagerAvailableAuthsForRouteModel_CodexIgnoresLocalCooling(t *testing.
 	}
 }
 
+func TestManagerAvailableAuthsForRouteModel_CodexAPIKeyHealthOpenBlocksSelection(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	const model = "gpt-5.5"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	blocked := codexAPIKeyHealthTestAuth("blocked", "https://unstable.example/v1")
+	blocked.ModelStates = map[string]*ModelState{
+		model: {
+			Status: StatusActive,
+			Health: HealthState{
+				Observed:     true,
+				Score:        10,
+				BreakerState: HealthBreakerOpen,
+				OpenUntil:    now.Add(2 * time.Minute),
+			},
+		},
+	}
+	healthy := codexAPIKeyHealthTestAuth("healthy", "https://stable.example/v1")
+
+	available, err := manager.availableAuthsForRouteModel([]*Auth{blocked, healthy}, "codex", model, now)
+	if err != nil {
+		t.Fatalf("availableAuthsForRouteModel() error = %v", err)
+	}
+	if len(available) != 1 || available[0].ID != "healthy" {
+		t.Fatalf("availableAuthsForRouteModel() = %+v, want only healthy codex api-key auth", available)
+	}
+
+	availableOther, err := manager.availableAuthsForRouteModel([]*Auth{blocked, healthy}, "codex", "gpt-5.4", now)
+	if err != nil {
+		t.Fatalf("availableAuthsForRouteModel(other model) error = %v", err)
+	}
+	if len(availableOther) != 2 {
+		t.Fatalf("availableAuthsForRouteModel(other model) len = %d, want 2 model-scoped candidates", len(availableOther))
+	}
+}
+
 func TestManagerMarkResult_CodexFailureDoesNotCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -451,6 +488,54 @@ func TestManagerMarkResult_CodexFailureDoesNotCooldown(t *testing.T) {
 	}
 	if state.Health.BreakerState != "" || state.Health.Observed {
 		t.Fatalf("codex model health = %+v, want clear", state.Health)
+	}
+}
+
+func TestManagerMarkResult_CodexAPIKeyFailuresOpenModelHealthBreaker(t *testing.T) {
+	t.Parallel()
+
+	const model = "gpt-5.5"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	bad := codexAPIKeyHealthTestAuth("codex-a", "https://unstable.example/v1")
+	sameBase := codexAPIKeyHealthTestAuth("codex-b", "https://unstable.example/v1")
+	stable := codexAPIKeyHealthTestAuth("codex-c", "https://stable.example/v1")
+	manager.auths[bad.ID] = bad
+	manager.auths[sameBase.ID] = sameBase
+	manager.auths[stable.ID] = stable
+
+	for i := 0; i < channelBreakerOpenFailures; i++ {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:   bad.ID,
+			Provider: bad.Provider,
+			Model:    model,
+			Success:  false,
+			Error: &Error{
+				HTTPStatus: http.StatusServiceUnavailable,
+				Code:       "api_error",
+				Message:    "upstream unavailable",
+				Retryable:  true,
+			},
+		})
+	}
+
+	badState := manager.auths[bad.ID].ModelStates[model]
+	if badState == nil || badState.Health.BreakerState != HealthBreakerOpen {
+		t.Fatalf("bad model health = %+v, want open breaker", badState)
+	}
+	peerState := manager.auths[sameBase.ID].ModelStates[model]
+	if peerState == nil || peerState.Health.BreakerState != HealthBreakerOpen {
+		t.Fatalf("same-base peer health = %+v, want propagated open breaker", peerState)
+	}
+	if state := manager.auths[stable.ID].ModelStates[model]; state != nil && state.Health.Observed {
+		t.Fatalf("stable peer health = %+v, want unaffected stable base URL", state.Health)
+	}
+
+	available, err := manager.availableAuthsForRouteModel([]*Auth{bad, sameBase, stable}, "codex", model, time.Now())
+	if err != nil {
+		t.Fatalf("availableAuthsForRouteModel() error = %v", err)
+	}
+	if len(available) != 1 || available[0].ID != stable.ID {
+		t.Fatalf("availableAuthsForRouteModel() = %+v, want only stable base URL while breaker is open", available)
 	}
 }
 

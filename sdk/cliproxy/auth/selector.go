@@ -961,10 +961,15 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if isCodexAuth(auth) {
+	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
 		return false, blockReasonNone, time.Time{}
 	}
 	authBlocked, authReason, authNext := authLevelBlockState(auth, now)
+	if isCodexAPIKeyAuth(auth) {
+		if blocked, next := healthBlockStateForAuth(auth, model, now); blocked {
+			return true, blockReasonOther, next
+		}
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
@@ -1011,6 +1016,20 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, authReason, authNext
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func healthBlockStateForAuth(auth *Auth, model string, now time.Time) (bool, time.Time) {
+	if auth == nil {
+		return false, time.Time{}
+	}
+	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
+		return false, time.Time{}
+	}
+	state := resolveHealthState(auth, model)
+	if state.BreakerState != HealthBreakerOpen || state.OpenUntil.IsZero() || !state.OpenUntil.After(now) {
+		return false, time.Time{}
+	}
+	return true, state.OpenUntil
 }
 
 func authLevelBlockState(auth *Auth, now time.Time) (bool, blockReason, time.Time) {

@@ -35,6 +35,35 @@ func TestMiniMaxHighspeedNarrativeGuardMatchesAndCaps(t *testing.T) {
 	}
 }
 
+func TestMiniMaxHighspeedNarrativeGuardUsesRaisedDefaults(t *testing.T) {
+	cfg := &sdkconfig.SDKConfig{
+		RequestGuards: sdkconfig.RequestGuardsConfig{
+			MiniMaxHighspeedNarrative: sdkconfig.MiniMaxHighspeedNarrativeGuardConfig{
+				Enabled: true,
+			},
+		},
+	}
+	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())
+	limiter := &miniMaxHighspeedNarrativeLimiter{}
+	var decisions []miniMaxHighspeedNarrativeGuardDecision
+	for range defaultMiniMaxHighspeedNarrativeMaxConcurrent {
+		decision := prepareMiniMaxHighspeedNarrativeGuard(context.Background(), payload, cfg, limiter)
+		if decision.release == nil {
+			t.Fatal("matching request should be admitted under the default concurrency")
+		}
+		if decision.maxConcurrent != defaultMiniMaxHighspeedNarrativeMaxConcurrent {
+			t.Fatalf("maxConcurrent = %d, want %d", decision.maxConcurrent, defaultMiniMaxHighspeedNarrativeMaxConcurrent)
+		}
+		if got := gjson.GetBytes(decision.rawJSON, "max_tokens").Int(); got != int64(defaultMiniMaxHighspeedNarrativeMaxOutputTokens) {
+			t.Fatalf("max_tokens = %d, want %d", got, defaultMiniMaxHighspeedNarrativeMaxOutputTokens)
+		}
+		decisions = append(decisions, decision)
+	}
+	for _, decision := range decisions {
+		decision.release()
+	}
+}
+
 func TestMiniMaxHighspeedNarrativeGuardQueuesAboveConcurrency(t *testing.T) {
 	cfg := miniMaxHighspeedNarrativeTestConfig(2, 4096)
 	payload := miniMaxHighspeedNarrativeTestPayload(12000, miniMaxHighspeedNarrativeTestPrompt())

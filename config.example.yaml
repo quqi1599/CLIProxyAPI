@@ -172,10 +172,10 @@ nonstream-keepalive-interval: 0
 # request-guards:
 #   minimax-m27-highspeed-narrative:
 #     enabled: true
-#     max-concurrent: 2      # Matching requests above this wait before upstream execution.
-#     max-queue: 20          # Optional. 0 or omitted means unlimited local wait queue.
+#     max-concurrent: 4      # Matching requests above this wait before upstream execution.
+#     max-queue: 40          # Optional. 0 or omitted means unlimited local wait queue.
 #     max-wait-seconds: 600  # Optional. 0 or omitted means no local queue wait timeout.
-#     max-output-tokens: 4096
+#     max-output-tokens: 8192
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

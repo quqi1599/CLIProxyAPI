@@ -221,15 +221,7 @@ func (b *Builder) Build() (*Service, error) {
 				}
 			}
 		}
-		var selector coreauth.Selector
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
-		case "sequential-fill", "sf":
-			selector = &coreauth.SequentialFillSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
+		selector := coreauth.SelectorForRoutingStrategy(strategy)
 
 		// Wrap with session affinity if enabled (failover is always on)
 		if sessionAffinity {
