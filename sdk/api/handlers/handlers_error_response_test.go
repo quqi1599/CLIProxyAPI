@@ -100,6 +100,37 @@ func TestWriteErrorResponse_NormalizesMiniMaxInputNewSensitiveStatus(t *testing.
 	}
 }
 
+func TestWriteErrorResponse_NormalizesContentSafety1301Status(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      errors.New("status_code=502, claude executor: upstream returned error event: [1301] content violates safety policy"),
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Error.Type != "invalid_request_error" {
+		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+	}
+	if payload.Error.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, contentPolicyViolationErrorCode)
+	}
+}
+
 func TestEnrichAuthSelectionError_DefaultsTo503WithConciseMessage(t *testing.T) {
 	in := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
@@ -173,6 +204,24 @@ func TestBuildErrorResponseBody_NormalizesMiniMaxInputNewSensitive(t *testing.T)
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesContentSafety1301(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadGateway, `{"error":{"message":"[1301] content violates safety policy","code":"1301"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Error.Type != "invalid_request_error" {
+		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+	}
+	if payload.Error.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, contentPolicyViolationErrorCode)
+	}
+}
+
 func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesMiniMaxInputNewSensitive(t *testing.T) {
 	body := BuildOpenAIResponsesStreamErrorChunk(http.StatusInternalServerError, `{"error":{"message":"input new_sensitive (1026)","code":"1026"}}`, 7)
 
@@ -185,6 +234,27 @@ func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesMiniMaxInputNewSensitive
 	}
 	if payload.SequenceNumber != 7 {
 		t.Fatalf("sequence_number = %d, want 7", payload.SequenceNumber)
+	}
+	if payload.Message != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Code, contentPolicyViolationErrorCode)
+	}
+}
+
+func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesContentSafety1301(t *testing.T) {
+	body := BuildOpenAIResponsesStreamErrorChunk(http.StatusBadGateway, `{"error":{"message":"[1301] content violates safety policy","code":"1301"}}`, 11)
+
+	var payload openAIResponsesStreamErrorChunk
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Type != "error" {
+		t.Fatalf("type = %q, want error", payload.Type)
+	}
+	if payload.SequenceNumber != 11 {
+		t.Fatalf("sequence_number = %d, want 11", payload.SequenceNumber)
 	}
 	if payload.Message != UserFacingContentSafetyMessage("input") {
 		t.Fatalf("message = %q, want %q", payload.Message, UserFacingContentSafetyMessage("input"))

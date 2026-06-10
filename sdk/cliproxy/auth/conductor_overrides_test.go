@@ -26,6 +26,7 @@ const requestScopedContextLimitMessage = "invalid params, context window exceeds
 const miniMaxNewSensitiveMessage = "server_error: input new_sensitive, messages[2]'s content[1] image is sensitive, please check your input (1026)"
 const miniMaxOutputNewSensitiveMessage = "server_error: output new_sensitive, generated content is sensitive, please check your input (1027)"
 const miniMaxUnknown1000Message = "server_error: unknown error, 999 (1000)"
+const zhipuContentSafety1301Message = "claude executor: upstream returned error event: [1301] content violates safety policy"
 
 func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testing.T) {
 	m := NewManager(nil, nil, nil)
@@ -2567,6 +2568,11 @@ func TestManager_MarkResult_RequestScopedContentSafetyDoesNotCooldownAuth(t *tes
 			httpStatus: http.StatusInternalServerError,
 			message:    miniMaxNewSensitiveMessage,
 		},
+		{
+			name:       "zhipu 1301 bad gateway",
+			httpStatus: http.StatusBadGateway,
+			message:    zhipuContentSafety1301Message,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2638,6 +2644,11 @@ func TestRequestScopedContentSafetyStopsRetry(t *testing.T) {
 			httpStatus: http.StatusInternalServerError,
 			message:    miniMaxNewSensitiveMessage,
 		},
+		{
+			name:       "zhipu 1301 bad gateway",
+			httpStatus: http.StatusBadGateway,
+			message:    zhipuContentSafety1301Message,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2681,6 +2692,21 @@ func TestMiniMaxOutputNewSensitiveDoesNotFallbackForConfiguredRouteModels(t *tes
 	for _, model := range []string{"claude-sonnet-4-6", "glm-4.7"} {
 		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
 			t.Fatalf("expected MiniMax output new_sensitive to stop fallback for %s", model)
+		}
+	}
+}
+
+func TestContentSafety1301DoesNotFallbackForConfiguredRouteModels(t *testing.T) {
+	err := &Error{
+		HTTPStatus: http.StatusBadGateway,
+		Message:    zhipuContentSafety1301Message,
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected 1301 content safety to be request invalid")
+	}
+	for _, model := range []string{"claude-sonnet-4-6", "glm-4.7"} {
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected 1301 content safety to stop fallback for %s", model)
 		}
 	}
 }
@@ -3191,6 +3217,64 @@ func TestManager_Execute_GLMAliasMetadataMiniMaxOutputNewSensitiveStops(t *testi
 	}
 	got := executor.ExecuteCalls()
 	want := []string{minimaxAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManager_Execute_GLMAliasMetadataContentSafety1301Stops(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-zhipu-auth": &Error{
+				HTTPStatus: http.StatusBadGateway,
+				Message:    zhipuContentSafety1301Message,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	routeModel := "step-3.7-flash"
+	zhipuAuth := &Auth{ID: "aa-zhipu-auth", Provider: "claude"}
+	stepAuth := &Auth{ID: "bb-step-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(zhipuAuth.ID, "claude", []*registry.ModelInfo{{ID: routeModel}})
+	reg.RegisterClient(stepAuth.ID, "claude", []*registry.ModelInfo{{ID: routeModel}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(zhipuAuth.ID)
+		reg.UnregisterClient(stepAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), zhipuAuth); errRegister != nil {
+		t.Fatalf("register zhipu auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), stepAuth); errRegister != nil {
+		t.Fatalf("register step auth: %v", errRegister)
+	}
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "glm-4.7",
+		},
+	})
+	if errExecute == nil {
+		t.Fatal("expected 1301 content safety error")
+	}
+	if code := errorCodeFromError(errExecute); code != "" {
+		t.Fatalf("error code = %q, want empty code from text-only 1301 error", code)
+	}
+	if status := statusCodeFromError(errExecute); status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadGateway)
+	}
+	got := executor.ExecuteCalls()
+	want := []string{zhipuAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}

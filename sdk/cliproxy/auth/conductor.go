@@ -5914,7 +5914,42 @@ func isRequestScopedContentSafetySignal(code, message string) bool {
 	return (strings.Contains(lower, "request was rejected") &&
 		(strings.Contains(lower, "high risk") || strings.Contains(lower, "high-risk"))) ||
 		(strings.Contains(lower, "content") && strings.Contains(lower, "blocked")) ||
+		isContentSafety1301Signal(code, message) ||
 		isMiniMaxNewSensitiveSignal(code, message)
+}
+
+func isContentSafety1301Signal(code, message string) bool {
+	normalizedCode := strings.Trim(strings.ToLower(strings.TrimSpace(code)), `"'(),:;[]{}<>`)
+	if normalizedCode == "1301" {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if !strings.Contains(lower, "1301") {
+		return false
+	}
+	if strings.Contains(lower, "[1301]") || strings.Contains(lower, "(1301)") {
+		return true
+	}
+	for _, marker := range []string{
+		"content safety",
+		"sensitive",
+		"unsafe",
+		"policy",
+		"blocked",
+		"high risk",
+		"high-risk",
+		"敏感",
+		"安全",
+		"高风险",
+		"不合规",
+		"违规",
+		"审核",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func isMiniMaxNewSensitiveMessage(message string) bool {
@@ -5983,6 +6018,17 @@ func hasHTTPStatusInMessage(message string, statuses ...int) bool {
 }
 
 func isRequestScopedContentSafetyStatus(status int, code, message string) bool {
+	if isContentSafety1301Signal(code, message) {
+		switch status {
+		case http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway, http.StatusUnavailableForLegalReasons:
+			return true
+		case 0:
+			return !hasHTTPStatusInMessage(message, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests) ||
+				hasHTTPStatusInMessage(message, http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway, http.StatusUnavailableForLegalReasons)
+		default:
+			return false
+		}
+	}
 	if isMiniMaxNewSensitiveSignal(code, message) {
 		switch status {
 		case http.StatusBadRequest, http.StatusInternalServerError, http.StatusUnavailableForLegalReasons:
@@ -6189,7 +6235,8 @@ func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cli
 	if !isRequestScopedRouteFallbackError(err) {
 		return false
 	}
-	if isMiniMaxNewSensitiveSignal(errorCodeFromError(err), err.Error()) {
+	if isMiniMaxNewSensitiveSignal(errorCodeFromError(err), err.Error()) ||
+		isContentSafety1301Signal(errorCodeFromError(err), err.Error()) {
 		return false
 	}
 	if isRequestScopedFallbackModel(routeModel) {

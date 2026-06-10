@@ -101,6 +101,8 @@ func contentSafetySignalDirection(text string) (string, bool) {
 		return contentSafetyInputDirection, true
 	case "1027":
 		return contentSafetyOutputDirection, true
+	case "1301":
+		return contentSafetyInputDirection, true
 	}
 
 	if strings.Contains(lower, "input new_sensitive") {
@@ -115,5 +117,37 @@ func contentSafetySignalDirection(text string) (string, bool) {
 	if strings.Contains(lower, "new_sensitive") && strings.Contains(lower, "1027") {
 		return contentSafetyOutputDirection, true
 	}
+	if isContentSafety1301Text(lower) {
+		return contentSafetyInputDirection, true
+	}
 	return "", false
+}
+
+func isContentSafety1301Text(lower string) bool {
+	if !strings.Contains(lower, "1301") {
+		return false
+	}
+	if strings.Contains(lower, "[1301]") || strings.Contains(lower, "(1301)") {
+		return true
+	}
+	for _, marker := range []string{
+		"content safety",
+		"sensitive",
+		"unsafe",
+		"policy",
+		"blocked",
+		"high risk",
+		"high-risk",
+		"敏感",
+		"安全",
+		"高风险",
+		"不合规",
+		"违规",
+		"审核",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
