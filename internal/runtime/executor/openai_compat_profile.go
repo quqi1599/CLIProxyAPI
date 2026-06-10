@@ -33,6 +33,9 @@ type openAICompatProfile struct {
 	SupportsStreamUsage      bool
 	SupportsParallelToolCall bool
 	SupportsReasoning        bool
+	SupportsNativeThinking   bool
+	PreserveReasoningContent bool
+	NormalizeToolHistory     bool
 	SupportsMetadata         bool
 	SupportsStore            bool
 	SystemMessagesAsUser     bool
@@ -57,6 +60,8 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		SupportsStreamUsage:      false,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
+		PreserveReasoningContent: true,
+		NormalizeToolHistory:     true,
 		SupportsMetadata:         false,
 		SupportsStore:            false,
 	},
@@ -76,6 +81,9 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		SupportsStreamUsage:      false,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
+		SupportsNativeThinking:   true,
+		PreserveReasoningContent: true,
+		NormalizeToolHistory:     true,
 		SupportsMetadata:         false,
 		SupportsStore:            false,
 	},
@@ -246,12 +254,14 @@ func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byt
 		}
 	}
 	if !profile.SupportsReasoning {
-		for _, path := range []string{"reasoning", "reasoning_effort"} {
-			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-				payload = updated
+		if !profile.SupportsNativeThinking {
+			for _, path := range []string{"reasoning", "reasoning_effort"} {
+				if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+					payload = updated
+				}
 			}
 		}
-		if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "kimi" {
+		if !profile.PreserveReasoningContent {
 			payload = deleteMessageReasoningContent(payload)
 		}
 	}
@@ -269,15 +279,18 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = repairOpenAICompatToolCallHistory(payload)
 	payload = sanitizeOpenAICompatToolSchemas(payload)
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "kimi" {
-		if normalized, err := normalizeKimiToolMessageLinks(payload); err == nil {
+	if profile.NormalizeToolHistory {
+		if normalized, err := normalizeOpenAICompatToolMessageLinks(payload, "openai compat executor"); err == nil {
 			payload = normalized
 		} else {
-			log.WithError(err).Warn("openai compat executor: failed to normalize kimi tool message history")
+			log.WithError(err).WithField("compat_kind", config.NormalizeOpenAICompatibilityKind(profile.Kind)).Warn("openai compat executor: failed to normalize tool message history")
 		}
 	}
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "xiaomi" {
+		payload = scrubXiaomiPayloadForModel(payload, model)
+	}
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
@@ -301,7 +314,71 @@ func scrubDoubaoPayloadForModel(payload []byte, model string) []byte {
 	payload = normalizeDoubaoSeed20Temperature(payload)
 	payload = normalizeDoubaoSeed20TokenFields(payload)
 	payload = normalizeDoubaoChatContentParts(payload)
-	payload = normalizeDoubaoToolCallArguments(payload)
+	payload = normalizeOpenAICompatToolCallArguments(payload)
+	return payload
+}
+
+func scrubXiaomiPayloadForModel(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	payload = normalizeXiaomiThinkingConfig(payload)
+	payload = normalizeXiaomiThinkingHyperparameters(payload)
+	payload = normalizeOpenAICompatToolCallArguments(payload)
+	payload = scrubXiaomiToolSchemas(payload)
+	return payload
+}
+
+func normalizeXiaomiThinkingConfig(payload []byte) []byte {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	if thinkingType == "" {
+		thinkingType = xiaomiThinkingTypeFromReasoning(payload)
+	}
+	switch thinkingType {
+	case "none", "off", "false", "disabled", "disable":
+		payload, _ = sjson.SetBytes(payload, "thinking.type", "disabled")
+	case "low", "medium", "high", "max", "auto", "adaptive", "true", "enabled", "enable":
+		payload, _ = sjson.SetBytes(payload, "thinking.type", "enabled")
+	}
+	for _, path := range []string{
+		"reasoning",
+		"reasoning_effort",
+		"thinking.reasoning_effort",
+		"thinking.budget_tokens",
+		"thinking_budget",
+	} {
+		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func xiaomiThinkingTypeFromReasoning(payload []byte) string {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		if value.Type == gjson.String {
+			if effort := strings.ToLower(strings.TrimSpace(value.String())); effort != "" {
+				return effort
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeXiaomiThinkingHyperparameters(payload []byte) []byte {
+	if !strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()), "enabled") {
+		return payload
+	}
+	if updated, err := sjson.SetBytes(payload, "temperature", 1.0); err == nil {
+		payload = updated
+	}
+	if updated, err := sjson.SetBytes(payload, "top_p", 0.95); err == nil {
+		payload = updated
+	}
 	return payload
 }
 
@@ -532,7 +609,7 @@ func firstDoubaoMediaURL(part map[string]any, targetType string, sourceType stri
 	return ""
 }
 
-func normalizeDoubaoToolCallArguments(payload []byte) []byte {
+func normalizeOpenAICompatToolCallArguments(payload []byte) []byte {
 	if !gjson.GetBytes(payload, "messages").IsArray() {
 		return payload
 	}
@@ -565,7 +642,7 @@ func normalizeDoubaoToolCallArguments(payload []byte) []byte {
 			if !okFunction {
 				continue
 			}
-			arguments, changedArguments := normalizeDoubaoToolArgumentsValue(function["arguments"])
+			arguments, changedArguments := normalizeOpenAICompatToolArgumentsValue(function["arguments"])
 			if changedArguments {
 				function["arguments"] = arguments
 				changed = true
@@ -583,7 +660,7 @@ func normalizeDoubaoToolCallArguments(payload []byte) []byte {
 	return out
 }
 
-func normalizeDoubaoToolArgumentsValue(raw any) (string, bool) {
+func normalizeOpenAICompatToolArgumentsValue(raw any) (string, bool) {
 	switch typed := raw.(type) {
 	case string:
 		trimmed := strings.TrimSpace(typed)
@@ -1057,6 +1134,13 @@ func scrubOpenAICompatFunctionToolPayload(payload []byte, profile openAICompatPr
 				}
 			}
 		}
+		if profileKind == "xiaomi" {
+			if function, okFunction := cleaned["function"].(map[string]any); okFunction {
+				if parameters, okParameters := function["parameters"]; okParameters {
+					function["parameters"] = normalizeXiaomiToolSchema(parameters)
+				}
+			}
+		}
 		if originalName := openAICompatOriginalFunctionName(rawTool); originalName != "" {
 			if normalizedName := openAICompatNormalizedFunctionName(cleaned); normalizedName != "" && normalizedName != originalName {
 				nameMapping[originalName] = normalizedName
@@ -1078,6 +1162,183 @@ func scrubOpenAICompatFunctionToolPayload(payload []byte, profile openAICompatPr
 	out, err := json.Marshal(root)
 	if err != nil || !gjson.ValidBytes(out) {
 		return payload
+	}
+	return out
+}
+
+func scrubXiaomiToolSchemas(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.GetBytes(payload, "tools").IsArray() {
+		return payload
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload
+	}
+	tools, ok := root["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return payload
+	}
+
+	changed := false
+	for _, rawTool := range tools {
+		tool, okTool := rawTool.(map[string]any)
+		if !okTool {
+			continue
+		}
+		if _, okStrict := tool["strict"]; okStrict {
+			delete(tool, "strict")
+			changed = true
+		}
+		function, okFunction := tool["function"].(map[string]any)
+		if !okFunction {
+			continue
+		}
+		if _, okStrict := function["strict"]; okStrict {
+			delete(function, "strict")
+			changed = true
+		}
+		parameters, okParameters := function["parameters"]
+		if !okParameters {
+			continue
+		}
+		normalized := normalizeXiaomiToolSchema(parameters)
+		if !jsonValuesEqual(parameters, normalized) {
+			function["parameters"] = normalized
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	root["tools"] = tools
+	out, err := json.Marshal(root)
+	if err != nil || !gjson.ValidBytes(out) {
+		return payload
+	}
+	return out
+}
+
+func normalizeXiaomiToolSchema(parameters any) any {
+	normalized := normalizeOpenAICompatParameters(parameters)
+	return simplifyXiaomiToolSchema(normalized)
+}
+
+func simplifyXiaomiToolSchema(node any) any {
+	switch typed := node.(type) {
+	case map[string]any:
+		if branch, ok := firstXiaomiSchemaCombinerBranch(typed); ok {
+			return simplifyXiaomiToolSchema(branch)
+		}
+		out := make(map[string]any, 4)
+		schemaType := xiaomiSchemaType(typed)
+		out["type"] = schemaType
+		if description := strings.TrimSpace(compatStringValue(typed["description"])); description != "" {
+			out["description"] = description
+		}
+		if enumValues := xiaomiScalarArray(typed["enum"]); len(enumValues) > 0 {
+			out["enum"] = enumValues
+		}
+		switch schemaType {
+		case "object":
+			out["properties"] = simplifyXiaomiToolProperties(typed["properties"])
+			if required := normalizeOpenAICompatStringArray(typed["required"]); len(required) > 0 {
+				out["required"] = required
+			}
+		case "array":
+			out["items"] = simplifyXiaomiArrayItems(typed["items"])
+		}
+		return out
+	case []any:
+		if len(typed) == 0 {
+			return map[string]any{"type": "string"}
+		}
+		return simplifyXiaomiToolSchema(typed[0])
+	case string:
+		if schemaType, ok := normalizeOpenAICompatSchemaType(typed); ok {
+			return openAICompatSchemaForType(schemaType)
+		}
+		return map[string]any{"type": "string"}
+	default:
+		if schemaType, ok := normalizeOpenAICompatScalarSchemaType(typed); ok {
+			return openAICompatSchemaForType(schemaType)
+		}
+		return map[string]any{"type": "string"}
+	}
+}
+
+func firstXiaomiSchemaCombinerBranch(schema map[string]any) (any, bool) {
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		branches, ok := schema[key].([]any)
+		if !ok || len(branches) == 0 {
+			continue
+		}
+		for _, branch := range branches {
+			branchMap, okBranch := branch.(map[string]any)
+			if !okBranch {
+				continue
+			}
+			if schemaType, okType := normalizeOpenAICompatScalarSchemaType(branchMap["type"]); okType && schemaType == "null" {
+				continue
+			}
+			return branch, true
+		}
+		return branches[0], true
+	}
+	return nil, false
+}
+
+func xiaomiSchemaType(schema map[string]any) string {
+	if schemaType, ok := normalizeOpenAICompatScalarSchemaType(schema["type"]); ok && schemaType != "null" {
+		return schemaType
+	}
+	if _, ok := schema["properties"]; ok {
+		return "object"
+	}
+	if _, ok := schema["items"]; ok {
+		return "array"
+	}
+	return "string"
+}
+
+func simplifyXiaomiToolProperties(raw any) map[string]any {
+	properties, ok := raw.(map[string]any)
+	if !ok || len(properties) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(properties))
+	for name, value := range properties {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		out[name] = simplifyXiaomiToolSchema(value)
+	}
+	return out
+}
+
+func simplifyXiaomiArrayItems(raw any) any {
+	if raw == nil {
+		return map[string]any{"type": "string"}
+	}
+	return simplifyXiaomiToolSchema(raw)
+}
+
+func xiaomiScalarArray(raw any) []any {
+	values, ok := raw.([]any)
+	if !ok || len(values) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		switch typed := value.(type) {
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				out = append(out, typed)
+			}
+		case float64, bool:
+			out = append(out, typed)
+		}
 	}
 	return out
 }

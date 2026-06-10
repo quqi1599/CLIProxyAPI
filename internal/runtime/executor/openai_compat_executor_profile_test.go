@@ -840,14 +840,59 @@ func TestOpenAICompatPayloadXiaomiScrubsUnsupportedOpenAIExtras(t *testing.T) {
 		"reasoning_effort",
 		"metadata",
 		"store",
-		"messages.0.reasoning_content",
 	} {
 		if gjson.GetBytes(out, path).Exists() {
 			t.Fatalf("unexpected field %s in payload: %s", path, string(out))
 		}
 	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "hidden" {
+		t.Fatalf("messages.0.reasoning_content = %q, want hidden: %s", got, string(out))
+	}
 	if !gjson.GetBytes(out, "thinking").Exists() {
 		t.Fatalf("native thinking field should be preserved: %s", string(out))
+	}
+}
+
+func TestOpenAICompatPayloadXiaomiRepairsAssistantToolCallReasoning(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[
+			{"role":"assistant","content":"first plan","reasoning_content":"r1"},
+			{"role":"assistant","content":"read file","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		],
+		"thinking":{"type":"enabled"}
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://token-plan-cn.xiaomimimo.com/v1")
+
+	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != "r1" {
+		t.Fatalf("messages.1.reasoning_content = %q, want inherited r1: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadXiaomiMapsReasoningEffortToNativeThinking(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"high",
+		"temperature":0.2,
+		"top_p":0.4
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://api.xiaomimimo.com/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after Xiaomi native thinking mapping: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "temperature").Float(); got != 1.0 {
+		t.Fatalf("temperature = %v, want 1.0 for Xiaomi thinking mode: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != 0.95 {
+		t.Fatalf("top_p = %v, want 0.95 for Xiaomi thinking mode: %s", got, string(out))
 	}
 }
 
@@ -876,6 +921,57 @@ func TestOpenAICompatPayloadXiaomiNormalizesClaudeStyleTools(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.type.type").String(); got != "object" {
 		t.Fatalf("properties.type should be an object schema, got %q: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadXiaomiSanitizesToolSchemaAndArguments(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[
+			{"role":"assistant","content":"call","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"unterminated"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"lookup",
+				"strict":true,
+				"parameters":{
+					"type":"object",
+					"title":"LookupArgs",
+					"additionalProperties":false,
+					"properties":{
+						"query":{"anyOf":[{"type":"string"},{"type":"null"}],"default":""},
+						"tags":{"type":"array","items":{"type":"string","minLength":1}}
+					},
+					"required":["query"]
+				}
+			}
+		}]
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://token-plan-cn.xiaomimimo.com/v1")
+
+	if got := gjson.GetBytes(out, "messages.0.tool_calls.0.function.arguments").String(); got != "{}" {
+		t.Fatalf("tool call arguments = %q, want repaired empty object: %s", got, string(out))
+	}
+	for _, path := range []string{
+		"tools.0.function.strict",
+		"tools.0.function.parameters.title",
+		"tools.0.function.parameters.additionalProperties",
+		"tools.0.function.parameters.properties.query.anyOf",
+		"tools.0.function.parameters.properties.query.default",
+		"tools.0.function.parameters.properties.tags.items.minLength",
+	} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("unexpected Xiaomi-incompatible schema field %s: %s", path, string(out))
+		}
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.query.type").String(); got != "string" {
+		t.Fatalf("query.type = %q, want string: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.tags.items.type").String(); got != "string" {
+		t.Fatalf("tags.items.type = %q, want string: %s", got, string(out))
 	}
 }
 

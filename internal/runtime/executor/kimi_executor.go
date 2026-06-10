@@ -812,8 +812,16 @@ func sanitizeKimiOpenAICompatibleRequestBody(body []byte) ([]byte, error) {
 }
 
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
+	return normalizeOpenAICompatToolMessageLinks(body, "kimi executor")
+}
+
+func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body, nil
+	}
+	logScope = strings.TrimSpace(logScope)
+	if logScope == "" {
+		logScope = "openai compat executor"
 	}
 
 	messages := gjson.GetBytes(body, "messages")
@@ -822,12 +830,12 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	}
 
 	msgs := messages.Array()
-	out, dropped, err := filterKimiEmptyAssistantMessages(body, msgs)
+	out, dropped, err := filterOpenAICompatEmptyAssistantMessages(body, msgs)
 	if err != nil {
 		return body, err
 	}
 	if dropped > 0 {
-		log.WithField("dropped_assistant_messages", dropped).Debug("kimi executor: dropped empty assistant messages")
+		log.WithField("dropped_assistant_messages", dropped).Debug(logScope + ": dropped empty assistant messages")
 	}
 
 	messages = gjson.GetBytes(out, "messages")
@@ -873,7 +881,7 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 				path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
 				next, err := sjson.SetBytes(out, path, reasoningText)
 				if err != nil {
-					return body, fmt.Errorf("kimi executor: failed to set assistant reasoning_content: %w", err)
+					return body, fmt.Errorf("%s: failed to set assistant reasoning_content: %w", logScope, err)
 				}
 				out = next
 				patchedReasoning++
@@ -894,7 +902,7 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 					path := fmt.Sprintf("messages.%d.tool_call_id", msgIdx)
 					next, err := sjson.SetBytes(out, path, toolCallID)
 					if err != nil {
-						return body, fmt.Errorf("kimi executor: failed to set tool_call_id from call_id: %w", err)
+						return body, fmt.Errorf("%s: failed to set tool_call_id from call_id: %w", logScope, err)
 					}
 					out = next
 					patched++
@@ -906,7 +914,7 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 					path := fmt.Sprintf("messages.%d.tool_call_id", msgIdx)
 					next, err := sjson.SetBytes(out, path, toolCallID)
 					if err != nil {
-						return body, fmt.Errorf("kimi executor: failed to infer tool_call_id: %w", err)
+						return body, fmt.Errorf("%s: failed to infer tool_call_id: %w", logScope, err)
 					}
 					out = next
 					patched++
@@ -924,23 +932,23 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		log.WithFields(log.Fields{
 			"patched_tool_messages":      patched,
 			"patched_reasoning_messages": patchedReasoning,
-		}).Debug("kimi executor: normalized tool message fields")
+		}).Debug(logScope + ": normalized tool message fields")
 	}
 	if ambiguous > 0 {
 		log.WithFields(log.Fields{
 			"ambiguous_tool_messages": ambiguous,
 			"pending_tool_calls":      len(pending),
-		}).Warn("kimi executor: tool messages missing tool_call_id with ambiguous candidates")
+		}).Warn(logScope + ": tool messages missing tool_call_id with ambiguous candidates")
 	}
 
 	return out, nil
 }
 
-func filterKimiEmptyAssistantMessages(body []byte, msgs []gjson.Result) ([]byte, int, error) {
+func filterOpenAICompatEmptyAssistantMessages(body []byte, msgs []gjson.Result) ([]byte, int, error) {
 	kept := make([]string, 0, len(msgs))
 	dropped := 0
 	for _, msg := range msgs {
-		if shouldDropKimiAssistantMessage(msg) {
+		if shouldDropOpenAICompatAssistantMessage(msg) {
 			dropped++
 			continue
 		}
@@ -953,27 +961,27 @@ func filterKimiEmptyAssistantMessages(body []byte, msgs []gjson.Result) ([]byte,
 	rawMessages := []byte("[" + strings.Join(kept, ",") + "]")
 	out, err := sjson.SetRawBytes(body, "messages", rawMessages)
 	if err != nil {
-		return body, 0, fmt.Errorf("kimi executor: failed to drop empty assistant messages: %w", err)
+		return body, 0, fmt.Errorf("openai compat executor: failed to drop empty assistant messages: %w", err)
 	}
 	return out, dropped, nil
 }
 
-func shouldDropKimiAssistantMessage(msg gjson.Result) bool {
+func shouldDropOpenAICompatAssistantMessage(msg gjson.Result) bool {
 	if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
 		return false
 	}
-	if hasKimiToolCalls(msg) || hasKimiLegacyFunctionCall(msg) || hasKimiAssistantReasoning(msg) {
+	if hasOpenAICompatToolCalls(msg) || hasOpenAICompatLegacyFunctionCall(msg) || hasOpenAICompatAssistantReasoning(msg) {
 		return false
 	}
-	return isKimiAssistantContentEmpty(msg.Get("content"))
+	return isOpenAICompatAssistantContentEmpty(msg.Get("content"))
 }
 
-func hasKimiToolCalls(msg gjson.Result) bool {
+func hasOpenAICompatToolCalls(msg gjson.Result) bool {
 	toolCalls := msg.Get("tool_calls")
 	return toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
 }
 
-func hasKimiLegacyFunctionCall(msg gjson.Result) bool {
+func hasOpenAICompatLegacyFunctionCall(msg gjson.Result) bool {
 	functionCall := msg.Get("function_call")
 	if !functionCall.Exists() || functionCall.Type == gjson.Null {
 		return false
@@ -984,12 +992,12 @@ func hasKimiLegacyFunctionCall(msg gjson.Result) bool {
 	return strings.TrimSpace(functionCall.Raw) != ""
 }
 
-func hasKimiAssistantReasoning(msg gjson.Result) bool {
+func hasOpenAICompatAssistantReasoning(msg gjson.Result) bool {
 	reasoning := msg.Get("reasoning_content")
 	return reasoning.Exists() && strings.TrimSpace(reasoning.String()) != ""
 }
 
-func isKimiAssistantContentEmpty(content gjson.Result) bool {
+func isOpenAICompatAssistantContentEmpty(content gjson.Result) bool {
 	if !content.Exists() || content.Type == gjson.Null {
 		return true
 	}
@@ -1000,14 +1008,14 @@ func isKimiAssistantContentEmpty(content gjson.Result) bool {
 		return false
 	}
 	for _, part := range content.Array() {
-		if !isKimiAssistantContentPartEmpty(part) {
+		if !isOpenAICompatAssistantContentPartEmpty(part) {
 			return false
 		}
 	}
 	return true
 }
 
-func isKimiAssistantContentPartEmpty(part gjson.Result) bool {
+func isOpenAICompatAssistantContentPartEmpty(part gjson.Result) bool {
 	if !part.Exists() || part.Type == gjson.Null {
 		return true
 	}
