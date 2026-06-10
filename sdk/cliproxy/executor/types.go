@@ -26,6 +26,24 @@ const MessageCountMetadataKey = "message_count"
 // ToolCountMetadataKey stores the inbound request tool/tool-call item count for safe failure logs.
 const ToolCountMetadataKey = "tool_count"
 
+// DeclaredToolCountMetadataKey stores the inbound declared tool count.
+const DeclaredToolCountMetadataKey = "declared_tool_count"
+
+// ToolInteractionCountMetadataKey stores inbound tool call/result item count.
+const ToolInteractionCountMetadataKey = "tool_interaction_count"
+
+// MCPToolCountMetadataKey stores inbound MCP-shaped tool item count.
+const MCPToolCountMetadataKey = "mcp_tool_count"
+
+// BuiltinToolCountMetadataKey stores inbound built-in tool item count.
+const BuiltinToolCountMetadataKey = "builtin_tool_count"
+
+// ToolShapeTypesMetadataKey stores a bounded comma-separated set of sanitized tool types.
+const ToolShapeTypesMetadataKey = "tool_types"
+
+// ToolNameHashesMetadataKey stores a bounded comma-separated set of tool name hashes.
+const ToolNameHashesMetadataKey = "tool_name_hashes"
+
 // ClientProfileMetadataKey stores a lightweight inferred client profile such as claude_code.
 const ClientProfileMetadataKey = "client_profile"
 

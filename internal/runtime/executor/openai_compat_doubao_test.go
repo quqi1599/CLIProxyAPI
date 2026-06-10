@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -74,6 +75,117 @@ func TestOpenAICompatPayloadDoubaoSeed20NormalizesArkChatPayload(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "messages.1.tool_calls.0.function.arguments").String(); got != "{}" {
 		t.Fatalf("tool arguments = %q, want empty JSON object: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatExecutorDoubaoResponsesPassthroughPreservesMCPTool(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","output":[]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	upstreamAuth := &auth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":    server.URL + "/api/v3",
+			"api_key":     "test",
+			"compat_kind": "doubao",
+		},
+	}
+
+	_, err := executor.Execute(context.Background(), upstreamAuth, cliproxyexecutor.Request{
+		Model: "doubao-seed-1.6",
+		Payload: []byte(`{
+			"model":"doubao-seed-1.6",
+			"input":[{"role":"user","content":"search docs"}],
+			"tools":[{"type":"mcp","server_label":"docs","server_url":"https://mcp.example.test"}],
+			"stream":false
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/responses",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/api/v3/responses" {
+		t.Fatalf("path = %q, want /api/v3/responses", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.type").String(); got != "mcp" {
+		t.Fatalf("tools.0.type = %q, want mcp: %s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "messages").Exists() {
+		t.Fatalf("responses payload should not be translated to chat messages: %s", string(gotBody))
+	}
+	if !gjson.GetBytes(gotBody, "input").Exists() {
+		t.Fatalf("responses input should be preserved: %s", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorDoubaoResponsesStreamPassthrough(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	upstreamAuth := &auth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":    server.URL + "/api/v3",
+			"api_key":     "test",
+			"compat_kind": "doubao",
+		},
+	}
+
+	result, err := executor.ExecuteStream(context.Background(), upstreamAuth, cliproxyexecutor.Request{
+		Model: "doubao-seed-1.6",
+		Payload: []byte(`{
+			"model":"doubao-seed-1.6",
+			"input":[{"role":"user","content":"search docs"}],
+			"tools":[{"type":"mcp","server_label":"docs","server_url":"https://mcp.example.test"}],
+			"stream":true
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/responses",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var gotStream strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		gotStream.Write(chunk.Payload)
+	}
+	if gotPath != "/api/v3/responses" {
+		t.Fatalf("path = %q, want /api/v3/responses", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.type").String(); got != "mcp" {
+		t.Fatalf("tools.0.type = %q, want mcp: %s", got, string(gotBody))
+	}
+	if !strings.Contains(gotStream.String(), `"response.output_text.delta"`) {
+		t.Fatalf("stream payload did not preserve responses event: %q", gotStream.String())
 	}
 }
 

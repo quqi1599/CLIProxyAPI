@@ -80,6 +80,18 @@ func translateOpenAICompatStreamLine(ctx context.Context, upstreamFormat, downst
 	return sdktranslator.TranslateStream(ctx, upstreamFormat, downstreamFormat, model, originalRequestRawJSON, requestRawJSON, rawCopy, param)
 }
 
+func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliproxyexecutor.Options, profile openAICompatProfile) (sdktranslator.Format, string) {
+	to := sdktranslator.FromString("openai")
+	endpoint := "/chat/completions"
+	if opts.Alt == "responses/compact" && profile.SupportsResponses {
+		return sdktranslator.FromString("openai-response"), "/responses/compact"
+	}
+	if opts.Alt == "" && profile.SupportsNativeResponses && strings.EqualFold(strings.TrimSpace(from.String()), "openai-response") {
+		return sdktranslator.FromString("openai-response"), "/responses"
+	}
+	return to, endpoint
+}
+
 func applyOpenAICompatRequestCorrelationHeaders(ctx context.Context, req *http.Request, source http.Header) {
 	if req == nil {
 		return
@@ -251,12 +263,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
-	endpoint := "/chat/completions"
-	if opts.Alt == "responses/compact" && profile.SupportsResponses {
-		to = sdktranslator.FromString("openai-response")
-		endpoint = "/responses/compact"
-	}
+	to, endpoint := openAICompatTargetFormatAndEndpoint(from, opts, profile)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -491,7 +498,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
+	to, endpoint := openAICompatTargetFormatAndEndpoint(from, opts, profile)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -537,7 +544,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if errValidate := validateOpenAICompatOutboundJSON(translated); errValidate != nil {
 		return nil, errValidate
 	}
-	endpoint := "/chat/completions"
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {

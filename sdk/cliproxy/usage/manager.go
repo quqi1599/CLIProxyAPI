@@ -81,6 +81,16 @@ type RequestShape struct {
 	ToolCount    int
 }
 
+// ToolShape stores safe redacted inbound tool-shape telemetry.
+type ToolShape struct {
+	ToolTypes         string
+	ToolNameHashes    string
+	DeclaredToolCount int
+	InteractionCount  int
+	MCPToolCount      int
+	BuiltinToolCount  int
+}
+
 // RequestFinal stores the final outcome for one client request.
 type RequestFinal struct {
 	RequestID    string
@@ -92,6 +102,7 @@ type RequestFinal struct {
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type requestShapeContextKey struct{}
+type toolShapeContextKey struct{}
 type requestAttemptContextKey struct{}
 type routingGroupContextKey struct{}
 
@@ -193,6 +204,65 @@ func normalizeRequestShape(shape RequestShape) RequestShape {
 	}
 	if shape.ToolCount < 0 {
 		shape.ToolCount = 0
+	}
+	return shape
+}
+
+// WithToolShape stores safe inbound tool-shape telemetry for usage sinks.
+func WithToolShape(ctx context.Context, shape ToolShape) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	shape = normalizeToolShape(shape)
+	if !shape.HasData() {
+		return ctx
+	}
+	return context.WithValue(ctx, toolShapeContextKey{}, shape)
+}
+
+// ToolShapeFromContext returns safe inbound tool-shape telemetry stored in ctx.
+func ToolShapeFromContext(ctx context.Context) ToolShape {
+	if ctx == nil {
+		return ToolShape{}
+	}
+	raw := ctx.Value(toolShapeContextKey{})
+	switch value := raw.(type) {
+	case ToolShape:
+		return normalizeToolShape(value)
+	case *ToolShape:
+		if value == nil {
+			return ToolShape{}
+		}
+		return normalizeToolShape(*value)
+	default:
+		return ToolShape{}
+	}
+}
+
+// HasData reports whether the shape carries any telemetry.
+func (s ToolShape) HasData() bool {
+	return s.ToolTypes != "" ||
+		s.ToolNameHashes != "" ||
+		s.DeclaredToolCount > 0 ||
+		s.InteractionCount > 0 ||
+		s.MCPToolCount > 0 ||
+		s.BuiltinToolCount > 0
+}
+
+func normalizeToolShape(shape ToolShape) ToolShape {
+	shape.ToolTypes = strings.TrimSpace(shape.ToolTypes)
+	shape.ToolNameHashes = strings.TrimSpace(shape.ToolNameHashes)
+	if shape.DeclaredToolCount < 0 {
+		shape.DeclaredToolCount = 0
+	}
+	if shape.InteractionCount < 0 {
+		shape.InteractionCount = 0
+	}
+	if shape.MCPToolCount < 0 {
+		shape.MCPToolCount = 0
+	}
+	if shape.BuiltinToolCount < 0 {
+		shape.BuiltinToolCount = 0
 	}
 	return shape
 }

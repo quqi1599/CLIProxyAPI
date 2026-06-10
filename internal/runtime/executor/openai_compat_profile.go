@@ -33,6 +33,7 @@ const kimiTopP = 0.95
 type openAICompatProfile struct {
 	Kind                     string
 	SupportsResponses        bool
+	SupportsNativeResponses  bool
 	SupportsStreamUsage      bool
 	SupportsParallelToolCall bool
 	SupportsReasoning        bool
@@ -101,7 +102,8 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 	},
 	"doubao": {
 		Kind:                     "doubao",
-		SupportsResponses:        false,
+		SupportsResponses:        true,
+		SupportsNativeResponses:  true,
 		SupportsStreamUsage:      false,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
@@ -398,9 +400,9 @@ func normalizeKimiThinkingConfig(payload []byte, model string) []byte {
 		if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
 			payload = updated
 		}
-		if updated, err := sjson.SetBytes(payload, "thinking.keep", "all"); err == nil {
-			payload = updated
-		}
+	}
+	if updated, err := sjson.DeleteBytes(payload, "thinking.keep"); err == nil {
+		payload = updated
 	}
 	return payload
 }

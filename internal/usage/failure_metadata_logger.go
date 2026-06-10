@@ -85,8 +85,33 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 	if routingGroup := safeFailureMetadataString(coreusage.RoutingGroupFromContext(ctx)); routingGroup != "" {
 		fields["routing_group"] = routingGroup
 	}
+	addFailureToolShapeFields(fields, coreusage.ToolShapeFromContext(ctx))
 
 	log.WithFields(fields).Warn("failure_metadata")
+}
+
+func addFailureToolShapeFields(fields log.Fields, shape coreusage.ToolShape) {
+	if len(fields) == 0 || !shape.HasData() {
+		return
+	}
+	if shape.DeclaredToolCount > 0 {
+		fields["declared_tool_count"] = shape.DeclaredToolCount
+	}
+	if shape.InteractionCount > 0 {
+		fields["tool_interaction_count"] = shape.InteractionCount
+	}
+	if shape.MCPToolCount > 0 {
+		fields["mcp_tool_count"] = shape.MCPToolCount
+	}
+	if shape.BuiltinToolCount > 0 {
+		fields["builtin_tool_count"] = shape.BuiltinToolCount
+	}
+	if shape.ToolTypes != "" {
+		fields["tool_types"] = safeFailureMetadataString(shape.ToolTypes)
+	}
+	if shape.ToolNameHashes != "" {
+		fields["tool_name_hashes"] = safeFailureMetadataString(shape.ToolNameHashes)
+	}
 }
 
 func failureMetadataStatus(record coreusage.Record) int {

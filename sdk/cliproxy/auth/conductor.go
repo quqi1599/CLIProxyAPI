@@ -2069,6 +2069,8 @@ type streamExecutionLogMeta struct {
 	provider       string
 	executor       string
 	requestPath    string
+	compatKind     string
+	toolShape      coreusage.ToolShape
 }
 
 type streamRuntimeStats struct {
@@ -2428,6 +2430,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			provider:       provider,
 			executor:       providerExecutorName(executor),
 			requestPath:    metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey),
+			compatKind:     routePlanThinkingProviderKey(auth, provider),
+			toolShape:      toolShapeFromOptions(opts),
 		}
 		return m.wrapStreamResult(ctx, auth.Clone(), streamMeta, responseModelAlias, streamResult.Headers, buffered, remaining, streamResult.Close, startedAt, firstPayloadDelay, releaseSlot), nil
 	}
@@ -3480,6 +3484,7 @@ func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.O
 		ctx = coreusage.WithReasoningEffort(ctx, effort)
 	}
 	ctx = coreusage.WithRequestShape(ctx, requestShapeFromOptions(opts))
+	ctx = coreusage.WithToolShape(ctx, toolShapeFromOptions(opts))
 	return ctx
 }
 
@@ -3533,6 +3538,20 @@ func requestShapeFromOptions(opts cliproxyexecutor.Options) coreusage.RequestSha
 	return coreusage.RequestShape{
 		MessageCount: intMetadataValue(opts.Metadata[cliproxyexecutor.MessageCountMetadataKey]),
 		ToolCount:    intMetadataValue(opts.Metadata[cliproxyexecutor.ToolCountMetadataKey]),
+	}
+}
+
+func toolShapeFromOptions(opts cliproxyexecutor.Options) coreusage.ToolShape {
+	if len(opts.Metadata) == 0 {
+		return coreusage.ToolShape{}
+	}
+	return coreusage.ToolShape{
+		ToolTypes:         metadataString(opts.Metadata, cliproxyexecutor.ToolShapeTypesMetadataKey),
+		ToolNameHashes:    metadataString(opts.Metadata, cliproxyexecutor.ToolNameHashesMetadataKey),
+		DeclaredToolCount: intMetadataValue(opts.Metadata[cliproxyexecutor.DeclaredToolCountMetadataKey]),
+		InteractionCount:  intMetadataValue(opts.Metadata[cliproxyexecutor.ToolInteractionCountMetadataKey]),
+		MCPToolCount:      intMetadataValue(opts.Metadata[cliproxyexecutor.MCPToolCountMetadataKey]),
+		BuiltinToolCount:  intMetadataValue(opts.Metadata[cliproxyexecutor.BuiltinToolCountMetadataKey]),
 	}
 }
 

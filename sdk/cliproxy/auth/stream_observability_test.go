@@ -7,6 +7,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
@@ -57,6 +58,15 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 		provider:       "claude",
 		executor:       "ClaudeExecutor",
 		requestPath:    "/v1/chat/completions",
+		compatKind:     "xiaomi",
+		toolShape: coreusage.ToolShape{
+			ToolTypes:         "mcp,web_search_call",
+			ToolNameHashes:    "0123456789abcdef",
+			DeclaredToolCount: 2,
+			InteractionCount:  3,
+			MCPToolCount:      1,
+			BuiltinToolCount:  1,
+		},
 	}
 
 	remaining := make(chan cliproxyexecutor.StreamChunk, 1)
@@ -126,6 +136,21 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 	}
 	if got := entry.Data["client_gone"]; got != false {
 		t.Fatalf("client_gone = %#v, want false", got)
+	}
+	if got := entry.Data["compat_kind"]; got != "xiaomi" {
+		t.Fatalf("compat_kind = %#v, want xiaomi", got)
+	}
+	if got := entry.Data["tool_types"]; got != "mcp,web_search_call" {
+		t.Fatalf("tool_types = %#v, want mcp,web_search_call", got)
+	}
+	if got := entry.Data["tool_name_hashes"]; got != "0123456789abcdef" {
+		t.Fatalf("tool_name_hashes = %#v, want hash", got)
+	}
+	if got := entry.Data["declared_tool_count"]; got != 2 {
+		t.Fatalf("declared_tool_count = %#v, want 2", got)
+	}
+	if got := entry.Data["tool_interaction_count"]; got != 3 {
+		t.Fatalf("tool_interaction_count = %#v, want 3", got)
 	}
 }
 

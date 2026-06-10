@@ -161,6 +161,7 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 		"provider":                      meta.provider,
 		"executor":                      meta.executor,
 		"request_path":                  meta.requestPath,
+		"compat_kind":                   meta.compatKind,
 		"time_to_first_chunk_ms":        record.TimeToFirstChunkMs,
 		"upstream_chunk_wait_ms":        record.UpstreamChunkWaitMs,
 		"upstream_chunk_wait_count":     record.UpstreamChunkWaitCount,
@@ -179,11 +180,36 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 		"client_gone":                   record.ClientGone,
 		"finish_reason":                 record.FinishReason,
 	}
+	addToolShapeLogFields(fields, meta.toolShape)
 	addStreamSummaryAttemptFields(fields, attempt)
 	logEntryWithRequestID(ctx).WithFields(fields).Info("stream execution summary")
 
 	if dbPlugin := internalusage.GetDatabasePlugin(); dbPlugin != nil {
 		dbPlugin.HandleStreamSummary(ctx, record)
+	}
+}
+
+func addToolShapeLogFields(fields log.Fields, shape coreusage.ToolShape) {
+	if len(fields) == 0 || !shape.HasData() {
+		return
+	}
+	if shape.DeclaredToolCount > 0 {
+		fields["declared_tool_count"] = shape.DeclaredToolCount
+	}
+	if shape.InteractionCount > 0 {
+		fields["tool_interaction_count"] = shape.InteractionCount
+	}
+	if shape.MCPToolCount > 0 {
+		fields["mcp_tool_count"] = shape.MCPToolCount
+	}
+	if shape.BuiltinToolCount > 0 {
+		fields["builtin_tool_count"] = shape.BuiltinToolCount
+	}
+	if shape.ToolTypes != "" {
+		fields["tool_types"] = shape.ToolTypes
+	}
+	if shape.ToolNameHashes != "" {
+		fields["tool_name_hashes"] = shape.ToolNameHashes
 	}
 }
 

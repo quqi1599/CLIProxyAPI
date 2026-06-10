@@ -802,8 +802,8 @@ func TestOpenAICompatPayloadKimiPreservesAssistantReasoningContent(t *testing.T)
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed for kimi compat payload: %s", string(out))
 	}
-	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
-		t.Fatalf("thinking.keep = %q, want all: %s", got, string(out))
+	if gjson.GetBytes(out, "thinking.keep").Exists() {
+		t.Fatalf("thinking.keep should be removed for kimi k2.5/k2.6 compat payload: %s", string(out))
 	}
 }
 
@@ -845,8 +845,8 @@ func TestOpenAICompatPayloadKimiK26NormalizesThinkingToolChoiceAndSampling(t *te
 	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
 		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
-		t.Fatalf("thinking.keep = %q, want all: %s", got, string(out))
+	if gjson.GetBytes(out, "thinking.keep").Exists() {
+		t.Fatalf("thinking.keep should be removed for kimi k2.5/k2.6 compat payload: %s", string(out))
 	}
 	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
 		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))

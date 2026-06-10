@@ -330,6 +330,7 @@ func setRequestShapeMetadata(meta map[string]any, rawJSON []byte) {
 	messageCount, toolCount := requestShapeCounts(rawJSON)
 	meta[coreexecutor.MessageCountMetadataKey] = messageCount
 	meta[coreexecutor.ToolCountMetadataKey] = toolCount
+	setToolShapeMetadata(meta, rawJSON)
 }
 
 func requestShapeCounts(rawJSON []byte) (int, int) {
@@ -411,7 +412,10 @@ func isResponsesToolItemType(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "function_call", "function_call_output", "tool_call", "tool_result",
 		"computer_call", "computer_call_output", "local_shell_call",
-		"local_shell_call_output", "mcp_call", "mcp_call_output":
+		"local_shell_call_output", "mcp_call", "mcp_call_output",
+		"web_search_call", "web_search_call_output", "file_search_call",
+		"file_search_call_output", "code_interpreter_call", "code_interpreter_call_output",
+		"image_generation_call", "image_generation_call_output":
 		return true
 	default:
 		return false

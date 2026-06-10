@@ -30,6 +30,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -2040,6 +2041,7 @@ type compatRepairLogMeta struct {
 	compatKind     string
 	messageCount   int
 	toolCount      int
+	toolShape      coreusage.ToolShape
 }
 
 func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstreamModel, provider, executor, requestPath, compatKind string) compatRepairLogMeta {
@@ -2052,6 +2054,14 @@ func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstr
 		compatKind:     compatKind,
 		messageCount:   executorIntMetadataValue(opts.Metadata[cliproxyexecutor.MessageCountMetadataKey]),
 		toolCount:      executorIntMetadataValue(opts.Metadata[cliproxyexecutor.ToolCountMetadataKey]),
+		toolShape: coreusage.ToolShape{
+			ToolTypes:         executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ToolShapeTypesMetadataKey),
+			ToolNameHashes:    executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ToolNameHashesMetadataKey),
+			DeclaredToolCount: executorIntMetadataValue(opts.Metadata[cliproxyexecutor.DeclaredToolCountMetadataKey]),
+			InteractionCount:  executorIntMetadataValue(opts.Metadata[cliproxyexecutor.ToolInteractionCountMetadataKey]),
+			MCPToolCount:      executorIntMetadataValue(opts.Metadata[cliproxyexecutor.MCPToolCountMetadataKey]),
+			BuiltinToolCount:  executorIntMetadataValue(opts.Metadata[cliproxyexecutor.BuiltinToolCountMetadataKey]),
+		},
 	}
 }
 
@@ -2121,10 +2131,35 @@ func compatRepairLogEntry(ctx context.Context, meta compatRepairLogMeta, repairT
 		"payload_bytes_after":  afterBytes,
 		"repair_duration_ms":   duration.Milliseconds(),
 	}
+	addCompatRepairToolShapeFields(fields, meta.toolShape)
 	for key, value := range extra {
 		fields[key] = value
 	}
 	return helps.LogWithRequestID(ctx).WithFields(fields)
+}
+
+func addCompatRepairToolShapeFields(fields log.Fields, shape coreusage.ToolShape) {
+	if len(fields) == 0 || !shape.HasData() {
+		return
+	}
+	if shape.DeclaredToolCount > 0 {
+		fields["declared_tool_count"] = shape.DeclaredToolCount
+	}
+	if shape.InteractionCount > 0 {
+		fields["tool_interaction_count"] = shape.InteractionCount
+	}
+	if shape.MCPToolCount > 0 {
+		fields["mcp_tool_count"] = shape.MCPToolCount
+	}
+	if shape.BuiltinToolCount > 0 {
+		fields["builtin_tool_count"] = shape.BuiltinToolCount
+	}
+	if shape.ToolTypes != "" {
+		fields["tool_types"] = shape.ToolTypes
+	}
+	if shape.ToolNameHashes != "" {
+		fields["tool_name_hashes"] = shape.ToolNameHashes
+	}
 }
 
 func executorIntMetadataValue(raw any) int {
