@@ -111,6 +111,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	if strings.TrimSpace(errText) == "" {
 		errText = http.StatusText(status)
 	}
+	if body, ok := BuildContentSafetyErrorBody(status, errText); ok {
+		return body
+	}
 	if body, ok := BuildContextWindowExceededErrorBody(status, errText); ok {
 		return body
 	}
@@ -1346,6 +1349,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			errText = v
 		}
 	}
+	status = NormalizeContentSafetyStatus(status, errText)
 
 	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 	body := BuildErrorResponseBody(status, errText)

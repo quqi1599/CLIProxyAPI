@@ -46,6 +46,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
+	status = NormalizeContentSafetyStatus(status, errText)
 	if sequenceNumber < 0 {
 		sequenceNumber = 0
 	}
@@ -56,6 +57,11 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	}
 
 	code := openAIResponsesStreamErrorCode(status)
+	direction, isContentSafety := contentSafetyDirection(status, errText)
+	if isContentSafety {
+		message = UserFacingContentSafetyMessage(direction)
+		code = contentPolicyViolationErrorCode
+	}
 	_, isContextWindowExceeded := contextWindowExceededErrorDetail(status, errText)
 	if isContextWindowExceeded {
 		message = UserFacingContextWindowMessage()
@@ -70,12 +76,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 				sequenceNumber = int(v)
 			}
 			if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) == "error" {
-				if !isContextWindowExceeded {
+				if !isContextWindowExceeded && !isContentSafety {
 					if m, ok := payload["message"].(string); ok && strings.TrimSpace(m) != "" {
 						message = strings.TrimSpace(m)
 					}
 				}
-				if !isContextWindowExceeded {
+				if !isContextWindowExceeded && !isContentSafety {
 					if v, ok := payload["code"]; ok && v != nil {
 						if c, ok := v.(string); ok && strings.TrimSpace(c) != "" {
 							code = strings.TrimSpace(c)
@@ -86,12 +92,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 				}
 			}
 			if e, ok := payload["error"].(map[string]any); ok {
-				if !isContextWindowExceeded {
+				if !isContextWindowExceeded && !isContentSafety {
 					if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
 						message = strings.TrimSpace(m)
 					}
 				}
-				if !isContextWindowExceeded {
+				if !isContextWindowExceeded && !isContentSafety {
 					if v, ok := e["code"]; ok && v != nil {
 						if c, ok := v.(string); ok && strings.TrimSpace(c) != "" {
 							code = strings.TrimSpace(c)
