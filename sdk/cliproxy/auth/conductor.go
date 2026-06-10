@@ -6189,8 +6189,7 @@ func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cli
 	if !isRequestScopedRouteFallbackError(err) {
 		return false
 	}
-	if isMiniMaxNewSensitiveSignal(errorCodeFromError(err), err.Error()) &&
-		!isMiniMaxInputNewSensitiveSignal(errorCodeFromError(err), err.Error()) {
+	if isMiniMaxNewSensitiveSignal(errorCodeFromError(err), err.Error()) {
 		return false
 	}
 	if isRequestScopedFallbackModel(routeModel) {

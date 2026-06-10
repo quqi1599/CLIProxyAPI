@@ -2653,18 +2653,18 @@ func TestRequestScopedContentSafetyStopsRetry(t *testing.T) {
 	}
 }
 
-func TestMiniMaxNewSensitiveFallsBackForConfiguredRouteModels(t *testing.T) {
+func TestMiniMaxInputNewSensitiveDoesNotFallbackForConfiguredRouteModels(t *testing.T) {
 	err := &Error{
 		Code:       "1026",
 		HTTPStatus: http.StatusInternalServerError,
 		Message:    miniMaxNewSensitiveMessage,
 	}
 	if !isRequestInvalidError(err) {
-		t.Fatal("expected MiniMax new_sensitive to be request invalid")
+		t.Fatal("expected MiniMax input new_sensitive to be request invalid")
 	}
 	for _, model := range []string{"claude-sonnet-4-6", "glm-4.7"} {
-		if !shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
-			t.Fatalf("expected MiniMax new_sensitive to fallback for %s", model)
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected MiniMax input new_sensitive to stop fallback for %s", model)
 		}
 	}
 }
@@ -3089,7 +3089,7 @@ func TestManager_Execute_ClaudeSonnetAliasMetadataContextLimitFallsBack(t *testi
 	}
 }
 
-func TestManager_Execute_GLMAliasMetadataMiniMaxNewSensitiveFallsBack(t *testing.T) {
+func TestManager_Execute_GLMAliasMetadataMiniMaxInputNewSensitiveStops(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
@@ -3122,19 +3122,19 @@ func TestManager_Execute_GLMAliasMetadataMiniMaxNewSensitiveFallsBack(t *testing
 		t.Fatalf("register step auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{
 		Metadata: map[string]any{
 			cliproxyexecutor.RequestedModelMetadataKey: "glm-4.7",
 		},
 	})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
+	if errExecute == nil {
+		t.Fatal("expected MiniMax input new_sensitive error")
 	}
-	if string(resp.Payload) != stepAuth.ID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), stepAuth.ID)
+	if code := errorCodeFromError(errExecute); code != "1026" {
+		t.Fatalf("error code = %q, want 1026", code)
 	}
 	got := executor.ExecuteCalls()
-	want := []string{minimaxAuth.ID, stepAuth.ID}
+	want := []string{minimaxAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}

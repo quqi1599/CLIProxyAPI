@@ -15,7 +15,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestManager_RecordContentSafetyRequest_WritesSanitizedPromptLog(t *testing.T) {
+func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t *testing.T) {
 	logDir := t.TempDir()
 	t.Setenv(contentSafetyLogDirEnv, logDir)
 
@@ -24,6 +24,7 @@ func TestManager_RecordContentSafetyRequest_WritesSanitizedPromptLog(t *testing.
 		id: "claude",
 		executeErrors: map[string]error{
 			"aa-blocked-auth": &Error{
+				Code:       "1026",
 				HTTPStatus: http.StatusUnavailableForLegalReasons,
 				Message:    miniMaxNewSensitiveMessage,
 			},
@@ -70,15 +71,19 @@ func TestManager_RecordContentSafetyRequest_WritesSanitizedPromptLog(t *testing.
 	})
 
 	ctx := logging.WithRequestID(context.Background(), "req-451")
-	resp, errExecute := m.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{
+	_, errExecute := m.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{
 		OriginalRequest: originalRequest,
 		Metadata:        map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/chat/completions"},
 	})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success after content safety fallback", errExecute)
+	if errExecute == nil {
+		t.Fatal("expected content safety rejection")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if code := errorCodeFromError(errExecute); code != "1026" {
+		t.Fatalf("error code = %q, want 1026", code)
+	}
+	gotCalls := executor.ExecuteCalls()
+	if len(gotCalls) != 1 || gotCalls[0] != blockedAuth.ID {
+		t.Fatalf("execute calls = %v, want only %s", gotCalls, blockedAuth.ID)
 	}
 
 	files, errGlob := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
