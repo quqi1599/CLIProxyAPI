@@ -255,8 +255,8 @@ func TestOpenAICompatExecutorClaudeSourceNormalizesKimiToolReferences(t *testing
 	if got := gjson.GetBytes(gotBody, "tools.0.function.name").String(); got != "read_file" {
 		t.Fatalf("tool name = %q, want read_file: %s", got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "tool_choice.function.name").String(); got != "read_file" {
-		t.Fatalf("tool_choice name = %q, want read_file: %s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto for kimi thinking mode: %s", got, string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "messages.1.tool_calls.0.function.name").String(); got != "read_file" {
 		t.Fatalf("tool_call name = %q, want read_file: %s", got, string(gotBody))
@@ -802,6 +802,9 @@ func TestOpenAICompatPayloadKimiPreservesAssistantReasoningContent(t *testing.T)
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed for kimi compat payload: %s", string(out))
 	}
+	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
+		t.Fatalf("thinking.keep = %q, want all: %s", got, string(out))
+	}
 }
 
 func TestOpenAICompatPayloadKimiRepairsMissingAssistantToolCallReasoning(t *testing.T) {
@@ -817,6 +820,77 @@ func TestOpenAICompatPayloadKimiRepairsMissingAssistantToolCallReasoning(t *test
 
 	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "I will read it" {
 		t.Fatalf("messages.0.reasoning_content = %q, want content fallback: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadKimiK26NormalizesThinkingToolChoiceAndSampling(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k2.6",
+		"messages":[
+			{"role":"assistant","content":"planning","reasoning_content":"actual reasoning","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		],
+		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],
+		"tool_choice":{"type":"function","function":{"name":"read_file"}},
+		"thinking":{"type":"high"},
+		"temperature":0.2,
+		"top_p":0.4,
+		"n":2,
+		"presence_penalty":1.0,
+		"frequency_penalty":1.0
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.6", "https://api.kimi.com/coding/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
+		t.Fatalf("thinking.keep = %q, want all: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "temperature").Float(); got != kimiThinkingTemperature {
+		t.Fatalf("temperature = %v, want %v: %s", got, kimiThinkingTemperature, string(out))
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != kimiTopP {
+		t.Fatalf("top_p = %v, want %v: %s", got, kimiTopP, string(out))
+	}
+	if got := gjson.GetBytes(out, "n").Int(); got != 1 {
+		t.Fatalf("n = %v, want 1: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "presence_penalty").Float(); got != 0 {
+		t.Fatalf("presence_penalty = %v, want 0: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "frequency_penalty").Float(); got != 0 {
+		t.Fatalf("frequency_penalty = %v, want 0: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadKimiK25WebSearchDisablesThinking(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k2.5",
+		"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"builtin_function","function":{"name":"$web_search"}}],
+		"tool_choice":"required",
+		"thinking":{"type":"enabled","keep":"all"},
+		"temperature":1.0
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.5", "https://api.moonshot.ai/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "thinking.keep").Exists() {
+		t.Fatalf("thinking.keep should be removed for web_search non-thinking mode: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "temperature").Float(); got != kimiInstantTemperature {
+		t.Fatalf("temperature = %v, want %v: %s", got, kimiInstantTemperature, string(out))
 	}
 }
 
@@ -983,7 +1057,8 @@ func TestOpenAICompatPayloadNormalizesFunctionNameReferences(t *testing.T) {
 			{"role":"tool","tool_call_id":"call_1","content":"ok"}
 		],
 		"tools":[{"type":"function","function":{"name":"read:file","parameters":{"type":"object","properties":{}}}}],
-		"tool_choice":{"type":"function","function":{"name":"read:file"}}
+		"tool_choice":{"type":"function","function":{"name":"read:file"}},
+		"thinking":{"type":"disabled"}
 	}`)
 
 	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.6", "https://api.moonshot.ai/v1")

@@ -137,10 +137,27 @@ type MonitorFailureStatsResult struct {
 	Filters MonitorFilterOptions
 }
 
+// MonitorClientGoneStats represents client-disconnect stream aggregates by token, model and path.
+type MonitorClientGoneStats struct {
+	APIKey                string
+	Model                 string
+	Path                  string
+	Source                string
+	AuthIndex             string
+	ClientGoneCount       int64
+	LastClientGoneAt      *time.Time
+	AvgTimeToFirstChunkMs float64
+	AvgStreamDurationMs   float64
+	AvgTotalDurationMs    float64
+	ChunksCount           int64
+	BytesOut              int64
+}
+
 type monitorQueryableStore interface {
 	QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error)
 	QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error)
 	QueryMonitorFailureStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorFailureStatsResult, error)
+	QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error)
 	QueryMonitorRequestDetails(ctx context.Context, filter MonitorRequestDetailFilter) ([]MonitorRequestDetail, error)
 	QueryMonitorKpi(ctx context.Context, filter MonitorQueryFilter) (MonitorKpiResult, error)
 	QueryMonitorModelDistribution(ctx context.Context, filter MonitorQueryFilter, limit int, sortByTokens bool) ([]MonitorModelDistItem, error)
@@ -313,6 +330,18 @@ func (p *DatabasePlugin) QueryMonitorRequestDetails(ctx context.Context, filter 
 	filter.Model = strings.TrimSpace(filter.Model)
 	filter.RequestID = strings.TrimSpace(filter.RequestID)
 	return queryable.QueryMonitorRequestDetails(ctx, filter)
+}
+
+// QueryMonitorClientGoneStats queries client-disconnect stream aggregates.
+func (p *DatabasePlugin) QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error) {
+	queryable, err := p.monitorQueryableStore()
+	if err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return queryable.QueryMonitorClientGoneStats(ctx, normalizeMonitorFilter(filter), limit)
 }
 
 func (p *DatabasePlugin) monitorQueryableStore() (monitorQueryableStore, error) {
@@ -930,6 +959,13 @@ func (s *mirrorUsageStore) QueryMonitorFailureStats(ctx context.Context, filter 
 		return MonitorFailureStatsResult{}, fmt.Errorf("usage store: mirror store not initialized")
 	}
 	return s.local.QueryMonitorFailureStats(ctx, filter, limit, recentLimit)
+}
+
+func (s *mirrorUsageStore) QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error) {
+	if s == nil || s.local == nil {
+		return nil, fmt.Errorf("usage store: mirror store not initialized")
+	}
+	return s.local.QueryMonitorClientGoneStats(ctx, filter, limit)
 }
 
 func (s *mirrorUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter MonitorRequestDetailFilter) ([]MonitorRequestDetail, error) {
@@ -2528,6 +2564,192 @@ func sortedSet(items map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (s *sqliteUsageStore) QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("usage store: sqlite store not initialized")
+	}
+	limit = clampInt(limit, 1, 100, 20)
+	whereClause, args := buildSQLiteMonitorWhere(filter, true)
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(NULLIF(u.api_key, ''), 'unknown'),
+			COALESCE(NULLIF(u.model, ''), 'unknown'),
+			COALESCE(NULLIF(u.path, ''), 'unknown'),
+			COALESCE(NULLIF(u.source, ''), 'unknown'),
+			COALESCE(u.auth_index, ''),
+			COUNT(*),
+			MAX(u.requested_at),
+			AVG(COALESCE(ss.time_to_first_chunk_ms, 0)),
+			AVG(COALESCE(ss.stream_duration_ms, 0)),
+			AVG(COALESCE(ss.total_duration_ms, 0)),
+			COALESCE(SUM(ss.chunks_count), 0),
+			COALESCE(SUM(ss.bytes_out), 0)
+		FROM usage_records u
+		INNER JOIN usage_stream_summaries ss
+			ON ss.request_id = u.request_id AND ss.attempt_no = u.attempt_no
+		WHERE ss.client_gone = 1 AND %s
+		GROUP BY
+			COALESCE(NULLIF(u.api_key, ''), 'unknown'),
+			COALESCE(NULLIF(u.model, ''), 'unknown'),
+			COALESCE(NULLIF(u.path, ''), 'unknown'),
+			COALESCE(NULLIF(u.source, ''), 'unknown'),
+			COALESCE(u.auth_index, '')
+		ORDER BY COUNT(*) DESC, MAX(u.requested_at) DESC
+		LIMIT ?
+	`, whereClause)
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage store: query client_gone stats: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]MonitorClientGoneStats, 0, limit)
+	for rows.Next() {
+		var (
+			item        MonitorClientGoneStats
+			lastUnix    sql.NullInt64
+			avgTTF      sql.NullFloat64
+			avgStream   sql.NullFloat64
+			avgTotal    sql.NullFloat64
+			chunksCount sql.NullInt64
+			bytesOut    sql.NullInt64
+		)
+		if err = rows.Scan(
+			&item.APIKey,
+			&item.Model,
+			&item.Path,
+			&item.Source,
+			&item.AuthIndex,
+			&item.ClientGoneCount,
+			&lastUnix,
+			&avgTTF,
+			&avgStream,
+			&avgTotal,
+			&chunksCount,
+			&bytesOut,
+		); err != nil {
+			return nil, fmt.Errorf("usage store: scan client_gone stats: %w", err)
+		}
+		item.LastClientGoneAt = nullUnixPointer(lastUnix)
+		if avgTTF.Valid {
+			item.AvgTimeToFirstChunkMs = avgTTF.Float64
+		}
+		if avgStream.Valid {
+			item.AvgStreamDurationMs = avgStream.Float64
+		}
+		if avgTotal.Valid {
+			item.AvgTotalDurationMs = avgTotal.Float64
+		}
+		if chunksCount.Valid {
+			item.ChunksCount = chunksCount.Int64
+		}
+		if bytesOut.Valid {
+			item.BytesOut = bytesOut.Int64
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("usage store: iterate client_gone stats: %w", err)
+	}
+	return items, nil
+}
+
+func (s *pgUsageStore) QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("usage store: postgres store not initialized")
+	}
+	limit = clampInt(limit, 1, 100, 20)
+	whereClause, args := buildPostgresMonitorWhere(filter, true)
+	table := s.fullTableName("usage_records")
+	streamTable := s.fullTableName("usage_stream_summaries")
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(NULLIF(u.api_key, ''), 'unknown'),
+			COALESCE(NULLIF(u.model, ''), 'unknown'),
+			COALESCE(NULLIF(u.path, ''), 'unknown'),
+			COALESCE(NULLIF(u.source, ''), 'unknown'),
+			COALESCE(u.auth_index, ''),
+			COUNT(*),
+			MAX(u.requested_at),
+			AVG(COALESCE(ss.time_to_first_chunk_ms, 0)::float8),
+			AVG(COALESCE(ss.stream_duration_ms, 0)::float8),
+			AVG(COALESCE(ss.total_duration_ms, 0)::float8),
+			COALESCE(SUM(ss.chunks_count), 0),
+			COALESCE(SUM(ss.bytes_out), 0)
+		FROM %s u
+		INNER JOIN %s ss
+			ON ss.request_id = u.request_id AND ss.attempt_no = u.attempt_no
+		WHERE ss.client_gone = 1 AND %s
+		GROUP BY
+			COALESCE(NULLIF(u.api_key, ''), 'unknown'),
+			COALESCE(NULLIF(u.model, ''), 'unknown'),
+			COALESCE(NULLIF(u.path, ''), 'unknown'),
+			COALESCE(NULLIF(u.source, ''), 'unknown'),
+			COALESCE(u.auth_index, '')
+		ORDER BY COUNT(*) DESC, MAX(u.requested_at) DESC
+		LIMIT %s
+	`, table, streamTable, whereClause, pgPlaceholder(len(args)+1))
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("usage store: query client_gone stats: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]MonitorClientGoneStats, 0, limit)
+	for rows.Next() {
+		var (
+			item        MonitorClientGoneStats
+			lastTime    sql.NullTime
+			avgTTF      sql.NullFloat64
+			avgStream   sql.NullFloat64
+			avgTotal    sql.NullFloat64
+			chunksCount sql.NullInt64
+			bytesOut    sql.NullInt64
+		)
+		if err = rows.Scan(
+			&item.APIKey,
+			&item.Model,
+			&item.Path,
+			&item.Source,
+			&item.AuthIndex,
+			&item.ClientGoneCount,
+			&lastTime,
+			&avgTTF,
+			&avgStream,
+			&avgTotal,
+			&chunksCount,
+			&bytesOut,
+		); err != nil {
+			return nil, fmt.Errorf("usage store: scan client_gone stats: %w", err)
+		}
+		item.LastClientGoneAt = nullTimePointer(lastTime)
+		if avgTTF.Valid {
+			item.AvgTimeToFirstChunkMs = avgTTF.Float64
+		}
+		if avgStream.Valid {
+			item.AvgStreamDurationMs = avgStream.Float64
+		}
+		if avgTotal.Valid {
+			item.AvgTotalDurationMs = avgTotal.Float64
+		}
+		if chunksCount.Valid {
+			item.ChunksCount = chunksCount.Int64
+		}
+		if bytesOut.Valid {
+			item.BytesOut = bytesOut.Int64
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("usage store: iterate client_gone stats: %w", err)
+	}
+	return items, nil
 }
 
 func (s *sqliteUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter MonitorRequestDetailFilter) ([]MonitorRequestDetail, error) {

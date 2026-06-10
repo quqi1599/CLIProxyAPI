@@ -2199,6 +2199,120 @@ buildKeyStatsResponse:
 	})
 }
 
+// GetMonitorClientGoneStats returns stream client-disconnect aggregates by token, model and path.
+func (h *Handler) GetMonitorClientGoneStats(c *gin.Context) {
+	start, end, err := parseMonitorTimeRange(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	status, err := parseStatusFilter(firstQuery(c, "status"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	limit, err := parseBoundedInt(firstQuery(c, "limit"), 20, 1, monitorMaxTopLimit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	dbPlugin := usage.GetDatabasePlugin()
+	if dbPlugin == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"items":      []any{},
+			"filters":    monitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+			"time_range": monitorTimeRange{Start: start, End: end},
+		})
+		return
+	}
+	if !isExplicitAllTimeRange(c) {
+		start, end = applyDefaultTimeRange(start, end, 1)
+	}
+
+	sourceResolver := newMonitorSourceResolver(h.cfg, h.authManager)
+	filter := monitorRecordFilter{
+		APIKey:      firstQuery(c, "api", "api_key", "token"),
+		APIContains: firstQuery(c, "api_filter", "apiFilter", "api_like", "apiLike", "q"),
+		Model:       firstQuery(c, "model"),
+		Source:      firstQuery(c, "source", "channel"),
+		Status:      status,
+		Start:       start,
+		End:         end,
+	}
+	providerType := normalizeMonitorProviderType(firstQuery(c, "provider_type", "providerType"))
+	if providerType != "" {
+		filter.Sources, filter.AuthIndices = sourceResolver.FilterKeysForProviderType(providerType)
+		if len(filter.Sources) == 0 && len(filter.AuthIndices) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"items":      []any{},
+				"filters":    monitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+				"time_range": monitorTimeRange{Start: start, End: end},
+			})
+			return
+		}
+	}
+
+	rows, queryErr := dbPlugin.QueryMonitorClientGoneStats(c.Request.Context(), toUsageMonitorFilter(filter), limit)
+	if queryErr != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"items":      []any{},
+			"filters":    monitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+			"time_range": monitorTimeRange{Start: start, End: end},
+		})
+		return
+	}
+
+	type clientGoneItem struct {
+		Token                 string           `json:"token"`
+		APIKey                string           `json:"api_key"`
+		Model                 string           `json:"model"`
+		Path                  string           `json:"path"`
+		Source                string           `json:"source"`
+		SourceRef             monitorSourceRef `json:"source_ref"`
+		AuthIndex             string           `json:"auth_index,omitempty"`
+		ClientGoneCount       int64            `json:"client_gone_count"`
+		LastClientGoneAt      *time.Time       `json:"last_client_gone_at,omitempty"`
+		AvgTimeToFirstChunkMs float64          `json:"avg_time_to_first_chunk_ms"`
+		AvgStreamDurationMs   float64          `json:"avg_stream_duration_ms"`
+		AvgTotalDurationMs    float64          `json:"avg_total_duration_ms"`
+		ChunksCount           int64            `json:"chunks_count"`
+		BytesOut              int64            `json:"bytes_out"`
+	}
+
+	items := make([]clientGoneItem, 0, len(rows))
+	apiSet := make(map[string]struct{}, len(rows))
+	modelSet := make(map[string]struct{}, len(rows))
+	sourceSet := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		apiSet[row.APIKey] = struct{}{}
+		modelSet[row.Model] = struct{}{}
+		sourceSet[row.Source] = struct{}{}
+		items = append(items, clientGoneItem{
+			Token:                 row.APIKey,
+			APIKey:                row.APIKey,
+			Model:                 row.Model,
+			Path:                  row.Path,
+			Source:                row.Source,
+			SourceRef:             sourceResolver.Resolve(row.Source, row.AuthIndex),
+			AuthIndex:             row.AuthIndex,
+			ClientGoneCount:       row.ClientGoneCount,
+			LastClientGoneAt:      row.LastClientGoneAt,
+			AvgTimeToFirstChunkMs: row.AvgTimeToFirstChunkMs,
+			AvgStreamDurationMs:   row.AvgStreamDurationMs,
+			AvgTotalDurationMs:    row.AvgTotalDurationMs,
+			ChunksCount:           row.ChunksCount,
+			BytesOut:              row.BytesOut,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"items":      items,
+		"filters":    monitorFilterOptions{APIs: setToSortedSlice(apiSet), Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)},
+		"time_range": monitorTimeRange{Start: start, End: end},
+	})
+}
+
 // GetMonitorRequestDetails returns request-level details with method/path from the database.
 func (h *Handler) GetMonitorRequestDetails(c *gin.Context) {
 	var center *time.Time

@@ -26,6 +26,9 @@ const deepSeekThinkingBudgetMin = 100
 const deepSeekThinkingBudgetMax = 32768
 const doubaoSeed20MaxTemperature = 1.5
 const doubaoSeed20MaxCompletionTokens = 98304
+const kimiThinkingTemperature = 1.0
+const kimiInstantTemperature = 0.6
+const kimiTopP = 0.95
 
 type openAICompatProfile struct {
 	Kind                     string
@@ -57,7 +60,7 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 	"kimi": {
 		Kind:                     "kimi",
 		SupportsResponses:        false,
-		SupportsStreamUsage:      false,
+		SupportsStreamUsage:      true,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
 		PreserveReasoningContent: true,
@@ -272,6 +275,10 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
 		payload = repaired
 	}
+	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
+	if compatKind == "kimi" {
+		payload = normalizeKimiThinkingConfig(payload, model)
+	}
 	payload = scrubOpenAICompatPayload(payload, profile)
 	if profile.SystemMessagesAsUser {
 		payload = rewriteOpenAICompatSystemMessagesAsUser(payload)
@@ -288,19 +295,245 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	}
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "xiaomi" {
+	if compatKind == "kimi" {
+		payload = scrubKimiPayloadForModel(payload, model)
+	}
+	if compatKind == "xiaomi" {
 		payload = scrubXiaomiPayloadForModel(payload, model)
 	}
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
+	if compatKind == "zhipu" {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "doubao" {
+	if compatKind == "doubao" {
 		payload = scrubDoubaoPayloadForModel(payload, model)
 	}
 	if requiresDeepSeekToolSchemaCompatibility(model) {
 		payload = scrubDeepSeekToolPayload(payload, baseURL)
 	}
 	return payload
+}
+
+func scrubKimiPayloadForModel(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !requiresKimiK25K26PayloadCompatibility(payload, model) {
+		return payload
+	}
+	payload = normalizeKimiThinkingConfig(payload, model)
+	hasOfficialWebSearch := kimiPayloadHasOfficialWebSearch(payload)
+	if hasOfficialWebSearch && kimiThinkingEnabled(payload) {
+		if updated, err := sjson.SetBytes(payload, "thinking.type", "disabled"); err == nil {
+			payload = updated
+		}
+		if updated, err := sjson.DeleteBytes(payload, "thinking.keep"); err == nil {
+			payload = updated
+		}
+	}
+	payload = normalizeKimiFixedSamplingParams(payload)
+	payload = normalizeKimiToolChoice(payload, kimiThinkingEnabled(payload) || hasOfficialWebSearch)
+	payload = normalizeOpenAICompatToolCallArguments(payload)
+	return payload
+}
+
+func requiresKimiK25K26Compatibility(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
+		modelName = modelName[slash+1:]
+	}
+	modelName = strings.TrimPrefix(modelName, "kimi-")
+	return modelName == "k2.5" ||
+		modelName == "k2.6" ||
+		strings.HasPrefix(modelName, "k2.5-") ||
+		strings.HasPrefix(modelName, "k2.6-")
+}
+
+func requiresKimiK25K26PayloadCompatibility(payload []byte, model string) bool {
+	if requiresKimiK25K26Compatibility(model) {
+		return true
+	}
+	payloadModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	return payloadModel != "" && requiresKimiK25K26Compatibility(payloadModel)
+}
+
+func normalizeKimiThinkingConfig(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !requiresKimiK25K26PayloadCompatibility(payload, model) {
+		return payload
+	}
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	if thinkingType == "" {
+		thinkingType = kimiThinkingTypeFromReasoning(payload)
+	}
+	switch thinkingType {
+	case "none", "off", "false", "disabled", "disable":
+		if updated, err := sjson.SetBytes(payload, "thinking.type", "disabled"); err == nil {
+			payload = updated
+		}
+	case "", "low", "medium", "high", "max", "auto", "adaptive", "true", "enabled", "enable":
+		if thinkingType != "" {
+			if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
+				payload = updated
+			}
+		}
+	default:
+		if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
+			payload = updated
+		}
+	}
+	for _, path := range []string{
+		"reasoning",
+		"reasoning_effort",
+		"thinking.reasoning_effort",
+		"thinking.budget_tokens",
+		"thinking_budget",
+	} {
+		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	if !kimiThinkingEnabled(payload) {
+		if updated, err := sjson.DeleteBytes(payload, "thinking.keep"); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	if kimiPayloadHasReasoningContent(payload) {
+		if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
+			payload = updated
+		}
+		if updated, err := sjson.SetBytes(payload, "thinking.keep", "all"); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func kimiThinkingTypeFromReasoning(payload []byte) string {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		if effort := strings.ToLower(strings.TrimSpace(value.String())); effort != "" {
+			return effort
+		}
+	}
+	return ""
+}
+
+func kimiThinkingEnabled(payload []byte) bool {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	switch thinkingType {
+	case "none", "off", "false", "disabled", "disable":
+		return false
+	default:
+		return true
+	}
+}
+
+func kimiPayloadHasReasoningContent(payload []byte) bool {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+	for _, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+			continue
+		}
+		if strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeKimiFixedSamplingParams(payload []byte) []byte {
+	temperature := kimiThinkingTemperature
+	if !kimiThinkingEnabled(payload) {
+		temperature = kimiInstantTemperature
+	}
+	for path, value := range map[string]any{
+		"temperature":       temperature,
+		"top_p":             kimiTopP,
+		"n":                 1,
+		"presence_penalty":  0.0,
+		"frequency_penalty": 0.0,
+	} {
+		if !gjson.GetBytes(payload, path).Exists() {
+			continue
+		}
+		if updated, err := sjson.SetBytes(payload, path, value); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func normalizeKimiToolChoice(payload []byte, enforceAutoNone bool) []byte {
+	toolChoice := gjson.GetBytes(payload, "tool_choice")
+	if !toolChoice.Exists() {
+		return payload
+	}
+	if !gjson.GetBytes(payload, "tools").IsArray() {
+		if updated, err := sjson.DeleteBytes(payload, "tool_choice"); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	if !enforceAutoNone {
+		return payload
+	}
+	if value, ok := kimiToolChoiceAutoOrNone(toolChoice); ok {
+		if updated, err := sjson.SetBytes(payload, "tool_choice", value); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	if updated, err := sjson.SetBytes(payload, "tool_choice", "auto"); err == nil {
+		payload = updated
+	}
+	return payload
+}
+
+func kimiToolChoiceAutoOrNone(toolChoice gjson.Result) (string, bool) {
+	switch toolChoice.Type {
+	case gjson.String:
+		value := strings.ToLower(strings.TrimSpace(toolChoice.String()))
+		return value, value == "auto" || value == "none"
+	case gjson.JSON:
+		value := strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String()))
+		return value, value == "auto" || value == "none"
+	default:
+		return "", false
+	}
+}
+
+func kimiPayloadHasOfficialWebSearch(payload []byte) bool {
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if kimiToolLooksLikeOfficialWebSearch(tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func kimiToolLooksLikeOfficialWebSearch(tool gjson.Result) bool {
+	toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+	toolName := strings.ToLower(strings.TrimSpace(tool.Get("name").String()))
+	if toolName == "" {
+		toolName = strings.ToLower(strings.TrimSpace(tool.Get("function.name").String()))
+	}
+	if strings.Contains(toolName, "$web_search") || toolName == "_web_search" || strings.Contains(toolType, "web_search") {
+		return true
+	}
+	if toolType != "function" && strings.Contains(toolName, "web_search") {
+		return true
+	}
+	if strings.Contains(toolType, "builtin") && strings.Contains(strings.ToLower(tool.Raw), "web_search") {
+		return true
+	}
+	return false
 }
 
 func scrubDoubaoPayloadForModel(payload []byte, model string) []byte {

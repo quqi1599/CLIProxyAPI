@@ -164,7 +164,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, err = sanitizeKimiOpenAICompatibleRequestBody(body)
+	body, err = sanitizeKimiOpenAICompatibleRequestBodyForModel(body, baseModel, baseURL)
 	if err != nil {
 		return resp, err
 	}
@@ -282,7 +282,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, err = sanitizeKimiOpenAICompatibleRequestBody(body)
+	body, err = sanitizeKimiOpenAICompatibleRequestBodyForModel(body, baseModel, baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -804,11 +804,14 @@ func claudeToolResultIDsInNextUserMessage(messages []gjson.Result, assistantIdx 
 }
 
 func sanitizeKimiOpenAICompatibleRequestBody(body []byte) ([]byte, error) {
-	body = repairOpenAICompatToolCallHistory(body)
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	return sanitizeKimiOpenAICompatibleRequestBodyForModel(body, model, "")
+}
+
+func sanitizeKimiOpenAICompatibleRequestBodyForModel(body []byte, model string, baseURL string) ([]byte, error) {
 	profile := openAICompatProfileForKind("kimi")
-	body = sanitizeOpenAICompatToolSchemas(body)
-	body = scrubOpenAICompatProviderToolPayload(body, profile)
-	return normalizeKimiToolMessageLinks(body)
+	body = scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
+	return body, nil
 }
 
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {

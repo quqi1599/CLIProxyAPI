@@ -269,6 +269,94 @@ func upsertStreamSummary(t *testing.T, store *sqliteUsageStore, record StreamSum
 	}
 }
 
+func TestSQLiteUsageStoreQueryMonitorClientGoneStats(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "token-a", Model: "kimi-k2.6", Source: "kimi-a", AuthIndex: "0", Path: "/v1/chat/completions", RequestID: "req-1", RequestedAt: base.Add(-30 * time.Minute)},
+		UsageRecord{APIKey: "token-a", Model: "kimi-k2.6", Source: "kimi-a", AuthIndex: "0", Path: "/v1/chat/completions", RequestID: "req-2", RequestedAt: base.Add(-20 * time.Minute)},
+		UsageRecord{APIKey: "token-a", Model: "kimi-k2.6", Source: "kimi-a", AuthIndex: "0", Path: "/v1/responses", RequestID: "req-3", RequestedAt: base.Add(-10 * time.Minute)},
+		UsageRecord{APIKey: "token-b", Model: "kimi-k2.6", Source: "kimi-a", AuthIndex: "1", Path: "/v1/chat/completions", RequestID: "req-4", RequestedAt: base.Add(-5 * time.Minute)},
+		UsageRecord{APIKey: "token-a", Model: "kimi-k2.6", Source: "kimi-a", AuthIndex: "0", Path: "/v1/chat/completions", RequestID: "req-5", RequestedAt: base.Add(-48 * time.Hour)},
+	)
+	upsertStreamSummary(t, store, StreamSummaryRecord{
+		RequestID:          "req-1",
+		TimeToFirstChunkMs: 100,
+		StreamDurationMs:   1000,
+		TotalDurationMs:    1100,
+		ChunksCount:        10,
+		BytesOut:           1000,
+		ClientGone:         true,
+		RecordedAt:         base,
+	})
+	upsertStreamSummary(t, store, StreamSummaryRecord{
+		RequestID:          "req-2",
+		TimeToFirstChunkMs: 300,
+		StreamDurationMs:   3000,
+		TotalDurationMs:    3300,
+		ChunksCount:        30,
+		BytesOut:           3000,
+		ClientGone:         true,
+		RecordedAt:         base,
+	})
+	upsertStreamSummary(t, store, StreamSummaryRecord{
+		RequestID:          "req-3",
+		TimeToFirstChunkMs: 200,
+		StreamDurationMs:   2000,
+		TotalDurationMs:    2200,
+		ChunksCount:        20,
+		BytesOut:           2000,
+		ClientGone:         true,
+		RecordedAt:         base,
+	})
+	upsertStreamSummary(t, store, StreamSummaryRecord{
+		RequestID:  "req-4",
+		ClientGone: false,
+		RecordedAt: base,
+	})
+	upsertStreamSummary(t, store, StreamSummaryRecord{
+		RequestID:  "req-5",
+		ClientGone: true,
+		RecordedAt: base,
+	})
+
+	start := base.Add(-1 * time.Hour)
+	end := base
+	items, err := store.QueryMonitorClientGoneStats(ctx, MonitorQueryFilter{
+		APIKey: "token-a",
+		Start:  &start,
+		End:    &end,
+	}, 10)
+	if err != nil {
+		t.Fatalf("QueryMonitorClientGoneStats failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 client_gone groups, got %d: %+v", len(items), items)
+	}
+	first := items[0]
+	if first.APIKey != "token-a" || first.Model != "kimi-k2.6" || first.Path != "/v1/chat/completions" || first.Source != "kimi-a" || first.AuthIndex != "0" {
+		t.Fatalf("unexpected first group identity: %+v", first)
+	}
+	if first.ClientGoneCount != 2 {
+		t.Fatalf("client_gone_count = %d, want 2", first.ClientGoneCount)
+	}
+	if first.AvgTimeToFirstChunkMs != 200 || first.AvgStreamDurationMs != 2000 || first.AvgTotalDurationMs != 2200 {
+		t.Fatalf("unexpected averages: %+v", first)
+	}
+	if first.ChunksCount != 40 || first.BytesOut != 4000 {
+		t.Fatalf("unexpected totals: chunks=%d bytes=%d", first.ChunksCount, first.BytesOut)
+	}
+	if first.LastClientGoneAt == nil || !first.LastClientGoneAt.Equal(base.Add(-20*time.Minute)) {
+		t.Fatalf("unexpected last_client_gone_at: %v", first.LastClientGoneAt)
+	}
+	if items[1].Path != "/v1/responses" || items[1].ClientGoneCount != 1 {
+		t.Fatalf("unexpected second group: %+v", items[1])
+	}
+}
+
 func assertStringSliceEqual(t *testing.T, got, want []string) {
 	t.Helper()
 	gotCopy := append([]string(nil), got...)
