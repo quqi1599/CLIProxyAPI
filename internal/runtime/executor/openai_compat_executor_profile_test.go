@@ -970,6 +970,42 @@ func TestOpenAICompatPayloadXiaomiMapsReasoningEffortToNativeThinking(t *testing
 	}
 }
 
+func TestOpenAICompatPayloadXiaomiClampsMimo25ProTokenFields(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"max_tokens":384000,
+		"max_completion_tokens":"200000",
+		"max_output_tokens":131073
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://api.xiaomimimo.com/v1")
+
+	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if got := gjson.GetBytes(out, path).Int(); got != 131072 {
+			t.Fatalf("%s = %d, want 131072: %s", path, got, string(out))
+		}
+	}
+}
+
+func TestOpenAICompatPayloadXiaomiMimo25ProTokenClampLowerBoundAndInvalid(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"max_tokens":0,
+		"max_completion_tokens":"nope"
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://api.xiaomimimo.com/v1")
+
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 1 {
+		t.Fatalf("max_tokens = %d, want 1: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "max_completion_tokens").Exists() {
+		t.Fatalf("invalid max_completion_tokens should be removed: %s", string(out))
+	}
+}
+
 func TestOpenAICompatPayloadXiaomiNormalizesClaudeStyleTools(t *testing.T) {
 	payload := []byte(`{
 		"model":"mimo-v2.5",
@@ -1197,6 +1233,46 @@ func TestOpenAICompatPayloadDeepSeekNormalizesThinkingBudget(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
 		t.Fatalf("reasoning_effort = %q, want max: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadDoubaoDeepSeekMapsReasoningEffort(t *testing.T) {
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"xhigh",
+		"thinking":{"type":"enabled","budget_tokens":99999},
+		"tools":[{
+			"name":"read:file",
+			"description":"Read file",
+			"input_schema":{"type":"object","properties":{"path":{"type":"string"}}}
+		}],
+		"tool_choice":{"type":"function","function":{"name":"read:file"}}
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("doubao"), "deepseek-v4-pro", "https://ark.cn-beijing.volces.com/api/v3")
+
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high: %s", got, string(out))
+	}
+	for _, path := range []string{
+		"reasoning_effort",
+		"thinking",
+		"thinking_budget",
+		"output_config.effort",
+	} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be removed for doubao DeepSeek compat: %s", path, string(out))
+		}
+	}
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tool type = %q, want function: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "read_file" {
+		t.Fatalf("tool function name = %q, want read_file: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "read_file" {
+		t.Fatalf("tool_choice function name = %q, want read_file: %s", got, string(out))
 	}
 }
 

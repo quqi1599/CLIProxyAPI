@@ -96,6 +96,13 @@ var oauthToolsToRemove = map[string]bool{}
 // omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
 
+const (
+	largeClaudeCompatToolHistoryPayloadBytes = 2 * 1024 * 1024
+	largeClaudeCompatToolHistoryMessages     = 400
+	largeClaudeCompatToolHistoryInteractions = 250
+	largeClaudeCompatToolHistoryMCPTools     = 40
+)
+
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
@@ -205,6 +212,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, compatKind)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
+	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
 	preflight := newClaudeCompatPreflight(body)
 	if preflight.hasSystemRole {
@@ -216,6 +224,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = normalizeClaudeTemperatureForThinking(body)
 	body, _, _, err = normalizeThinkingHistoryForModel(body, "claude", baseModel)
 	if err != nil {
+		return resp, err
+	}
+	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
 		return resp, err
 	}
 	if preflight.hasToolUse {
@@ -436,6 +447,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, compatKind)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
+	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
 	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, true)
 	preflight := newClaudeCompatPreflight(body)
@@ -448,6 +460,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = normalizeClaudeTemperatureForThinking(body)
 	body, _, _, err = normalizeThinkingHistoryForModel(body, "claude", baseModel)
 	if err != nil {
+		return nil, err
+	}
+	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
 		return nil, err
 	}
 	if preflight.hasToolUse {
@@ -1378,6 +1393,47 @@ func applyMiniMaxStreamingThinkingDefaultForCompat(compatKind string, body []byt
 	return out
 }
 
+func scrubDoubaoClaudeDeepSeekThinkingForCompat(body []byte, model string, compatKind string) []byte {
+	if compatKind != "doubao" || len(body) == 0 || !gjson.ValidBytes(body) || !isDoubaoDeepSeekReasoningModel(model) {
+		return body
+	}
+	effort, disabled := doubaoDeepSeekReasoningIntent(body, model)
+	for _, path := range []string{
+		"reasoning",
+		"reasoning_effort",
+		"thinking.reasoning_effort",
+		"thinking_budget",
+		"output_config.effort",
+	} {
+		if updated, err := sjson.DeleteBytes(body, path); err == nil {
+			body = updated
+		}
+	}
+	if disabled {
+		if updated, err := sjson.DeleteBytes(body, "thinking"); err == nil {
+			body = updated
+		}
+		return deleteEmptyClaudeOutputConfig(body)
+	}
+	effort, disabled = normalizeDoubaoDeepSeekReasoningEffort(effort)
+	if disabled || effort == "" {
+		return deleteEmptyClaudeOutputConfig(body)
+	}
+	body, _ = sjson.SetBytes(body, "thinking.type", "adaptive")
+	body, _ = sjson.DeleteBytes(body, "thinking.budget_tokens")
+	body, _ = sjson.SetBytes(body, "output_config.effort", effort)
+	return body
+}
+
+func deleteEmptyClaudeOutputConfig(body []byte) []byte {
+	if oc := gjson.GetBytes(body, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+		if updated, err := sjson.DeleteBytes(body, "output_config"); err == nil {
+			return updated
+		}
+	}
+	return body
+}
+
 func isClaudeOAuthToken(apiKey string) bool {
 	return strings.Contains(apiKey, "sk-ant-oat")
 }
@@ -2106,6 +2162,84 @@ func repairClaudeToolUseHistoryWithCompatLog(ctx context.Context, body []byte, m
 	return repaired, nil
 }
 
+func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) error {
+	reason, ok := largeClaudeCompatToolHistoryRejectReason(body, meta, preflight)
+	if !ok {
+		return nil
+	}
+	fields := log.Fields{
+		"event":           "compat_repair_guard",
+		"requested_model": meta.requestedModel,
+		"upstream_model":  meta.upstreamModel,
+		"provider":        meta.provider,
+		"executor":        meta.executor,
+		"request_path":    meta.requestPath,
+		"compat_kind":     meta.compatKind,
+		"reason":          reason,
+		"payload_bytes":   len(body),
+		"message_count":   meta.messageCount,
+		"tool_count":      meta.toolCount,
+	}
+	addCompatRepairToolShapeFields(fields, meta.toolShape)
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large Claude tool history rejected before compat repair")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       "request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility; reduce tool history/context or use a native Claude route",
+	}
+}
+
+func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) (string, bool) {
+	if !preflight.hasToolUse && !preflight.hasToolResult {
+		return "", false
+	}
+	if !isClaudeSonnet46CompatModel(meta.requestedModel) && !isClaudeSonnet46CompatModel(meta.upstreamModel) {
+		return "", false
+	}
+	if !isMiniMaxStepClaudeCompatKind(meta.compatKind) {
+		return "", false
+	}
+	interactions := meta.toolShape.InteractionCount
+	if interactions <= 0 {
+		interactions = meta.toolCount
+	}
+	payloadBytes := len(body)
+	if payloadBytes >= largeClaudeCompatToolHistoryPayloadBytes {
+		return "payload_bytes", true
+	}
+	if meta.messageCount >= largeClaudeCompatToolHistoryMessages && interactions >= largeClaudeCompatToolHistoryInteractions {
+		return "message_tool_history", true
+	}
+	if interactions >= largeClaudeCompatToolHistoryInteractions+100 {
+		return "tool_history", true
+	}
+	if meta.toolShape.MCPToolCount >= largeClaudeCompatToolHistoryMCPTools && interactions >= largeClaudeCompatToolHistoryInteractions {
+		return "mcp_tool_history", true
+	}
+	return "", false
+}
+
+func isClaudeSonnet46CompatModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	base := strings.TrimSpace(thinking.ParseSuffix(model).ModelName)
+	if base == "" {
+		base = model
+	}
+	return strings.EqualFold(base, "claude-sonnet-4-6")
+}
+
+func isMiniMaxStepClaudeCompatKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "minimax", "step":
+		return true
+	default:
+		return false
+	}
+}
+
 func compatRepairStatsTotal(stats claudeToolHistoryRepairStats) int {
 	return stats.mergedToolResultMessages +
 		stats.dedupedToolResults +
@@ -2806,6 +2940,7 @@ func sanitizeClaudeHTTPRequestToolNames(req *http.Request) (*claudeToolNameSanit
 	}
 	body = downgradeClaudeToolSearchForCompatKind(compatKind, requestURLString(req), body)
 	body = scrubDeepSeekThinkingBudgetForCompat(body, gjson.GetBytes(body, "model").String(), requestURLString(req), compatKind)
+	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, gjson.GetBytes(body, "model").String(), compatKind)
 	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, gjson.GetBytes(body, "stream").Bool())
 	body = normalizeClaudeSystemRoleMessages(body)
 	updated, mapping := sanitizeClaudeToolNamesForUpstream(body)

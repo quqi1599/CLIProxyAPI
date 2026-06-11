@@ -59,16 +59,27 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 		model = safeFailureMetadataString(record.Model)
 	}
 
+	normalizedStatus, normalizedErrorType, normalizedErrorCode := normalizeFailureMetadataError(status, errorCode)
 	fields := log.Fields{
 		"event":            "failure_metadata",
 		"failure_class":    classifyFailureMetadata(status, errorCode),
 		"model":            model,
-		"endpoint":         safeFailureMetadataString(internallogging.GetEndpoint(ctx)),
+		"endpoint_method":  safeFailureMetadataString(internallogging.GetEndpointMethod(ctx)),
+		"endpoint_path":    safeFailureMetadataString(internallogging.GetEndpointPath(ctx)),
 		"message_count":    messageCount,
 		"tool_count":       toolCount,
 		"reasoning_effort": reasoningEffort,
 		"attempt_count":    attemptCount,
 		"duration_ms":      durationMilliseconds(record.Latency),
+	}
+	if normalizedStatus > 0 {
+		fields["normalized_status"] = normalizedStatus
+	}
+	if normalizedErrorType != "" {
+		fields["error_type"] = normalizedErrorType
+	}
+	if normalizedErrorCode != "" {
+		fields["error_code"] = normalizedErrorCode
 	}
 	if status > 0 {
 		fields["upstream_status"] = status
@@ -88,6 +99,46 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 	addFailureToolShapeFields(fields, coreusage.ToolShapeFromContext(ctx))
 
 	log.WithFields(fields).Warn("failure_metadata")
+}
+
+func normalizeFailureMetadataError(status int, errorCode string) (int, string, string) {
+	code := strings.Trim(strings.ToLower(strings.TrimSpace(errorCode)), `"'(),:;[]{}<>`)
+	if isFailureMetadataContentSafetyCode(code) {
+		return http.StatusBadRequest, "invalid_request_error", "content_policy_violation"
+	}
+	if status <= 0 {
+		return 0, "", ""
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return status, "authentication_error", "invalid_api_key"
+	case http.StatusForbidden:
+		return status, "permission_error", "insufficient_quota"
+	case http.StatusTooManyRequests:
+		return status, "rate_limit_error", "rate_limit_exceeded"
+	case http.StatusNotFound:
+		return status, "invalid_request_error", "model_not_found"
+	default:
+		if status >= http.StatusInternalServerError {
+			return status, "server_error", "internal_server_error"
+		}
+		if status >= http.StatusBadRequest {
+			if code != "" {
+				return status, "invalid_request_error", code
+			}
+			return status, "invalid_request_error", "invalid_request_error"
+		}
+	}
+	return status, "", code
+}
+
+func isFailureMetadataContentSafetyCode(code string) bool {
+	switch code {
+	case "1026", "1027", "1301", "content_policy_violation":
+		return true
+	default:
+		return false
+	}
 }
 
 func addFailureToolShapeFields(fields log.Fields, shape coreusage.ToolShape) {

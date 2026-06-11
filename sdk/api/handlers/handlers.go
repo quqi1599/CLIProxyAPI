@@ -572,7 +572,8 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
-	endpoint := ""
+	endpointMethod := ""
+	endpointPath := ""
 	if c != nil && c.Request != nil {
 		path := strings.TrimSpace(c.FullPath())
 		if path == "" && c.Request.URL != nil {
@@ -580,15 +581,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 		if path != "" {
 			method := strings.TrimSpace(c.Request.Method)
-			if method != "" {
-				endpoint = method + " " + path
-			} else {
-				endpoint = path
-			}
+			endpointMethod = method
+			endpointPath = path
 		}
 	}
-	if endpoint != "" {
-		newCtx = logging.WithEndpoint(newCtx, endpoint)
+	if endpointMethod != "" || endpointPath != "" {
+		newCtx = logging.WithEndpointParts(newCtx, endpointMethod, endpointPath)
 	}
 	newCtx = coreauth.WithStreamSummaryTracking(newCtx)
 	newCtx = logging.WithResponseStatusHolder(newCtx)

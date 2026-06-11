@@ -110,6 +110,9 @@ type routePlanSummary struct {
 	RoutingGroup     string `json:"routing_group,omitempty"`
 	FallbackFrom     string `json:"fallback_from,omitempty"`
 	FallbackReason   string `json:"fallback_reason,omitempty"`
+	CompatKind       string `json:"compat_kind,omitempty"`
+	CompatKindSource string `json:"compat_kind_source,omitempty"`
+	CompatMapping    string `json:"compat_mapping,omitempty"`
 	CompatBaseHost   string `json:"compat_base_host,omitempty"`
 	ClientProfile    string `json:"client_profile,omitempty"`
 	ContextHint      string `json:"model_context_hint,omitempty"`
@@ -324,10 +327,13 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 			summary.FinalStatus = status
 		}
 	}
+	summary.FinalStatus = normalizeRequestExecutionFinalStatus(summary.FinalStatus, finalErr)
+	logFinalSuccess := finalSuccess && (summary.FinalStatus == 0 || summary.FinalStatus < http.StatusBadRequest)
+	finalErrorType, finalErrorCode := requestExecutionSummaryErrorFields(summary.FinalStatus, finalErr)
 
 	fields := log.Fields{
 		"event":                "request_execution_summary",
-		"final_success":        finalSuccess,
+		"final_success":        logFinalSuccess,
 		"attempt_count":        summary.AttemptCount,
 		"fallback_count":       summary.FallbackCount,
 		"max_attempts":         summary.MaxAttempts,
@@ -340,6 +346,12 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	if summary.FinalStatus > 0 {
 		fields["final_status"] = summary.FinalStatus
 	}
+	if finalErrorType != "" {
+		fields["final_error_type"] = finalErrorType
+	}
+	if finalErrorCode != "" {
+		fields["final_error_code"] = finalErrorCode
+	}
 	if summary.FinalProvider != "" {
 		fields["final_provider"] = summary.FinalProvider
 	}
@@ -350,6 +362,56 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 		fields["final_executor"] = summary.FinalExecutor
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
+}
+
+func normalizeRequestExecutionFinalStatus(status int, err error) int {
+	if isRequestScopedContentSafetyError(err) {
+		return http.StatusBadRequest
+	}
+	if status > 0 {
+		return status
+	}
+	if err == nil {
+		return 0
+	}
+	if errStatus := statusCodeFromError(err); errStatus > 0 {
+		return errStatus
+	}
+	return 0
+}
+
+func requestExecutionSummaryErrorFields(status int, err error) (string, string) {
+	if isRequestScopedContentSafetyError(err) {
+		return "invalid_request_error", "content_policy_violation"
+	}
+	code := strings.TrimSpace(errorCodeFromError(err))
+	if status <= 0 || status < http.StatusBadRequest {
+		return "", ""
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error", firstNonEmpty(code, "invalid_api_key")
+	case http.StatusForbidden:
+		return "permission_error", firstNonEmpty(code, "insufficient_quota")
+	case http.StatusTooManyRequests:
+		return "rate_limit_error", firstNonEmpty(code, "rate_limit_exceeded")
+	case http.StatusNotFound:
+		return "invalid_request_error", firstNonEmpty(code, "model_not_found")
+	default:
+		if status >= http.StatusInternalServerError {
+			return "server_error", firstNonEmpty(code, "internal_server_error")
+		}
+		return "invalid_request_error", firstNonEmpty(code, "status_"+strconv.Itoa(status))
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func logRoutePlan(ctx context.Context, auth *Auth, provider, routeModel, resolvedModel, upstreamModel string, opts cliproxyexecutor.Options, executor ProviderExecutor, operation string) {
@@ -378,6 +440,7 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 	effortOriginal := metadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortOriginalMetadataKey)
 	requestedModel := routePlanRequestedModel(opts, routeModel)
 	clientProfile := metadataString(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)
+	compatKind, compatKindSource := routePlanCompatKindWithSource(auth)
 	return routePlanSummary{
 		RequestedModel:   requestedModel,
 		ResolvedModel:    strings.TrimSpace(resolvedModel),
@@ -391,6 +454,9 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 		RoutingGroup:     routingGroup,
 		FallbackFrom:     routePlanFallbackFrom(previous),
 		FallbackReason:   strings.TrimSpace(attempt.RetryReason),
+		CompatKind:       compatKind,
+		CompatKindSource: compatKindSource,
+		CompatMapping:    routePlanCompatMapping(requestedModel, resolvedModel, compatKind),
 		CompatBaseHost:   routePlanCompatBaseHost(auth),
 		ClientProfile:    clientProfile,
 		ContextHint:      metadataString(opts.Metadata, cliproxyexecutor.ModelContextHintMetadataKey),
@@ -398,6 +464,37 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 		EffortOriginal:   effortOriginal,
 		EffortNormalized: routePlanNormalizedReasoningEffort(auth, provider, requestedModel, clientProfile, resolvedModel, effortOriginal),
 	}
+}
+
+func routePlanCompatKindWithSource(auth *Auth) (string, string) {
+	if auth == nil || auth.Attributes == nil {
+		return "", ""
+	}
+	if kind := internalconfig.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
+		return kind, "auth_attribute:compat_kind"
+	}
+	if kind := internalconfig.InferCompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
+		return kind, "base_url_inference"
+	}
+	if providerKey := internalconfig.NormalizeOpenAICompatibilityKind(auth.Attributes["provider_key"]); providerKey != "" {
+		return providerKey, "auth_attribute:provider_key"
+	}
+	return "", ""
+}
+
+func routePlanCompatMapping(requestedModel, resolvedModel, compatKind string) string {
+	if internalconfig.NormalizeOpenAICompatibilityKind(compatKind) != "doubao" {
+		return ""
+	}
+	if isDeepSeekV4RouteModel(requestedModel) || isDeepSeekV4RouteModel(resolvedModel) {
+		return "deepseek_v4_via_doubao_volcengine"
+	}
+	return ""
+}
+
+func isDeepSeekV4RouteModel(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return strings.HasPrefix(modelName, "deepseek-v4-pro") || strings.HasPrefix(modelName, "deepseek-v4-flash")
 }
 
 func routePlanCompatBaseHost(auth *Auth) string {
@@ -440,8 +537,7 @@ func isDeepSeekOfficialRoute(auth *Auth, resolvedModel string) bool {
 	if auth == nil {
 		return false
 	}
-	modelKey := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(resolvedModel).ModelName))
-	if !strings.HasPrefix(modelKey, "deepseek-v4-pro") && !strings.HasPrefix(modelKey, "deepseek-v4-flash") {
+	if !isDeepSeekV4RouteModel(resolvedModel) {
 		return false
 	}
 	if auth.Attributes != nil {
@@ -2064,13 +2160,15 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 }
 
 type streamExecutionLogMeta struct {
-	requestedModel string
-	upstreamModel  string
-	provider       string
-	executor       string
-	requestPath    string
-	compatKind     string
-	toolShape      coreusage.ToolShape
+	requestedModel   string
+	upstreamModel    string
+	provider         string
+	executor         string
+	requestPath      string
+	compatKind       string
+	compatKindSource string
+	compatMapping    string
+	toolShape        coreusage.ToolShape
 }
 
 type streamRuntimeStats struct {
@@ -2424,14 +2522,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if requestedModel == "" {
 			requestedModel = routeModel
 		}
+		compatKind, compatKindSource := routePlanCompatKindWithSource(auth)
+		if compatKind == "" {
+			compatKind = routePlanThinkingProviderKey(auth, provider)
+		}
 		streamMeta := streamExecutionLogMeta{
-			requestedModel: requestedModel,
-			upstreamModel:  execModel,
-			provider:       provider,
-			executor:       providerExecutorName(executor),
-			requestPath:    metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey),
-			compatKind:     routePlanThinkingProviderKey(auth, provider),
-			toolShape:      toolShapeFromOptions(opts),
+			requestedModel:   requestedModel,
+			upstreamModel:    execModel,
+			provider:         provider,
+			executor:         providerExecutorName(executor),
+			requestPath:      metadataString(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey),
+			compatKind:       compatKind,
+			compatKindSource: compatKindSource,
+			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
+			toolShape:        toolShapeFromOptions(opts),
 		}
 		return m.wrapStreamResult(ctx, auth.Clone(), streamMeta, responseModelAlias, streamResult.Headers, buffered, remaining, streamResult.Close, startedAt, firstPayloadDelay, releaseSlot), nil
 	}
@@ -4419,6 +4523,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					!isRequestScopedFeatureUnsupportedResultError(result.Error) &&
 					!isRequestScopedContentSafetyResultError(result.Error) &&
 					!isRequestScopedContextLimitResultError(result.Error) &&
+					!isRequestScopedInvalidParameterResultError(result.Error) &&
+					!isRequestScopedParameterRangeResultError(result.Error) &&
 					!isTransientRoutingResultError(result.Error) {
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, managedModel)
@@ -4667,7 +4773,9 @@ func isCodexAPIKeyRequestScopedResultError(err *Error) bool {
 	return isRequestScopedNotFoundResultError(err) ||
 		isRequestScopedFeatureUnsupportedResultError(err) ||
 		isRequestScopedContentSafetyResultError(err) ||
-		isRequestScopedContextLimitResultError(err)
+		isRequestScopedContextLimitResultError(err) ||
+		isRequestScopedInvalidParameterResultError(err) ||
+		isRequestScopedParameterRangeResultError(err)
 }
 
 func applyCodexAPIKeyHealthFailure(health *HealthState, now time.Time, statusCode int) {
@@ -4710,6 +4818,8 @@ func openAICompatAvailabilityAliasForResult(auth *Auth, requestedModelAlias stri
 		isRequestScopedFeatureUnsupportedResultError(result.Error) ||
 		isRequestScopedContentSafetyResultError(result.Error) ||
 		isRequestScopedContextLimitResultError(result.Error) ||
+		isRequestScopedInvalidParameterResultError(result.Error) ||
+		isRequestScopedParameterRangeResultError(result.Error) ||
 		isTransientRoutingResultError(result.Error) ||
 		isModelSupportResultError(result.Error) ||
 		isAccountQuotaExhaustedResultError(result.Error) ||
@@ -4862,7 +4972,9 @@ func shouldCountChannelBreakerFailure(result Result) bool {
 	if isRequestScopedNotFoundResultError(result.Error) ||
 		isRequestScopedFeatureUnsupportedResultError(result.Error) ||
 		isRequestScopedContentSafetyResultError(result.Error) ||
-		isRequestScopedContextLimitResultError(result.Error) {
+		isRequestScopedContextLimitResultError(result.Error) ||
+		isRequestScopedInvalidParameterResultError(result.Error) ||
+		isRequestScopedParameterRangeResultError(result.Error) {
 		return false
 	}
 	if isTransientRoutingResultError(result.Error) {
@@ -5897,6 +6009,49 @@ func isRequestScopedFeatureUnsupportedMessage(message string) bool {
 	return false
 }
 
+func isLargeClaudeCompatToolHistoryMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(lower, "large_claude_tool_history")
+}
+
+func isRequestScopedInvalidParameterMessage(code, message string) bool {
+	combined := strings.ToLower(strings.TrimSpace(code + " " + message))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "invalidparameter") ||
+		strings.Contains(combined, "invalid parameter")
+}
+
+func isRequestScopedInvalidParameterResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	return (status == 0 || status == http.StatusBadRequest) && isRequestScopedInvalidParameterMessage(err.Code, err.Message)
+}
+
+func isRequestScopedParameterRangeMessage(code, message string) bool {
+	combined := strings.ToLower(strings.TrimSpace(code + " " + message))
+	if !strings.Contains(combined, "out of supported range") {
+		return false
+	}
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if strings.Contains(combined, field) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequestScopedParameterRangeResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	return (status == 0 || status == http.StatusBadRequest) && isRequestScopedParameterRangeMessage(err.Code, err.Message)
+}
+
 func isRequestScopedNotFoundMessage(message string) bool {
 	if message == "" {
 		return false
@@ -5934,7 +6089,35 @@ func isRequestScopedContentSafetySignal(code, message string) bool {
 		(strings.Contains(lower, "high risk") || strings.Contains(lower, "high-risk"))) ||
 		(strings.Contains(lower, "content") && strings.Contains(lower, "blocked")) ||
 		isContentSafety1301Signal(code, message) ||
-		isMiniMaxNewSensitiveSignal(code, message)
+		isMiniMaxNewSensitiveSignal(code, message) ||
+		isGenericContentSafetySignal(code, message)
+}
+
+func isGenericContentSafetySignal(code, message string) bool {
+	normalizedCode := strings.Trim(strings.ToLower(strings.TrimSpace(code)), `"'(),:;[]{}<>`)
+	if normalizedCode == "content_policy_violation" {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "content_policy_violation") {
+		return true
+	}
+	if strings.Contains(lower, "有敏感内容") ||
+		strings.Contains(lower, "敏感内容，请勿重复") ||
+		(strings.Contains(lower, "敏感内容") && strings.Contains(lower, "请勿重复")) ||
+		(strings.Contains(lower, "敏感") && strings.Contains(lower, "请勿重复请求")) ||
+		(strings.Contains(lower, "敏感") && strings.Contains(lower, "请勿重复尝试")) {
+		return true
+	}
+	if strings.Contains(lower, "内容安全") ||
+		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "触发")) ||
+		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "拦截")) {
+		return true
+	}
+	return false
 }
 
 func isContentSafety1301Signal(code, message string) bool {
@@ -6037,36 +6220,20 @@ func hasHTTPStatusInMessage(message string, statuses ...int) bool {
 }
 
 func isRequestScopedContentSafetyStatus(status int, code, message string) bool {
-	if isContentSafety1301Signal(code, message) {
+	if isRequestScopedContentSafetySignal(code, message) {
 		switch status {
 		case http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway, http.StatusUnavailableForLegalReasons:
 			return true
 		case 0:
-			return !hasHTTPStatusInMessage(message, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests) ||
-				hasHTTPStatusInMessage(message, http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway, http.StatusUnavailableForLegalReasons)
+			if hasHTTPStatusInMessage(message, http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway, http.StatusUnavailableForLegalReasons) {
+				return true
+			}
+			return !hasHTTPStatusInMessage(message, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests)
 		default:
 			return false
 		}
 	}
-	if isMiniMaxNewSensitiveSignal(code, message) {
-		switch status {
-		case http.StatusBadRequest, http.StatusInternalServerError, http.StatusUnavailableForLegalReasons:
-			return true
-		case 0:
-			return !hasHTTPStatusInMessage(message, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests) ||
-				hasHTTPStatusInMessage(message, http.StatusBadRequest, http.StatusInternalServerError, http.StatusUnavailableForLegalReasons)
-		default:
-			return false
-		}
-	}
-	switch status {
-	case http.StatusBadRequest, http.StatusUnavailableForLegalReasons:
-		return true
-	case 0:
-		return hasHTTPStatusInMessage(message, http.StatusBadRequest, http.StatusUnavailableForLegalReasons)
-	default:
-		return false
-	}
+	return false
 }
 
 func isRequestScopedContentSafetyResultError(err *Error) bool {
@@ -6230,32 +6397,22 @@ func isRetryableEmptyUpstreamResponseError(err error) bool {
 }
 
 func isRequestScopedRouteFallbackError(err error) bool {
-	if isRequestScopedContentSafetyError(err) {
-		return true
-	}
 	return isRequestScopedContextLimitError(err)
 }
 
 func shouldFallbackRequestScopedContentSafetyError(routeModel string, err error) bool {
-	if !isRequestScopedFallbackModel(routeModel) {
-		return false
-	}
-	return isRequestScopedContentSafetyError(err) && isRequestScopedRouteFallbackError(err)
+	return false
 }
 
 func shouldFallbackRequestScopedContentSafetyErrorForRequest(routeModel string, opts cliproxyexecutor.Options, err error) bool {
-	if !isRequestScopedContentSafetyError(err) {
-		return false
-	}
-	return shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, err)
+	return false
 }
 
 func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cliproxyexecutor.Options, err error) bool {
 	if !isRequestScopedRouteFallbackError(err) {
 		return false
 	}
-	if isMiniMaxNewSensitiveSignal(errorCodeFromError(err), err.Error()) ||
-		isContentSafety1301Signal(errorCodeFromError(err), err.Error()) {
+	if isRequestScopedContentSafetyError(err) {
 		return false
 	}
 	if isRequestScopedFallbackModel(routeModel) {
@@ -6291,7 +6448,8 @@ func isSpecificFallbackModel(model string, target string) bool {
 
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error", request-scoped content safety/context-window rejections,
+// "invalid_request_error"/"InvalidParameter", guarded oversized Claude compat
+// tool-history requests, request-scoped content safety/context-window rejections,
 // request-scoped 404 item misses caused by `store=false`, and all 422 responses
 // as request-shape failures for the generic retry loop. Model-support errors are
 // excluded so routing can fall through to another auth or upstream.
@@ -6301,6 +6459,10 @@ func isRequestInvalidError(err error) bool {
 	}
 	if isModelSupportError(err) {
 		return false
+	}
+	if isLargeClaudeCompatToolHistoryMessage(err.Error()) {
+		status := statusCodeFromError(err)
+		return status == 0 || status == http.StatusBadRequest
 	}
 	if isRequestScopedFeatureUnsupportedMessage(err.Error()) {
 		return false
@@ -6316,6 +6478,8 @@ func isRequestInvalidError(err error) bool {
 	case http.StatusBadRequest:
 		msg := err.Error()
 		return (strings.Contains(msg, "invalid_request_error") && !isRetryableAvailabilityErrorMessage(msg)) ||
+			isRequestScopedInvalidParameterMessage("", msg) ||
+			isRequestScopedParameterRangeMessage("", msg) ||
 			strings.Contains(msg, "INVALID_ARGUMENT") ||
 			strings.Contains(msg, "FAILED_PRECONDITION")
 	case http.StatusUnavailableForLegalReasons:

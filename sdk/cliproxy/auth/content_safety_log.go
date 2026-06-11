@@ -192,6 +192,8 @@ func contentSafetyErrorDetails(err error) (string, string) {
 		return fallbackContentSafetyCode(code, "1027"), "output"
 	case isContentSafety1301Signal(code, message):
 		return fallbackContentSafetyCode(code, "1301"), "input"
+	case isGenericContentSafetySignal(code, message):
+		return code, "input"
 	default:
 		return code, ""
 	}

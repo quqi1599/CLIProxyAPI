@@ -131,6 +131,37 @@ func TestWriteErrorResponse_NormalizesContentSafety1301Status(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponse_NormalizesGenericChineseContentSafety(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New("status_code=400, 有敏感内容，请勿重复请求"),
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Error.Type != "invalid_request_error" {
+		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+	}
+	if payload.Error.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, contentPolicyViolationErrorCode)
+	}
+}
+
 func TestEnrichAuthSelectionError_DefaultsTo503WithConciseMessage(t *testing.T) {
 	in := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
@@ -195,6 +226,24 @@ func TestBuildErrorResponseBody_NormalizesMiniMaxInputNewSensitive(t *testing.T)
 	}
 	if payload.Error.Message != UserFacingContentSafetyMessage("input") {
 		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Error.Type != "invalid_request_error" {
+		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+	}
+	if payload.Error.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, contentPolicyViolationErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_NormalizesMiniMaxInputImageNewSensitive(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusInternalServerError, "status_code=500, input new_sensitive, messages[2]'s content[1] image is sensitive, please check your input (1026)")
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingContentSafetyMessage("input_image") {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input_image"))
 	}
 	if payload.Error.Type != "invalid_request_error" {
 		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)

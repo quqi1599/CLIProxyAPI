@@ -3,11 +3,14 @@ package logging
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
 
 type endpointKey struct{}
+type endpointMethodKey struct{}
+type endpointPathKey struct{}
 type responseStatusKey struct{}
 type responseHeadersKey struct{}
 
@@ -24,7 +27,27 @@ func WithEndpoint(ctx context.Context, endpoint string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, endpointKey{}, endpoint)
+	endpoint = strings.TrimSpace(endpoint)
+	method, path := SplitEndpoint(endpoint)
+	return WithEndpointParts(context.WithValue(ctx, endpointKey{}, endpoint), method, path)
+}
+
+func WithEndpointParts(ctx context.Context, method string, path string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	path = strings.TrimSpace(path)
+	if method != "" {
+		ctx = context.WithValue(ctx, endpointMethodKey{}, method)
+	}
+	if path != "" {
+		ctx = context.WithValue(ctx, endpointPathKey{}, path)
+	}
+	if endpoint := JoinEndpoint(method, path); endpoint != "" {
+		ctx = context.WithValue(ctx, endpointKey{}, endpoint)
+	}
+	return ctx
 }
 
 func GetEndpoint(ctx context.Context) string {
@@ -35,6 +58,62 @@ func GetEndpoint(ctx context.Context) string {
 		return endpoint
 	}
 	return ""
+}
+
+func GetEndpointMethod(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if method, ok := ctx.Value(endpointMethodKey{}).(string); ok {
+		return method
+	}
+	method, _ := SplitEndpoint(GetEndpoint(ctx))
+	return method
+}
+
+func GetEndpointPath(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if path, ok := ctx.Value(endpointPathKey{}).(string); ok {
+		return path
+	}
+	_, path := SplitEndpoint(GetEndpoint(ctx))
+	return path
+}
+
+func SplitEndpoint(endpoint string) (string, string) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", ""
+	}
+	fields := strings.Fields(endpoint)
+	if len(fields) >= 2 && isHTTPMethod(fields[0]) {
+		return strings.ToUpper(fields[0]), fields[1]
+	}
+	return "", endpoint
+}
+
+func JoinEndpoint(method string, path string) string {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	path = strings.TrimSpace(path)
+	switch {
+	case method != "" && path != "":
+		return method + " " + path
+	case path != "":
+		return path
+	default:
+		return method
+	}
+}
+
+func isHTTPMethod(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 func WithResponseStatusHolder(ctx context.Context) context.Context {

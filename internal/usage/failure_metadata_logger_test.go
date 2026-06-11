@@ -66,17 +66,66 @@ func TestFailureMetadataLoggerLogsOnlySafeFields(t *testing.T) {
 	requireJSONField(t, payload, "event", "failure_metadata")
 	requireJSONField(t, payload, "failure_class", "upstream_api_error")
 	requireJSONField(t, payload, "model", "gpt-5.5")
-	requireJSONField(t, payload, "endpoint", "POST /v1/chat/completions")
+	requireMissingJSONField(t, payload, "endpoint")
+	requireJSONField(t, payload, "endpoint_method", "POST")
+	requireJSONField(t, payload, "endpoint_path", "/v1/chat/completions")
 	requireJSONField(t, payload, "reasoning_effort", "minimal")
 	requireJSONNumberField(t, payload, "message_count", 127)
 	requireJSONNumberField(t, payload, "tool_count", 49)
 	requireJSONNumberField(t, payload, "attempt_count", 4)
 	requireJSONNumberField(t, payload, "duration_ms", 3025)
+	requireJSONNumberField(t, payload, "normalized_status", http.StatusInternalServerError)
+	requireJSONField(t, payload, "error_type", "server_error")
+	requireJSONField(t, payload, "error_code", "internal_server_error")
 	requireJSONNumberField(t, payload, "upstream_status", http.StatusInternalServerError)
 	requireJSONField(t, payload, "upstream_error_code", "api_error")
 	requireJSONField(t, payload, "request_id", "req-safe-1")
 	requireJSONField(t, payload, "auth_index", "safe-auth-index")
 	requireJSONField(t, payload, "routing_group", "codex-primary")
+}
+
+func TestFailureMetadataLoggerNormalizesContentSafetyFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOut := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.WarnLevel)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	}()
+
+	ctx := internallogging.WithRequestID(context.Background(), "req-safe-2")
+	ctx = internallogging.WithEndpointParts(ctx, http.MethodPost, "/v1/messages")
+
+	plugin := &FailureMetadataLogger{}
+	plugin.HandleUsage(ctx, coreusage.Record{
+		Model:              "MiniMax-M3-highspeed",
+		Failed:             true,
+		ProviderStatusCode: http.StatusInternalServerError,
+		ErrorCode:          "1026",
+		Latency:            time.Second,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusInternalServerError,
+			ErrorCode:  "1026",
+		},
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
+	}
+	requireJSONField(t, payload, "endpoint_method", "POST")
+	requireJSONField(t, payload, "endpoint_path", "/v1/messages")
+	requireJSONNumberField(t, payload, "upstream_status", http.StatusInternalServerError)
+	requireJSONNumberField(t, payload, "normalized_status", http.StatusBadRequest)
+	requireJSONField(t, payload, "error_type", "invalid_request_error")
+	requireJSONField(t, payload, "error_code", "content_policy_violation")
+	requireJSONField(t, payload, "upstream_error_code", "1026")
 }
 
 func TestFailureMetadataLoggerSkipsSuccessfulRecords(t *testing.T) {
@@ -100,6 +149,13 @@ func TestFailureMetadataLoggerSkipsSuccessfulRecords(t *testing.T) {
 
 	if buf.Len() != 0 {
 		t.Fatalf("successful usage should not be logged: %s", buf.String())
+	}
+}
+
+func requireMissingJSONField(t *testing.T, payload map[string]any, key string) {
+	t.Helper()
+	if _, ok := payload[key]; ok {
+		t.Fatalf("%s = %v, want missing", key, payload[key])
 	}
 }
 

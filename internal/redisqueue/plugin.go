@@ -112,6 +112,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Model:           modelName,
 		Alias:           aliasName,
 		Endpoint:        resolveEndpoint(ctx),
+		EndpointMethod:  resolveEndpointMethod(ctx),
+		EndpointPath:    resolveEndpointPath(ctx),
 		AuthType:        authType,
 		APIKey:          apiKey,
 		RequestID:       requestID,
@@ -129,6 +131,8 @@ type queuedUsageDetail struct {
 	Model           string `json:"model"`
 	Alias           string `json:"alias"`
 	Endpoint        string `json:"endpoint"`
+	EndpointMethod  string `json:"endpoint_method,omitempty"`
+	EndpointPath    string `json:"endpoint_path,omitempty"`
 	AuthType        string `json:"auth_type"`
 	APIKey          string `json:"api_key"`
 	RequestID       string `json:"request_id"`
@@ -198,6 +202,14 @@ func resolveSuccess(ctx context.Context) bool {
 
 func resolveEndpoint(ctx context.Context) string {
 	return strings.TrimSpace(internallogging.GetEndpoint(ctx))
+}
+
+func resolveEndpointMethod(ctx context.Context) string {
+	return strings.TrimSpace(internallogging.GetEndpointMethod(ctx))
+}
+
+func resolveEndpointPath(ctx context.Context) string {
+	return strings.TrimSpace(internallogging.GetEndpointPath(ctx))
 }
 
 const httpStatusBadRequest = 400

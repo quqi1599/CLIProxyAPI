@@ -15,6 +15,7 @@ import (
 func TestManager_Execute_LogsRequestExecutionSummary(t *testing.T) {
 	hook := logtest.NewGlobal()
 	hook.Reset()
+	t.Cleanup(hook.Reset)
 
 	previousLevel := log.GetLevel()
 	log.SetLevel(log.InfoLevel)
@@ -96,6 +97,88 @@ func TestManager_Execute_LogsRequestExecutionSummary(t *testing.T) {
 	}
 	if got := entry.Data["final_executor"]; got != "authFallbackExecutor" {
 		t.Fatalf("final_executor = %#v, want authFallbackExecutor", got)
+	}
+}
+
+func TestLogRequestExecutionSummaryTreatsFinal4xxAsFailure(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-400")
+	trace := &requestAttemptTrace{
+		requestID:      "req-summary-400",
+		attempts:       1,
+		maxAttempts:    1,
+		maxFallbacks:   0,
+		translatorRuns: 1,
+		finalStatus:    http.StatusBadRequest,
+		finalProvider:  "claude",
+		finalModel:     "MiniMax-M3",
+		finalExecutor:  "ClaudeExecutor",
+	}
+
+	logRequestExecutionSummary(ctx, trace, true, nil)
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["final_success"]; got != false {
+		t.Fatalf("final_success = %#v, want false", got)
+	}
+	if got := entry.Data["final_status"]; got != http.StatusBadRequest {
+		t.Fatalf("final_status = %#v, want %d", got, http.StatusBadRequest)
+	}
+	if got := entry.Data["final_error_type"]; got != "invalid_request_error" {
+		t.Fatalf("final_error_type = %#v, want invalid_request_error", got)
+	}
+	if got := entry.Data["final_error_code"]; got != "status_400" {
+		t.Fatalf("final_error_code = %#v, want status_400", got)
+	}
+}
+
+func TestLogRequestExecutionSummaryNormalizesContentSafetyError(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-sensitive")
+	trace := &requestAttemptTrace{
+		requestID:      "req-summary-sensitive",
+		attempts:       1,
+		maxAttempts:    1,
+		translatorRuns: 1,
+		finalStatus:    http.StatusInternalServerError,
+		finalProvider:  "openai-compatibility",
+		finalModel:     "MiniMax-M3-highspeed",
+		finalExecutor:  "OpenAICompatExecutor",
+	}
+	errSensitive := &Error{
+		Code:       "1026",
+		HTTPStatus: http.StatusInternalServerError,
+		Message:    miniMaxNewSensitiveMessage,
+	}
+
+	logRequestExecutionSummary(ctx, trace, false, errSensitive)
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["final_success"]; got != false {
+		t.Fatalf("final_success = %#v, want false", got)
+	}
+	if got := entry.Data["final_status"]; got != http.StatusBadRequest {
+		t.Fatalf("final_status = %#v, want %d", got, http.StatusBadRequest)
+	}
+	if got := entry.Data["final_error_type"]; got != "invalid_request_error" {
+		t.Fatalf("final_error_type = %#v, want invalid_request_error", got)
+	}
+	if got := entry.Data["final_error_code"]; got != "content_policy_violation" {
+		t.Fatalf("final_error_code = %#v, want content_policy_violation", got)
 	}
 }
 

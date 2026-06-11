@@ -162,6 +162,8 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 		"executor":                      meta.executor,
 		"request_path":                  meta.requestPath,
 		"compat_kind":                   meta.compatKind,
+		"compat_kind_source":            meta.compatKindSource,
+		"compat_mapping":                meta.compatMapping,
 		"time_to_first_chunk_ms":        record.TimeToFirstChunkMs,
 		"upstream_chunk_wait_ms":        record.UpstreamChunkWaitMs,
 		"upstream_chunk_wait_count":     record.UpstreamChunkWaitCount,

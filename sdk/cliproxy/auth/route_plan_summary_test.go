@@ -8,6 +8,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
@@ -217,6 +218,35 @@ func TestRoutePlanNormalizedReasoningEffort_RemappedDeepSeekIntentUsesFinalSuppo
 	got := routePlanNormalizedReasoningEffort(auth, "openai-compatibility", "deepseek-v4-pro[1m]", "claude_code", "generic-openai-model", "max")
 	if got != "high" {
 		t.Fatalf("routePlanNormalizedReasoningEffort() = %q, want high", got)
+	}
+}
+
+func TestBuildRoutePlanSummaryMarksDeepSeekV4ViaDoubaoMapping(t *testing.T) {
+	auth := &Auth{
+		ID:       "route-plan-doubao-deepseek",
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":    "https://ark.cn-beijing.volces.com/api/v3",
+			"compat_kind": "doubao",
+		},
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "deepseek-v4-pro[1m]",
+			cliproxyexecutor.RequestPathMetadataKey:    "/v1/messages",
+		},
+	}
+
+	plan := buildRoutePlanSummary(requestExecutionSummary{}, auth, "openai-compatibility", "deepseek-v4-pro[1m]", "deepseek-v4-pro", "deepseek-v4-pro", opts, nil, "execute", coreusage.RequestAttempt{})
+	if plan.CompatKind != "doubao" {
+		t.Fatalf("compat_kind = %q, want doubao", plan.CompatKind)
+	}
+	if plan.CompatKindSource != "auth_attribute:compat_kind" {
+		t.Fatalf("compat_kind_source = %q, want auth_attribute:compat_kind", plan.CompatKindSource)
+	}
+	if plan.CompatMapping != "deepseek_v4_via_doubao_volcengine" {
+		t.Fatalf("compat_mapping = %q, want deepseek_v4_via_doubao_volcengine", plan.CompatMapping)
 	}
 }
 

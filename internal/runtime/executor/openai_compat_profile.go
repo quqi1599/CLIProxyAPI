@@ -24,6 +24,7 @@ const openAICompatAccountQuotaRetryWait = 24 * time.Hour
 const openAICompatEmptyUpstreamResponseCode = "empty_upstream_response"
 const deepSeekThinkingBudgetMin = 100
 const deepSeekThinkingBudgetMax = 32768
+const xiaomiMimo25MaxTokens = 131072
 const doubaoSeed20MaxTemperature = 1.5
 const doubaoSeed20MaxCompletionTokens = 98304
 const kimiThinkingTemperature = 1.0
@@ -281,7 +282,11 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if compatKind == "kimi" {
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
+	doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
 	payload = scrubOpenAICompatPayload(payload, profile)
+	if compatKind == "doubao" {
+		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)
+	}
 	if profile.SystemMessagesAsUser {
 		payload = rewriteOpenAICompatSystemMessagesAsUser(payload)
 	}
@@ -542,7 +547,7 @@ func scrubDoubaoPayloadForModel(payload []byte, model string) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-	payload = scrubDoubaoUnsupportedOpenAIFields(payload)
+	payload = scrubDoubaoUnsupportedOpenAIFields(payload, model)
 	if !requiresDoubaoSeed20Compatibility(model) {
 		return payload
 	}
@@ -559,9 +564,61 @@ func scrubXiaomiPayloadForModel(payload []byte, model string) []byte {
 	}
 	payload = normalizeXiaomiThinkingConfig(payload)
 	payload = normalizeXiaomiThinkingHyperparameters(payload)
+	payload = normalizeXiaomiMimo25TokenFields(payload, model)
 	payload = normalizeOpenAICompatToolCallArguments(payload)
 	payload = scrubXiaomiToolSchemas(payload)
 	return payload
+}
+
+func normalizeXiaomiMimo25TokenFields(payload []byte, model string) []byte {
+	if !requiresXiaomiMimo25TokenClamp(model) {
+		return payload
+	}
+	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		tokens, ok := xiaomiTokenLimitValue(value)
+		if !ok {
+			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+				payload = updated
+			}
+			continue
+		}
+		if tokens < 1 {
+			tokens = 1
+		} else if tokens > xiaomiMimo25MaxTokens {
+			tokens = xiaomiMimo25MaxTokens
+		}
+		if updated, err := sjson.SetBytes(payload, path, tokens); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func requiresXiaomiMimo25TokenClamp(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
+		modelName = modelName[slash+1:]
+	}
+	return modelName == "mimo-v2.5-pro" || strings.HasPrefix(modelName, "mimo-v2.5-pro-")
+}
+
+func xiaomiTokenLimitValue(value gjson.Result) (int64, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return value.Int(), true
+	case gjson.String:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(value.String()), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func normalizeXiaomiThinkingConfig(payload []byte) []byte {
@@ -622,8 +679,8 @@ func requiresDoubaoSeed20Compatibility(model string) bool {
 	return strings.HasPrefix(modelName, "doubao-seed-2.0-")
 }
 
-func scrubDoubaoUnsupportedOpenAIFields(payload []byte) []byte {
-	for _, path := range []string{
+func scrubDoubaoUnsupportedOpenAIFields(payload []byte, model string) []byte {
+	unsupportedPaths := []string{
 		"user",
 		"response_format",
 		"store",
@@ -631,15 +688,121 @@ func scrubDoubaoUnsupportedOpenAIFields(payload []byte) []byte {
 		"parallel_tool_calls",
 		"stream_options",
 		"service_tier",
-		"reasoning",
 		"reasoning_effort",
-	} {
+		"thinking.reasoning_effort",
+		"thinking.budget_tokens",
+		"thinking_budget",
+		"thinking",
+		"output_config.effort",
+	}
+	if !isDoubaoDeepSeekReasoningModel(model) {
+		unsupportedPaths = append(unsupportedPaths, "reasoning")
+	}
+	for _, path := range unsupportedPaths {
 		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	if oc := gjson.GetBytes(payload, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+		if updated, err := sjson.DeleteBytes(payload, "output_config"); err == nil {
 			payload = updated
 		}
 	}
 	payload = deleteMessageReasoningContent(payload)
 	return payload
+}
+
+func doubaoDeepSeekReasoningIntent(payload []byte, model string) (string, bool) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !isDoubaoDeepSeekReasoningModel(model) {
+		return "", false
+	}
+	for _, path := range []string{"reasoning.effort", "reasoning_effort", "thinking.reasoning_effort", "output_config.effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		normalized, disabled := normalizeDoubaoDeepSeekReasoningEffort(value.String())
+		if disabled || normalized != "" {
+			return normalized, disabled
+		}
+	}
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	switch thinkingType {
+	case "disabled", "none", "off", "false", "disable":
+		return "", true
+	case "enabled", "adaptive", "auto", "true", "enable":
+		return "high", false
+	}
+	for _, path := range []string{"thinking.budget_tokens", "thinking_budget"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		if budget, ok := deepSeekThinkingBudgetValue(value); ok {
+			if budget <= 0 {
+				return "", true
+			}
+			return "high", false
+		}
+	}
+	return "", false
+}
+
+func applyDoubaoDeepSeekReasoningIntent(payload []byte, model, effort string, disabled bool) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !isDoubaoDeepSeekReasoningModel(model) {
+		return payload
+	}
+	if disabled {
+		for _, path := range []string{
+			"reasoning",
+			"reasoning_effort",
+			"thinking",
+			"thinking_budget",
+			"output_config.effort",
+		} {
+			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+				payload = updated
+			}
+		}
+		if oc := gjson.GetBytes(payload, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+			if updated, err := sjson.DeleteBytes(payload, "output_config"); err == nil {
+				payload = updated
+			}
+		}
+		return payload
+	}
+	effort, disabled = normalizeDoubaoDeepSeekReasoningEffort(effort)
+	if disabled || effort == "" {
+		return payload
+	}
+	updated, err := sjson.SetBytes(payload, "reasoning.effort", effort)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func normalizeDoubaoDeepSeekReasoningEffort(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "default":
+		return "", false
+	case "none", "off", "disabled", "disable", "false":
+		return "", true
+	case "minimal", "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(raw)), false
+	case "auto", "adaptive", "enabled", "enable", "true", "xhigh", "max":
+		return "high", false
+	default:
+		return "", false
+	}
+}
+
+func isDoubaoDeepSeekReasoningModel(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
+		modelName = modelName[slash+1:]
+	}
+	return strings.HasPrefix(modelName, "deepseek-v4") || strings.Contains(modelName, "deepseek-r1")
 }
 
 func normalizeDoubaoSeed20Temperature(payload []byte) []byte {
@@ -929,6 +1092,8 @@ type openAICompatPayloadDiagnostic struct {
 	AuthID            string
 	AuthLabel         string
 	CompatName        string
+	CompatKindSource  string
+	CompatMapping     string
 	PayloadSize       int
 	PayloadFields     []string
 	AddedFields       []string
@@ -953,6 +1118,8 @@ func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompat
 		ModifiedFields:    sortedModifiedFields(beforeFields, afterFields),
 		UpstreamRequestID: firstHeaderValue(responseHeaders, "X-Tt-Logid", "X-Volc-Request-Id", "X-Request-Id", "X-Request-ID", "X-Requestid", "Request-Id"),
 	}
+	diag.CompatKindSource = openAICompatKindSource(profile, auth)
+	diag.CompatMapping = openAICompatMapping(profile, model)
 	if auth != nil {
 		diag.AuthID = strings.TrimSpace(auth.ID)
 		diag.AuthLabel = strings.TrimSpace(auth.Label)
@@ -961,6 +1128,33 @@ func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompat
 		}
 	}
 	return diag
+}
+
+func openAICompatKindSource(profile openAICompatProfile, auth *cliproxyauth.Auth) string {
+	kind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
+	if kind == "" {
+		return ""
+	}
+	if auth != nil && auth.Attributes != nil {
+		if attrKind := config.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); attrKind == kind {
+			return "auth_attribute:compat_kind"
+		}
+		if inferred := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); inferred == kind {
+			return "base_url_inference"
+		}
+	}
+	return "compat_config"
+}
+
+func openAICompatMapping(profile openAICompatProfile, model string) string {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "doubao" {
+		return ""
+	}
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if strings.HasPrefix(modelName, "deepseek-v4-pro") || strings.HasPrefix(modelName, "deepseek-v4-flash") {
+		return "deepseek_v4_via_doubao_volcengine"
+	}
+	return ""
 }
 
 func (d openAICompatPayloadDiagnostic) relevant() bool {
@@ -2690,10 +2884,12 @@ func containsAny(message string, patterns ...string) bool {
 
 func logOpenAICompatUpstreamError(profile openAICompatProfile, auth *cliproxyauth.Auth, routeModel string, statusCode int, retryAfter *time.Duration, contentType string, body []byte) {
 	entry := log.WithFields(log.Fields{
-		"provider":    profile.KindOrFallback(auth),
-		"compat_kind": profile.Kind,
-		"model":       strings.TrimSpace(routeModel),
-		"status":      statusCode,
+		"provider":           profile.KindOrFallback(auth),
+		"compat_kind":        profile.Kind,
+		"compat_kind_source": openAICompatKindSource(profile, auth),
+		"compat_mapping":     openAICompatMapping(profile, routeModel),
+		"model":              strings.TrimSpace(routeModel),
+		"status":             statusCode,
 	})
 	if auth != nil {
 		if authID := strings.TrimSpace(auth.ID); authID != "" {

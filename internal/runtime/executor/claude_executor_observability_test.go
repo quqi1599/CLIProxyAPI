@@ -2,9 +2,12 @@ package executor
 
 import (
 	"context"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
@@ -109,6 +112,81 @@ func TestRepairClaudeToolUseHistoryWithLog_EmitsAggregatedFieldsOnly(t *testing.
 	}
 }
 
+func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+
+	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}]}`)
+	meta := compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M3",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "minimax",
+		messageCount:   546,
+		toolCount:      490,
+		toolShape: coreusage.ToolShape{
+			DeclaredToolCount: 78,
+			InteractionCount:  490,
+			MCPToolCount:      54,
+		},
+	}
+	ctx := logging.WithRequestID(context.Background(), "req-large-tool-history")
+
+	err := rejectLargeClaudeCompatToolHistory(ctx, body, meta, claudeCompatPreflight{hasToolUse: true})
+	if err == nil {
+		t.Fatal("expected large tool history rejection, got nil")
+	}
+	se, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("error type = %T, want statusErr", err)
+	}
+	if se.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", se.StatusCode(), http.StatusBadRequest)
+	}
+	if !strings.Contains(err.Error(), "large_claude_tool_history") {
+		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
+	}
+
+	entry := findCompatRepairGuardEntry(t, hook.AllEntries())
+	if got := entry.Data["request_id"]; got != "req-large-tool-history" {
+		t.Fatalf("request_id = %#v, want req-large-tool-history", got)
+	}
+	if got := entry.Data["event"]; got != "compat_repair_guard" {
+		t.Fatalf("event = %#v, want compat_repair_guard", got)
+	}
+	if got := entry.Data["reason"]; got != "message_tool_history" {
+		t.Fatalf("reason = %#v, want message_tool_history", got)
+	}
+	if got := entry.Data["message_count"]; got != 546 {
+		t.Fatalf("message_count = %#v, want 546", got)
+	}
+	if got := entry.Data["tool_interaction_count"]; got != 490 {
+		t.Fatalf("tool_interaction_count = %#v, want 490", got)
+	}
+	if _, exists := entry.Data["payload"]; exists {
+		t.Fatal("unexpected raw payload field logged")
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_AllowsSmallToolHistory(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}]}`)
+	meta := compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M3",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "minimax",
+		messageCount:   20,
+		toolCount:      8,
+	}
+	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, claudeCompatPreflight{hasToolUse: true}); err != nil {
+		t.Fatalf("unexpected rejection for small tool history: %v", err)
+	}
+}
+
 func findCompatRepairEntry(t *testing.T, entries []*log.Entry, repairType string) *log.Entry {
 	t.Helper()
 	for i := len(entries) - 1; i >= 0; i-- {
@@ -121,5 +199,20 @@ func findCompatRepairEntry(t *testing.T, entries []*log.Entry, repairType string
 		}
 	}
 	t.Fatalf("compat_repair log entry not found for %s", repairType)
+	return nil
+}
+
+func findCompatRepairGuardEntry(t *testing.T, entries []*log.Entry) *log.Entry {
+	t.Helper()
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if entry == nil {
+			continue
+		}
+		if entry.Data["event"] == "compat_repair_guard" {
+			return entry
+		}
+	}
+	t.Fatal("compat_repair_guard log entry not found")
 	return nil
 }

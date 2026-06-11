@@ -3732,6 +3732,65 @@ func TestDeepSeekClaudeCompatNormalizesThinkingBudgetByModelName(t *testing.T) {
 	}
 }
 
+func TestDoubaoClaudeDeepSeekThinkingClampsUnsupportedEffort(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"reasoning_effort":"xhigh",
+		"thinking":{"type":"enabled","budget_tokens":99999},
+		"output_config":{"effort":"max"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	out := scrubDoubaoClaudeDeepSeekThinkingForCompat(payload, "deepseek-v4-pro", "doubao")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+		t.Fatalf("output_config.effort = %q, want high: %s", got, string(out))
+	}
+	for _, path := range []string{
+		"reasoning",
+		"reasoning_effort",
+		"thinking.reasoning_effort",
+		"thinking.budget_tokens",
+		"thinking_budget",
+	} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be removed for doubao Claude DeepSeek compat: %s", path, string(out))
+		}
+	}
+}
+
+func TestSanitizeClaudeHTTPRequestToolNames_NormalizesDoubaoDeepSeekThinking(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"model":"deepseek-v4-pro","reasoning_effort":"xhigh","thinking":{"type":"enabled","budget_tokens":"50"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "https://ark.cn-beijing.volces.com/api/v3/v1/messages?beta=true", strings.NewReader(payload))
+
+	if _, err := sanitizeClaudeHTTPRequestToolNames(req); err != nil {
+		t.Fatalf("sanitizeClaudeHTTPRequestToolNames() error = %v", err)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive: %s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "output_config.effort").String(); got != "high" {
+		t.Fatalf("output_config.effort = %q, want high: %s", got, string(body))
+	}
+	if gjson.GetBytes(body, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed: %s", string(body))
+	}
+	if gjson.GetBytes(body, "thinking.budget_tokens").Exists() {
+		t.Fatalf("thinking.budget_tokens should be removed: %s", string(body))
+	}
+}
+
 func TestSanitizeClaudeHTTPRequestToolNames_DowngradesDeepSeekAnthropicBody(t *testing.T) {
 	t.Parallel()
 

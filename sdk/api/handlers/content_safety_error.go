@@ -9,18 +9,21 @@ import (
 )
 
 const (
-	contentPolicyViolationErrorCode = "content_policy_violation"
-	contentSafetyInputDirection     = "input"
-	contentSafetyOutputDirection    = "output"
+	contentPolicyViolationErrorCode  = "content_policy_violation"
+	contentSafetyInputDirection      = "input"
+	contentSafetyInputImageDirection = "input_image"
+	contentSafetyOutputDirection     = "output"
 )
 
 // UserFacingContentSafetyMessage returns a deterministic message for upstream safety rejections.
 func UserFacingContentSafetyMessage(direction string) string {
 	switch direction {
+	case contentSafetyInputImageDirection:
+		return "有敏感内容，请勿重复尝试。系统已拦截本次请求，检测类型：输入图片或多模态内容触发内容安全策略。请替换、移除或改写相关内容后再提交；重复提交相同内容不会提高成功率，只会继续被拦截。"
 	case contentSafetyOutputDirection:
-		return "生成内容触发安全策略，请勿重复请求。请修改提示词后再请求。"
+		return "有敏感内容，请勿重复尝试。系统已拦截本次请求，检测类型：模型输出触发内容安全策略。请调整提示词或降低敏感表达后重新提交；重复提交相同内容不会提高成功率，只会继续被拦截。"
 	default:
-		return "有敏感内容，请勿重复请求。请修改内容后再请求。"
+		return "有敏感内容，请勿重复尝试。系统已拦截本次请求，检测类型：输入内容触发内容安全策略。请删除或改写相关敏感内容后再提交；重复提交相同内容不会提高成功率，只会继续被拦截。"
 	}
 }
 
@@ -106,12 +109,18 @@ func contentSafetySignalDirection(text string) (string, bool) {
 	}
 
 	if strings.Contains(lower, "input new_sensitive") {
+		if isInputImageContentSafetyText(lower) {
+			return contentSafetyInputImageDirection, true
+		}
 		return contentSafetyInputDirection, true
 	}
 	if strings.Contains(lower, "output new_sensitive") {
 		return contentSafetyOutputDirection, true
 	}
 	if strings.Contains(lower, "new_sensitive") && strings.Contains(lower, "1026") {
+		if isInputImageContentSafetyText(lower) {
+			return contentSafetyInputImageDirection, true
+		}
 		return contentSafetyInputDirection, true
 	}
 	if strings.Contains(lower, "new_sensitive") && strings.Contains(lower, "1027") {
@@ -120,7 +129,36 @@ func contentSafetySignalDirection(text string) (string, bool) {
 	if isContentSafety1301Text(lower) {
 		return contentSafetyInputDirection, true
 	}
+	if isGenericContentSafetyText(lower) {
+		return contentSafetyInputDirection, true
+	}
 	return "", false
+}
+
+func isInputImageContentSafetyText(lower string) bool {
+	return strings.Contains(lower, "image is sensitive") ||
+		strings.Contains(lower, "image content is sensitive") ||
+		(strings.Contains(lower, "content[") && strings.Contains(lower, "image") && strings.Contains(lower, "sensitive")) ||
+		(strings.Contains(lower, "image") && strings.Contains(lower, "new_sensitive") && strings.Contains(lower, "1026"))
+}
+
+func isGenericContentSafetyText(lower string) bool {
+	if strings.Contains(lower, "content_policy_violation") {
+		return true
+	}
+	if strings.Contains(lower, "有敏感内容") ||
+		strings.Contains(lower, "敏感内容，请勿重复") ||
+		(strings.Contains(lower, "敏感内容") && strings.Contains(lower, "请勿重复")) ||
+		(strings.Contains(lower, "敏感") && strings.Contains(lower, "请勿重复请求")) ||
+		(strings.Contains(lower, "敏感") && strings.Contains(lower, "请勿重复尝试")) {
+		return true
+	}
+	if strings.Contains(lower, "内容安全") ||
+		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "触发")) ||
+		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "拦截")) {
+		return true
+	}
+	return false
 }
 
 func isContentSafety1301Text(lower string) bool {

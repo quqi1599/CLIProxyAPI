@@ -27,6 +27,7 @@ const miniMaxNewSensitiveMessage = "server_error: input new_sensitive, messages[
 const miniMaxOutputNewSensitiveMessage = "server_error: output new_sensitive, generated content is sensitive, please check your input (1027)"
 const miniMaxUnknown1000Message = "server_error: unknown error, 999 (1000)"
 const zhipuContentSafety1301Message = "claude executor: upstream returned error event: [1301] content violates safety policy"
+const genericChineseContentSafetyMessage = "status_code=400, 有敏感内容，请勿重复请求"
 
 func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testing.T) {
 	m := NewManager(nil, nil, nil)
@@ -2243,6 +2244,250 @@ func TestManager_RequestScopedFeatureUnsupportedBadRequest_FallsBackWithoutSuspe
 	}
 }
 
+func TestManager_LargeClaudeCompatToolHistoryBadRequest_DoesNotFallbackOrSuspendAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-sonnet-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected large tool history request error, got nil")
+	}
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusBadRequest)
+	}
+	if !strings.Contains(errExecute.Error(), "large_claude_tool_history") {
+		t.Fatalf("error = %q, want large_claude_tool_history marker", errExecute.Error())
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected large tool history request error to avoid model suspension, got state=%+v", *state)
+	}
+}
+
+func TestManager_InvalidParameterBadRequest_DoesNotFallbackOrSuspendAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				Code:       "InvalidParameter",
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "InvalidParameter: reasoning_effort xhigh is not supported",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "deepseek-v4-pro"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected InvalidParameter request error, got nil")
+	}
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusBadRequest)
+	}
+	if !strings.Contains(strings.ToLower(errExecute.Error()), "invalidparameter") {
+		t.Fatalf("error = %q, want InvalidParameter marker", errExecute.Error())
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatal("InvalidParameter request error should not make auth unavailable")
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected InvalidParameter request error to avoid model suspension, got state=%+v", *state)
+	}
+}
+
+func TestManager_ParameterRangeBadRequest_DoesNotFallbackOrSuspendAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "openai-compatibility",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				Code:       "bad_request_error",
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "invalid params, max_tokens 384000 is out of supported range (0, 131072]",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "mimo-v2.5-pro"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "openai-compatibility"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "openai-compatibility"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "openai-compatibility", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "openai-compatibility", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	_, errExecute := m.Execute(context.Background(), []string{"openai-compatibility"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected parameter range request error, got nil")
+	}
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusBadRequest)
+	}
+	if !strings.Contains(strings.ToLower(errExecute.Error()), "out of supported range") {
+		t.Fatalf("error = %q, want supported range marker", errExecute.Error())
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatal("parameter range request error should not make auth unavailable")
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected parameter range request error to avoid model suspension, got state=%+v", *state)
+	}
+}
+
+func TestManagerExecuteStream_LargeClaudeCompatToolHistoryBadRequest_DoesNotFallbackOrSuspendAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamFirstErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-sonnet-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		if streamResult != nil && streamResult.Chunks != nil {
+			for range streamResult.Chunks {
+			}
+		}
+		t.Fatal("expected large tool history stream setup error, got nil")
+	}
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("stream status = %d, want %d", statusCodeFromError(errExecute), http.StatusBadRequest)
+	}
+	if !strings.Contains(errExecute.Error(), "large_claude_tool_history") {
+		t.Fatalf("stream error = %q, want large_claude_tool_history marker", errExecute.Error())
+	}
+
+	got := executor.StreamCalls()
+	want := []string{badAuth.ID}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected large tool history stream error to avoid model suspension, got state=%+v", *state)
+	}
+}
+
 func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
@@ -2573,6 +2818,11 @@ func TestManager_MarkResult_RequestScopedContentSafetyDoesNotCooldownAuth(t *tes
 			httpStatus: http.StatusBadGateway,
 			message:    zhipuContentSafety1301Message,
 		},
+		{
+			name:       "generic chinese sensitive content bad request",
+			httpStatus: http.StatusBadRequest,
+			message:    genericChineseContentSafetyMessage,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2649,6 +2899,11 @@ func TestRequestScopedContentSafetyStopsRetry(t *testing.T) {
 			httpStatus: http.StatusBadGateway,
 			message:    zhipuContentSafety1301Message,
 		},
+		{
+			name:       "generic chinese sensitive content bad request",
+			httpStatus: http.StatusBadRequest,
+			message:    genericChineseContentSafetyMessage,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2711,13 +2966,29 @@ func TestContentSafety1301DoesNotFallbackForConfiguredRouteModels(t *testing.T) 
 	}
 }
 
-func TestManager_Execute_ClaudeSonnetAliasContentSafetyFallsBack(t *testing.T) {
+func TestGenericChineseContentSafetyDoesNotFallbackForConfiguredRouteModels(t *testing.T) {
+	err := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    genericChineseContentSafetyMessage,
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected generic chinese content safety to be request invalid")
+	}
+	for _, model := range []string{"claude-sonnet-4-6", "glm-4.7", "MiniMax-M3-highspeed", "MiniMax-M2.7-highspeed"} {
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected generic chinese content safety to stop fallback for %s", model)
+		}
+	}
+}
+
+func TestManager_Execute_ClaudeSonnetAliasContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
 		executeErrors: map[string]error{
 			"aa-blocked-auth": &Error{
-				Message: "status_code=451, " + requestScopedContentBlockedMessage,
+				HTTPStatus: http.StatusUnavailableForLegalReasons,
+				Message:    "status_code=451, " + requestScopedContentBlockedMessage,
 			},
 		},
 	}
@@ -2742,15 +3013,15 @@ func TestManager_Execute_ClaudeSonnetAliasContentSafetyFallsBack(t *testing.T) {
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected content safety error")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
 	}
 	got := executor.ExecuteCalls()
-	want := []string{blockedAuth.ID, goodAuth.ID}
+	want := []string{blockedAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -2765,14 +3036,14 @@ func TestManager_Execute_ClaudeSonnetAliasContentSafetyFallsBack(t *testing.T) {
 		t.Fatalf("expected blocked auth to remain registered")
 	}
 	if updatedBlocked.Unavailable {
-		t.Fatalf("expected content safety fallback to keep blocked auth available")
+		t.Fatalf("expected content safety stop to keep blocked auth available")
 	}
 	if state := updatedBlocked.ModelStates[model]; state != nil {
-		t.Fatalf("expected content safety fallback to avoid model cooldown state, got %#v", state)
+		t.Fatalf("expected content safety stop to avoid model cooldown state, got %#v", state)
 	}
 }
 
-func TestManager_Execute_ClaudeSonnetAliasContentSafetyIgnoresCredentialLimit(t *testing.T) {
+func TestManager_Execute_ClaudeSonnetAliasContentSafetyStopsBeforeCredentialLimit(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(0, 0, 1)
 	executor := &authFallbackExecutor{
@@ -2815,15 +3086,15 @@ func TestManager_Execute_ClaudeSonnetAliasContentSafetyIgnoresCredentialLimit(t 
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected content safety error")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
 	}
 	got := executor.ExecuteCalls()
-	want := []string{blockedAuthA.ID, blockedAuthB.ID, goodAuth.ID}
+	want := []string{blockedAuthA.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -2834,7 +3105,7 @@ func TestManager_Execute_ClaudeSonnetAliasContentSafetyIgnoresCredentialLimit(t 
 	}
 }
 
-func TestManager_Execute_ClaudeSonnetAliasMetadataContentSafetyFallsBack(t *testing.T) {
+func TestManager_Execute_ClaudeSonnetAliasMetadataContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
@@ -2866,19 +3137,19 @@ func TestManager_Execute_ClaudeSonnetAliasMetadataContentSafetyFallsBack(t *test
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: routeModel}, cliproxyexecutor.Options{
 		Metadata: map[string]any{
 			cliproxyexecutor.RequestedModelMetadataKey: "claude-sonnet-4-6",
 		},
 	})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
+	if errExecute == nil {
+		t.Fatal("expected content safety error")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
 	}
 	got := executor.ExecuteCalls()
-	want := []string{blockedAuth.ID, goodAuth.ID}
+	want := []string{blockedAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -3285,7 +3556,7 @@ func TestManager_Execute_GLMAliasMetadataContentSafety1301Stops(t *testing.T) {
 	}
 }
 
-func TestManager_ExecuteCount_ClaudeSonnetAliasContentSafetyFallsBack(t *testing.T) {
+func TestManager_ExecuteCount_ClaudeSonnetAliasContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
@@ -3317,15 +3588,15 @@ func TestManager_ExecuteCount_ClaudeSonnetAliasContentSafetyFallsBack(t *testing
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute count error = %v, want success", errExecute)
+	_, errExecute := m.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected content safety error")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("execute count payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
 	}
 	got := executor.CountCalls()
-	want := []string{blockedAuth.ID, goodAuth.ID}
+	want := []string{blockedAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("count calls = %v, want %v", got, want)
 	}
@@ -3336,7 +3607,7 @@ func TestManager_ExecuteCount_ClaudeSonnetAliasContentSafetyFallsBack(t *testing
 	}
 }
 
-func TestManager_ExecuteStream_ClaudeSonnetAliasContentSafetyFallsBack(t *testing.T) {
+func TestManager_ExecuteStream_ClaudeSonnetAliasContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
@@ -3368,22 +3639,15 @@ func TestManager_ExecuteStream_ClaudeSonnetAliasContentSafetyFallsBack(t *testin
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute stream error = %v, want success", errExecute)
+	_, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected content safety error")
 	}
-	var payload []byte
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("execute stream chunk error = %v, want success", chunk.Err)
-		}
-		payload = append(payload, chunk.Payload...)
-	}
-	if string(payload) != goodAuth.ID {
-		t.Fatalf("execute stream payload = %q, want %q", string(payload), goodAuth.ID)
+	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
 	}
 	got := executor.StreamCalls()
-	want := []string{blockedAuth.ID, goodAuth.ID}
+	want := []string{blockedAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("stream calls = %v, want %v", got, want)
 	}

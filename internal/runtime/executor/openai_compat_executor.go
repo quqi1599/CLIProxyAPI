@@ -200,13 +200,15 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 		diagnostic.UpstreamRequestID = firstHeaderValue(headers, "X-Tt-Logid", "X-Volc-Request-Id", "X-Request-Id", "X-Request-ID", "X-Requestid", "Request-Id")
 	}
 	fields := log.Fields{
-		"event":         "compatibility_diagnostic",
-		"provider":      "openai-compatibility",
-		"compat_kind":   diagnostic.CompatKind,
-		"model":         diagnostic.Model,
-		"endpoint":      diagnostic.Endpoint,
-		"payload_bytes": diagnostic.PayloadSize,
-		"status":        statusCode,
+		"event":              "compatibility_diagnostic",
+		"provider":           "openai-compatibility",
+		"compat_kind":        diagnostic.CompatKind,
+		"compat_kind_source": diagnostic.CompatKindSource,
+		"compat_mapping":     diagnostic.CompatMapping,
+		"model":              diagnostic.Model,
+		"endpoint":           diagnostic.Endpoint,
+		"payload_bytes":      diagnostic.PayloadSize,
+		"status":             statusCode,
 	}
 	if diagnostic.RequestPath != "" {
 		fields["request_path"] = diagnostic.RequestPath

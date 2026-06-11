@@ -252,6 +252,9 @@ func TestOpenAICompatExecutorDoubaoLogsCompatibilityDiagnosticOn400(t *testing.T
 	if got := entry.Data["compat_kind"]; got != "doubao" {
 		t.Fatalf("compat_kind = %#v, want doubao", got)
 	}
+	if got := entry.Data["compat_kind_source"]; got != "auth_attribute:compat_kind" {
+		t.Fatalf("compat_kind_source = %#v, want auth_attribute:compat_kind", got)
+	}
 	if got := entry.Data["channel"]; got != "3" {
 		t.Fatalf("channel = %#v, want 3", got)
 	}
