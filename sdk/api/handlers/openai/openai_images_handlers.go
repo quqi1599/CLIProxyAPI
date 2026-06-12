@@ -420,6 +420,48 @@ func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, strea
 	return payload
 }
 
+func buildOpenAICompatImagesEditJSONRequestFromMultipart(form *multipart.Form, imageModel string, prompt string, images []string, mask string, stream bool) []byte {
+	payload := []byte(`{"model":"","prompt":""}`)
+	payload, _ = sjson.SetBytes(payload, "model", imageModel)
+	payload, _ = sjson.SetBytes(payload, "prompt", prompt)
+	for _, img := range images {
+		if strings.TrimSpace(img) == "" {
+			continue
+		}
+		part := []byte(`{"image_url":""}`)
+		part, _ = sjson.SetBytes(part, "image_url", img)
+		payload, _ = sjson.SetRawBytes(payload, "images.-1", part)
+	}
+	if strings.TrimSpace(mask) != "" {
+		payload, _ = sjson.SetBytes(payload, "mask.image_url", mask)
+	}
+	if form != nil {
+		for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation", "response_format"} {
+			if value := openAICompatImagesFormValue(form, field); value != "" {
+				payload, _ = sjson.SetBytes(payload, field, value)
+			}
+		}
+		for _, field := range []string{"output_compression", "partial_images"} {
+			if value := openAICompatImagesFormValue(form, field); value != "" {
+				if parsed, errParse := strconv.ParseInt(value, 10, 64); errParse == nil {
+					payload, _ = sjson.SetBytes(payload, field, parsed)
+				}
+			}
+		}
+	}
+	if stream {
+		payload, _ = sjson.SetBytes(payload, "stream", true)
+	}
+	return payload
+}
+
+func openAICompatImagesFormValue(form *multipart.Form, key string) string {
+	if form == nil || len(form.Value[key]) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(form.Value[key][0])
+}
+
 var openAICompatImagesToolControlFields = []string{
 	"tool_choice",
 	"tools",
@@ -771,17 +813,22 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	if isDefaultImagesToolModel(imageModel) {
-		imageReq, contentType, errBuild := buildOpenAICompatImagesMultipartRequest(form, imageModel, stream)
-		if errBuild != nil {
-			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-				Error: handlers.ErrorDetail{
-					Message: fmt.Sprintf("Invalid request: %v", errBuild),
-					Type:    "invalid_request_error",
-				},
-			})
-			return
+		mask := ""
+		if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+			dataURL, errData := multipartFileToDataURL(maskFiles[0])
+			if errData != nil {
+				c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+					Error: handlers.ErrorDetail{
+						Message: fmt.Sprintf("Invalid request: %v", errData),
+						Type:    "invalid_request_error",
+					},
+				})
+				return
+			}
+			mask = dataURL
 		}
-		c.Request.Header.Set("Content-Type", contentType)
+		imageReq := buildOpenAICompatImagesEditJSONRequestFromMultipart(form, imageModel, prompt, images, mask, stream)
+		c.Request.Header.Set("Content-Type", "application/json")
 		h.handleRoutedImages(c, imageReq, imageModel, stream)
 		return
 	}

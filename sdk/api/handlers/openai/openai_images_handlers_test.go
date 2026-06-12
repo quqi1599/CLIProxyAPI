@@ -182,6 +182,43 @@ func TestBuildOpenAICompatImagesJSONRequestDropsToolControlFields(t *testing.T) 
 	}
 }
 
+func TestBuildOpenAICompatImagesEditJSONRequestFromMultipartDropsToolControlFields(t *testing.T) {
+	form := &multipart.Form{
+		Value: map[string][]string{
+			"size":                {"1024x1024"},
+			"quality":             {"high"},
+			"response_format":     {"url"},
+			"output_compression":  {"80"},
+			"tool_choice":         {`{"type":"image_generation"}`},
+			"tools[0][type]":      {"image_generation"},
+			"parallel_tool_calls": {"true"},
+		},
+	}
+
+	req := buildOpenAICompatImagesEditJSONRequestFromMultipart(form, "gpt-image-2", "edit it", []string{"data:image/png;base64,AA=="}, "data:image/png;base64,BB==", false)
+
+	if got := gjson.GetBytes(req, "model").String(); got != "gpt-image-2" {
+		t.Fatalf("model = %q, want gpt-image-2; body=%s", got, string(req))
+	}
+	if got := gjson.GetBytes(req, "prompt").String(); got != "edit it" {
+		t.Fatalf("prompt = %q, want edit it; body=%s", got, string(req))
+	}
+	if got := gjson.GetBytes(req, "images.0.image_url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("image url = %q; body=%s", got, string(req))
+	}
+	if got := gjson.GetBytes(req, "mask.image_url").String(); got != "data:image/png;base64,BB==" {
+		t.Fatalf("mask url = %q; body=%s", got, string(req))
+	}
+	if got := gjson.GetBytes(req, "output_compression").Int(); got != 80 {
+		t.Fatalf("output_compression = %d, want 80; body=%s", got, string(req))
+	}
+	for _, field := range []string{"tool_choice", "tools", "parallel_tool_calls", "tools[0][type]"} {
+		if gjson.GetBytes(req, field).Exists() {
+			t.Fatalf("%s should be removed from images edit request: %s", field, string(req))
+		}
+	}
+}
+
 func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentType(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
