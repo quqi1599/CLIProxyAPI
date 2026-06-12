@@ -406,6 +406,9 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 
 func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, stream bool) []byte {
 	payload := rawJSON
+	for _, field := range openAICompatImagesToolControlFields {
+		payload, _ = sjson.DeleteBytes(payload, field)
+	}
 	if model := strings.TrimSpace(imageModel); model != "" {
 		payload, _ = sjson.SetBytes(payload, "model", model)
 	}
@@ -415,6 +418,22 @@ func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, strea
 		payload, _ = sjson.DeleteBytes(payload, "stream")
 	}
 	return payload
+}
+
+var openAICompatImagesToolControlFields = []string{
+	"tool_choice",
+	"tools",
+	"parallel_tool_calls",
+}
+
+func isOpenAICompatImagesToolControlField(key string) bool {
+	key = strings.TrimSpace(strings.ToLower(key))
+	for _, field := range openAICompatImagesToolControlFields {
+		if key == field || strings.HasPrefix(key, field+".") || strings.HasPrefix(key, field+"[") {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneMIMEHeader(src textproto.MIMEHeader) textproto.MIMEHeader {
@@ -442,6 +461,9 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 	}
 	for key, values := range form.Value {
 		if key == "model" || key == "stream" {
+			continue
+		}
+		if isOpenAICompatImagesToolControlField(key) {
 			continue
 		}
 		for _, value := range values {

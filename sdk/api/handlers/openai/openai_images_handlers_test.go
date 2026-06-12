@@ -166,6 +166,22 @@ func TestBuildOpenAICompatImagesJSONRequestDropsStreamForNonStreaming(t *testing
 	}
 }
 
+func TestBuildOpenAICompatImagesJSONRequestDropsToolControlFields(t *testing.T) {
+	req := buildOpenAICompatImagesJSONRequest([]byte(`{"model":"compat-image","prompt":"draw","tool_choice":{"type":"image_generation"},"tools":[{"type":"image_generation"}],"parallel_tool_calls":true}`), "upstream-image", false)
+
+	if got := gjson.GetBytes(req, "model").String(); got != "upstream-image" {
+		t.Fatalf("model = %q, want upstream-image; body=%s", got, string(req))
+	}
+	if got := gjson.GetBytes(req, "prompt").String(); got != "draw" {
+		t.Fatalf("prompt = %q, want draw; body=%s", got, string(req))
+	}
+	for _, field := range openAICompatImagesToolControlFields {
+		if gjson.GetBytes(req, field).Exists() {
+			t.Fatalf("%s should be removed from images request: %s", field, string(req))
+		}
+	}
+}
+
 func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentType(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -177,6 +193,15 @@ func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentTyp
 	}
 	if errWrite := writer.WriteField("prompt", "edit"); errWrite != nil {
 		t.Fatalf("write prompt field: %v", errWrite)
+	}
+	if errWrite := writer.WriteField("tool_choice", `{"type":"image_generation"}`); errWrite != nil {
+		t.Fatalf("write tool_choice field: %v", errWrite)
+	}
+	if errWrite := writer.WriteField("tools[0][type]", "image_generation"); errWrite != nil {
+		t.Fatalf("write tools field: %v", errWrite)
+	}
+	if errWrite := writer.WriteField("parallel_tool_calls", "true"); errWrite != nil {
+		t.Fatalf("write parallel_tool_calls field: %v", errWrite)
 	}
 	header := make(textproto.MIMEHeader)
 	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "image.png"))
@@ -232,6 +257,11 @@ func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentTyp
 	}
 	if got := rewrittenForm.Value["prompt"]; len(got) != 1 || got[0] != "edit" {
 		t.Fatalf("prompt values = %#v, want edit", got)
+	}
+	for _, field := range []string{"tool_choice", "tools[0][type]", "parallel_tool_calls"} {
+		if got := rewrittenForm.Value[field]; len(got) != 0 {
+			t.Fatalf("%s values = %#v, want removed", field, got)
+		}
 	}
 	if got := rewrittenForm.File["image"]; len(got) != 1 || got[0].Header.Get("Content-Type") != "image/png" {
 		t.Fatalf("image headers = %#v, want image/png", got)
