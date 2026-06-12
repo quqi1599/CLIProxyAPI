@@ -148,6 +148,17 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 	if !strings.Contains(err.Error(), "large_claude_tool_history") {
 		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
 	}
+	for _, want := range []string{
+		"too many prior tool calls",
+		"not a channel outage",
+		"Start a new conversation",
+		"summarize or compress",
+		"native Claude route",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	}
 
 	entry := findCompatRepairGuardEntry(t, hook.AllEntries())
 	if got := entry.Data["request_id"]; got != "req-large-tool-history" {

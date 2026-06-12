@@ -1149,7 +1149,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	if strings.EqualFold(routeModelBaseName(baseModel), "gpt-image-2") && !allowImageModel {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", routeModelBaseName(baseModel)),
+			Error:      errors.New(imageModelEndpointHelpMessage(routeModelBaseName(baseModel))),
 		}
 	}
 
@@ -1184,6 +1184,14 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func imageModelEndpointHelpMessage(modelName string) string {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		modelName = "this image model"
+	}
+	return fmt.Sprintf("%s is an image model and cannot be called through text endpoints such as /v1/chat/completions, /v1/responses, or /v1/messages. To fix the URL, keep your normal /v1 base_url and change the endpoint path: for image generation use POST /v1/images/generations with model=%s and prompt; for image edit/reference-image tasks use POST /v1/images/edits with multipart/form-data, model=%s, prompt, and image file(s). If your base_url is already https://your-domain/v1, call https://your-domain/v1/images/generations or https://your-domain/v1/images/edits, not the chat/messages/responses URL.", modelName, modelName, modelName)
 }
 
 func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []string {

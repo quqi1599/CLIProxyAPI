@@ -175,6 +175,19 @@ func rejectUnsupportedImagesModel(c *gin.Context, model string) bool {
 	return true
 }
 
+func imagesPromptRequiredMessage(model string, endpointPath string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = defaultImagesToolModel
+	}
+	endpointPath = strings.TrimSpace(endpointPath)
+	if endpointPath == "" {
+		endpointPath = imagesGenerationsPath
+	}
+
+	return fmt.Sprintf("Invalid request: prompt is required on %s. %s needs a non-empty prompt that describes what image to create or how to edit the input image. For image generation, send JSON to POST %s with fields model=%s and prompt. For image edit/reference-image tasks, send multipart/form-data to POST %s with fields model=%s, prompt, and image file(s). This is a request-parameter issue, not a channel or model outage.", endpointPath, model, imagesGenerationsPath, model, imagesEditsPath, model)
+}
+
 func normalizeImagesResponseFormat(responseFormat string) string {
 	if strings.EqualFold(strings.TrimSpace(responseFormat), "url") {
 		return "url"
@@ -617,7 +630,7 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
-				Message: "Invalid request: prompt is required",
+				Message: imagesPromptRequiredMessage(imageModel, imagesGenerationsPath),
 				Type:    "invalid_request_error",
 			},
 		})
@@ -749,7 +762,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
-				Message: "Invalid request: prompt is required",
+				Message: imagesPromptRequiredMessage(imageModel, imagesEditsPath),
 				Type:    "invalid_request_error",
 			},
 		})
@@ -946,7 +959,7 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
-				Message: "Invalid request: prompt is required",
+				Message: imagesPromptRequiredMessage(imageModel, imagesEditsPath),
 				Type:    "invalid_request_error",
 			},
 		})

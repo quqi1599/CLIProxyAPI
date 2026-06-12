@@ -2185,8 +2185,12 @@ func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta c
 	return statusErr{
 		code:      http.StatusBadRequest,
 		errorCode: "request_feature_unsupported",
-		msg:       "request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility; reduce tool history/context or use a native Claude route",
+		msg:       largeClaudeCompatToolHistoryUserMessage(),
 	}
+}
+
+func largeClaudeCompatToolHistoryUserMessage() string {
+	return "request_feature_unsupported: large_claude_tool_history. This Claude request contains too many prior tool calls or tool results to be safely converted through MiniMax/Step Anthropic compatibility. This is a request-shape/context issue, not a channel outage. Start a new conversation, summarize or compress the old tool history as plain text, reduce MCP/tool usage, or use a native Claude route."
 }
 
 func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) (string, bool) {

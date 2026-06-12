@@ -231,8 +231,19 @@ func TestGetRequestDetails_ImageModelReturns400(t *testing.T) {
 		t.Fatalf("expected error message, got nil")
 	}
 	msg := errMsg.Error.Error()
-	if !strings.Contains(msg, "/v1/images/generations") || !strings.Contains(msg, "/v1/images/edits") {
-		t.Fatalf("unexpected error message: %q", msg)
+	for _, want := range []string{
+		"image model",
+		"/v1/chat/completions",
+		"/v1/responses",
+		"/v1/messages",
+		"/v1/images/generations",
+		"/v1/images/edits",
+		"multipart/form-data",
+		"base_url",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error message %q should contain %q", msg, want)
+		}
 	}
 }
 
