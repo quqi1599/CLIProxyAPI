@@ -326,7 +326,7 @@ func buildXAIImagesEditRequest(model string, prompt string, images []string, res
 func collectXAIImagesFromJSON(rawJSON []byte) []string {
 	var images []string
 	appendImage := func(url string) {
-		url = strings.TrimSpace(url)
+		url = normalizeImageReference(url)
 		if url != "" {
 			images = append(images, url)
 		}
@@ -341,6 +341,9 @@ func collectXAIImagesFromJSON(rawJSON []byte) []string {
 				appendImage(imageURL.String())
 			}
 			appendImage(image.Get("url").String())
+			appendImage(image.Get("data_url").String())
+			appendImage(image.Get("b64_json").String())
+			appendImage(image.Get("base64").String())
 		}
 	}
 	if imagesResult := gjson.GetBytes(rawJSON, "images"); imagesResult.IsArray() {
@@ -354,6 +357,9 @@ func collectXAIImagesFromJSON(rawJSON []byte) []string {
 				appendImage(imageURL.String())
 			}
 			appendImage(img.Get("url").String())
+			appendImage(img.Get("data_url").String())
+			appendImage(img.Get("b64_json").String())
+			appendImage(img.Get("base64").String())
 		}
 	}
 	return images
@@ -389,6 +395,112 @@ func mimeTypeFromOutputFormat(outputFormat string) string {
 	}
 }
 
+func normalizeImageReference(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if normalized, ok := normalizeImageDataURL(raw); ok {
+		return normalized
+	}
+	if mediaType, ok := detectBase64ImageMediaType(raw); ok {
+		return "data:" + mediaType + ";base64," + compactBase64(raw)
+	}
+	return raw
+}
+
+func normalizeImageDataURL(raw string) (string, bool) {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "data:") {
+		return "", false
+	}
+	comma := strings.Index(raw, ",")
+	if comma < 0 {
+		return raw, true
+	}
+	meta := strings.TrimSpace(raw[len("data:"):comma])
+	data := compactBase64(raw[comma+1:])
+	if data == "" {
+		return raw, true
+	}
+	parts := strings.Split(meta, ";")
+	mediaType := strings.ToLower(strings.TrimSpace(parts[0]))
+	isBase64 := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "base64") {
+			isBase64 = true
+			break
+		}
+	}
+	if !isBase64 {
+		return raw, true
+	}
+	if strings.HasPrefix(mediaType, "image/") {
+		return "data:" + mediaType + ";base64," + data, true
+	}
+	if detected, ok := detectBase64ImageMediaType(data); ok {
+		return "data:" + detected + ";base64," + data, true
+	}
+	return raw, true
+}
+
+func compactBase64(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		switch r {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func detectBase64ImageMediaType(raw string) (string, bool) {
+	compact := compactBase64(raw)
+	if len(compact) < 8 || strings.Contains(compact, "://") {
+		return "", false
+	}
+	sample := compact
+	if len(sample) > 512 {
+		sample = sample[:512]
+	}
+	if rem := len(sample) % 4; rem != 0 {
+		sample = sample[:len(sample)-rem]
+	}
+	if len(sample) < 8 {
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(sample)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(sample, "="))
+	}
+	if err != nil || len(decoded) == 0 {
+		return "", false
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(http.DetectContentType(decoded)))
+	if strings.HasPrefix(mediaType, "image/") {
+		return mediaType, true
+	}
+	return "", false
+}
+
+func imageMediaTypeFromData(data []byte, rawMediaType string) (string, error) {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(rawMediaType, ";", 2)[0]))
+	if strings.HasPrefix(mediaType, "image/") {
+		return mediaType, nil
+	}
+	detected := strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	if strings.HasPrefix(detected, "image/") {
+		return detected, nil
+	}
+	if mediaType == "" {
+		mediaType = detected
+	}
+	return "", fmt.Errorf("unsupported image MIME type %q; upload an image file or send a data URL like data:image/png;base64,...", mediaType)
+}
+
 func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	if fileHeader == nil {
 		return "", fmt.Errorf("upload file is nil")
@@ -409,12 +521,13 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	}
 
 	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = http.DetectContentType(data)
+	normalizedMediaType, errMedia := imageMediaTypeFromData(data, mediaType)
+	if errMedia != nil {
+		return "", errMedia
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(data)
-	return "data:" + mediaType + ";base64," + b64, nil
+	return "data:" + normalizedMediaType + ";base64," + b64, nil
 }
 
 func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, stream bool) []byte {

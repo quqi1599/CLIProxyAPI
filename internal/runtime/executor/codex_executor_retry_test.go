@@ -94,6 +94,46 @@ func TestNewCodexStatusErrSanitizesCloudflare524(t *testing.T) {
 	assertCodexErrorCode(t, err.Error(), "server_error", "upstream_timeout")
 }
 
+func TestNewCodexStatusErrSanitizesMixedJSONAndSSEErrorBody(t *testing.T) {
+	body := []byte(`{"error":{"message":"model \"gpt-5.3-codex-spark\" does not support image input","param":"input","type":"invalid_request_error"}}event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"upstream_error","message":"Upstream request failed"}}}`)
+
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+
+	if got := err.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+	if strings.Contains(err.Error(), "event:") || strings.Contains(err.Error(), "response.failed") {
+		t.Fatalf("error body leaked SSE frame: %s", err.Error())
+	}
+	if !json.Valid([]byte(err.Error())) {
+		t.Fatalf("error body is not valid JSON: %s", err.Error())
+	}
+	if got := gjson.Get(err.Error(), "error.message").String(); got != `model "gpt-5.3-codex-spark" does not support image input` {
+		t.Fatalf("error.message = %q", got)
+	}
+}
+
+func TestNewCodexStatusErrSanitizesPureSSEFailedErrorBody(t *testing.T) {
+	body := []byte(`event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"upstream_error","message":"Upstream request failed"}}}`)
+
+	err := newCodexStatusErr(http.StatusBadGateway, body)
+
+	if got := err.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
+	}
+	if strings.Contains(err.Error(), "event:") || strings.Contains(err.Error(), "response.failed") {
+		t.Fatalf("error body leaked SSE frame: %s", err.Error())
+	}
+	if !json.Valid([]byte(err.Error())) {
+		t.Fatalf("error body is not valid JSON: %s", err.Error())
+	}
+	if got := gjson.Get(err.Error(), "error.message").String(); got != "Upstream request failed" {
+		t.Fatalf("error.message = %q", got)
+	}
+}
+
 func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 	tests := []struct {
 		name       string

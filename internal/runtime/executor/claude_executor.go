@@ -229,7 +229,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
 		return resp, err
 	}
-	if preflight.hasToolUse {
+	if shouldRepairClaudeToolUseHistoryForCompat(preflight, repairMeta.compatKind) {
 		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
 		if err != nil {
 			return resp, err
@@ -465,7 +465,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
 		return nil, err
 	}
-	if preflight.hasToolUse {
+	if shouldRepairClaudeToolUseHistoryForCompat(preflight, repairMeta.compatKind) {
 		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
 		if err != nil {
 			return nil, err
@@ -2139,7 +2139,7 @@ func repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx context.Context, body 
 }
 
 func repairClaudeToolUseHistoryWithCompatLog(ctx context.Context, body []byte, meta compatRepairLogMeta) ([]byte, error) {
-	if !helps.HasClaudeToolUseMarker(body) {
+	if !helps.HasClaudeToolUseOrResultMarkers(body) {
 		return body, nil
 	}
 	started := time.Now()
@@ -2160,6 +2160,13 @@ func repairClaudeToolUseHistoryWithCompatLog(ctx context.Context, body []byte, m
 			Warn("compat repair applied")
 	}
 	return repaired, nil
+}
+
+func shouldRepairClaudeToolUseHistoryForCompat(preflight claudeCompatPreflight, compatKind string) bool {
+	if preflight.hasToolUse {
+		return true
+	}
+	return preflight.hasToolResult && requiresClaudeToolAdjacencyRepair(compatKind)
 }
 
 func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) error {

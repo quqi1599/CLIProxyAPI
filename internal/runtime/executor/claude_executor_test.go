@@ -695,12 +695,15 @@ func TestRepairMiniMaxClaudeToolAdjacencyForCompatWithLogSkipsWhenNoToolResultMa
 	}
 }
 
-func TestRepairClaudeToolUseHistoryWithCompatLogSkipsWhenNoToolUseMarker(t *testing.T) {
+func TestRepairClaudeToolUseHistoryWithCompatLogDropsOrphanToolResultWithoutToolUseMarker(t *testing.T) {
 	t.Parallel()
 
 	body := []byte(`{
 		"messages": [
-			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"orphan"}]}
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_1","content":"orphan"},
+				{"type":"text","text":"continue"}
+			]}
 		]
 	}`)
 	meta := compatRepairLogMeta{compatKind: "minimax"}
@@ -709,8 +712,11 @@ func TestRepairClaudeToolUseHistoryWithCompatLogSkipsWhenNoToolUseMarker(t *test
 	if err != nil {
 		t.Fatalf("repairClaudeToolUseHistoryWithCompatLog() error = %v", err)
 	}
-	if string(out) != string(body) {
-		t.Fatalf("body changed without tool_use marker:\n got: %s\nwant: %s", out, body)
+	if strings.Contains(string(out), `"tool_use_id":"call_1"`) {
+		t.Fatalf("orphan tool_result should be dropped: %s", out)
+	}
+	if !strings.Contains(string(out), `"text":"continue"`) {
+		t.Fatalf("non-tool user content should be preserved: %s", out)
 	}
 }
 

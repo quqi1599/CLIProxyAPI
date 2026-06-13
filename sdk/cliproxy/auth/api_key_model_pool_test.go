@@ -366,6 +366,57 @@ func TestManagerExecute_ClaudeSonnetMiniMaxVideoRoutesToStandardM3(t *testing.T)
 	}
 }
 
+func TestManagerExecute_ClaudeSonnetImageInputSkipsCodexSpark(t *testing.T) {
+	alias := "claude-sonnet-4-6"
+	executor := &apiKeyPoolExecutor{id: "claude"}
+	m := newClaudeAPIKeyPoolTestManager(t, alias, []internalconfig.ClaudeModel{
+		{Name: "gpt-5.3-codex-spark", Alias: alias},
+		{Name: "MiniMax-M3", Alias: alias},
+	}, executor)
+
+	resp, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model: alias,
+		Payload: []byte(`{"messages":[{"role":"user","content":[
+			{"type":"text","text":"describe this"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+		]}],"max_tokens":1024}`),
+	}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if string(resp.Payload) != "MiniMax-M3" {
+		t.Fatalf("payload = %q, want MiniMax-M3", string(resp.Payload))
+	}
+	got := executor.ExecuteModels()
+	if len(got) != 1 || got[0] != "MiniMax-M3" {
+		t.Fatalf("execute models = %v, want only MiniMax-M3", got)
+	}
+}
+
+func TestManagerExecute_ClaudeSonnetTextInputKeepsCodexSpark(t *testing.T) {
+	alias := "claude-sonnet-4-6"
+	executor := &apiKeyPoolExecutor{id: "claude"}
+	m := newClaudeAPIKeyPoolTestManager(t, alias, []internalconfig.ClaudeModel{
+		{Name: "gpt-5.3-codex-spark", Alias: alias},
+		{Name: "MiniMax-M3", Alias: alias},
+	}, executor)
+
+	resp, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{
+		Model:   alias,
+		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"write code"}]}],"max_tokens":1024}`),
+	}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if string(resp.Payload) != "gpt-5.3-codex-spark" {
+		t.Fatalf("payload = %q, want gpt-5.3-codex-spark", string(resp.Payload))
+	}
+	got := executor.ExecuteModels()
+	if len(got) != 1 || got[0] != "gpt-5.3-codex-spark" {
+		t.Fatalf("execute models = %v, want only gpt-5.3-codex-spark", got)
+	}
+}
+
 func TestManagerExecute_MiniMaxM3HighspeedRouteUsesStandardM3(t *testing.T) {
 	model := "MiniMax-M3-highspeed"
 	executor := &apiKeyPoolExecutor{id: "claude"}

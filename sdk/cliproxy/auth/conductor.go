@@ -1420,6 +1420,7 @@ func (m *Manager) preparedExecutionModelsForRequest(auth *Auth, routeModel strin
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
 	models := m.filterExecutionModels(auth, routeModel, candidates, pooled)
+	models = filterImageInputUnsupportedExecutionModels(req, opts, models)
 	models = filterMiniMaxM3RequiredExecutionModels(routeModel, req, opts, models)
 	return models, pooled
 }

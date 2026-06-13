@@ -139,3 +139,44 @@ func TestCodexOpenAIImageEmptyOutputErrUsesToolCallStatus(t *testing.T) {
 		t.Fatalf("error = %q, want tool call reason", err.Error())
 	}
 }
+
+func TestCodexPrepareOpenAIImageEditJSONNormalizesLooseImageReferences(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-image-2",
+		"prompt":"edit",
+		"image":{"image_url":{"url":"data:image;base64,iVBORw0KGgo="}},
+		"images":[
+			{"image_url":"iVBORw0KGgo="},
+			{"url":"https://example.com/ref.png"}
+		],
+		"mask":{"image_url":{"url":"data:image;base64,iVBORw0KGgo="}}
+	}`)
+
+	prepared, err := codexPrepareOpenAIImageEditJSON(raw, "gpt-image-2")
+	if err != nil {
+		t.Fatalf("codexPrepareOpenAIImageEditJSON() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(prepared.Body, "input.0.content.1.image_url").String(); got != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("first image_url = %q; body=%s", got, string(prepared.Body))
+	}
+	if got := gjson.GetBytes(prepared.Body, "input.0.content.2.image_url").String(); got != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("second image_url = %q; body=%s", got, string(prepared.Body))
+	}
+	if got := gjson.GetBytes(prepared.Body, "input.0.content.3.image_url").String(); got != "https://example.com/ref.png" {
+		t.Fatalf("third image_url = %q; body=%s", got, string(prepared.Body))
+	}
+	if got := gjson.GetBytes(prepared.Body, "tools.0.input_image_mask.image_url").String(); got != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("mask image_url = %q; body=%s", got, string(prepared.Body))
+	}
+}
+
+func TestCodexImageMediaTypeFromDataRepairsGenericImageHeader(t *testing.T) {
+	mediaType, err := codexImageMediaTypeFromData([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, "image")
+	if err != nil {
+		t.Fatalf("codexImageMediaTypeFromData() error = %v", err)
+	}
+	if mediaType != "image/png" {
+		t.Fatalf("media type = %q, want image/png", mediaType)
+	}
+}

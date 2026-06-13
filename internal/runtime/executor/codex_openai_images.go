@@ -446,16 +446,21 @@ func codexPrepareOpenAIImageEditJSON(rawJSON []byte, routeModel string) (codexOp
 	}
 	prompt := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt").String())
 	images := make([]string, 0)
+	appendImage := func(raw string) {
+		if ref := codexNormalizeImageReference(raw); ref != "" {
+			images = append(images, ref)
+		}
+	}
+	if imageResult := gjson.GetBytes(rawJSON, "image"); imageResult.Exists() {
+		appendImage(codexImageReferenceFromResult(imageResult))
+	}
 	if imagesResult := gjson.GetBytes(rawJSON, "images"); imagesResult.IsArray() {
 		for _, img := range imagesResult.Array() {
-			url := strings.TrimSpace(img.Get("image_url").String())
-			if url != "" {
-				images = append(images, url)
-			}
+			appendImage(codexImageReferenceFromResult(img))
 		}
 	}
 	tool := codexBuildOpenAIImageTool(rawJSON, routeModel, "edit", []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"}, []string{"output_compression", "partial_images"})
-	if mask := strings.TrimSpace(gjson.GetBytes(rawJSON, "mask.image_url").String()); mask != "" {
+	if mask := codexNormalizeImageReference(codexImageReferenceFromResult(gjson.GetBytes(rawJSON, "mask"))); mask != "" {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
 	}
 	body := codexBuildImagesResponsesRequest(prompt, images, tool)
@@ -634,10 +639,140 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 		return "", fmt.Errorf("read upload file failed: %w", errRead)
 	}
 	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = http.DetectContentType(data)
+	normalizedMediaType, errMedia := codexImageMediaTypeFromData(data, mediaType)
+	if errMedia != nil {
+		return "", errMedia
 	}
-	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+	return "data:" + normalizedMediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func codexImageReferenceFromResult(result gjson.Result) string {
+	if !result.Exists() {
+		return ""
+	}
+	if result.Type == gjson.String {
+		return result.String()
+	}
+	for _, path := range []string{
+		"image_url.url",
+		"image_url",
+		"url",
+		"data_url",
+		"b64_json",
+		"base64",
+	} {
+		value := strings.TrimSpace(result.Get(path).String())
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func codexNormalizeImageReference(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if normalized, ok := codexNormalizeImageDataURL(raw); ok {
+		return normalized
+	}
+	if mediaType, ok := codexDetectBase64ImageMediaType(raw); ok {
+		return "data:" + mediaType + ";base64," + codexCompactBase64(raw)
+	}
+	return raw
+}
+
+func codexNormalizeImageDataURL(raw string) (string, bool) {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "data:") {
+		return "", false
+	}
+	comma := strings.Index(raw, ",")
+	if comma < 0 {
+		return raw, true
+	}
+	meta := strings.TrimSpace(raw[len("data:"):comma])
+	data := codexCompactBase64(raw[comma+1:])
+	if data == "" {
+		return raw, true
+	}
+	parts := strings.Split(meta, ";")
+	mediaType := strings.ToLower(strings.TrimSpace(parts[0]))
+	isBase64 := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "base64") {
+			isBase64 = true
+			break
+		}
+	}
+	if !isBase64 {
+		return raw, true
+	}
+	if strings.HasPrefix(mediaType, "image/") {
+		return "data:" + mediaType + ";base64," + data, true
+	}
+	if detected, ok := codexDetectBase64ImageMediaType(data); ok {
+		return "data:" + detected + ";base64," + data, true
+	}
+	return raw, true
+}
+
+func codexCompactBase64(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		switch r {
+		case ' ', '\n', '\r', '\t':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func codexDetectBase64ImageMediaType(raw string) (string, bool) {
+	compact := codexCompactBase64(raw)
+	if len(compact) < 8 || strings.Contains(compact, "://") {
+		return "", false
+	}
+	sample := compact
+	if len(sample) > 512 {
+		sample = sample[:512]
+	}
+	if rem := len(sample) % 4; rem != 0 {
+		sample = sample[:len(sample)-rem]
+	}
+	if len(sample) < 8 {
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(sample)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(sample, "="))
+	}
+	if err != nil || len(decoded) == 0 {
+		return "", false
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(http.DetectContentType(decoded)))
+	if strings.HasPrefix(mediaType, "image/") {
+		return mediaType, true
+	}
+	return "", false
+}
+
+func codexImageMediaTypeFromData(data []byte, rawMediaType string) (string, error) {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(rawMediaType, ";", 2)[0]))
+	if strings.HasPrefix(mediaType, "image/") {
+		return mediaType, nil
+	}
+	detected := strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	if strings.HasPrefix(detected, "image/") {
+		return detected, nil
+	}
+	if mediaType == "" {
+		mediaType = detected
+	}
+	return "", fmt.Errorf("unsupported image MIME type %q; upload an image file or send a data URL like data:image/png;base64,...", mediaType)
 }
 
 func codexExtractImagesFromResponsesCompleted(payload []byte) (results []codexImageCallResult, createdAt int64, usageRaw []byte, firstMeta codexImageCallResult, err error) {

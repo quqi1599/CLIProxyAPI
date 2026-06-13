@@ -232,7 +232,9 @@ func TestGetRequestDetails_ImageModelReturns400(t *testing.T) {
 	}
 	msg := errMsg.Error.Error()
 	for _, want := range []string{
-		"image model",
+		"请求路径错误",
+		"图片生成/编辑模型",
+		"正确的 Images API URL",
 		"/v1/chat/completions",
 		"/v1/responses",
 		"/v1/messages",
@@ -240,6 +242,7 @@ func TestGetRequestDetails_ImageModelReturns400(t *testing.T) {
 		"/v1/images/edits",
 		"multipart/form-data",
 		"base_url",
+		"不要继续使用 chat/messages/responses",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error message %q should contain %q", msg, want)

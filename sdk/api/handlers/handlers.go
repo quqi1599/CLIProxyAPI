@@ -1191,7 +1191,7 @@ func imageModelEndpointHelpMessage(modelName string) string {
 	if modelName == "" {
 		modelName = "this image model"
 	}
-	return fmt.Sprintf("%s is an image model and cannot be called through text endpoints such as /v1/chat/completions, /v1/responses, or /v1/messages. To fix the URL, keep your normal /v1 base_url and change the endpoint path: for image generation use POST /v1/images/generations with model=%s and prompt; for image edit/reference-image tasks use POST /v1/images/edits with multipart/form-data, model=%s, prompt, and image file(s). If your base_url is already https://your-domain/v1, call https://your-domain/v1/images/generations or https://your-domain/v1/images/edits, not the chat/messages/responses URL.", modelName, modelName, modelName)
+	return fmt.Sprintf("请求路径错误：%s 是图片生成/编辑模型，不能通过文字对话接口调用，例如 /v1/chat/completions、/v1/responses 或 /v1/messages。请使用正确的 Images API URL：如果你的 base_url 是 https://your-domain/v1，生图请调用 POST https://your-domain/v1/images/generations，请求 JSON 至少包含 model=%s 和 prompt；图片编辑/参考图请调用 POST https://your-domain/v1/images/edits，使用 multipart/form-data，并包含 model=%s、prompt 和 image 文件。不要继续使用 chat/messages/responses 接口调用这个图片模型。", modelName, modelName, modelName)
 }
 
 func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []string {

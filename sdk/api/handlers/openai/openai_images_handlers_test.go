@@ -170,6 +170,71 @@ func TestBuildXAIImagesEditRequestSingleImage(t *testing.T) {
 	}
 }
 
+func TestCollectXAIImagesFromJSONNormalizesLooseImageReferences(t *testing.T) {
+	raw := []byte(`{
+		"image":{"image_url":{"url":"data:image;base64,iVBORw0KGgo="}},
+		"images":[
+			"iVBORw0KGgo=",
+			{"b64_json":"iVBORw0KGgo="},
+			{"url":"https://example.com/image.png"}
+		]
+	}`)
+
+	images := collectXAIImagesFromJSON(raw)
+
+	want := []string{
+		"data:image/png;base64,iVBORw0KGgo=",
+		"data:image/png;base64,iVBORw0KGgo=",
+		"data:image/png;base64,iVBORw0KGgo=",
+		"https://example.com/image.png",
+	}
+	if len(images) != len(want) {
+		t.Fatalf("images len = %d, want %d: %#v", len(images), len(want), images)
+	}
+	for i := range want {
+		if images[i] != want[i] {
+			t.Fatalf("images[%d] = %q, want %q; all=%#v", i, images[i], want[i], images)
+		}
+	}
+}
+
+func TestMultipartFileToDataURLRepairsGenericImageContentType(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "image.png"))
+	header.Set("Content-Type", "image")
+	part, errCreate := writer.CreatePart(header)
+	if errCreate != nil {
+		t.Fatalf("create image field: %v", errCreate)
+	}
+	if _, errWrite := part.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}); errWrite != nil {
+		t.Fatalf("write image field: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(body.Bytes()), writer.Boundary())
+	form, errRead := reader.ReadForm(32 << 20)
+	if errRead != nil {
+		t.Fatalf("read form: %v", errRead)
+	}
+	defer func() {
+		if errRemove := form.RemoveAll(); errRemove != nil {
+			t.Fatalf("remove form files: %v", errRemove)
+		}
+	}()
+
+	dataURL, err := multipartFileToDataURL(form.File["image"][0])
+	if err != nil {
+		t.Fatalf("multipartFileToDataURL() error = %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:image/png;base64,") {
+		t.Fatalf("data URL = %q, want image/png data URL", dataURL)
+	}
+}
+
 func TestBuildOpenAICompatImagesJSONRequestPreservesStreamForStreaming(t *testing.T) {
 	req := buildOpenAICompatImagesJSONRequest([]byte(`{"model":"compat-image","prompt":"draw","stream":false}`), "upstream-image", true)
 

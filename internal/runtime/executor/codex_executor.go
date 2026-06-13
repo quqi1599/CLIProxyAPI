@@ -1018,6 +1018,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
+	body = sanitizeCodexStatusErrorBody(body)
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
@@ -1037,6 +1038,87 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func sanitizeCodexStatusErrorBody(body []byte) []byte {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || json.Valid(trimmed) {
+		return body
+	}
+	if jsonBody, ok := firstJSONValueFromMixedCodexErrorBody(trimmed); ok {
+		return jsonBody
+	}
+	if sseBody, ok := codexSSEErrorBody(trimmed); ok {
+		return sseBody
+	}
+	return body
+}
+
+func firstJSONValueFromMixedCodexErrorBody(body []byte) ([]byte, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, false
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' || !json.Valid(raw) {
+		return nil, false
+	}
+	rest := strings.TrimSpace(string(body[decoder.InputOffset():]))
+	if rest == "" {
+		return raw, true
+	}
+	if strings.HasPrefix(rest, "event:") || strings.HasPrefix(rest, "data:") || strings.Contains(rest, "\nevent:") || strings.Contains(rest, "\ndata:") {
+		return raw, true
+	}
+	return nil, false
+}
+
+func codexSSEErrorBody(body []byte) ([]byte, bool) {
+	blocks := bytes.Split(body, []byte("\n\n"))
+	for _, block := range blocks {
+		eventType := ""
+		dataParts := make([][]byte, 0, 1)
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			switch {
+			case bytes.HasPrefix(line, []byte("event:")):
+				eventType = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+			case bytes.HasPrefix(line, dataTag):
+				data := bytes.TrimSpace(bytes.TrimPrefix(line, dataTag))
+				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
+					dataParts = append(dataParts, data)
+				}
+			}
+		}
+		if len(dataParts) == 0 {
+			continue
+		}
+		eventData := bytes.Join(dataParts, []byte("\n"))
+		if !gjson.ValidBytes(eventData) {
+			continue
+		}
+		if eventType == "" {
+			eventType = gjson.GetBytes(eventData, "type").String()
+		}
+		switch eventType {
+		case "response.failed":
+			if errorBody := codexTerminalErrorBody(eventData, "response.error"); len(errorBody) > 0 {
+				return errorBody, true
+			}
+			if errorBody := codexTerminalErrorBody(eventData, "error"); len(errorBody) > 0 {
+				return errorBody, true
+			}
+		case "error":
+			if errorBody := codexTerminalErrorBody(eventData, "error"); len(errorBody) > 0 {
+				return errorBody, true
+			}
+			if errorBody := codexTerminalTopLevelErrorBody(eventData); len(errorBody) > 0 {
+				return errorBody, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func isCodexCloudflareTimeoutError(statusCode int, body []byte) bool {
