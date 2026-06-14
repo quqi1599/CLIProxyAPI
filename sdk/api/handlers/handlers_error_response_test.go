@@ -162,6 +162,37 @@ func TestWriteErrorResponse_NormalizesGenericChineseContentSafety(t *testing.T) 
 	}
 }
 
+func TestWriteErrorResponse_NormalizesRequestFeatureUnsupportedStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      errors.New("status_code=500, request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility"),
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingRequestFeatureUnsupportedMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingRequestFeatureUnsupportedMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
 func TestEnrichAuthSelectionError_DefaultsTo503WithConciseMessage(t *testing.T) {
 	in := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
@@ -271,6 +302,24 @@ func TestBuildErrorResponseBody_NormalizesContentSafety1301(t *testing.T) {
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesRequestFeatureUnsupportedJSON(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: minimax anthropic compatibility does not support server tool type \"web_search\"","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingRequestFeatureUnsupportedMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingRequestFeatureUnsupportedMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
 func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesMiniMaxInputNewSensitive(t *testing.T) {
 	body := BuildOpenAIResponsesStreamErrorChunk(http.StatusInternalServerError, `{"error":{"message":"input new_sensitive (1026)","code":"1026"}}`, 7)
 
@@ -289,6 +338,27 @@ func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesMiniMaxInputNewSensitive
 	}
 	if payload.Code != contentPolicyViolationErrorCode {
 		t.Fatalf("code = %q, want %q", payload.Code, contentPolicyViolationErrorCode)
+	}
+}
+
+func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesRequestFeatureUnsupported(t *testing.T) {
+	body := BuildOpenAIResponsesStreamErrorChunk(http.StatusInternalServerError, `{"error":{"message":"request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax/Step Anthropic compatibility","code":"request_feature_unsupported"}}`, 9)
+
+	var payload openAIResponsesStreamErrorChunk
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Type != "error" {
+		t.Fatalf("type = %q, want error", payload.Type)
+	}
+	if payload.SequenceNumber != 9 {
+		t.Fatalf("sequence_number = %d, want 9", payload.SequenceNumber)
+	}
+	if payload.Message != UserFacingRequestFeatureUnsupportedMessage() {
+		t.Fatalf("message = %q, want %q", payload.Message, UserFacingRequestFeatureUnsupportedMessage())
+	}
+	if payload.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Code, requestFeatureUnsupportedErrorCode)
 	}
 }
 

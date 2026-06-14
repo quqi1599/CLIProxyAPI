@@ -323,6 +323,11 @@ func parseFailureErrorCodeFromText(text string) string {
 			return sanitizeFailureErrorCode(code)
 		}
 	}
+	if payload := firstFailureSSEDataJSONPayload(text); payload != "" {
+		if code := firstFailureJSONValue([]byte(payload), "error.code", "code", "error.type", "type", "error.err_code"); code != "" {
+			return sanitizeFailureErrorCode(code)
+		}
+	}
 	if idx := strings.Index(text, ":"); idx > 0 {
 		prefix := strings.TrimSpace(text[:idx])
 		if comma := strings.LastIndex(prefix, ","); comma >= 0 {
@@ -347,6 +352,24 @@ func parseFailureErrorCodeFromText(text string) string {
 	return ""
 }
 
+func firstFailureSSEDataJSONPayload(text string) string {
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		line = strings.TrimSpace(line)
+		idx := strings.Index(strings.ToLower(line), "data:")
+		if idx < 0 {
+			continue
+		}
+		payload := strings.TrimSpace(line[idx+len("data:"):])
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if gjson.Valid(payload) {
+			return payload
+		}
+	}
+	return ""
+}
+
 func firstFailureJSONValue(body []byte, paths ...string) string {
 	for _, path := range paths {
 		value := gjson.GetBytes(body, path)
@@ -366,6 +389,10 @@ func sanitizeFailureErrorCode(code string) string {
 		return ""
 	}
 	lower := strings.ToLower(code)
+	switch lower {
+	case "data", "event", "id", "retry":
+		return ""
+	}
 	if strings.HasPrefix(lower, "sk-") || strings.Contains(lower, "authorization") || strings.Contains(lower, "bearer") {
 		return ""
 	}

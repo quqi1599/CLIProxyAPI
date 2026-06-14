@@ -73,6 +73,23 @@ func TestNewOpenAICompatStatusErr_EmptyBodyHasErrorCode(t *testing.T) {
 	}
 }
 
+func TestNewOpenAICompatStatusErr_ParsesSSEDataErrorBody(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("event: error\ndata: {\"error\":{\"message\":\"invalid function arguments json string\",\"type\":\"invalid_request_error\",\"code\":\"invalid_function_arguments\"}}\n\n")
+	err := newOpenAICompatStatusErr(openAICompatProfileForKind("mimo"), nil, "mimo-v2.5-pro", http.StatusBadRequest, nil, "text/event-stream", body)
+
+	if err.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("StatusCode() = %d, want %d", err.StatusCode(), http.StatusBadRequest)
+	}
+	if err.ErrorCode() != "invalid_function_arguments" {
+		t.Fatalf("ErrorCode() = %q, want invalid_function_arguments", err.ErrorCode())
+	}
+	if got := err.Error(); got != "invalid_request_error: invalid function arguments json string" {
+		t.Fatalf("Error() = %q, want parsed SSE JSON message", got)
+	}
+}
+
 func TestNewOpenAICompatStatusErr_KimiBillingCycleUsageLimitHasRetryAfter(t *testing.T) {
 	t.Parallel()
 

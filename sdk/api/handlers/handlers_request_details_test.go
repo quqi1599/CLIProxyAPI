@@ -220,33 +220,62 @@ func TestFilterProvidersByToolCompatibility(t *testing.T) {
 func TestGetRequestDetails_ImageModelReturns400(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
-	_, _, errMsg := handler.getRequestDetails("gpt-image-2")
-	if errMsg == nil {
-		t.Fatalf("expected error for gpt-image-2, got nil")
+	for _, model := range []string{"gpt-image-2", "image-01", "image-01-live", "minimax/image-01-live"} {
+		t.Run(model, func(t *testing.T) {
+			_, _, errMsg := handler.getRequestDetails(model)
+			if errMsg == nil {
+				t.Fatalf("expected error for %s, got nil", model)
+			}
+			if errMsg.StatusCode != http.StatusBadRequest {
+				t.Fatalf("unexpected status code: got %d want %d", errMsg.StatusCode, http.StatusBadRequest)
+			}
+			if errMsg.Error == nil {
+				t.Fatalf("expected error message, got nil")
+			}
+			msg := errMsg.Error.Error()
+			for _, want := range []string{
+				"请求路径错误",
+				"图片生成/编辑模型",
+				"正确的 Images API URL",
+				"/v1/chat/completions",
+				"/v1/responses",
+				"/v1/messages",
+				"/v1/images/generations",
+				"/v1/images/edits",
+				"multipart/form-data",
+				"base_url",
+				"不要继续使用 chat/messages/responses",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error message %q should contain %q", msg, want)
+				}
+			}
+			if !strings.Contains(msg, routeModelBaseName(model)) {
+				t.Fatalf("error message %q should contain model %q", msg, routeModelBaseName(model))
+			}
+		})
 	}
-	if errMsg.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unexpected status code: got %d want %d", errMsg.StatusCode, http.StatusBadRequest)
+}
+
+func TestIsImageOnlyModelForTextEndpoint(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{model: "gpt-image-2", want: true},
+		{model: "image-01", want: true},
+		{model: "image-01-live", want: true},
+		{model: "minimax/image-01", want: true},
+		{model: "MiniMax/Image-01-Live", want: true},
+		{model: "gpt-5.4-mini", want: false},
+		{model: "MiniMax-M3", want: false},
 	}
-	if errMsg.Error == nil {
-		t.Fatalf("expected error message, got nil")
-	}
-	msg := errMsg.Error.Error()
-	for _, want := range []string{
-		"请求路径错误",
-		"图片生成/编辑模型",
-		"正确的 Images API URL",
-		"/v1/chat/completions",
-		"/v1/responses",
-		"/v1/messages",
-		"/v1/images/generations",
-		"/v1/images/edits",
-		"multipart/form-data",
-		"base_url",
-		"不要继续使用 chat/messages/responses",
-	} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("error message %q should contain %q", msg, want)
-		}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := isImageOnlyModelForTextEndpoint(tt.model); got != tt.want {
+				t.Fatalf("isImageOnlyModelForTextEndpoint(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
 	}
 }
 

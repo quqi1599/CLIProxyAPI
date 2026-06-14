@@ -47,6 +47,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		status = http.StatusInternalServerError
 	}
 	status = NormalizeContentSafetyStatus(status, errText)
+	status = NormalizeRequestFeatureUnsupportedStatus(status, errText)
 	if sequenceNumber < 0 {
 		sequenceNumber = 0
 	}
@@ -67,6 +68,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		message = UserFacingContextWindowMessage()
 		code = contextWindowExceededErrorCode
 	}
+	_, isRequestFeatureUnsupported := requestFeatureUnsupportedErrorDetail(status, errText)
+	if isRequestFeatureUnsupported {
+		message = UserFacingRequestFeatureUnsupportedMessage()
+		code = requestFeatureUnsupportedErrorCode
+	}
+	isNormalizedError := isContentSafety || isContextWindowExceeded || isRequestFeatureUnsupported
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
@@ -76,12 +83,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 				sequenceNumber = int(v)
 			}
 			if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) == "error" {
-				if !isContextWindowExceeded && !isContentSafety {
+				if !isNormalizedError {
 					if m, ok := payload["message"].(string); ok && strings.TrimSpace(m) != "" {
 						message = strings.TrimSpace(m)
 					}
 				}
-				if !isContextWindowExceeded && !isContentSafety {
+				if !isNormalizedError {
 					if v, ok := payload["code"]; ok && v != nil {
 						if c, ok := v.(string); ok && strings.TrimSpace(c) != "" {
 							code = strings.TrimSpace(c)
@@ -92,12 +99,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 				}
 			}
 			if e, ok := payload["error"].(map[string]any); ok {
-				if !isContextWindowExceeded && !isContentSafety {
+				if !isNormalizedError {
 					if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
 						message = strings.TrimSpace(m)
 					}
 				}
-				if !isContextWindowExceeded && !isContentSafety {
+				if !isNormalizedError {
 					if v, ok := e["code"]; ok && v != nil {
 						if c, ok := v.(string); ok && strings.TrimSpace(c) != "" {
 							code = strings.TrimSpace(c)

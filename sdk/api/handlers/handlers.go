@@ -117,6 +117,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	if body, ok := BuildContextWindowExceededErrorBody(status, errText); ok {
 		return body
 	}
+	if body, ok := BuildRequestFeatureUnsupportedErrorBody(status, errText); ok {
+		return body
+	}
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
@@ -1146,7 +1149,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
-	if strings.EqualFold(routeModelBaseName(baseModel), "gpt-image-2") && !allowImageModel {
+	if isImageOnlyModelForTextEndpoint(baseModel) && !allowImageModel {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      errors.New(imageModelEndpointHelpMessage(routeModelBaseName(baseModel))),
@@ -1282,6 +1285,15 @@ func routeModelBaseName(model string) string {
 	return model
 }
 
+func isImageOnlyModelForTextEndpoint(model string) bool {
+	switch strings.ToLower(routeModelBaseName(model)) {
+	case "gpt-image-2", "image-01", "image-01-live":
+		return true
+	default:
+		return false
+	}
+}
+
 func cloneHeader(src http.Header) http.Header {
 	if src == nil {
 		return nil
@@ -1360,6 +1372,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 	status = NormalizeContentSafetyStatus(status, errText)
+	status = NormalizeRequestFeatureUnsupportedStatus(status, errText)
 
 	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 	body := BuildErrorResponseBody(status, errText)

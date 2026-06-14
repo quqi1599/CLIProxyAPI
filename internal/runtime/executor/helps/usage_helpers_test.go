@@ -286,6 +286,16 @@ func TestFailureMetadataFromErrorParsesCommonTextWithoutMessages(t *testing.T) {
 	}
 }
 
+func TestFailureMetadataFromErrorIgnoresSSEDataPrefixAsCode(t *testing.T) {
+	status, code := failureMetadataFromError(fmt.Errorf("status_code=400, data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid params\"}}"))
+	if status != 400 {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if code != "invalid_request_error" {
+		t.Fatalf("code = %q, want invalid_request_error", code)
+	}
+}
+
 func TestFailureMetadataFromErrorRejectsUnsafeCodeCandidates(t *testing.T) {
 	_, code := failureMetadataFromError(metadataStatusError{
 		status: 401,

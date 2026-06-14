@@ -2586,10 +2586,11 @@ func summarizeOpenAICompatError(body []byte) string {
 	if trimmed == "" {
 		return "empty upstream response"
 	}
-	if !gjson.ValidBytes(body) {
+	jsonBody := openAICompatJSONErrorBody(body)
+	if !gjson.ValidBytes(jsonBody) {
 		return trimmed
 	}
-	message := firstNonEmptyJSONValue(body,
+	message := firstNonEmptyJSONValue(jsonBody,
 		"error.message",
 		"message",
 		"msg",
@@ -2607,7 +2608,7 @@ func summarizeOpenAICompatError(body []byte) string {
 	if message == "" {
 		return trimmed
 	}
-	label := firstNonEmptyJSONValue(body, "error.type", "type", "error.code", "code", "error.err_code")
+	label := firstNonEmptyJSONValue(jsonBody, "error.type", "type", "error.code", "code", "error.err_code")
 	if label == "" {
 		return message
 	}
@@ -2617,6 +2618,27 @@ func summarizeOpenAICompatError(body []byte) string {
 		return message
 	}
 	return label + ": " + message
+}
+
+func openAICompatJSONErrorBody(body []byte) []byte {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || gjson.Valid(trimmed) {
+		return []byte(trimmed)
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(line), "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(line[len("data:"):])
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if gjson.Valid(payload) {
+			return []byte(payload)
+		}
+	}
+	return body
 }
 
 func firstNonEmptyJSONValue(body []byte, paths ...string) string {
@@ -2912,8 +2934,9 @@ func logOpenAICompatUpstreamError(profile openAICompatProfile, auth *cliproxyaut
 func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Auth, routeModel string, statusCode int, headers http.Header, contentType string, body []byte) statusErr {
 	retryAfter := openAICompatRetryAfter(headers, body)
 	logOpenAICompatUpstreamError(profile, auth, routeModel, statusCode, retryAfter, contentType, body)
+	jsonBody := openAICompatJSONErrorBody(body)
 	message := summarizeOpenAICompatError(body)
-	errorCode := firstNonEmptyJSONValue(body, "error.code", "code", "error.type", "type", "error.err_code")
+	errorCode := firstNonEmptyJSONValue(jsonBody, "error.code", "code", "error.type", "type", "error.err_code")
 	if errorCode == "" && strings.TrimSpace(string(body)) == "" {
 		errorCode = openAICompatEmptyUpstreamResponseCode
 	}
