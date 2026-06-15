@@ -302,6 +302,29 @@ func TestBuildErrorResponseBody_NormalizesContentSafety1301(t *testing.T) {
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesImageGenerationSafetyRefusal(t *testing.T) {
+	errText := "upstream returned text instead of image output: 抱歉，我不能帮助生成涉及对未成年人施暴、伤害细节或带血腥结果的画面。"
+
+	if got := NormalizeContentSafetyStatus(http.StatusBadGateway, errText); got != http.StatusBadRequest {
+		t.Fatalf("normalized status = %d, want %d", got, http.StatusBadRequest)
+	}
+
+	body := BuildErrorResponseBody(http.StatusBadGateway, errText)
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, UserFacingContentSafetyMessage("input"))
+	}
+	if payload.Error.Type != "invalid_request_error" {
+		t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+	}
+	if payload.Error.Code != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, contentPolicyViolationErrorCode)
+	}
+}
+
 func TestBuildErrorResponseBody_NormalizesRequestFeatureUnsupportedJSON(t *testing.T) {
 	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: minimax anthropic compatibility does not support server tool type \"web_search\"","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
 

@@ -129,6 +129,9 @@ func contentSafetySignalDirection(text string) (string, bool) {
 	if isContentSafety1301Text(lower) {
 		return contentSafetyInputDirection, true
 	}
+	if isImageGenerationSafetyRefusalText(lower) {
+		return contentSafetyInputDirection, true
+	}
 	if isGenericContentSafetyText(lower) {
 		return contentSafetyInputDirection, true
 	}
@@ -156,6 +159,31 @@ func isGenericContentSafetyText(lower string) bool {
 	if strings.Contains(lower, "内容安全") ||
 		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "触发")) ||
 		(strings.Contains(lower, "安全策略") && strings.Contains(lower, "拦截")) {
+		return true
+	}
+	return false
+}
+
+func isImageGenerationSafetyRefusalText(lower string) bool {
+	if !strings.Contains(lower, "upstream returned text instead of image output") {
+		return false
+	}
+	if strings.Contains(lower, "不能帮助生成") ||
+		strings.Contains(lower, "无法帮助生成") ||
+		strings.Contains(lower, "不能协助生成") ||
+		strings.Contains(lower, "无法协助生成") ||
+		strings.Contains(lower, "不能生成") ||
+		strings.Contains(lower, "无法生成") ||
+		strings.Contains(lower, "can't help generate") ||
+		strings.Contains(lower, "cannot help generate") ||
+		strings.Contains(lower, "can't assist with generating") ||
+		strings.Contains(lower, "cannot assist with generating") {
+		return true
+	}
+	if strings.Contains(lower, "安全版本") ||
+		strings.Contains(lower, "safe version") ||
+		strings.Contains(lower, "policy") ||
+		strings.Contains(lower, "safety") {
 		return true
 	}
 	return false

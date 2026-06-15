@@ -749,6 +749,9 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		})
 		return
 	}
+	if rejectUnsafeImagePrompt(c, prompt) {
+		return
+	}
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
 	if responseFormat == "" {
@@ -879,6 +882,9 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
+		return
+	}
+	if rejectUnsafeImagePrompt(c, prompt) {
 		return
 	}
 
@@ -1076,6 +1082,9 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
+		return
+	}
+	if rejectUnsafeImagePrompt(c, prompt) {
 		return
 	}
 
