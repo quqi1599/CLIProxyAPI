@@ -124,12 +124,12 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 		executor:       "ClaudeExecutor",
 		requestPath:    "/v1/messages",
 		compatKind:     "minimax",
-		messageCount:   546,
-		toolCount:      490,
+		messageCount:   900,
+		toolCount:      620,
 		toolShape: coreusage.ToolShape{
 			DeclaredToolCount: 78,
-			InteractionCount:  490,
-			MCPToolCount:      54,
+			InteractionCount:  620,
+			MCPToolCount:      90,
 		},
 	}
 	ctx := logging.WithRequestID(context.Background(), "req-large-tool-history")
@@ -149,11 +149,11 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
 	}
 	for _, want := range []string{
-		"too many prior tool calls",
-		"not a channel outage",
-		"Start a new conversation",
-		"summarize or compress",
-		"native Claude route",
+		"历史工具调用过多",
+		"不是通道宕机",
+		"请新开会话",
+		"MCP 工具结果压缩",
+		"原生支持该能力的 Claude 路由",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want %q", err.Error(), want)
@@ -170,14 +170,36 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 	if got := entry.Data["reason"]; got != "message_tool_history" {
 		t.Fatalf("reason = %#v, want message_tool_history", got)
 	}
-	if got := entry.Data["message_count"]; got != 546 {
-		t.Fatalf("message_count = %#v, want 546", got)
+	if got := entry.Data["message_count"]; got != 900 {
+		t.Fatalf("message_count = %#v, want 900", got)
 	}
-	if got := entry.Data["tool_interaction_count"]; got != 490 {
-		t.Fatalf("tool_interaction_count = %#v, want 490", got)
+	if got := entry.Data["tool_interaction_count"]; got != 620 {
+		t.Fatalf("tool_interaction_count = %#v, want 620", got)
 	}
 	if _, exists := entry.Data["payload"]; exists {
 		t.Fatal("unexpected raw payload field logged")
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_AllowsPreviouslyGuardedMidrangeHistory(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}]}`)
+	meta := compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M3",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "minimax",
+		messageCount:   546,
+		toolCount:      490,
+		toolShape: coreusage.ToolShape{
+			DeclaredToolCount: 78,
+			InteractionCount:  490,
+			MCPToolCount:      54,
+		},
+	}
+	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, claudeCompatPreflight{hasToolUse: true}); err != nil {
+		t.Fatalf("unexpected rejection for midrange tool history: %v", err)
 	}
 }
 

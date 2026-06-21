@@ -15,7 +15,7 @@ const (
 
 // UserFacingRequestFeatureUnsupportedMessage returns the normalized client-facing message for unsupported request shapes.
 func UserFacingRequestFeatureUnsupportedMessage() string {
-	return "当前请求的上下文过长，或包含当前模型/路由不支持的工具调用能力，无法安全转发。请清理或压缩对话历史，减少历史工具调用/MCP 工具结果，或切换到原生支持该能力的模型后重试；原样重复提交不会提高成功率。"
+	return "当前请求的历史工具调用过多、上下文过大，或包含当前模型/路由不支持的工具能力，当前 Claude 兼容路由无法安全承载并转发。请新开会话，或将历史工具调用/MCP 工具结果压缩成普通文本摘要，减少工具/联网/MCP 使用；也可以切换到原生支持该能力的 Claude 路由后重试。原样重复提交不会提高成功率。"
 }
 
 // NormalizeRequestFeatureUnsupportedStatus converts deterministic request-shape rejections to client errors.

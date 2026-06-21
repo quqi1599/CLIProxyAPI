@@ -97,10 +97,11 @@ var oauthToolsToRemove = map[string]bool{}
 const defaultModelMaxTokens = 1024
 
 const (
-	largeClaudeCompatToolHistoryPayloadBytes = 2 * 1024 * 1024
-	largeClaudeCompatToolHistoryMessages     = 400
-	largeClaudeCompatToolHistoryInteractions = 250
-	largeClaudeCompatToolHistoryMCPTools     = 40
+	largeClaudeCompatToolHistoryPayloadBytes     = 4 * 1024 * 1024
+	largeClaudeCompatToolHistoryMessages         = 800
+	largeClaudeCompatToolHistoryInteractions     = 500
+	largeClaudeCompatToolHistoryOnlyInteractions = 700
+	largeClaudeCompatToolHistoryMCPTools         = 80
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
@@ -2197,7 +2198,7 @@ func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta c
 }
 
 func largeClaudeCompatToolHistoryUserMessage() string {
-	return "request_feature_unsupported: large_claude_tool_history. This Claude request contains too many prior tool calls or tool results to be safely converted through MiniMax/Step Anthropic compatibility. This is a request-shape/context issue, not a channel outage. Start a new conversation, summarize or compress the old tool history as plain text, reduce MCP/tool usage, or use a native Claude route."
+	return "request_feature_unsupported: large_claude_tool_history. 历史工具调用过多或上下文过大，当前 Claude 兼容路由（MiniMax/Step）无法安全承载并转发该请求。这是请求形态/上下文问题，不是通道宕机。请新开会话、把历史工具调用/MCP 工具结果压缩成普通文本摘要、减少工具使用，或切换到原生支持该能力的 Claude 路由；原样重复提交不会提高成功率。"
 }
 
 func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) (string, bool) {
@@ -2221,7 +2222,7 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 	if meta.messageCount >= largeClaudeCompatToolHistoryMessages && interactions >= largeClaudeCompatToolHistoryInteractions {
 		return "message_tool_history", true
 	}
-	if interactions >= largeClaudeCompatToolHistoryInteractions+100 {
+	if interactions >= largeClaudeCompatToolHistoryOnlyInteractions {
 		return "tool_history", true
 	}
 	if meta.toolShape.MCPToolCount >= largeClaudeCompatToolHistoryMCPTools && interactions >= largeClaudeCompatToolHistoryInteractions {
