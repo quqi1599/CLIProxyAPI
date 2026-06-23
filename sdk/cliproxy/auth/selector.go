@@ -589,9 +589,6 @@ func getSpreadAvailableAuths(auths []*Auth, provider, model string, now time.Tim
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
-// For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -610,39 +607,6 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		limit = 4096
 	}
 
-	// Check if any available auth has gemini_virtual_parent attribute,
-	// indicating gemini-cli virtual auths that should use credential-level polling.
-	groups, parentOrder := groupByVirtualParent(available)
-	if len(parentOrder) > 1 {
-		// Two-level round-robin: first select a credential group, then pick within it.
-		groupKey := key + "::group"
-		s.ensureCursorKey(groupKey, limit)
-		if _, exists := s.cursors[groupKey]; !exists {
-			// Seed with a random initial offset so the starting credential is randomized.
-			s.cursors[groupKey] = rand.IntN(len(parentOrder))
-		}
-		groupIndex := s.cursors[groupKey]
-		if groupIndex >= 2_147_483_640 {
-			groupIndex = 0
-		}
-		s.cursors[groupKey] = groupIndex + 1
-
-		selectedParent := parentOrder[groupIndex%len(parentOrder)]
-		group := groups[selectedParent]
-
-		// Second level: round-robin within the selected credential group.
-		innerKey := key + "::cred:" + selectedParent
-		s.ensureCursorKey(innerKey, limit)
-		innerIndex := s.cursors[innerKey]
-		if innerIndex >= 2_147_483_640 {
-			innerIndex = 0
-		}
-		s.cursors[innerKey] = innerIndex + 1
-		s.mu.Unlock()
-		return group[innerIndex%len(group)], nil
-	}
-
-	// Flat round-robin for non-grouped auths (original behavior).
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
@@ -799,14 +763,6 @@ func (s *SpreadSelector) MarkDone(authID, model string) {
 	s.load.markDone(authID, model, time.Now())
 }
 
-// ensureCursorKey ensures the cursor map has capacity for the given key.
-// Must be called with s.mu held.
-func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
-	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
-		s.cursors = make(map[string]int)
-	}
-}
-
 // groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
 // Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
 // Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
@@ -822,18 +778,24 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 			parent = strings.TrimSpace(a.Attributes["gemini_virtual_parent"])
 		}
 		if parent == "" {
-			// Non-virtual auth present; fall back to flat round-robin.
 			return nil, nil
 		}
 		groups[parent] = append(groups[parent], a)
 	}
-	// Collect parent IDs in sorted order for stable cursor indexing.
 	parentOrder := make([]string, 0, len(groups))
-	for p := range groups {
-		parentOrder = append(parentOrder, p)
+	for parent := range groups {
+		parentOrder = append(parentOrder, parent)
 	}
 	sort.Strings(parentOrder)
 	return groups, parentOrder
+}
+
+// ensureCursorKey ensures the cursor map has capacity for the given key.
+// Must be called with s.mu held.
+func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
+	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
+		s.cursors = make(map[string]int)
+	}
 }
 
 // Pick selects the first available auth for the provider in a deterministic manner.
@@ -1097,11 +1059,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
 //  2. X-Session-ID header
 //  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  4. X-Client-Request-Id header (PI)
+//  5. metadata.user_id (non-Claude Code format)
+//  6. conversation_id field in request body
+//  7. Stable hash from first few messages content (fallback)
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1208,11 +1169,10 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
 //  2. X-Session-ID header
 //  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  4. X-Client-Request-Id header (PI)
+//  5. metadata.user_id (non-Claude Code format)
+//  6. conversation_id field in request body
+//  7. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -1250,19 +1210,15 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 
 	// 3. Session_id header (Codex)
 	if headers != nil {
+		if sid := headers.Get("Session-Id"); sid != "" {
+			return "codex:" + sid, ""
+		}
 		if sid := headers.Get("Session_id"); sid != "" {
 			return "codex:" + sid, ""
 		}
 	}
 
-	// 4. X-Amp-Thread-Id header (Amp CLI thread ID)
-	if headers != nil {
-		if tid := headers.Get("X-Amp-Thread-Id"); tid != "" {
-			return "amp:" + tid, ""
-		}
-	}
-
-	// 5. X-Client-Request-Id header (PI)
+	// 4. X-Client-Request-Id header (PI)
 	if headers != nil {
 		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
 			return "clientreq:" + rid, ""

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -77,60 +76,57 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 }
 
-func TestNewCodexStatusErrSanitizesCloudflare524(t *testing.T) {
-	body := []byte(`<!DOCTYPE html><html><head><title>example.cc | 524: A timeout occurred</title></head><body>Cloudflare</body></html>`)
-
-	err := newCodexStatusErr(524, body)
-
-	if got := err.StatusCode(); got != http.StatusGatewayTimeout {
-		t.Fatalf("status code = %d, want %d", got, http.StatusGatewayTimeout)
-	}
-	if got := err.ProviderStatusCode(); got != 524 {
-		t.Fatalf("provider status code = %d, want 524", got)
-	}
-	if strings.Contains(err.Error(), "<!DOCTYPE") || strings.Contains(err.Error(), "<html") {
-		t.Fatalf("error leaked HTML body: %s", err.Error())
-	}
-	assertCodexErrorCode(t, err.Error(), "server_error", "upstream_timeout")
-}
-
-func TestNewCodexStatusErrSanitizesMixedJSONAndSSEErrorBody(t *testing.T) {
-	body := []byte(`{"error":{"message":"model \"gpt-5.3-codex-spark\" does not support image input","param":"input","type":"invalid_request_error"}}event: response.failed
-data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"upstream_error","message":"Upstream request failed"}}}`)
+func TestNewCodexStatusErrTreatsUsageLimitAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":120}}`)
 
 	err := newCodexStatusErr(http.StatusBadRequest, body)
 
-	if got := err.StatusCode(); got != http.StatusBadRequest {
-		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
-	if strings.Contains(err.Error(), "event:") || strings.Contains(err.Error(), "response.failed") {
-		t.Fatalf("error body leaked SSE frame: %s", err.Error())
+	retryAfter := err.RetryAfter()
+	if retryAfter == nil {
+		t.Fatalf("expected retryAfter from usage_limit_reached, got nil")
 	}
-	if !json.Valid([]byte(err.Error())) {
-		t.Fatalf("error body is not valid JSON: %s", err.Error())
-	}
-	if got := gjson.Get(err.Error(), "error.message").String(); got != `model "gpt-5.3-codex-spark" does not support image input` {
-		t.Fatalf("error.message = %q", got)
+	if *retryAfter != 120*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", *retryAfter, 120*time.Second)
 	}
 }
 
-func TestNewCodexStatusErrSanitizesPureSSEFailedErrorBody(t *testing.T) {
-	body := []byte(`event: response.failed
-data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"upstream_error","message":"Upstream request failed"}}}`)
+func TestIsCodexUsageLimitError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{
+			name: "nested usage_limit_reached",
+			body: []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":30}}`),
+			want: true,
+		},
+		{
+			name: "top-level usage_limit_reached",
+			body: []byte(`{"type":"usage_limit_reached"}`),
+			want: true,
+		},
+		{
+			name: "transient rate limit is excluded",
+			body: []byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`),
+			want: false,
+		},
+		{
+			name: "empty body",
+			body: nil,
+			want: false,
+		},
+	}
 
-	err := newCodexStatusErr(http.StatusBadGateway, body)
-
-	if got := err.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
-	}
-	if strings.Contains(err.Error(), "event:") || strings.Contains(err.Error(), "response.failed") {
-		t.Fatalf("error body leaked SSE frame: %s", err.Error())
-	}
-	if !json.Valid([]byte(err.Error())) {
-		t.Fatalf("error body is not valid JSON: %s", err.Error())
-	}
-	if got := gjson.Get(err.Error(), "error.message").String(); got != "Upstream request failed" {
-		t.Fatalf("error.message = %q", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCodexUsageLimitError(tc.body); got != tc.want {
+				t.Fatalf("isCodexUsageLimitError = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

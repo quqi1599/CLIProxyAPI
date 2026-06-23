@@ -3,6 +3,9 @@ package helps
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,91 +107,37 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	}
 }
 
-func TestParseOpenAIStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
-	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"}}]}`)
-	if detail, ok := ParseOpenAIStreamUsage(line); ok {
-		t.Fatalf("ParseOpenAIStreamUsage() = (%+v, true), want false for plain content chunk", detail)
+func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_read_input_tokens":7,"cache_creation_input_tokens":19514}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.InputTokens != 3085 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 3085)
+	}
+	if detail.OutputTokens != 253 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 253)
+	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 7)
+	}
+	if detail.CacheCreationTokens != 19514 {
+		t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, 19514)
+	}
+	if detail.CachedTokens != 7 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
+	}
+	if detail.TotalTokens != 22859 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22859)
 	}
 }
 
-func TestParseClaudeStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
-	line := []byte(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`)
-	if detail, ok := ParseClaudeStreamUsage(line); ok {
-		t.Fatalf("ParseClaudeStreamUsage() = (%+v, true), want false for plain content chunk", detail)
+func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_creation_input_tokens":19514}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.CachedTokens != 19514 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 19514)
 	}
-}
-
-func TestParseGeminiCLIStreamUsageSkipsPlainChunkWithoutUsageMarkers(t *testing.T) {
-	line := []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}}`)
-	if detail, ok := ParseGeminiCLIStreamUsage(line); ok {
-		t.Fatalf("ParseGeminiCLIStreamUsage() = (%+v, true), want false for plain content chunk", detail)
-	}
-}
-
-func TestShouldParseStreamUsagePayloadMarkers(t *testing.T) {
-	tests := []struct {
-		name    string
-		payload []byte
-		want    bool
-	}{
-		{name: "usage wrapper", payload: []byte(`{"usage":{"prompt_tokens":1}}`), want: true},
-		{name: "usage metadata camel", payload: []byte(`{"usageMetadata":{"promptTokenCount":1}}`), want: true},
-		{name: "usage metadata snake", payload: []byte(`{"usage_metadata":{"promptTokenCount":1}}`), want: true},
-		{name: "input tokens", payload: []byte(`{"input_tokens":1}`), want: true},
-		{name: "output tokens", payload: []byte(`{"output_tokens":1}`), want: true},
-		{name: "completion tokens", payload: []byte(`{"completion_tokens":1}`), want: true},
-		{name: "plain content", payload: []byte(`{"choices":[{"delta":{"content":"hello"}}]}`), want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldParseStreamUsagePayload(tt.payload); got != tt.want {
-				t.Fatalf("shouldParseStreamUsagePayload() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestParseGeminiCLIUsage_TopLevelUsageMetadata(t *testing.T) {
-	data := []byte(`{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"thoughtsTokenCount":3,"totalTokenCount":21,"cachedContentTokenCount":5}}`)
-	detail := ParseGeminiCLIUsage(data)
-	if detail.InputTokens != 11 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 11)
-	}
-	if detail.OutputTokens != 7 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 7)
-	}
-	if detail.ReasoningTokens != 3 {
-		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 3)
-	}
-	if detail.TotalTokens != 21 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 21)
-	}
-	if detail.CachedTokens != 5 {
-		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 5)
-	}
-}
-
-func TestParseGeminiCLIStreamUsage_ResponseSnakeCaseUsageMetadata(t *testing.T) {
-	line := []byte(`data: {"response":{"usage_metadata":{"promptTokenCount":13,"candidatesTokenCount":2,"totalTokenCount":15}}}`)
-	detail, ok := ParseGeminiCLIStreamUsage(line)
-	if !ok {
-		t.Fatal("ParseGeminiCLIStreamUsage() ok = false, want true")
-	}
-	if detail.InputTokens != 13 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 13)
-	}
-	if detail.OutputTokens != 2 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 2)
-	}
-	if detail.TotalTokens != 15 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 15)
-	}
-}
-
-func TestParseGeminiCLIStreamUsage_IgnoresTrafficTypeOnlyUsageMetadata(t *testing.T) {
-	line := []byte(`data: {"response":{"usageMetadata":{"trafficType":"ON_DEMAND"}}}`)
-	if detail, ok := ParseGeminiCLIStreamUsage(line); ok {
-		t.Fatalf("ParseGeminiCLIStreamUsage() = (%+v, true), want false for traffic-only usage metadata", detail)
+	if detail.TotalTokens != 22852 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22852)
 	}
 }
 
@@ -208,6 +157,41 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
+	delay := 40 * time.Millisecond
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	client := reporter.TrackHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			time.Sleep(delay)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    req,
+			}, nil
+		}),
+	})
+
+	req, errNewRequest := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.invalid/v1/chat/completions", strings.NewReader("{}"))
+	if errNewRequest != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", errNewRequest)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		t.Fatalf("Do() error = %v", errDo)
+	}
+	if _, errRead := io.ReadAll(resp.Body); errRead != nil {
+		t.Fatalf("ReadAll() error = %v", errRead)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close error = %v", errClose)
+	}
+	if got := reporter.ttftDuration(); got < delay {
+		t.Fatalf("ttft = %v, want >= %v", got, delay)
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
@@ -221,6 +205,18 @@ func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	}
 }
 
+func TestNewExecutorUsageReporterIncludesExecutorType(t *testing.T) {
+	reporter := NewExecutorUsageReporter(context.Background(), &TestUsageExecutor{}, "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Provider != "test-provider" {
+		t.Fatalf("provider = %q, want %q", record.Provider, "test-provider")
+	}
+	if record.ExecutorType != "TestUsageExecutor" {
+		t.Fatalf("executor type = %q, want %q", record.ExecutorType, "TestUsageExecutor")
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
 	ctx := usage.WithReasoningEffort(context.Background(), "medium")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
@@ -231,16 +227,36 @@ func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestUsageReporterBuildRecordIncludesRequestShape(t *testing.T) {
-	ctx := usage.WithRequestShape(context.Background(), usage.RequestShape{MessageCount: 127, ToolCount: 49})
+func TestUsageReporterBuildRecordIncludesServiceTier(t *testing.T) {
+	ctx := usage.WithServiceTier(context.Background(), "priority")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, true)
-	if record.MessageCount != 127 {
-		t.Fatalf("message count = %d, want 127", record.MessageCount)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ServiceTier != "priority" {
+		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "priority")
 	}
-	if record.ToolCount != 49 {
-		t.Fatalf("tool count = %d, want 49", record.ToolCount)
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortUpdatesServiceTier(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+
+	reporter.SetTranslatedReasoningEffort([]byte(`{"service_tier":"priority"}`), "openai")
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ServiceTier != "priority" {
+		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "priority")
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortDefaultsServiceTierWhenRemoved(t *testing.T) {
+	ctx := usage.WithServiceTier(context.Background(), "priority")
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	reporter.SetTranslatedReasoningEffort([]byte(`{"model":"gpt-5.4"}`), "openai")
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ServiceTier != usage.DefaultServiceTier {
+		t.Fatalf("service tier = %q, want %q", record.ServiceTier, usage.DefaultServiceTier)
 	}
 }
 
@@ -262,47 +278,14 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 }
 
-func TestFailureMetadataFromErrorUsesSafeStructuredFields(t *testing.T) {
-	status, code := failureMetadataFromError(metadataStatusError{
-		status: 402,
-		code:   "insufficient_balance",
-		msg:    `{"error":{"message":"secret body must not be persisted","code":"ignored"}}`,
-	})
-	if status != 402 {
-		t.Fatalf("status = %d, want 402", status)
-	}
-	if code != "insufficient_balance" {
-		t.Fatalf("code = %q, want insufficient_balance", code)
-	}
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
-func TestFailureMetadataFromErrorParsesCommonTextWithoutMessages(t *testing.T) {
-	status, code := failureMetadataFromError(fmt.Errorf("status_code=400, invalid_request_error: messages.1 tool_use mismatch with sk-secret-token"))
-	if status != 400 {
-		t.Fatalf("status = %d, want 400", status)
-	}
-	if code != "invalid_request_error" {
-		t.Fatalf("code = %q, want invalid_request_error", code)
-	}
-}
+type TestUsageExecutor struct{}
 
-func TestFailureMetadataFromErrorIgnoresSSEDataPrefixAsCode(t *testing.T) {
-	status, code := failureMetadataFromError(fmt.Errorf("status_code=400, data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid params\"}}"))
-	if status != 400 {
-		t.Fatalf("status = %d, want 400", status)
-	}
-	if code != "invalid_request_error" {
-		t.Fatalf("code = %q, want invalid_request_error", code)
-	}
-}
-
-func TestFailureMetadataFromErrorRejectsUnsafeCodeCandidates(t *testing.T) {
-	_, code := failureMetadataFromError(metadataStatusError{
-		status: 401,
-		code:   "sk-secret-token",
-		msg:    "status_code=401, sk-secret-token: unauthorized",
-	})
-	if code != "" {
-		t.Fatalf("code = %q, want empty unsafe token", code)
-	}
+func (TestUsageExecutor) Identifier() string {
+	return "test-provider"
 }

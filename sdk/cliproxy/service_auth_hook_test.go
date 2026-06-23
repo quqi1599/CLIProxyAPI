@@ -259,7 +259,7 @@ func TestRegisterModelsForAuth_UsesProviderNativeTypeForConfiguredModels(t *test
 				reg.UnregisterClient(tt.auth.ID)
 			})
 
-			svc.registerModelsForAuth(tt.auth)
+			svc.registerModelsForAuth(context.Background(), tt.auth)
 
 			got := reg.GetModelsForClient(tt.auth.ID)
 			if len(got) != 1 {

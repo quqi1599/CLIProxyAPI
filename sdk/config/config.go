@@ -15,7 +15,6 @@ type RequestGuardsConfig = internalconfig.RequestGuardsConfig
 type MiniMaxHighspeedNarrativeGuardConfig = internalconfig.MiniMaxHighspeedNarrativeGuardConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
-type AmpCode = internalconfig.AmpCode
 type OAuthModelAlias = internalconfig.OAuthModelAlias
 type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule

@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -70,14 +69,12 @@ type Params struct {
 	HasSentFinalEvents   bool   // Indicates if final content/message events have been sent
 	HasToolUse           bool   // Indicates if tool use was observed in the stream
 	HasContent           bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	HasWebSearchTool     bool
+	WebSearchRequests    int64
+	WebSearchTextBuffer  strings.Builder
 
 	// Signature caching support
 	CurrentThinkingText strings.Builder // Accumulates thinking text for signature caching
-
-	// Web search support
-	WebSearchQuery   string
-	WebSearchResults []map[string]any
-	WebSearchEmitted bool
 
 	// Reverse map: sanitized Gemini function name → original Claude tool name.
 	// Populated lazily on the first response chunk from the original request JSON.
@@ -98,12 +95,12 @@ var toolUseIDCounter uint64
 // Parameters:
 //   - ctx: The context for the request, used for cancellation and timeout handling
 //   - modelName: The name of the model being used for the response (unused in current implementation)
-//   - rawJSON: The raw JSON response from the Gemini CLI API
+//   - rawJSON: The raw JSON response from the Antigravity API
 //   - param: A pointer to a parameter object for maintaining state between calls
 //
 // Returns:
 //   - [][]byte: A slice of bytes, each containing a Claude Code-compatible SSE payload.
-func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &Params{
 			HasFirstResponse: false,
@@ -131,6 +128,20 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 	appendEvent := func(event, payload string) {
 		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
 	}
+	webSearchStreamMode := shouldTranslateWebSearchGrounding(originalRequestRawJSON, requestRawJSON)
+	appendThinkingSignature := func(signature string) {
+		if signature == "" || params.ResponseType != 2 {
+			return
+		}
+		if params.CurrentThinkingText.Len() > 0 {
+			cache.CacheSignatureBestEffort(ctx, modelName, params.CurrentThinkingText.String(), signature)
+			params.CurrentThinkingText.Reset()
+		}
+		sigValue := formatClaudeSignatureValue(modelName, signature)
+		data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex)), "delta.signature", sigValue)
+		appendEvent("content_block_delta", string(data))
+		params.HasContent = true
+	}
 
 	// Initialize the streaming session with a message_start event
 	// This is only sent for the very first response chunk to establish the streaming session
@@ -143,11 +154,11 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		if promptTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.promptTokenCount"); promptTokenCount.Exists() {
 			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.input_tokens", promptTokenCount.Int())
 		}
-		if candidatesTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.candidatesTokenCount"); candidatesTokenCount.Exists() {
+		if candidatesTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.candidatesTokenCount"); candidatesTokenCount.Exists() && !webSearchStreamMode {
 			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.output_tokens", candidatesTokenCount.Int())
 		}
 
-		// Override default values with actual response metadata if available from the Gemini CLI response
+		// Override default values with actual response metadata if available from the Antigravity response
 		if modelVersionResult := gjson.GetBytes(rawJSON, "response.modelVersion"); modelVersionResult.Exists() {
 			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.model", modelVersionResult.String())
 		}
@@ -159,10 +170,28 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		params.HasFirstResponse = true
 	}
 
+	handledWebSearchGrounding := false
+	if webSearchStreamMode && !params.HasWebSearchTool {
+		root := gjson.ParseBytes(rawJSON)
+		if groundingMetadata := antigravityGroundingMetadata(root); groundingMetadata.Exists() {
+			toolUseID := newClaudeWebSearchToolUseID()
+			textContent := params.WebSearchTextBuffer.String() + antigravityTextContent(root)
+			params.WebSearchTextBuffer.Reset()
+			params.ResponseIndex = appendClaudeWebSearchStreamBlocks(appendEvent, params.ResponseIndex, toolUseID, textContent, groundingMetadata)
+			params.HasWebSearchTool = true
+			params.WebSearchRequests = 1
+			params.HasContent = true
+			params.ResponseType = 0
+			handledWebSearchGrounding = true
+		}
+	}
+
 	// Process the response parts array from the backend client
 	// Each part can contain text content, thinking content, or function calls
 	partsResult := gjson.GetBytes(rawJSON, "response.candidates.0.content.parts")
-	if partsResult.IsArray() {
+	if partsResult.IsArray() && webSearchStreamMode && !params.HasWebSearchTool && !handledWebSearchGrounding {
+		appendWebSearchBufferedText(partsResult, &params.WebSearchTextBuffer)
+	} else if partsResult.IsArray() && !handledWebSearchGrounding {
 		partResults := partsResult.Array()
 		for i := 0; i < len(partResults); i++ {
 			partResult := partResults[i]
@@ -170,12 +199,22 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			// Extract the different types of content from each part
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
+			thoughtSignatureResult := partResult.Get("thoughtSignature")
+			if !thoughtSignatureResult.Exists() {
+				thoughtSignatureResult = partResult.Get("thought_signature")
+			}
+			hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != "" && !functionCallResult.Exists()
+
+			if hasThoughtSignature && !partTextResult.Exists() {
+				appendThinkingSignature(thoughtSignatureResult.String())
+				continue
+			}
 
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
 				// Process thinking content (internal reasoning)
-				if partResult.Get("thought").Bool() {
-					if thoughtSignature := partResult.Get("thoughtSignature"); thoughtSignature.Exists() && thoughtSignature.String() != "" {
+				if partResult.Get("thought").Bool() || hasThoughtSignature {
+					if hasThoughtSignature {
 						// log.Debug("Branch: signature_delta")
 
 						// Flush co-located text before emitting the signature
@@ -194,16 +233,7 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 							appendEvent("content_block_delta", string(data))
 						}
 
-						if params.CurrentThinkingText.Len() > 0 {
-							cache.CacheSignature(modelName, params.CurrentThinkingText.String(), thoughtSignature.String())
-							// log.Debugf("Cached signature for thinking block (textLen=%d)", params.CurrentThinkingText.Len())
-							params.CurrentThinkingText.Reset()
-						}
-
-						sigValue := formatClaudeSignatureValue(modelName, thoughtSignature.String())
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex)), "delta.signature", sigValue)
-						appendEvent("content_block_delta", string(data))
-						params.HasContent = true
+						appendThinkingSignature(thoughtSignatureResult.String())
 					} else if params.ResponseType == 2 { // Continue existing thinking block if already in thinking state
 						params.CurrentThinkingText.WriteString(partTextResult.String())
 						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", partTextResult.String())
@@ -309,15 +339,6 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		}
 	}
 
-	if q, results := extractWebSearchFromAntigravity(rawJSON); q != "" || len(results) > 0 {
-		if q != "" {
-			params.WebSearchQuery = q
-		}
-		if len(results) > 0 {
-			params.WebSearchResults = results
-		}
-	}
-
 	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
 		params.HasFinishReason = true
 		params.FinishReason = finishReasonResult.String()
@@ -338,12 +359,39 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		}
 	}
 
+	if webSearchStreamMode && !params.HasWebSearchTool && params.HasFinishReason && params.WebSearchTextBuffer.Len() > 0 {
+		appendBufferedWebSearchTextBlock(params, appendEvent)
+	}
+
 	if params.HasUsageMetadata && params.HasFinishReason {
-		appendWebSearchBlocks(params, &output)
 		appendFinalEvents(params, &output, false)
 	}
 
 	return [][]byte{output}
+}
+
+func appendWebSearchBufferedText(partsResult gjson.Result, buffer *strings.Builder) {
+	for _, partResult := range partsResult.Array() {
+		if partResult.Get("thought").Bool() || partResult.Get("functionCall").Exists() {
+			continue
+		}
+		if partTextResult := partResult.Get("text"); partTextResult.Exists() {
+			buffer.WriteString(partTextResult.String())
+		}
+	}
+}
+
+func appendBufferedWebSearchTextBlock(params *Params, appendEvent func(string, string)) {
+	text := params.WebSearchTextBuffer.String()
+	params.WebSearchTextBuffer.Reset()
+	if text == "" {
+		return
+	}
+	appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex))
+	data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", text)
+	appendEvent("content_block_delta", string(data))
+	params.ResponseType = 1
+	params.HasContent = true
 }
 
 func appendFinalEvents(params *Params, output *[]byte, force bool) {
@@ -375,6 +423,9 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 	}
 
 	delta := []byte(fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"input_tokens":%d,"output_tokens":%d}}`, stopReason, params.PromptTokenCount, usageOutputTokens))
+	if params.WebSearchRequests > 0 {
+		delta, _ = sjson.SetBytes(delta, "usage.server_tool_use.web_search_requests", params.WebSearchRequests)
+	}
 	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
 	if params.CachedTokenCount > 0 {
 		var err error
@@ -403,112 +454,12 @@ func resolveStopReason(params *Params) string {
 	return "end_turn"
 }
 
-func buildEncryptedContent(url, title string) string {
-	payload := map[string]string{"url": url, "title": title}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(encoded)
-}
-
-func extractWebSearchFromAntigravity(rawJSON []byte) (string, []map[string]any) {
-	candidate := gjson.GetBytes(rawJSON, "response.candidates.0")
-	if !candidate.Exists() {
-		candidate = gjson.GetBytes(rawJSON, "candidates.0")
-	}
-	if !candidate.Exists() {
-		return "", nil
-	}
-
-	query := candidate.Get("groundingMetadata.webSearchQueries.0").String()
-
-	chunks := candidate.Get("groundingChunks")
-	if !chunks.Exists() {
-		chunks = candidate.Get("groundingMetadata.groundingChunks")
-	}
-	if !chunks.Exists() || !chunks.IsArray() {
-		return query, nil
-	}
-
-	results := make([]map[string]any, 0, len(chunks.Array()))
-	for _, chunk := range chunks.Array() {
-		web := chunk.Get("web")
-		if !web.Exists() {
-			continue
-		}
-		url := web.Get("uri").String()
-		if url == "" {
-			url = web.Get("url").String()
-		}
-		title := web.Get("title").String()
-		if title == "" {
-			title = web.Get("domain").String()
-		}
-		if url == "" && title == "" {
-			continue
-		}
-		item := map[string]any{
-			"type":              "web_search_result",
-			"title":             title,
-			"url":               url,
-			"encrypted_content": buildEncryptedContent(url, title),
-			"page_age":          nil,
-		}
-		results = append(results, item)
-	}
-
-	if len(results) == 0 {
-		return query, nil
-	}
-	return query, results
-}
-
-func appendWebSearchBlocks(params *Params, output *[]byte) {
-	if params.WebSearchEmitted {
-		return
-	}
-	if params.WebSearchQuery == "" && len(params.WebSearchResults) == 0 {
-		return
-	}
-
-	if params.ResponseType != 0 {
-		*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-		params.ResponseType = 0
-		params.ResponseIndex++
-	}
-
-	toolUseID := fmt.Sprintf("srvtoolu_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))
-	serverToolBytes := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"","name":"web_search","input":{}}}`, params.ResponseIndex))
-	serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "content_block.id", toolUseID)
-	if params.WebSearchQuery != "" {
-		serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "content_block.input.query", params.WebSearchQuery)
-	}
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_start", string(serverToolBytes), 3)
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-	params.ResponseIndex++
-
-	resultBlockBytes := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"web_search_tool_result","tool_use_id":"","content":[]}}`, params.ResponseIndex))
-	resultBlockBytes, _ = sjson.SetBytes(resultBlockBytes, "content_block.tool_use_id", toolUseID)
-	if len(params.WebSearchResults) > 0 {
-		if raw, err := json.Marshal(params.WebSearchResults); err == nil {
-			resultBlockBytes, _ = sjson.SetRawBytes(resultBlockBytes, "content_block.content", raw)
-		}
-	}
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_start", string(resultBlockBytes), 3)
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-	params.ResponseIndex++
-
-	params.HasContent = true
-	params.WebSearchEmitted = true
-}
-
-// ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Gemini CLI response to a non-streaming Claude response.
+// ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Antigravity response to a non-streaming Claude response.
 //
 // Parameters:
 //   - ctx: The context for the request.
 //   - modelName: The name of the model.
-//   - rawJSON: The raw JSON response from the Gemini CLI API.
+//   - rawJSON: The raw JSON response from the Antigravity API.
 //   - param: A pointer to a parameter object for the conversion.
 //
 // Returns:
@@ -542,6 +493,16 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		responseJSON, err = sjson.SetBytes(responseJSON, "usage.cache_read_input_tokens", cachedTokens)
 		if err != nil {
 			log.Warnf("antigravity claude response: failed to set cache_read_input_tokens: %v", err)
+		}
+	}
+
+	if shouldTranslateWebSearchGrounding(originalRequestRawJSON, requestRawJSON) {
+		if groundingMetadata := antigravityGroundingMetadata(root); groundingMetadata.Exists() {
+			toolUseID := newClaudeWebSearchToolUseID()
+			responseJSON, _ = sjson.SetRawBytes(responseJSON, "content", buildClaudeWebSearchContent(toolUseID, antigravityTextContent(root), groundingMetadata))
+			responseJSON, _ = sjson.SetBytes(responseJSON, "stop_reason", "end_turn")
+			responseJSON, _ = sjson.SetBytes(responseJSON, "usage.server_tool_use.web_search_requests", 1)
+			return responseJSON
 		}
 	}
 
@@ -590,15 +551,14 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
-			isThought := part.Get("thought").Bool()
-			if isThought {
-				sig := part.Get("thoughtSignature")
-				if !sig.Exists() {
-					sig = part.Get("thought_signature")
-				}
-				if sig.Exists() && sig.String() != "" {
-					thinkingSignature = sig.String()
-				}
+			sig := part.Get("thoughtSignature")
+			if !sig.Exists() {
+				sig = part.Get("thought_signature")
+			}
+			hasThoughtSignature := sig.Exists() && sig.String() != "" && !part.Get("functionCall").Exists()
+			isThought := part.Get("thought").Bool() || hasThoughtSignature
+			if hasThoughtSignature {
+				thinkingSignature = sig.String()
 			}
 
 			if text := part.Get("text"); text.Exists() && text.String() != "" {
@@ -636,25 +596,6 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 	flushThinking()
 	flushText()
-	if query, results := extractWebSearchFromAntigravity(rawJSON); query != "" || len(results) > 0 {
-		ensureContentArray()
-		toolUseID := fmt.Sprintf("srvtoolu_%d", time.Now().UnixNano())
-		serverToolBytes := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
-		serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "id", toolUseID)
-		if query != "" {
-			serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "input.query", query)
-		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", serverToolBytes)
-
-		resultBlockBytes := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
-		resultBlockBytes, _ = sjson.SetBytes(resultBlockBytes, "tool_use_id", toolUseID)
-		if len(results) > 0 {
-			if raw, err := json.Marshal(results); err == nil {
-				resultBlockBytes, _ = sjson.SetRawBytes(resultBlockBytes, "content", raw)
-			}
-		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", resultBlockBytes)
-	}
 
 	stopReason := "end_turn"
 	if hasToolCall {

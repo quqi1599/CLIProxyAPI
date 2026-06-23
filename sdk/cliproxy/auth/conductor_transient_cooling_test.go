@@ -73,7 +73,7 @@ func TestApplyAuthFailureState_524WaitsForRepeatedFailuresBeforeAuthCooldown(t *
 
 	auth := &Auth{ID: "auth-524", Provider: "claude"}
 	before := time.Now()
-	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before)
+	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before, false)
 
 	if auth.StatusMessage != "transient upstream error" {
 		t.Fatalf("status message = %q, want %q", auth.StatusMessage, "transient upstream error")
@@ -82,8 +82,8 @@ func TestApplyAuthFailureState_524WaitsForRepeatedFailuresBeforeAuthCooldown(t *
 		t.Fatalf("first 524 auth cooldown = %v, want zero", auth.NextRetryAfter)
 	}
 
-	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before.Add(30*time.Second))
-	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before.Add(time.Minute))
+	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before.Add(30*time.Second), false)
+	applyAuthFailureState(auth, &Error{HTTPStatus: 524, Message: "gateway timeout"}, nil, before.Add(time.Minute), false)
 
 	if auth.NextRetryAfter.IsZero() {
 		t.Fatal("expected repeated 524 to set auth cooldown")

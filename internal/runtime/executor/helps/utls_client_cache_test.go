@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -15,8 +16,8 @@ import (
 func TestNewUtlsHTTPClientReusesClientForSameProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://reuse-proxy.example.com:8080"}}
 
-	first := NewUtlsHTTPClient(cfg, nil, 0)
-	second := NewUtlsHTTPClient(cfg, nil, 0)
+	first := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	second := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
 
 	if first == nil || second == nil {
 		t.Fatalf("expected non-nil clients, got first=%v second=%v", first, second)
@@ -32,8 +33,8 @@ func TestNewUtlsHTTPClientDistinctProxyDistinctClient(t *testing.T) {
 	cfgA := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://proxy-a.example.com:8080"}}
 	cfgB := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://proxy-b.example.com:8080"}}
 
-	clientA := NewUtlsHTTPClient(cfgA, nil, 0)
-	clientB := NewUtlsHTTPClient(cfgB, nil, 0)
+	clientA := NewUtlsHTTPClient(context.Background(), cfgA, nil, 0)
+	clientB := NewUtlsHTTPClient(context.Background(), cfgB, nil, 0)
 
 	if clientA == clientB {
 		t.Fatalf("expected distinct clients for distinct proxyURLs, got same pointer %p", clientA)
@@ -46,9 +47,9 @@ func TestNewUtlsHTTPClientDistinctProxyDistinctClient(t *testing.T) {
 func TestNewUtlsHTTPClientTimeoutBypassesCache(t *testing.T) {
 	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://timeout-proxy.example.com:8080"}}
 
-	cached := NewUtlsHTTPClient(cfg, nil, 0)
-	timed := NewUtlsHTTPClient(cfg, nil, 5*time.Second)
-	timedAgain := NewUtlsHTTPClient(cfg, nil, 5*time.Second)
+	cached := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	timed := NewUtlsHTTPClient(context.Background(), cfg, nil, 5*time.Second)
+	timedAgain := NewUtlsHTTPClient(context.Background(), cfg, nil, 5*time.Second)
 
 	if timed == cached {
 		t.Fatalf("expected timeout client to differ from cached client")
@@ -67,9 +68,9 @@ func TestNewUtlsHTTPClientAuthProxyOverridesConfig(t *testing.T) {
 	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://config-proxy.example.com:8080"}}
 	auth := &cliproxyauth.Auth{ProxyURL: "http://auth-proxy.example.com:8080"}
 
-	withAuth := NewUtlsHTTPClient(cfg, auth, 0)
-	withAuthAgain := NewUtlsHTTPClient(cfg, auth, 0)
-	configOnly := NewUtlsHTTPClient(cfg, nil, 0)
+	withAuth := NewUtlsHTTPClient(context.Background(), cfg, auth, 0)
+	withAuthAgain := NewUtlsHTTPClient(context.Background(), cfg, auth, 0)
+	configOnly := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
 
 	if withAuth != withAuthAgain {
 		t.Fatalf("expected same client for identical auth proxyURL")

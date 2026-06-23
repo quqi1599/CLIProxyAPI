@@ -1,22 +1,27 @@
 package codex
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func resetCodexRefreshGroupForTest() {
+	codexRefreshGroup = singleflight.Group{}
 }
 
 func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
@@ -47,40 +52,68 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 }
 
-func TestRefreshTokensWithRetry_NonRetryableLogsSourceLabel(t *testing.T) {
-	var buf bytes.Buffer
-	logger := log.StandardLogger()
-	oldOut := logger.Out
-	oldFormatter := logger.Formatter
-	oldLevel := logger.Level
-	log.SetOutput(&buf)
-	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableColors: true})
-	log.SetLevel(log.WarnLevel)
-	defer func() {
-		log.SetOutput(oldOut)
-		log.SetFormatter(oldFormatter)
-		log.SetLevel(oldLevel)
-	}()
+func TestRefreshTokens_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
 
-	auth := &CodexAuth{
-		httpClient: &http.Client{
-			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusUnauthorized,
-					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","code":"refresh_token_reused"}`)),
-					Header:     make(http.Header),
-					Request:    req,
-				}, nil
-			}),
-		},
+	var calls int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		once.Do(func() { close(started) })
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(`{
+				"access_token":"new-access",
+				"refresh_token":"new-refresh",
+				"token_type":"Bearer",
+				"expires_in":3600
+			}`)),
+			Header:  make(http.Header),
+			Request: req,
+		}, nil
+	})
+	authA := &CodexAuth{httpClient: &http.Client{Transport: transport}}
+	authB := &CodexAuth{httpClient: &http.Client{Transport: transport}}
+
+	results := make(chan *CodexTokenData, 2)
+	errs := make(chan error, 2)
+	runRefresh := func(auth *CodexAuth, launched chan<- struct{}) {
+		if launched != nil {
+			close(launched)
+		}
+		tokenData, errRefresh := auth.RefreshTokens(context.Background(), "shared-refresh-token")
+		results <- tokenData
+		errs <- errRefresh
 	}
 
-	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", "user@example.com", 3)
-	if err == nil {
-		t.Fatal("expected error for non-retryable refresh failure")
+	go runRefresh(authA, nil)
+	<-started
+
+	secondLaunched := make(chan struct{})
+	go runRefresh(authB, secondLaunched)
+	<-secondLaunched
+	time.Sleep(20 * time.Millisecond)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected concurrent refresh to share a single upstream call, got %d", got)
 	}
-	if got := buf.String(); !strings.Contains(got, "user@example.com") {
-		t.Fatalf("expected warning log to contain source label, got: %s", got)
+	close(release)
+
+	for i := 0; i < 2; i++ {
+		if errRefresh := <-errs; errRefresh != nil {
+			t.Fatalf("expected refresh to succeed, got %v", errRefresh)
+		}
+		tokenData := <-results
+		if tokenData == nil || tokenData.AccessToken != "new-access" || tokenData.RefreshToken != "new-refresh" {
+			t.Fatalf("unexpected token data: %#v", tokenData)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected both refresh callers to share a single upstream call, got %d", got)
 	}
 }
 

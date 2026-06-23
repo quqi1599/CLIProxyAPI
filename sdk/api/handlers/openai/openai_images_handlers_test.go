@@ -43,7 +43,7 @@ func assertUnsupportedImagesModelResponse(t *testing.T, resp *httptest.ResponseR
 	}
 
 	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
-	expectedMessage := "Model " + model + " is not supported on " + imagesGenerationsPath + " or " + imagesEditsPath + ". Use " + defaultImagesToolModel + ", " + defaultXAIImagesModel + ", " + xaiImagesQualityModel + ", or a configured openai-compatibility image model."
+	expectedMessage := "Model " + model + " is not supported on " + imagesGenerationsPath + " or " + imagesEditsPath + ". Use " + gptImage15Model + ", " + defaultImagesToolModel + ", " + defaultXAIImagesModel + ", " + xaiImagesQualityModel + ", or a configured openai-compatibility image model."
 	if message != expectedMessage {
 		t.Fatalf("error message = %q, want %q", message, expectedMessage)
 	}
@@ -52,34 +52,23 @@ func assertUnsupportedImagesModelResponse(t *testing.T, resp *httptest.ResponseR
 	}
 }
 
-func assertImagesPromptRequiredResponse(t *testing.T, resp *httptest.ResponseRecorder, endpointPath string) {
+func assertImagesPromptRequiredResponse(t *testing.T, resp *httptest.ResponseRecorder, path string) {
 	t.Helper()
 
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
 	}
-
 	message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String()
-	for _, want := range []string{
-		"prompt is required",
-		endpointPath,
-		defaultImagesToolModel,
-		imagesGenerationsPath,
-		imagesEditsPath,
-		"multipart/form-data",
-		"request-parameter issue",
-	} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("error message %q should contain %q", message, want)
-		}
+	if want := imagesPromptRequiredMessage(defaultImagesToolModel, path); message != want {
+		t.Fatalf("error message = %q, want %q", message, want)
 	}
 	if errorType := gjson.GetBytes(resp.Body.Bytes(), "error.type").String(); errorType != "invalid_request_error" {
 		t.Fatalf("error type = %q, want invalid_request_error", errorType)
 	}
 }
 
-func TestImagesModelValidationAllowsGPTImage2AndXAIModels(t *testing.T) {
-	for _, model := range []string{"gpt-image-2", "codex/gpt-image-2", "grok-imagine-image", "xai/grok-imagine-image", "grok-imagine-image-quality", "xai/grok-imagine-image-quality"} {
+func TestImagesModelValidationAllowsGPTImageAndXAIModels(t *testing.T) {
+	for _, model := range []string{"gpt-image-1.5", "codex/gpt-image-1.5", "gpt-image-2", "codex/gpt-image-2", "grok-imagine-image", "xai/grok-imagine-image", "grok-imagine-image-quality", "xai/grok-imagine-image-quality"} {
 		if !isSupportedImagesModel(model) {
 			t.Fatalf("expected %s to be supported", model)
 		}

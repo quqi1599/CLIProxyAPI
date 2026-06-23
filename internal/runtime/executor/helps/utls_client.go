@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -85,21 +86,23 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// anthropicHosts contains the hosts that should use utls Chrome TLS fingerprint.
-var anthropicHosts = map[string]struct{}{
+// utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
+// to bypass Cloudflare's TLS fingerprinting.
+var utlsProtectedHosts = map[string]struct{}{
 	"api.anthropic.com": {},
+	"chatgpt.com":       {},
 }
 
-// fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
-// standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
+// fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
+// standard transport for all other requests.
 type fallbackRoundTripper struct {
-	utls     *utlsRoundTripper
+	utls     http.RoundTripper
 	fallback http.RoundTripper
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
-		if _, ok := anthropicHosts[strings.ToLower(req.URL.Hostname())]; ok {
+		if _, ok := utlsProtectedHosts[strings.ToLower(req.URL.Hostname())]; ok {
 			return f.utls.RoundTrip(req)
 		}
 	}
@@ -111,14 +114,14 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // and HTTP/2 connection setup every time; the underlying utlsRoundTripper is
 // already concurrency-safe and designed for connection reuse, so sharing the
 // client process-wide removes the per-request handshake cost. Only timeout==0
-// clients are cached (see NewUtlsHTTPClient).
+// clients without context-injected transports are cached (see NewUtlsHTTPClient).
 var utlsClientCache sync.Map
 
 // buildUtlsHTTPClient assembles a utls-backed HTTP client for the given proxyURL.
 // The dialer, fallback transport, and fallbackRoundTripper are wired here so that
 // both the cached and uncached paths share identical construction logic.
-func buildUtlsHTTPClient(proxyURL string) *http.Client {
-	utlsRT := newUtlsRoundTripper(proxyURL)
+func buildUtlsHTTPClient(proxyURL string, ctxRoundTripper http.RoundTripper) *http.Client {
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
 
 	var standardTransport http.RoundTripper = &http.Transport{
 		DialContext: (&net.Dialer{
@@ -130,6 +133,9 @@ func buildUtlsHTTPClient(proxyURL string) *http.Client {
 		if transport := buildProxyTransport(proxyURL); transport != nil {
 			standardTransport = transport
 		}
+	} else if ctxRoundTripper != nil {
+		utlsRT = ctxRoundTripper
+		standardTransport = ctxRoundTripper
 	}
 
 	return &http.Client{
@@ -144,10 +150,10 @@ func buildUtlsHTTPClient(proxyURL string) *http.Client {
 // Use this for Claude API requests to match real Claude Code's TLS behavior.
 // Falls back to standard transport for non-HTTPS requests.
 //
-// When timeout == 0 the client is reused process-wide (keyed by proxyURL) to
-// avoid a fresh TLS handshake per request. When timeout > 0 a dedicated client
+// When timeout == 0 the client is reused process-wide (keyed by proxyURL) unless
+// a context-injected RoundTripper is present. When timeout > 0 a dedicated client
 // is built and not cached, preserving the per-request timeout semantics.
-func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
@@ -156,10 +162,18 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	var ctxRoundTripper http.RoundTripper
+	if proxyURL == "" && ctx != nil {
+		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
+	}
+
 	if timeout > 0 {
-		client := buildUtlsHTTPClient(proxyURL)
+		client := buildUtlsHTTPClient(proxyURL, ctxRoundTripper)
 		client.Timeout = timeout
 		return client
+	}
+	if ctxRoundTripper != nil {
+		return buildUtlsHTTPClient(proxyURL, ctxRoundTripper)
 	}
 
 	if cached, ok := utlsClientCache.Load(proxyURL); ok {
@@ -167,7 +181,7 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 			return client
 		}
 	}
-	client := buildUtlsHTTPClient(proxyURL)
+	client := buildUtlsHTTPClient(proxyURL, nil)
 	actual, _ := utlsClientCache.LoadOrStore(proxyURL, client)
 	if cached, ok := actual.(*http.Client); ok && cached != nil {
 		return cached

@@ -6,59 +6,41 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestConvertOpenAIRequestToClaude_PreservesOpenAIStyleThinkingToggle(t *testing.T) {
-	tests := []struct {
-		name       string
-		input      string
-		wantType   string
-		wantBudget bool
-		wantEffort bool
-	}{
-		{
-			name: "enabled without effort",
-			input: `{
-				"model":"deepseek-v4-pro",
-				"thinking":{"type":"enabled"},
-				"messages":[{"role":"user","content":"hi"}]
-			}`,
-			wantType: "enabled",
-		},
-		{
-			name: "disabled overrides effort",
-			input: `{
-				"model":"deepseek-v4-pro",
-				"thinking":{"type":"disabled"},
-				"reasoning_effort":"high",
-				"messages":[{"role":"user","content":"hi"}]
-			}`,
-			wantType: "disabled",
-		},
-		{
-			name: "enabled with effort",
-			input: `{
-				"model":"deepseek-v4-pro",
-				"thinking":{"type":"enabled"},
-				"reasoning_effort":"high",
-				"messages":[{"role":"user","content":"hi"}]
-			}`,
-			wantType:   "enabled",
-			wantBudget: true,
-		},
-	}
+func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"messages": [
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call.with space:1",
+						"type": "function",
+						"function": {
+							"name": "Read",
+							"arguments": "{\"path\":\"README.md\"}"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": "call.with space:1",
+				"content": "ok"
+			}
+		]
+	}`
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ConvertOpenAIRequestToClaude("deepseek-v4-pro", []byte(tt.input), false)
-			if got := gjson.GetBytes(result, "thinking.type").String(); got != tt.wantType {
-				t.Fatalf("thinking.type = %q, want %q; payload=%s", got, tt.wantType, string(result))
-			}
-			if got := gjson.GetBytes(result, "thinking.budget_tokens").Exists(); got != tt.wantBudget {
-				t.Fatalf("thinking.budget_tokens exists = %v, want %v; payload=%s", got, tt.wantBudget, string(result))
-			}
-			if got := gjson.GetBytes(result, "output_config.effort").Exists(); got != tt.wantEffort {
-				t.Fatalf("output_config.effort exists = %v, want %v; payload=%s", got, tt.wantEffort, string(result))
-			}
-		})
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	toolUseID := resultJSON.Get("messages.0.content.0.id").String()
+	toolResultID := resultJSON.Get("messages.1.content.0.tool_use_id").String()
+
+	if toolUseID != "call_with_space_1" {
+		t.Fatalf("tool_use id = %q, want %q", toolUseID, "call_with_space_1")
+	}
+	if toolResultID != toolUseID {
+		t.Fatalf("tool_result tool_use_id = %q, want same sanitized id %q", toolResultID, toolUseID)
 	}
 }
 

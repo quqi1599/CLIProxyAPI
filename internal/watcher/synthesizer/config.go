@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -140,6 +141,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if base != "" {
 			attrs["base_url"] = base
 		}
+		if ck.RebuildMidSystemMessage {
+			attrs["rebuild_mid_system_message"] = "true"
+		}
 		if hash := diff.ComputeClaudeModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
@@ -251,6 +255,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		if providerName == "" {
 			providerName = "openai-compatibility"
 		}
+		internalProviderKey := util.OpenAICompatibleProviderKey(providerName)
 		base := strings.TrimSpace(compat.BaseURL)
 		disableCooling := compat.DisableCooling
 
@@ -267,7 +272,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"base_url":        base,
 				"compat_name":     compat.Name,
 				"provider_family": "openai-compatibility",
-				"provider_key":    providerName,
+				"provider_key":    internalProviderKey,
 			}
 			routingGroup := strings.TrimSpace(entry.RoutingGroup)
 			if routingGroup == "" {
@@ -300,7 +305,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			a := &coreauth.Auth{
 				ID:         id,
-				Provider:   providerName,
+				Provider:   internalProviderKey,
 				Label:      compat.Name,
 				Prefix:     prefix,
 				Status:     status,
@@ -326,7 +331,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"base_url":        base,
 				"compat_name":     compat.Name,
 				"provider_family": "openai-compatibility",
-				"provider_key":    providerName,
+				"provider_key":    internalProviderKey,
 			}
 			if routingGroup := strings.TrimSpace(compat.RoutingGroup); routingGroup != "" {
 				attrs["routing_group"] = routingGroup
@@ -351,7 +356,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			a := &coreauth.Auth{
 				ID:         id,
-				Provider:   providerName,
+				Provider:   internalProviderKey,
 				Label:      compat.Name,
 				Prefix:     prefix,
 				Status:     status,

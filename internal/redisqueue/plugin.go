@@ -42,6 +42,10 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if provider == "" {
 		provider = "unknown"
 	}
+	executorType := strings.TrimSpace(record.ExecutorType)
+	if executorType == "" {
+		executorType = "unknown"
+	}
 	authType := strings.TrimSpace(record.AuthType)
 	if authType == "" {
 		authType = "unknown"
@@ -67,6 +71,10 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if reasoningEffort == "" {
 		reasoningEffort = coreusage.ReasoningEffortFromContext(ctx)
 	}
+	serviceTier := strings.TrimSpace(record.ServiceTier)
+	if serviceTier == "" {
+		serviceTier = coreusage.ServiceTierFromContext(ctx)
+	}
 
 	tokens := tokenStats{
 		InputTokens:         record.Detail.InputTokens,
@@ -91,24 +99,21 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	fail := resolveFail(ctx, record, failed)
 
 	detail := requestDetail{
-		Timestamp:          timestamp,
-		LatencyMs:          record.Latency.Milliseconds(),
-		Source:             record.Source,
-		AuthIndex:          record.AuthIndex,
-		AttemptNo:          attemptNo,
-		RetryReason:        strings.TrimSpace(retryReason),
-		FinalSuccess:       record.FinalSuccess,
-		Tokens:             tokens,
-		Failed:             failed,
-		ProviderStatusCode: record.ProviderStatusCode,
-		ErrorCode:          record.ErrorCode,
-		Fail:               fail,
-		ResponseHeaders:    record.ResponseHeaders,
+		Timestamp:       timestamp,
+		LatencyMs:       record.Latency.Milliseconds(),
+		TTFTMs:          record.TTFT.Milliseconds(),
+		Source:          record.Source,
+		AuthIndex:       record.AuthIndex,
+		Tokens:          tokens,
+		Failed:          failed,
+		Fail:            fail,
+		ResponseHeaders: record.ResponseHeaders,
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
 		requestDetail:   detail,
 		Provider:        provider,
+		ExecutorType:    executorType,
 		Model:           modelName,
 		Alias:           aliasName,
 		Endpoint:        resolveEndpoint(ctx),
@@ -118,6 +123,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		APIKey:          apiKey,
 		RequestID:       requestID,
 		ReasoningEffort: reasoningEffort,
+		ServiceTier:     serviceTier,
 	})
 	if err != nil {
 		return
@@ -128,6 +134,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 type queuedUsageDetail struct {
 	requestDetail
 	Provider        string `json:"provider"`
+	ExecutorType    string `json:"executor_type"`
 	Model           string `json:"model"`
 	Alias           string `json:"alias"`
 	Endpoint        string `json:"endpoint"`
@@ -137,22 +144,19 @@ type queuedUsageDetail struct {
 	APIKey          string `json:"api_key"`
 	RequestID       string `json:"request_id"`
 	ReasoningEffort string `json:"reasoning_effort"`
+	ServiceTier     string `json:"service_tier"`
 }
 
 type requestDetail struct {
-	Timestamp          time.Time   `json:"timestamp"`
-	LatencyMs          int64       `json:"latency_ms"`
-	Source             string      `json:"source"`
-	AuthIndex          string      `json:"auth_index"`
-	AttemptNo          int         `json:"attempt_no,omitempty"`
-	RetryReason        string      `json:"retry_reason,omitempty"`
-	FinalSuccess       *bool       `json:"final_success,omitempty"`
-	Tokens             tokenStats  `json:"tokens"`
-	Failed             bool        `json:"failed"`
-	ProviderStatusCode int         `json:"provider_status_code,omitempty"`
-	ErrorCode          string      `json:"error_code,omitempty"`
-	Fail               failDetail  `json:"fail"`
-	ResponseHeaders    http.Header `json:"response_headers,omitempty"`
+	Timestamp       time.Time   `json:"timestamp"`
+	LatencyMs       int64       `json:"latency_ms"`
+	TTFTMs          int64       `json:"ttft_ms"`
+	Source          string      `json:"source"`
+	AuthIndex       string      `json:"auth_index"`
+	Tokens          tokenStats  `json:"tokens"`
+	Failed          bool        `json:"failed"`
+	Fail            failDetail  `json:"fail"`
+	ResponseHeaders http.Header `json:"response_headers,omitempty"`
 }
 
 type tokenStats struct {

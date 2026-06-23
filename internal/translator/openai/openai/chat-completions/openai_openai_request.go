@@ -1,5 +1,5 @@
-// Package openai provides request translation for OpenAI Chat Completions
-// passthrough compatibility.
+// Package openai provides request translation functionality for OpenAI to OpenAI API compatibility.
+// It converts OpenAI Chat Completions requests into OpenAI-compatible JSON using gjson/sjson only.
 package chat_completions
 
 import (
@@ -8,7 +8,7 @@ import (
 )
 
 // ConvertOpenAIRequestToOpenAI converts an OpenAI Chat Completions request (raw JSON)
-// into an OpenAI-compatible request JSON.
+// into a complete OpenAI request JSON. All JSON construction uses sjson and lookups use gjson.
 //
 // Parameters:
 //   - modelName: The name of the model to use for the request
@@ -16,7 +16,7 @@ import (
 //   - stream: A boolean indicating if the request is for a streaming response (unused in current implementation)
 //
 // Returns:
-//   - []byte: The transformed request data in OpenAI-compatible API format
+//   - []byte: The transformed request data in OpenAI API format
 func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool) []byte {
 	inputRawJSON = util.NormalizeOpenAIChatRequestJSON(inputRawJSON)
 	updatedJSON, err := sjson.SetBytes(inputRawJSON, "model", modelName)

@@ -142,7 +142,6 @@ func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 		catalog.Claude,
 		catalog.Gemini,
 		catalog.Vertex,
-		catalog.GeminiCLI,
 		catalog.AIStudio,
 		catalog.CodexFree,
 		catalog.CodexTeam,

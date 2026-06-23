@@ -16,6 +16,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -38,19 +40,34 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
+	cfg                     *config.Config
+	configFilePath          string
+	mu                      sync.Mutex
+	reloadMu                sync.Mutex
+	reloadGeneration        uint64
+	appliedReloadGeneration uint64
+	attemptsMu              sync.Mutex
+	failedAttempts          map[string]*attemptInfo // keyed by client IP
+	authManager             *coreauth.Manager
+	usageStats              *usage.RequestStatistics
+	tokenStore              coreauth.Store
+	localPassword           string
+	allowRemoteOverride     bool
+	envSecret               string
+	logDir                  string
+	postAuthHook            coreauth.PostAuthHook
+	postAuthPersistHook     coreauth.PostAuthHook
+	pluginHost              *pluginhost.Host
+	configReloadHook        func(context.Context, *config.Config)
+	pluginStoreRegistryURL  string
+	pluginStoreHTTPClient   pluginstore.HTTPDoer
+	pluginReleaseCacheMu    sync.Mutex
+	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+}
+
+type configReloadSnapshot struct {
+	cfg        *config.Config
+	generation uint64
 }
 
 // NewHandler creates a new management handler instance.
@@ -130,6 +147,99 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 
+// SetPluginHost updates the plugin host used by plugin-backed management endpoints.
+func (h *Handler) SetPluginHost(host *pluginhost.Host) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.pluginHost = host
+	h.mu.Unlock()
+}
+
+// SetConfigReloadHook updates the callback used after management saves config changes.
+func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.configReloadHook = hook
+	h.mu.Unlock()
+}
+
+// reloadSnapshotConfigLocked clones the runtime config and assigns a reload generation.
+// Callers must hold h.mu.
+func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
+	if h == nil || h.cfg == nil {
+		return configReloadSnapshot{}
+	}
+	h.reloadGeneration++
+	return configReloadSnapshot{
+		cfg:        h.cfg.CloneForRuntime(),
+		generation: h.reloadGeneration,
+	}
+}
+
+// saveConfigAndSnapshotLocked saves h.cfg and returns a full runtime config snapshot.
+// Callers must hold h.mu.
+func (h *Handler) saveConfigAndSnapshotLocked(c *gin.Context) (configReloadSnapshot, bool) {
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
+		return configReloadSnapshot{}, false
+	}
+	return h.reloadSnapshotConfigLocked(), true
+}
+
+// reloadConfigAfterManagementSave reloads from an independent config snapshot.
+// Callers must pass a full Config clone captured immediately after a successful save.
+func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, snapshot configReloadSnapshot) {
+	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
+		return
+	}
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
+
+	h.mu.Lock()
+	if snapshot.generation < h.appliedReloadGeneration {
+		h.mu.Unlock()
+		return
+	}
+	hook := h.configReloadHook
+	host := h.pluginHost
+	h.mu.Unlock()
+	if hook != nil {
+		hook(ctx, snapshot.cfg)
+	} else if host != nil {
+		host.ApplyConfig(ctx, snapshot.cfg)
+	}
+
+	h.mu.Lock()
+	if snapshot.generation > h.appliedReloadGeneration {
+		h.appliedReloadGeneration = snapshot.generation
+	}
+	h.mu.Unlock()
+}
+
+// reloadConfigAfterManagementSaveAsync reloads from an independent config snapshot.
+// Callers must pass a full Config clone captured immediately after a successful save.
+func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snapshot configReloadSnapshot) {
+	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
+		return
+	}
+	reloadCtx := context.Background()
+	if ctx != nil {
+		reloadCtx = context.WithoutCancel(ctx)
+	}
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.WithField("panic", recovered).Error("management: async config reload panicked")
+			}
+		}()
+		h.reloadConfigAfterManagementSave(reloadCtx, snapshot)
+	}()
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
@@ -151,6 +261,11 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
 }
 
+// SetPostAuthPersistHook registers a hook to be called after auth persistence.
+func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
+	h.postAuthPersistHook = hook
+}
+
 // Middleware enforces access control for management endpoints.
 // All requests (local and remote) require a valid management key.
 // Additionally, remote access requires allow-remote-management=true.
@@ -159,6 +274,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
 		c.Header("X-CPA-COMMIT", buildinfo.Commit)
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
@@ -297,13 +413,17 @@ func (h *Handler) persist(c *gin.Context) bool {
 // persistLocked saves the current in-memory config to disk.
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
-	_, newSnap, ok := h.persistCurrentConfigLocked(c, "structured")
+	_, _, ok := h.persistCurrentConfigLocked(c, "structured")
 	if !ok {
 		return false
 	}
-	if c != nil {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": configVersionFromSnapshot(newSnap)})
+	snapshot := h.reloadSnapshotConfigLocked()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	var reqCtx context.Context
+	if c != nil && c.Request != nil {
+		reqCtx = c.Request.Context()
 	}
+	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
 	return true
 }
 
@@ -340,6 +460,130 @@ func isConfigBackedAuth(auth *coreauth.Auth) bool {
 	}
 	source := strings.ToLower(strings.TrimSpace(auth.Attributes["source"]))
 	return strings.HasPrefix(source, "config:")
+}
+
+func (h *Handler) disableAuth(ctx context.Context, path string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	syncCtx := coreauth.WithSkipPersist(ctx)
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if !sameAuthFilePath(authAttribute(auth, "path"), path) &&
+			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), path) &&
+			!sameAuthFilePath(auth.FileName, path) &&
+			!strings.EqualFold(strings.TrimSpace(auth.ID), path) {
+			continue
+		}
+		auth.Disabled = true
+		auth.Status = coreauth.StatusDisabled
+		auth.StatusMessage = "disabled after auth file removal"
+		if _, errUpdate := h.authManager.Update(syncCtx, auth); errUpdate != nil {
+			log.WithError(errUpdate).Warnf("failed to disable removed auth %s", auth.ID)
+		}
+	}
+}
+
+func (h *Handler) setConfigBackedAuthDisabledStateLocked(auth *coreauth.Auth, disabled bool) bool {
+	if h == nil || h.cfg == nil || auth == nil {
+		return false
+	}
+	targetID := strings.TrimSpace(auth.ID)
+	if targetID == "" {
+		return false
+	}
+	idGen := synthesizer.NewStableIDGenerator()
+	for i := range h.cfg.GeminiKey {
+		entry := &h.cfg.GeminiKey[i]
+		id, _ := idGen.Next("gemini:apikey", entry.APIKey, entry.BaseURL)
+		if id == targetID {
+			if entry.Disabled == disabled {
+				return false
+			}
+			entry.Disabled = disabled
+			return true
+		}
+	}
+	for i := range h.cfg.ClaudeKey {
+		entry := &h.cfg.ClaudeKey[i]
+		id, _ := idGen.Next("claude:apikey", entry.APIKey, entry.BaseURL)
+		if id == targetID {
+			if entry.Disabled == disabled {
+				return false
+			}
+			entry.Disabled = disabled
+			return true
+		}
+	}
+	for i := range h.cfg.CodexKey {
+		entry := &h.cfg.CodexKey[i]
+		id, _ := idGen.Next("codex:apikey", entry.APIKey, entry.BaseURL)
+		if id == targetID {
+			if entry.Disabled == disabled {
+				return false
+			}
+			entry.Disabled = disabled
+			return true
+		}
+	}
+	for i := range h.cfg.OpenAICompatibility {
+		compat := &h.cfg.OpenAICompatibility[i]
+		providerName := strings.ToLower(strings.TrimSpace(compat.Name))
+		if providerName == "" {
+			providerName = "openai-compatibility"
+		}
+		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
+		base := strings.TrimSpace(compat.BaseURL)
+		if len(compat.APIKeyEntries) == 0 {
+			id, _ := idGen.Next(idKind, base)
+			if id == targetID {
+				if compat.Disabled == disabled {
+					return false
+				}
+				compat.Disabled = disabled
+				return true
+			}
+			continue
+		}
+		for j := range compat.APIKeyEntries {
+			entry := &compat.APIKeyEntries[j]
+			id, _ := idGen.Next(idKind, entry.APIKey, base, entry.ProxyURL)
+			if id != targetID {
+				continue
+			}
+			changed := false
+			if entry.Disabled != disabled {
+				entry.Disabled = disabled
+				changed = true
+			}
+			if !disabled && compat.Disabled {
+				compat.Disabled = false
+				changed = true
+			}
+			return changed
+		}
+	}
+	for i := range h.cfg.VertexCompatAPIKey {
+		entry := &h.cfg.VertexCompatAPIKey[i]
+		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)
+		if id == targetID {
+			if entry.Disabled == disabled {
+				return false
+			}
+			entry.Disabled = disabled
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) syncRuntimeConfigLocked(ctx context.Context) {
@@ -398,9 +642,7 @@ func (h *Handler) syncRuntimeConfigLocked(ctx context.Context) {
 		if _, ok := desired[existing.ID]; ok {
 			continue
 		}
-		if errDelete := h.authManager.Delete(syncCtx, existing.ID); errDelete != nil {
-			log.WithError(errDelete).Warnf("failed to remove deleted config-backed auth %s", existing.ID)
-		}
+		h.authManager.Remove(syncCtx, existing.ID)
 	}
 }
 

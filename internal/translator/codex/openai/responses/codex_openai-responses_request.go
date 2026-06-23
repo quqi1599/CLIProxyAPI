@@ -94,43 +94,35 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 		return rawJSON
 	}
 
-	inputArray := inputResult.Array()
-	if len(inputArray) == 0 {
+	inputItems := inputResult.Array()
+	if len(inputItems) == 0 {
 		return rawJSON
 	}
 
 	changed := false
-	for _, item := range inputArray {
-		if item.Get("role").String() == "system" {
+	rebuiltInput := make([]json.RawMessage, 0, len(inputItems))
+	for _, item := range inputItems {
+		itemRaw := []byte(item.Raw)
+		if item.IsObject() && item.Get("role").String() == "system" {
+			updatedItem, errSetItem := sjson.SetRawBytes(itemRaw, "role", []byte(`"developer"`))
+			if errSetItem != nil {
+				return rawJSON
+			}
+			itemRaw = updatedItem
 			changed = true
-			break
 		}
+		rebuiltInput = append(rebuiltInput, json.RawMessage(itemRaw))
 	}
-
 	if !changed {
 		return rawJSON
 	}
 
-	rebuiltInput := make([]byte, 0, len(inputResult.Raw)+len(inputArray)*3)
-	rebuiltInput = append(rebuiltInput, '[')
-	for _, item := range inputArray {
-		itemRaw := []byte(item.Raw)
-		if item.Get("role").String() == "system" {
-			updatedItem, err := sjson.SetBytes(itemRaw, "role", "developer")
-			if err != nil {
-				return rawJSON
-			}
-			itemRaw = updatedItem
-		}
-		if len(rebuiltInput) > 1 {
-			rebuiltInput = append(rebuiltInput, ',')
-		}
-		rebuiltInput = append(rebuiltInput, itemRaw...)
+	inputRaw, errMarshalInput := json.Marshal(rebuiltInput)
+	if errMarshalInput != nil {
+		return rawJSON
 	}
-	rebuiltInput = append(rebuiltInput, ']')
-
-	updated, err := sjson.SetRawBytes(rawJSON, "input", rebuiltInput)
-	if err != nil {
+	updated, errSetInput := sjson.SetRawBytes(rawJSON, "input", inputRaw)
+	if errSetInput != nil {
 		return rawJSON
 	}
 	return updated

@@ -1254,14 +1254,21 @@ func rewriteOpenAICompatSystemMessagesAsUser(payload []byte) []byte {
 		if !ok {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(compatStringValue(message["role"])), "system") {
+		role := strings.TrimSpace(compatStringValue(message["role"]))
+		text := openAICompatTextContent(message["content"])
+		if strings.EqualFold(role, "system") {
+			message["role"] = "user"
+			if text != "" {
+				message["content"] = openAICompatSystemInstructionText(openAICompatUnwrapSystemReminder(text))
+			}
+			changed = true
 			continue
 		}
-		message["role"] = "user"
-		if text := openAICompatTextContent(message["content"]); text != "" {
-			message["content"] = openAICompatSystemInstructionText(text)
+		if reminder, okReminder := openAICompatSystemReminderText(text); okReminder {
+			message["role"] = "user"
+			message["content"] = openAICompatSystemInstructionText(reminder)
+			changed = true
 		}
-		changed = true
 	}
 	if !changed {
 		return payload
@@ -1281,6 +1288,21 @@ func openAICompatSystemInstructionText(text string) string {
 		return ""
 	}
 	return "System instructions:\n" + text
+}
+
+func openAICompatSystemReminderText(text string) (string, bool) {
+	unwrapped := openAICompatUnwrapSystemReminder(text)
+	return unwrapped, unwrapped != strings.TrimSpace(text) && unwrapped != ""
+}
+
+func openAICompatUnwrapSystemReminder(text string) string {
+	text = strings.TrimSpace(text)
+	const start = "<system-reminder>"
+	const end = "</system-reminder>"
+	if strings.HasPrefix(text, start) && strings.HasSuffix(text, end) {
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, start), end))
+	}
+	return text
 }
 
 func openAICompatTextContent(content any) string {

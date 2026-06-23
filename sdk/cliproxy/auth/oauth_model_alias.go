@@ -1,11 +1,14 @@
 package auth
 
 import (
+	"encoding/json"
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 )
+
+const oauthModelAliasesAttributeKey = "model_aliases"
 
 type modelAliasEntry interface {
 	GetName() string
@@ -186,7 +189,112 @@ func resolveModelAliasFromConfigModels(requestedModel string, models []modelAlia
 // the suffix is preserved in the returned model name. However, if the alias's
 // original name already contains a suffix, the config suffix takes priority.
 func (m *Manager) resolveOAuthUpstreamModel(auth *Auth, requestedModel string) string {
-	pool := m.resolveOAuthUpstreamModelPool(auth, requestedModel)
+	channel := modelAliasChannel(auth)
+	if channel == "" {
+		return ""
+	}
+	if resolved := resolveUpstreamModelFromAliases(OAuthModelAliasesFromAttributes(authAttributes(auth)), requestedModel); resolved != "" {
+		return resolved
+	}
+	return resolveUpstreamModelFromAliasTable(m, auth, requestedModel, channel)
+}
+
+func authAttributes(auth *Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	return auth.Attributes
+}
+
+// SetOAuthModelAliasesAttribute stores sanitized per-auth OAuth model aliases on an auth entry.
+func SetOAuthModelAliasesAttribute(auth *Auth, aliases []internalconfig.OAuthModelAlias) {
+	if auth == nil {
+		return
+	}
+	aliases = sanitizeOAuthModelAliases(aliases)
+	if len(aliases) == 0 {
+		return
+	}
+	data, errMarshal := json.Marshal(aliases)
+	if errMarshal != nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[oauthModelAliasesAttributeKey] = string(data)
+}
+
+// OAuthModelAliasesFromAttributes returns sanitized per-auth OAuth model aliases from auth attributes.
+func OAuthModelAliasesFromAttributes(attributes map[string]string) []internalconfig.OAuthModelAlias {
+	if len(attributes) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(attributes[oauthModelAliasesAttributeKey])
+	if raw == "" {
+		return nil
+	}
+	var aliases []internalconfig.OAuthModelAlias
+	if errUnmarshal := json.Unmarshal([]byte(raw), &aliases); errUnmarshal != nil {
+		return nil
+	}
+	return sanitizeOAuthModelAliases(aliases)
+}
+
+func sanitizeOAuthModelAliases(aliases []internalconfig.OAuthModelAlias) []internalconfig.OAuthModelAlias {
+	if len(aliases) == 0 {
+		return nil
+	}
+	cfg := internalconfig.Config{
+		OAuthModelAlias: map[string][]internalconfig.OAuthModelAlias{
+			"auth": aliases,
+		},
+	}
+	cfg.SanitizeOAuthModelAlias()
+	clean := cfg.OAuthModelAlias["auth"]
+	if len(clean) == 0 {
+		return nil
+	}
+	return append([]internalconfig.OAuthModelAlias(nil), clean...)
+}
+
+func resolveUpstreamModelFromAliases(aliases []internalconfig.OAuthModelAlias, requestedModel string) string {
+	if len(aliases) == 0 {
+		return ""
+	}
+	requestResult, candidates := modelAliasLookupCandidates(requestedModel)
+	if len(candidates) == 0 {
+		return ""
+	}
+	baseModel := requestResult.ModelName
+	if baseModel == "" {
+		baseModel = strings.TrimSpace(requestedModel)
+	}
+	for _, entry := range aliases {
+		original := strings.TrimSpace(entry.Name)
+		alias := strings.TrimSpace(entry.Alias)
+		if original == "" || alias == "" {
+			continue
+		}
+		for _, candidate := range candidates {
+			key := strings.TrimSpace(candidate)
+			if key == "" || !strings.EqualFold(alias, key) {
+				continue
+			}
+			if strings.EqualFold(original, baseModel) {
+				return ""
+			}
+			return preserveResolvedModelSuffix(original, requestResult)
+		}
+	}
+	return ""
+}
+
+func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, channel string) string {
+	if m == nil || auth == nil {
+		return ""
+	}
+	pool := resolveUpstreamModelPoolFromAliasTable(m, auth, requestedModel, channel)
 	if len(pool) == 0 {
 		return ""
 	}
@@ -291,33 +399,36 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
+// Built-in channels: vertex, aistudio, antigravity, claude, codex, kimi.
+// Plugin OAuth providers use their normalized provider key as the channel.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	authKind = strings.ToLower(strings.TrimSpace(authKind))
+	authKind = normalizeOAuthModelAliasAuthKind(authKind)
+	if authKind == "apikey" {
+		return ""
+	}
 	switch provider {
 	case "gemini":
-		// gemini provider uses gemini-api-key config, not oauth-model-alias.
-		// OAuth-based gemini auth is converted to "gemini-cli" by the synthesizer.
 		return ""
 	case "vertex":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "vertex"
 	case "claude":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "claude"
 	case "codex":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "kimi":
+	case "aistudio", "antigravity", "kimi":
 		return provider
 	default:
-		return ""
+		return provider
+	}
+}
+
+func normalizeOAuthModelAliasAuthKind(authKind string) string {
+	authKind = strings.ToLower(strings.TrimSpace(authKind))
+	switch authKind {
+	case "api_key", "api-key":
+		return "apikey"
+	default:
+		return authKind
 	}
 }

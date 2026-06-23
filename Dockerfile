@@ -1,31 +1,9 @@
-# CLIProxyAPI Docker image build file
-# Multi-platform build using tonistiigi/xx cross-compilation to avoid QEMU emulation
-# syntax=docker/dockerfile:1.4
-
-# Build stage running on BUILDPLATFORM for native-speed compilation
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
-
-# Version metadata
-ARG VERSION=dev
-ARG COMMIT=none
-ARG BUILD_DATE=unknown
-ARG STRIP_BINARY=true
-
-# Install the cross-compilation toolchain.
-# tonistiigi/xx provides the cross-platform build helpers.
-COPY --from=tonistiigi/xx:1.6.1 / /
-RUN apk add --no-cache git ca-certificates tzdata clang lld
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /app
 
-# Configure the cross-compilation toolchain for TARGETPLATFORM
-ARG TARGETPLATFORM
-RUN xx-apk add musl-dev gcc
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git && rm -rf /var/lib/apt/lists/*
 
-# Configure the Go module proxy
-ENV GOPROXY=https://proxy.golang.org,direct
-
-# Copy the Go module files
 COPY go.mod go.sum ./
 
 # Download dependencies on the native platform for faster builds
@@ -60,12 +38,11 @@ ARG COMMIT=none
 ARG BUILD_DATE=unknown
 ARG REPOSITORY_URL=unknown
 
-LABEL org.opencontainers.image.source="${REPOSITORY_URL}" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${COMMIT}" \
-      org.opencontainers.image.created="${BUILD_DATE}"
+RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-RUN apk add --no-cache tzdata ca-certificates
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir /CLIProxyAPI
 

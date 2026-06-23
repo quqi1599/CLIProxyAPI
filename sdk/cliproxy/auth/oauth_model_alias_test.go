@@ -19,9 +19,9 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 		{
 			name: "numeric suffix preserved",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro(8192)",
 			want:    "gemini-2.5-pro-exp-03-25(8192)",
 		},
@@ -37,9 +37,9 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 		{
 			name: "no suffix unchanged",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro",
 			want:    "gemini-2.5-pro-exp-03-25",
 		},
@@ -55,18 +55,18 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 		{
 			name: "auto suffix preserved",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro(auto)",
 			want:    "gemini-2.5-pro-exp-03-25(auto)",
 		},
 		{
 			name: "none suffix preserved",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro(none)",
 			want:    "gemini-2.5-pro-exp-03-25(none)",
 		},
@@ -82,25 +82,25 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 		{
 			name: "case insensitive alias lookup with suffix",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "Gemini-2.5-Pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "Gemini-2.5-Pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro(high)",
 			want:    "gemini-2.5-pro-exp-03-25(high)",
 		},
 		{
 			name: "no alias returns empty",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "unknown-model(high)",
 			want:    "",
 		},
 		{
 			name: "wrong channel returns empty",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
 			channel: "claude",
 			input:   "gemini-2.5-pro(high)",
@@ -109,18 +109,18 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 		{
 			name: "empty suffix filtered out",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro()",
 			want:    "gemini-2.5-pro-exp-03-25",
 		},
 		{
 			name: "incomplete suffix treated as no suffix",
 			aliases: map[string][]internalconfig.OAuthModelAlias{
-				"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro(high"}},
+				"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro(high"}},
 			},
-			channel: "gemini-cli",
+			channel: "antigravity",
 			input:   "gemini-2.5-pro(high",
 			want:    "gemini-2.5-pro-exp-03-25",
 		},
@@ -145,8 +145,8 @@ func TestResolveOAuthUpstreamModel_SuffixPreservation(t *testing.T) {
 
 func createAuthForChannel(channel string) *Auth {
 	switch channel {
-	case "gemini-cli":
-		return &Auth{Provider: "gemini-cli"}
+	case "antigravity":
+		return &Auth{Provider: "antigravity", Attributes: map[string]string{"auth_kind": "oauth"}}
 	case "claude":
 		return &Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth"}}
 	case "vertex":
@@ -155,12 +155,18 @@ func createAuthForChannel(channel string) *Auth {
 		return &Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
 	case "aistudio":
 		return &Auth{Provider: "aistudio"}
-	case "antigravity":
-		return &Auth{Provider: "antigravity"}
 	case "kimi":
 		return &Auth{Provider: "kimi"}
 	default:
 		return &Auth{Provider: channel}
+	}
+}
+
+func TestOAuthModelAliasChannel_APIKeyOnlyProviderUnsupported(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel("gemini", "oauth"); got != "" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want empty channel for API-key-only provider", got)
 	}
 }
 
@@ -172,18 +178,29 @@ func TestOAuthModelAliasChannel_Kimi(t *testing.T) {
 	}
 }
 
+func TestOAuthModelAliasChannel_PluginProvider(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel(" Sample-Provider ", "oauth"); got != "sample-provider" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "sample-provider")
+	}
+	if got := OAuthModelAliasChannel("sample-provider", "api_key"); got != "" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want empty channel for API key", got)
+	}
+}
+
 func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 	t.Parallel()
 
 	aliases := map[string][]internalconfig.OAuthModelAlias{
-		"gemini-cli": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
+		"antigravity": {{Name: "gemini-2.5-pro-exp-03-25", Alias: "gemini-2.5-pro"}},
 	}
 
 	mgr := NewManager(nil, nil, nil)
 	mgr.SetConfig(&internalconfig.Config{})
 	mgr.SetOAuthModelAlias(aliases)
 
-	auth := &Auth{ID: "test-auth-id", Provider: "gemini-cli"}
+	auth := &Auth{ID: "test-auth-id", Provider: "antigravity"}
 
 	resolvedModel := mgr.applyOAuthModelAlias(auth, "gemini-2.5-pro(8192)")
 	if resolvedModel != "gemini-2.5-pro-exp-03-25(8192)" {
@@ -191,64 +208,87 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 	}
 }
 
-func TestResolveOAuthUpstreamModelPool_MultipleTargetsPreservesOrder(t *testing.T) {
+func TestApplyOAuthModelAlias_PerAuthOverridesGlobalAlias(t *testing.T) {
 	t.Parallel()
 
-	aliases := map[string][]internalconfig.OAuthModelAlias{
-		"codex": {
-			{Name: "gpt-5", Alias: "g5"},
-			{Name: "gpt-5-chat", Alias: "g5"},
-		},
+	globalAliases := map[string][]internalconfig.OAuthModelAlias{
+		"codex": {{Name: "gpt-5-global", Alias: "gpt-5.5"}},
 	}
 
 	mgr := NewManager(nil, nil, nil)
 	mgr.SetConfig(&internalconfig.Config{})
-	mgr.SetOAuthModelAlias(aliases)
+	mgr.SetOAuthModelAlias(globalAliases)
 
-	auth := &Auth{ID: "test-auth-id", Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
-	got := mgr.resolveOAuthUpstreamModelPool(auth, "g5")
-	want := []string{"gpt-5", "gpt-5-chat"}
-	if len(got) != len(want) {
-		t.Fatalf("resolveOAuthUpstreamModelPool() len = %d, want %d", len(got), len(want))
+	auth := &Auth{
+		ID:       "codex-auth-id",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"auth_kind":     "oauth",
+			"model_aliases": `[{"name":"gpt-5.3-codex-spark","alias":"gpt-5.5"}]`,
+		},
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("resolveOAuthUpstreamModelPool()[%d] = %q, want %q", i, got[i], want[i])
-		}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "gpt-5.5(high)")
+	if resolvedModel != "gpt-5.3-codex-spark(high)" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gpt-5.3-codex-spark(high)")
 	}
 }
 
-func TestPrepareExecutionModels_RotatesOAuthAliasPool(t *testing.T) {
+func TestApplyOAuthModelAlias_PerAuthAliasSkipsAPIKey(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+
+	auth := &Auth{
+		ID:       "codex-api-key-auth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"auth_kind":     "api_key",
+			"model_aliases": `[{"name":"gpt-5.3-codex-spark","alias":"gpt-5.5"}]`,
+		},
+	}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "gpt-5.5")
+	if resolvedModel != "gpt-5.5" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gpt-5.5")
+	}
+}
+
+func TestApplyOAuthModelAlias_PluginProvider(t *testing.T) {
 	t.Parallel()
 
 	aliases := map[string][]internalconfig.OAuthModelAlias{
-		"codex": {
-			{Name: "gpt-5", Alias: "g5"},
-			{Name: "gpt-5-chat", Alias: "g5"},
-		},
+		"sample-provider": {{Name: "sample-model-latest", Alias: "sample-latest"}},
 	}
 
 	mgr := NewManager(nil, nil, nil)
 	mgr.SetConfig(&internalconfig.Config{})
 	mgr.SetOAuthModelAlias(aliases)
 
-	auth := &Auth{ID: "test-auth-id", Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
+	auth := &Auth{ID: "sample-provider-auth", Provider: "sample-provider", Attributes: map[string]string{"auth_kind": "oauth"}}
 
-	first := mgr.prepareExecutionModels(auth, "g5")
-	second := mgr.prepareExecutionModels(auth, "g5")
-
-	wantFirst := []string{"gpt-5", "gpt-5-chat"}
-	wantSecond := []string{"gpt-5-chat", "gpt-5"}
-
-	if len(first) != len(wantFirst) || len(second) != len(wantSecond) {
-		t.Fatalf("unexpected pool sizes: first=%v second=%v", first, second)
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "sample-latest")
+	if resolvedModel != "sample-model-latest" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "sample-model-latest")
 	}
-	for i := range wantFirst {
-		if first[i] != wantFirst[i] {
-			t.Fatalf("first[%d] = %q, want %q", i, first[i], wantFirst[i])
-		}
-		if second[i] != wantSecond[i] {
-			t.Fatalf("second[%d] = %q, want %q", i, second[i], wantSecond[i])
-		}
+}
+
+func TestApplyOAuthModelAlias_PluginProviderSkipsAPIKey(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"sample-provider": {{Name: "sample-model-latest", Alias: "sample-latest"}},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	auth := &Auth{ID: "sample-provider-auth", Provider: "sample-provider", Attributes: map[string]string{"auth_kind": "api_key"}}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "sample-latest")
+	if resolvedModel != "sample-latest" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "sample-latest")
 	}
 }

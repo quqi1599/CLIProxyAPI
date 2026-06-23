@@ -87,6 +87,69 @@ func (s toolShapeTelemetry) hasData() bool {
 		len(s.ToolNameHashes) > 0
 }
 
+func requestDeclaredToolCount(rawJSON []byte) int {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() {
+		return 0
+	}
+	return len(tools.Array())
+}
+
+func requestToolInteractionCount(rawJSON []byte) int {
+	count := 0
+	if messages := gjson.GetBytes(rawJSON, "messages"); messages.IsArray() {
+		for _, message := range messages.Array() {
+			count += toolInteractionsInObject(message)
+			role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
+			if role == "tool" || role == "function" {
+				count++
+			}
+		}
+	}
+	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
+		for _, item := range input.Array() {
+			count += toolInteractionsInObject(item)
+			if isResponsesToolItemType(item.Get("type").String()) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func toolInteractionsInObject(value gjson.Result) int {
+	count := 0
+	if toolCalls := value.Get("tool_calls"); toolCalls.IsArray() {
+		count += len(toolCalls.Array())
+	}
+	if functionCall := value.Get("function_call"); functionCall.Exists() && functionCall.Raw != "null" {
+		count++
+	}
+	content := value.Get("content")
+	if content.IsArray() {
+		for _, item := range content.Array() {
+			if isResponsesToolItemType(item.Get("type").String()) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func isResponsesToolItemType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "function_call", "function_call_output", "tool_call", "tool_result",
+		"computer_call", "computer_call_output", "local_shell_call",
+		"local_shell_call_output", "mcp_call", "mcp_call_output",
+		"web_search_call", "web_search_call_output", "file_search_call",
+		"file_search_call_output", "code_interpreter_call", "code_interpreter_call_output",
+		"image_generation_call", "image_generation_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *toolShapeTelemetry) addMessageToolShapes(message gjson.Result) {
 	if s == nil {
 		return

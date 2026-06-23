@@ -17,7 +17,6 @@ import (
 
 func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
 	authDir := filepath.Join(tempDir, "auth")
@@ -101,7 +100,6 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	fileName := "fallback-user.json"
@@ -128,33 +126,47 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	}
 }
 
-func TestRegisterAuthFromFilePreservesDisabledState(t *testing.T) {
+func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
-	fileName := "codex-user@example.com-plus.json"
+	fileName := "runtime-remove-user.json"
 	filePath := filepath.Join(authDir, fileName)
-	data := []byte(`{"type":"codex","email":"user@example.com","disabled":true}`)
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		t.Fatalf("failed to write auth file: %v", err)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"runtime@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
 	}
 
 	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "runtime-remove-auth",
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "runtime@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
 
-	if err := h.registerAuthFromFile(context.Background(), filePath, data); err != nil {
-		t.Fatalf("registerAuthFromFile() error = %v", err)
-	}
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
 
-	auth, ok := manager.GetByID(fileName)
-	if !ok || auth == nil {
-		t.Fatal("expected auth to be registered")
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
 	}
-	if !auth.Disabled {
-		t.Fatal("expected auth.Disabled to be true")
-	}
-	if auth.Status != coreauth.StatusDisabled {
-		t.Fatalf("expected auth status disabled, got %q", auth.Status)
+	if _, ok := manager.GetByID(record.ID); ok {
+		t.Fatalf("expected runtime auth %q to be removed", record.ID)
 	}
 }

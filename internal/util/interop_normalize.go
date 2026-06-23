@@ -189,6 +189,9 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 	if reasoning != "" {
 		msg, _ = sjson.SetBytes(msg, "reasoning_content", reasoning)
 	}
+	if encryptedContent := item.Get("encrypted_content"); encryptedContent.Exists() {
+		msg, _ = sjson.SetRawBytes(msg, "encrypted_content", []byte(encryptedContent.Raw))
+	}
 	if !contentAdded {
 		msg, _ = sjson.SetRawBytes(msg, "content", []byte(`[]`))
 	}
