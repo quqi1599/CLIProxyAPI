@@ -503,8 +503,16 @@ func TestNormalizeClaudeEmptyToolResults(t *testing.T) {
 			content: `{"type":"tool_result","tool_use_id":"call_1","content":""}`,
 		},
 		{
+			name:    "blank string content",
+			content: `{"type":"tool_result","tool_use_id":"call_1","content":"   "}`,
+		},
+		{
 			name:    "empty array content",
 			content: `{"type":"tool_result","tool_use_id":"call_1","content":[]}`,
+		},
+		{
+			name:    "blank text block content",
+			content: `{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"   "}]} `,
 		},
 	}
 
@@ -525,10 +533,25 @@ func TestNormalizeClaudeEmptyToolResults(t *testing.T) {
 			if got.Get("0.type").String() != "text" {
 				t.Fatalf("tool_result content[0].type = %q, want %q", got.Get("0.type").String(), "text")
 			}
-			if got.Get("0.text").String() != " " {
-				t.Fatalf("tool_result content[0].text = %q, want single space", got.Get("0.text").String())
+			if got.Get("0.text").String() != "No output." {
+				t.Fatalf("tool_result content[0].text = %q, want No output.", got.Get("0.text").String())
 			}
 		})
+	}
+}
+
+func TestNormalizeClaudeEmptyToolResultsPreservesNonTextContent(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`)
+
+	out, repairs, err := normalizeClaudeEmptyToolResults(input)
+	if err != nil {
+		t.Fatalf("normalizeClaudeEmptyToolResults() error = %v", err)
+	}
+	if repairs != 0 {
+		t.Fatalf("normalizeClaudeEmptyToolResults() repairs = %d, want 0", repairs)
+	}
+	if string(out) != string(input) {
+		t.Fatalf("non-text content should be preserved:\n got: %s\nwant: %s", out, input)
 	}
 }
 

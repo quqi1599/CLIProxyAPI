@@ -2242,7 +2242,7 @@ func normalizeClaudeEmptyToolResults(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	placeholder := []byte(`[{"type":"text","text":" "}]`)
+	placeholder := []byte(`[{"type":"text","text":"No output."}]`)
 	out := body
 	repairs := 0
 	for msgIdx, msg := range messages.Array() {
@@ -2255,10 +2255,7 @@ func normalizeClaudeEmptyToolResults(body []byte) ([]byte, int, error) {
 				continue
 			}
 			toolContent := part.Get("content")
-			needsRepair := !toolContent.Exists() ||
-				toolContent.Type == gjson.Null ||
-				(toolContent.Type == gjson.String && toolContent.String() == "") ||
-				(toolContent.IsArray() && len(toolContent.Array()) == 0)
+			needsRepair := claudeToolResultContentIsEmpty(toolContent)
 			if !needsRepair {
 				continue
 			}
@@ -2271,6 +2268,37 @@ func normalizeClaudeEmptyToolResults(body []byte) ([]byte, int, error) {
 		}
 	}
 	return out, repairs, nil
+}
+
+func claudeToolResultContentIsEmpty(toolContent gjson.Result) bool {
+	if !toolContent.Exists() || toolContent.Type == gjson.Null {
+		return true
+	}
+	if toolContent.Type == gjson.String {
+		return strings.TrimSpace(toolContent.String()) == ""
+	}
+	if !toolContent.IsArray() {
+		return false
+	}
+	items := toolContent.Array()
+	if len(items) == 0 {
+		return true
+	}
+	for _, item := range items {
+		switch {
+		case item.Type == gjson.String:
+			if strings.TrimSpace(item.String()) != "" {
+				return false
+			}
+		case item.Type == gjson.JSON && strings.TrimSpace(item.Get("type").String()) == "text":
+			if strings.TrimSpace(item.Get("text").String()) != "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func repairMiniMaxClaudeToolAdjacency(baseURL string, body []byte) ([]byte, error) {
