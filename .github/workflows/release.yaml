@@ -20,28 +20,6 @@ jobs:
     permissions:
       contents: write
 
-    strategy:
-      matrix:
-        include:
-          # macOS
-          - goos: darwin
-            goarch: amd64
-            output: cli-proxy-api-darwin-amd64
-          - goos: darwin
-            goarch: arm64
-            output: cli-proxy-api-darwin-arm64
-          # Linux
-          - goos: linux
-            goarch: amd64
-            output: cli-proxy-api-linux-amd64
-          - goos: linux
-            goarch: arm64
-            output: cli-proxy-api-linux-arm64
-          # Windows
-          - goos: windows
-            goarch: amd64
-            output: cli-proxy-api-windows-amd64.exe
-
     steps:
       - uses: actions/checkout@v6
         with:

@@ -1,5 +1,10 @@
 FROM golang:1.26-bookworm AS builder
 
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+ARG STRIP_BINARY=true
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git && rm -rf /var/lib/apt/lists/*
@@ -23,12 +28,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     if [ "${STRIP_BINARY}" = "true" ]; then \
       ldflags="-s -w ${ldflags}"; \
     fi; \
-    xx-go build \
+    go build \
     -buildvcs=false \
     -trimpath \
     -ldflags="${ldflags}" \
     -o ./CLIProxyAPI ./cmd/server/ && \
-    xx-verify CLIProxyAPI
+    test -x ./CLIProxyAPI
 
 # Runtime stage
 FROM alpine:3.23
