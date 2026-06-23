@@ -200,6 +200,126 @@ func TestHostHTTPDoStreamCallbackReturnsBeforeUpstreamCompletes(t *testing.T) {
 	}
 }
 
+func TestHostHTTPDoStreamClosesWithCallbackScope(t *testing.T) {
+	serverCtxDone := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("first"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		serverCtxDone <- struct{}{}
+	}))
+	defer server.Close()
+
+	host := New()
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+
+	rawReq, errMarshal := json.Marshal(rpcHostHTTPRequest{
+		HostCallbackID: callbackID,
+		Method:         http.MethodGet,
+		URL:            server.URL,
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostHTTPDoStream, rawReq)
+	if errCall != nil {
+		t.Fatalf("callFromPlugin() error = %v", errCall)
+	}
+	resp, errDecode := decodeRPCEnvelope[rpcHostHTTPStreamResponse](rawResp)
+	if errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if resp.StreamID == "" {
+		t.Fatalf("stream id is empty: %#v", resp)
+	}
+
+	closeCallback()
+
+	select {
+	case <-serverCtxDone:
+	case <-time.After(time.Second):
+		t.Fatal("server request context was not canceled after callback scope closed")
+	}
+
+	readReq, errMarshal := json.Marshal(rpcHostHTTPStreamReadRequest{StreamID: resp.StreamID})
+	if errMarshal != nil {
+		t.Fatalf("marshal read request: %v", errMarshal)
+	}
+	rawRead, errRead := host.callFromPlugin(context.Background(), pluginabi.MethodHostHTTPStreamRead, readReq)
+	if errRead != nil {
+		t.Fatalf("read after callback close error = %v", errRead)
+	}
+	chunk, errDecode := decodeRPCEnvelope[rpcHostHTTPStreamReadResponse](rawRead)
+	if errDecode != nil {
+		t.Fatalf("decode read response: %v", errDecode)
+	}
+	if !chunk.Done || len(chunk.Payload) != 0 || chunk.Error != "" {
+		t.Fatalf("read after callback close = %#v, want done without payload/error", chunk)
+	}
+	if got := hostHTTPStreamCountForTest(t, host); got != 0 {
+		t.Fatalf("http stream count = %d, want 0", got)
+	}
+}
+
+func TestHostHTTPDoStreamRejectsWhenTooManyOpen(t *testing.T) {
+	previousLimit := hostHTTPStreamMaxOpen
+	hostHTTPStreamMaxOpen = 1
+	defer func() {
+		hostHTTPStreamMaxOpen = previousLimit
+	}()
+
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("first"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	host := New()
+	firstCallbackID, closeFirst := host.openCallbackContext(context.Background())
+	defer closeFirst()
+
+	firstReq, errMarshal := json.Marshal(rpcHostHTTPRequest{
+		HostCallbackID: firstCallbackID,
+		Method:         http.MethodGet,
+		URL:            server.URL,
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal first request: %v", errMarshal)
+	}
+	if _, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostHTTPDoStream, firstReq); errCall != nil {
+		t.Fatalf("first callFromPlugin() error = %v", errCall)
+	}
+	if got := hostHTTPStreamCountForTest(t, host); got != 1 {
+		t.Fatalf("http stream count = %d, want 1", got)
+	}
+
+	secondReq, errMarshal := json.Marshal(pluginapi.HTTPRequest{
+		Method: http.MethodGet,
+		URL:    server.URL,
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal second request: %v", errMarshal)
+	}
+	_, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostHTTPDoStream, secondReq)
+	if errCall == nil {
+		t.Fatal("second callFromPlugin() error = nil, want open-stream limit error")
+	}
+	if !strings.Contains(errCall.Error(), "too many open host http streams") {
+		t.Fatalf("second callFromPlugin() error = %v, want open-stream limit error", errCall)
+	}
+}
+
 func TestHostStreamCallbacksEmitAndClose(t *testing.T) {
 	host := New()
 	streamID, chunks, cleanup := host.streams.open(context.Background())
@@ -708,6 +828,13 @@ func hostModelStreamCountForTest(t *testing.T, host *Host) int {
 	host.modelStreams.mu.Lock()
 	defer host.modelStreams.mu.Unlock()
 	return len(host.modelStreams.streams)
+}
+
+func hostHTTPStreamCountForTest(t *testing.T, host *Host) int {
+	t.Helper()
+	host.httpStreams.mu.Lock()
+	defer host.httpStreams.mu.Unlock()
+	return len(host.httpStreams.streams)
 }
 
 func TestHostLogCallbackRestoresRegisteredRequestContext(t *testing.T) {

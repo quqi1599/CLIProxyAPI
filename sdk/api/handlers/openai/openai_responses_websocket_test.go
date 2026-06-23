@@ -1543,6 +1543,46 @@ func TestResponsesWebsocketTimelineRecordsDisconnectEvent(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketRejectsOversizedFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousLimit := responsesWebsocketReadLimit
+	responsesWebsocketReadLimit = 128
+	defer func() {
+		responsesWebsocketReadLimit = previousLimit
+	}()
+
+	router := gin.New()
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	oversized := []byte(`{"type":"response.create","model":"test-model","input":"` + strings.Repeat("a", 256) + `"}`)
+	if err = conn.WriteMessage(websocket.TextMessage, oversized); err != nil {
+		t.Fatalf("write oversized frame: %v", err)
+	}
+
+	if err = conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("ReadMessage() error = nil, want close for oversized frame")
+	}
+	if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
+		t.Fatalf("ReadMessage() error = %v, want close code %d", err, websocket.CloseMessageTooBig)
+	}
+}
+
 func TestResponsesWebsocketClosesOnCodexUpstreamDisconnect(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2923,6 +2963,49 @@ func TestNormalizeSubsequentRequestIncrementalInputStillMerges(t *testing.T) {
 		if got != want {
 			t.Fatalf("input[%d].id = %q, want %q", i, got, want)
 		}
+	}
+}
+
+func TestNormalizeSubsequentRequestRejectsOversizedReplayMerge(t *testing.T) {
+	previousLimit := responsesWebsocketTranscriptReplayLimitBytes
+	responsesWebsocketTranscriptReplayLimitBytes = 160
+	defer func() {
+		responsesWebsocketTranscriptReplayLimitBytes = previousLimit
+	}()
+
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"type":"message","id":"msg-1","content":"` + strings.Repeat("a", 90) + `"}]}`)
+	lastResponseOutput := []byte(`[{"type":"message","id":"msg-2","content":"` + strings.Repeat("b", 90) + `"}]`)
+	raw := []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-3","content":"next"}]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequestWithMode(raw, lastRequest, lastResponseOutput, false, false)
+	if errMsg == nil {
+		t.Fatalf("normalized = %s, want transcript size error", normalized)
+	}
+	if errMsg.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if !strings.Contains(errMsg.Error.Error(), "websocket transcript exceeds 160 bytes") {
+		t.Fatalf("error = %q, want transcript size detail", errMsg.Error.Error())
+	}
+}
+
+func TestNormalizeSubsequentRequestIncrementalBypassesReplayLimit(t *testing.T) {
+	previousLimit := responsesWebsocketTranscriptReplayLimitBytes
+	responsesWebsocketTranscriptReplayLimitBytes = 160
+	defer func() {
+		responsesWebsocketTranscriptReplayLimitBytes = previousLimit
+	}()
+
+	lastRequest := []byte(`{"model":"test-model","stream":true,"instructions":"be helpful","input":[{"type":"message","id":"msg-1","content":"` + strings.Repeat("a", 90) + `"}]}`)
+	lastResponseOutput := []byte(`[{"type":"message","id":"msg-2","content":"` + strings.Repeat("b", 90) + `"}]`)
+	raw := []byte(`{"type":"response.create","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-3","content":"next"}]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequestWithMode(raw, lastRequest, lastResponseOutput, true, false)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if got := gjson.GetBytes(normalized, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want resp-1", got)
 	}
 }
 

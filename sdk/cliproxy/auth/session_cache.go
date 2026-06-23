@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const sessionCacheMaxEntries = 16384
+
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
 	authID    string
@@ -85,10 +87,18 @@ func (c *SessionCache) Set(sessionID, authID string) {
 	if sessionID == "" || authID == "" {
 		return
 	}
+	now := time.Now()
 	c.mu.Lock()
+	if _, exists := c.entries[sessionID]; !exists && len(c.entries) >= sessionCacheMaxEntries {
+		c.cleanupExpiredLocked(now)
+		if len(c.entries) >= sessionCacheMaxEntries {
+			c.mu.Unlock()
+			return
+		}
+	}
 	c.entries[sessionID] = sessionEntry{
 		authID:    authID,
-		expiresAt: time.Now().Add(c.ttl),
+		expiresAt: now.Add(c.ttl),
 	}
 	c.mu.Unlock()
 }
@@ -143,10 +153,14 @@ func (c *SessionCache) cleanupLoop() {
 func (c *SessionCache) cleanup() {
 	now := time.Now()
 	c.mu.Lock()
+	c.cleanupExpiredLocked(now)
+	c.mu.Unlock()
+}
+
+func (c *SessionCache) cleanupExpiredLocked(now time.Time) {
 	for sid, entry := range c.entries {
 		if now.After(entry.expiresAt) {
 			delete(c.entries, sid)
 		}
 	}
-	c.mu.Unlock()
 }

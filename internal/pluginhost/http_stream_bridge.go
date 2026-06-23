@@ -10,6 +10,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+var hostHTTPStreamMaxOpen = 256
+
 type hostHTTPStreamBridge struct {
 	next    atomic.Uint64
 	mu      sync.Mutex
@@ -17,26 +19,38 @@ type hostHTTPStreamBridge struct {
 }
 
 type hostHTTPStreamEntry struct {
-	chunks <-chan pluginapi.HTTPStreamChunk
-	cancel context.CancelFunc
+	ownerCallbackID string
+	chunks          <-chan pluginapi.HTTPStreamChunk
+	cancel          context.CancelFunc
 }
 
 func newHostHTTPStreamBridge() *hostHTTPStreamBridge {
 	return &hostHTTPStreamBridge{streams: make(map[string]hostHTTPStreamEntry)}
 }
 
-func (b *hostHTTPStreamBridge) open(chunks <-chan pluginapi.HTTPStreamChunk, cancel context.CancelFunc) string {
+func (b *hostHTTPStreamBridge) open(ownerCallbackID string, chunks <-chan pluginapi.HTTPStreamChunk, cancel context.CancelFunc) (string, error) {
 	if b == nil || chunks == nil {
 		if cancel != nil {
 			cancel()
 		}
-		return ""
+		return "", fmt.Errorf("host http stream bridge is unavailable")
 	}
 	id := strconv.FormatUint(b.next.Add(1), 10)
 	b.mu.Lock()
-	b.streams[id] = hostHTTPStreamEntry{chunks: chunks, cancel: cancel}
+	if hostHTTPStreamMaxOpen > 0 && len(b.streams) >= hostHTTPStreamMaxOpen {
+		b.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return "", fmt.Errorf("too many open host http streams")
+	}
+	b.streams[id] = hostHTTPStreamEntry{
+		ownerCallbackID: ownerCallbackID,
+		chunks:          chunks,
+		cancel:          cancel,
+	}
 	b.mu.Unlock()
-	return id
+	return id, nil
 }
 
 func (b *hostHTTPStreamBridge) read(ctx context.Context, id string) (pluginapi.HTTPStreamChunk, bool, error) {
@@ -44,10 +58,10 @@ func (b *hostHTTPStreamBridge) read(ctx context.Context, id string) (pluginapi.H
 		return pluginapi.HTTPStreamChunk{}, true, fmt.Errorf("http stream id is required")
 	}
 	b.mu.Lock()
-	entry := b.streams[id]
+	entry, ok := b.streams[id]
 	b.mu.Unlock()
-	if entry.chunks == nil {
-		return pluginapi.HTTPStreamChunk{}, true, fmt.Errorf("http stream %s is not open", id)
+	if !ok || entry.chunks == nil {
+		return pluginapi.HTTPStreamChunk{}, true, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()

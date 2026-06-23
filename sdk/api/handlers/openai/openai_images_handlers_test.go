@@ -224,6 +224,49 @@ func TestMultipartFileToDataURLRepairsGenericImageContentType(t *testing.T) {
 	}
 }
 
+func TestMultipartFileToDataURLRejectsOversizedUpload(t *testing.T) {
+	previousLimit := openAICompatImagesMaxUploadFileBytes
+	openAICompatImagesMaxUploadFileBytes = 4
+	defer func() {
+		openAICompatImagesMaxUploadFileBytes = previousLimit
+	}()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "large.png"))
+	header.Set("Content-Type", "image/png")
+	part, errCreate := writer.CreatePart(header)
+	if errCreate != nil {
+		t.Fatalf("create image field: %v", errCreate)
+	}
+	if _, errWrite := part.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}); errWrite != nil {
+		t.Fatalf("write image field: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(body.Bytes()), writer.Boundary())
+	form, errRead := reader.ReadForm(32 << 20)
+	if errRead != nil {
+		t.Fatalf("read form: %v", errRead)
+	}
+	defer func() {
+		if errRemove := form.RemoveAll(); errRemove != nil {
+			t.Fatalf("remove form files: %v", errRemove)
+		}
+	}()
+
+	_, err := multipartFileToDataURL(form.File["image"][0])
+	if err == nil {
+		t.Fatal("multipartFileToDataURL() error = nil, want upload size error")
+	}
+	if !strings.Contains(err.Error(), `upload file "large.png" exceeds 4 bytes`) {
+		t.Fatalf("multipartFileToDataURL() error = %q, want size detail", err.Error())
+	}
+}
+
 func TestBuildOpenAICompatImagesJSONRequestPreservesStreamForStreaming(t *testing.T) {
 	req := buildOpenAICompatImagesJSONRequest([]byte(`{"model":"compat-image","prompt":"draw","stream":false}`), "upstream-image", true)
 
@@ -382,6 +425,49 @@ func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentTyp
 	}
 	if got := rewrittenForm.File["image"]; len(got) != 1 || got[0].Header.Get("Content-Type") != "image/png" {
 		t.Fatalf("image headers = %#v, want image/png", got)
+	}
+}
+
+func TestBuildOpenAICompatImagesMultipartRequestRejectsOversizedBody(t *testing.T) {
+	previousLimit := openAICompatImagesMaxMultipartBodyBytes
+	openAICompatImagesMaxMultipartBodyBytes = 4
+	defer func() {
+		openAICompatImagesMaxMultipartBodyBytes = previousLimit
+	}()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", multipart.FileContentDisposition("image", "large.png"))
+	header.Set("Content-Type", "image/png")
+	part, errCreate := writer.CreatePart(header)
+	if errCreate != nil {
+		t.Fatalf("create image field: %v", errCreate)
+	}
+	if _, errWrite := part.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}); errWrite != nil {
+		t.Fatalf("write image field: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(body.Bytes()), writer.Boundary())
+	form, errRead := reader.ReadForm(32 << 20)
+	if errRead != nil {
+		t.Fatalf("read source form: %v", errRead)
+	}
+	defer func() {
+		if errRemove := form.RemoveAll(); errRemove != nil {
+			t.Fatalf("remove source form files: %v", errRemove)
+		}
+	}()
+
+	_, _, errBuild := buildOpenAICompatImagesMultipartRequest(form, "upstream-image", false)
+	if errBuild == nil {
+		t.Fatal("buildOpenAICompatImagesMultipartRequest() error = nil, want upload size error")
+	}
+	if !strings.Contains(errBuild.Error(), "multipart upload exceeds 4 bytes") {
+		t.Fatalf("buildOpenAICompatImagesMultipartRequest() error = %q, want size detail", errBuild.Error())
 	}
 }
 

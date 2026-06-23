@@ -70,6 +70,10 @@ const (
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
 	// Executors that do not support this marker may ignore it.
 	CloseAllExecutionSessionsID = "__all_execution_sessions__"
+	// schedulerHotPathSyncMinInterval caps how often request-path pick failures
+	// may trigger a full scheduler rebuild. Direct auth mutations still sync
+	// immediately.
+	schedulerHotPathSyncMinInterval = 100 * time.Millisecond
 )
 
 type requestAttemptTraceContextKey struct{}
@@ -923,6 +927,7 @@ type Manager struct {
 	maxRetryCredentials atomic.Int32
 	maxRetryInterval    atomic.Int64
 	retryQueueDelay     atomic.Int64
+	schedulerHotSyncDue atomic.Int64
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -1291,6 +1296,24 @@ func (m *Manager) syncScheduler() {
 		return
 	}
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+}
+
+func (m *Manager) syncSchedulerOnPickFailure(now time.Time) bool {
+	if m == nil || m.scheduler == nil {
+		return false
+	}
+	nowUnix := now.UnixNano()
+	nextAllowed := now.Add(schedulerHotPathSyncMinInterval).UnixNano()
+	for {
+		dueAt := m.schedulerHotSyncDue.Load()
+		if dueAt > nowUnix {
+			return false
+		}
+		if m.schedulerHotSyncDue.CompareAndSwap(dueAt, nextAllowed) {
+			m.syncScheduler()
+			return true
+		}
+	}
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -2750,13 +2773,13 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		if providerKey == "mixed" {
 			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-				m.syncScheduler()
+				m.syncSchedulerOnPickFailure(time.Now())
 				selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
 			}
 		} else {
 			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-				m.syncScheduler()
+				m.syncSchedulerOnPickFailure(time.Now())
 				selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 			}
 		}
@@ -8240,7 +8263,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	for {
 		selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+			m.syncSchedulerOnPickFailure(time.Now())
 			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 			if errPick != nil {
 				if fallbackAuth, fallbackExecutor, errFallback := m.pickNextLegacy(ctx, provider, model, opts, tried); errFallback == nil {
@@ -8430,7 +8453,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	for {
 		selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
+			m.syncSchedulerOnPickFailure(time.Now())
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 			if errPick != nil {
 				if fallbackAuth, fallbackExecutor, fallbackProvider, errFallback := m.pickNextMixedLegacy(ctx, providers, model, opts, tried); errFallback == nil {

@@ -37,6 +37,9 @@ const (
 	imagesEditsPath             = "/v1/images/edits"
 )
 
+var openAICompatImagesMaxUploadFileBytes int64 = 20 << 20
+var openAICompatImagesMaxMultipartBodyBytes int64 = 32 << 20
+
 type imageCallResult struct {
 	Result        string
 	RevisedPrompt string
@@ -580,19 +583,9 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	if fileHeader == nil {
 		return "", fmt.Errorf("upload file is nil")
 	}
-	f, err := fileHeader.Open()
+	data, err := readMultipartFileHeaderWithLimit(fileHeader, openAICompatImagesMaxUploadFileBytes)
 	if err != nil {
-		return "", fmt.Errorf("open upload file failed: %w", err)
-	}
-	defer func() {
-		if errClose := f.Close(); errClose != nil {
-			log.Errorf("openai images: close upload file error: %v", errClose)
-		}
-	}()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return "", fmt.Errorf("read upload file failed: %w", err)
+		return "", err
 	}
 
 	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
@@ -603,6 +596,33 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 
 	b64 := base64.StdEncoding.EncodeToString(data)
 	return "data:" + normalizedMediaType + ";base64," + b64, nil
+}
+
+func readMultipartFileHeaderWithLimit(fileHeader *multipart.FileHeader, maxBytes int64) ([]byte, error) {
+	if fileHeader == nil {
+		return nil, fmt.Errorf("upload file is nil")
+	}
+	if maxBytes > 0 && fileHeader.Size > maxBytes {
+		return nil, fmt.Errorf("upload file %q exceeds %d bytes", fileHeader.Filename, maxBytes)
+	}
+	f, err := fileHeader.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open upload file failed: %w", err)
+	}
+	defer func() {
+		if errClose := f.Close(); errClose != nil {
+			log.Errorf("openai images: close upload file error: %v", errClose)
+		}
+	}()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read upload file failed: %w", err)
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("upload file %q exceeds %d bytes", fileHeader.Filename, maxBytes)
+	}
+	return data, nil
 }
 
 func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, stream bool) []byte {
@@ -691,8 +711,12 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 	if form == nil {
 		return nil, "", fmt.Errorf("multipart form is nil")
 	}
+	if totalBytes := multipartFileHeaderTotalSize(form.File); openAICompatImagesMaxMultipartBodyBytes > 0 && totalBytes > openAICompatImagesMaxMultipartBodyBytes {
+		return nil, "", fmt.Errorf("multipart upload exceeds %d bytes", openAICompatImagesMaxMultipartBodyBytes)
+	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
+	var copiedTotal int64
 
 	if errWrite := writer.WriteField("model", imageModel); errWrite != nil {
 		return nil, "", fmt.Errorf("write model field failed: %w", errWrite)
@@ -721,6 +745,9 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 			if fileHeader == nil {
 				continue
 			}
+			if openAICompatImagesMaxUploadFileBytes > 0 && fileHeader.Size > openAICompatImagesMaxUploadFileBytes {
+				return nil, "", fmt.Errorf("upload file %q exceeds %d bytes", fileHeader.Filename, openAICompatImagesMaxUploadFileBytes)
+			}
 			header := cloneMIMEHeader(fileHeader.Header)
 			header.Set("Content-Disposition", multipart.FileContentDisposition(key, fileHeader.Filename))
 			if header.Get("Content-Type") == "" {
@@ -734,7 +761,7 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 			if errOpen != nil {
 				return nil, "", fmt.Errorf("open upload file failed: %w", errOpen)
 			}
-			_, errCopy := io.Copy(part, src)
+			written, errCopy := io.Copy(part, io.LimitReader(src, openAICompatImagesMaxUploadFileBytes+1))
 			if errClose := src.Close(); errClose != nil {
 				log.Errorf("openai images: close upload file error: %v", errClose)
 				if errCopy == nil {
@@ -744,6 +771,13 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 			if errCopy != nil {
 				return nil, "", fmt.Errorf("copy upload file failed: %w", errCopy)
 			}
+			if openAICompatImagesMaxUploadFileBytes > 0 && written > openAICompatImagesMaxUploadFileBytes {
+				return nil, "", fmt.Errorf("upload file %q exceeds %d bytes", fileHeader.Filename, openAICompatImagesMaxUploadFileBytes)
+			}
+			copiedTotal += written
+			if openAICompatImagesMaxMultipartBodyBytes > 0 && copiedTotal > openAICompatImagesMaxMultipartBodyBytes {
+				return nil, "", fmt.Errorf("multipart upload exceeds %d bytes", openAICompatImagesMaxMultipartBodyBytes)
+			}
 		}
 	}
 
@@ -751,6 +785,19 @@ func buildOpenAICompatImagesMultipartRequest(form *multipart.Form, imageModel st
 		return nil, "", fmt.Errorf("close multipart writer failed: %w", errClose)
 	}
 	return body.Bytes(), writer.FormDataContentType(), nil
+}
+
+func multipartFileHeaderTotalSize(files map[string][]*multipart.FileHeader) int64 {
+	var total int64
+	for _, list := range files {
+		for _, fileHeader := range list {
+			if fileHeader == nil || fileHeader.Size <= 0 {
+				continue
+			}
+			total += fileHeader.Size
+		}
+	}
+	return total
 }
 
 func parseIntField(raw string, fallback int64) int64 {

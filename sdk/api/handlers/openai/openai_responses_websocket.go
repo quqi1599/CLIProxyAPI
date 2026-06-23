@@ -39,6 +39,9 @@ const (
 	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
 )
 
+var responsesWebsocketReadLimit int64 = 32 << 20 // 32 MiB
+var responsesWebsocketTranscriptReplayLimitBytes = 64 << 20
+
 var responsesWebsocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -215,6 +218,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(responsesWebsocketReadLimit)
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
@@ -613,8 +617,19 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 
 		existingInput := gjson.GetBytes(lastRequest, "input")
+		existingInputRaw := normalizeJSONArrayRaw([]byte(existingInput.Raw))
+		normalizedLastResponseOutput := normalizeJSONArrayRaw(lastResponseOutput)
+		if websocketTranscriptReplayTooLarge(existingInputRaw, normalizedLastResponseOutput, appendInputRaw) {
+			return nil, lastRequest, &interfaces.ErrorMessage{
+				StatusCode: http.StatusRequestEntityTooLarge,
+				Error: fmt.Errorf(
+					"websocket transcript exceeds %d bytes; send a compact replay, continue with previous_response_id, or reconnect",
+					responsesWebsocketTranscriptReplayLimitBytes,
+				),
+			}
+		}
 		var errMerge error
-		mergedInput, errMerge = mergeJSONArrayRaw(existingInput.Raw, normalizeJSONArrayRaw(lastResponseOutput))
+		mergedInput, errMerge = mergeJSONArrayRaw(existingInputRaw, normalizedLastResponseOutput)
 		if errMerge != nil {
 			return nil, lastRequest, &interfaces.ErrorMessage{
 				StatusCode: http.StatusBadRequest,
@@ -637,6 +652,15 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	dedupedInput, errDedupeItemIDs := dedupeInputItemsByID(mergedInput)
 	if errDedupeItemIDs == nil {
 		mergedInput = dedupedInput
+	}
+	if len(mergedInput) > responsesWebsocketTranscriptReplayLimitBytes {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusRequestEntityTooLarge,
+			Error: fmt.Errorf(
+				"websocket transcript exceeds %d bytes; send a compact replay, continue with previous_response_id, or reconnect",
+				responsesWebsocketTranscriptReplayLimitBytes,
+			),
+		}
 	}
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
@@ -1247,6 +1271,14 @@ func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+func websocketTranscriptReplayTooLarge(existingInputRaw, lastResponseOutputRaw, appendInputRaw string) bool {
+	if responsesWebsocketTranscriptReplayLimitBytes <= 0 {
+		return false
+	}
+	total := len(existingInputRaw) + len(lastResponseOutputRaw) + len(strings.TrimSpace(appendInputRaw))
+	return total > responsesWebsocketTranscriptReplayLimitBytes
 }
 
 // inputContainsFullTranscript returns true when the input array carries compact

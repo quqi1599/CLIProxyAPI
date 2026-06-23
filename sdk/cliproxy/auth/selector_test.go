@@ -1466,6 +1466,29 @@ func TestSessionCache_GetAndRefresh(t *testing.T) {
 	}
 }
 
+func TestSessionCache_SetSkipsNewEntriesWhenFull(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	for i := 0; i < sessionCacheMaxEntries; i++ {
+		cache.Set(fmt.Sprintf("session-%d", i), "auth")
+	}
+
+	cache.Set("overflow", "auth-overflow")
+
+	if got, ok := cache.Get("overflow"); ok {
+		t.Fatalf("overflow entry = %q, %v, want '', false", got, ok)
+	}
+
+	cache.Set("session-0", "auth-updated")
+	got, ok := cache.Get("session-0")
+	if !ok || got != "auth-updated" {
+		t.Fatalf("existing entry update = %q, %v, want auth-updated, true", got, ok)
+	}
+}
+
 func TestSessionAffinitySelector_RoundRobinDistribution(t *testing.T) {
 	t.Parallel()
 

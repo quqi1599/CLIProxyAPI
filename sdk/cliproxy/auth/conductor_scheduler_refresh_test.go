@@ -217,3 +217,83 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
 	}
 }
+
+func TestManager_SyncSchedulerOnPickFailure_ThrottlesRepeatedRebuilds(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	first := time.Unix(100, 0)
+	if !manager.syncSchedulerOnPickFailure(first) {
+		t.Fatal("syncSchedulerOnPickFailure() first call = false, want true")
+	}
+
+	wantDue := first.Add(schedulerHotPathSyncMinInterval).UnixNano()
+	if got := manager.schedulerHotSyncDue.Load(); got != wantDue {
+		t.Fatalf("schedulerHotSyncDue after first call = %d, want %d", got, wantDue)
+	}
+
+	second := first.Add(schedulerHotPathSyncMinInterval / 2)
+	if manager.syncSchedulerOnPickFailure(second) {
+		t.Fatal("syncSchedulerOnPickFailure() second call = true, want false within throttle window")
+	}
+	if got := manager.schedulerHotSyncDue.Load(); got != wantDue {
+		t.Fatalf("schedulerHotSyncDue after throttled call = %d, want %d", got, wantDue)
+	}
+
+	third := first.Add(schedulerHotPathSyncMinInterval)
+	if !manager.syncSchedulerOnPickFailure(third) {
+		t.Fatal("syncSchedulerOnPickFailure() third call = false, want true at throttle boundary")
+	}
+}
+
+func TestManager_PickNext_FallsBackWhenHotPathSyncIsThrottled(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "gemini"})
+
+	registerSchedulerModels(t, "gemini", "scheduler-cooldown-throttled-model", "throttle-stale-old")
+
+	oldAuth := &Auth{
+		ID:       "throttle-stale-old",
+		Provider: "gemini",
+	}
+	if _, errRegister := manager.Register(ctx, oldAuth); errRegister != nil {
+		t.Fatalf("register old auth: %v", errRegister)
+	}
+
+	for range quotaHardCooldownFailures {
+		manager.MarkResult(ctx, Result{
+			AuthID:   oldAuth.ID,
+			Provider: "gemini",
+			Model:    "scheduler-cooldown-throttled-model",
+			Success:  false,
+			Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+		})
+	}
+
+	newAuth := &Auth{
+		ID:       "throttle-stale-new",
+		Provider: "gemini",
+	}
+	if _, errRegister := manager.Register(ctx, newAuth); errRegister != nil {
+		t.Fatalf("register new auth: %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(newAuth.ID, "gemini", []*registry.ModelInfo{{ID: "scheduler-cooldown-throttled-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(newAuth.ID)
+	})
+
+	manager.schedulerHotSyncDue.Store(time.Now().Add(time.Hour).UnixNano())
+
+	got, executor, errPick := manager.pickNext(ctx, "gemini", "scheduler-cooldown-throttled-model", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if executor == nil {
+		t.Fatal("pickNext() executor = nil")
+	}
+	if got == nil || got.ID != newAuth.ID {
+		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
+	}
+}

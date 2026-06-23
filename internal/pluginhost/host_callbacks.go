@@ -168,12 +168,21 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 		return nil, errDo
 	}
 	streamID := ""
+	var errOpen error
 	if h != nil && h.httpStreams != nil {
-		streamID = h.httpStreams.open(resp.Chunks, cancel)
+		streamID, errOpen = h.httpStreams.open(callbackID, resp.Chunks, cancel)
+	}
+	if errOpen != nil {
+		return nil, errOpen
 	}
 	if streamID == "" {
 		cancel()
 		return nil, fmt.Errorf("host http stream bridge is unavailable")
+	}
+	if callbackID != "" {
+		h.addCallbackCleanup(callbackID, func() {
+			h.httpStreams.close(streamID)
+		})
 	}
 	return marshalRPCResult(rpcHostHTTPStreamResponse{
 		StatusCode: resp.StatusCode,
