@@ -6,6 +6,62 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIRequestToClaude_PreservesOpenAIStyleThinkingToggle(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantType   string
+		wantBudget bool
+		wantEffort bool
+	}{
+		{
+			name: "enabled without effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"enabled"},
+				"messages":[{"role":"user","content":"hi"}]
+			}`,
+			wantType: "enabled",
+		},
+		{
+			name: "disabled overrides effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"disabled"},
+				"reasoning_effort":"high",
+				"messages":[{"role":"user","content":"hi"}]
+			}`,
+			wantType: "disabled",
+		},
+		{
+			name: "enabled with effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"enabled"},
+				"reasoning_effort":"high",
+				"messages":[{"role":"user","content":"hi"}]
+			}`,
+			wantType:   "enabled",
+			wantBudget: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ConvertOpenAIRequestToClaude("deepseek-v4-pro", []byte(tt.input), false)
+			if got := gjson.GetBytes(result, "thinking.type").String(); got != tt.wantType {
+				t.Fatalf("thinking.type = %q, want %q; payload=%s", got, tt.wantType, string(result))
+			}
+			if got := gjson.GetBytes(result, "thinking.budget_tokens").Exists(); got != tt.wantBudget {
+				t.Fatalf("thinking.budget_tokens exists = %v, want %v; payload=%s", got, tt.wantBudget, string(result))
+			}
+			if got := gjson.GetBytes(result, "output_config.effort").Exists(); got != tt.wantEffort {
+				t.Fatalf("output_config.effort exists = %v, want %v; payload=%s", got, tt.wantEffort, string(result))
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

@@ -508,25 +508,69 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 // OpenAI uses level-based thinking configuration only, no numeric budget support.
 // The "none" value is treated specially to return ModeNone.
 func extractOpenAIConfig(body []byte) ThinkingConfig {
+	config, ok := ExtractOpenAIStyleThinkingConfig(body)
+	if !ok {
+		return ThinkingConfig{}
+	}
+	return config
+}
+
+// ExtractOpenAIStyleThinkingConfig extracts OpenAI-compatible thinking controls.
+//
+// DeepSeek V4 accepts the official OpenAI-compatible toggle under
+// thinking.type, while reasoning_effort controls the effort level. A disabled
+// toggle wins over effort fields because it is an explicit off switch.
+func ExtractOpenAIStyleThinkingConfig(body []byte) (ThinkingConfig, bool) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ThinkingConfig{}, false
+	}
+	root := gjson.ParseBytes(body)
+
+	thinkingType := strings.ToLower(strings.TrimSpace(root.Get("thinking.type").String()))
+	switch thinkingType {
+	case "disabled", "off", string(LevelNone):
+		return ThinkingConfig{Mode: ModeNone, Budget: 0}, true
+	}
+
 	// Check reasoning_effort (OpenAI Chat Completions format)
 	if effort := gjson.GetBytes(body, "reasoning_effort"); effort.Exists() {
-		value := effort.String()
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
 		if value == "none" {
-			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}, true
 		}
-		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+		if value != "" {
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}, true
+		}
 	}
 	// Some OpenAI-compatible providers also accept a nested thinking.reasoning_effort
 	// field before the payload is normalized to reasoning_effort.
 	if effort := gjson.GetBytes(body, "thinking.reasoning_effort"); effort.Exists() {
-		value := effort.String()
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
 		if value == "none" {
-			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}, true
 		}
-		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+		if value != "" {
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}, true
+		}
 	}
 
-	return ThinkingConfig{}
+	switch thinkingType {
+	case "enabled":
+		if budget := root.Get("thinking.budget_tokens"); budget.Exists() {
+			return ThinkingConfig{Mode: ModeBudget, Budget: int(budget.Int())}, true
+		}
+		return ThinkingConfig{Mode: ModeAuto, Budget: -1}, true
+	case "adaptive", string(LevelAuto):
+		if effort := root.Get("output_config.effort"); effort.Exists() {
+			value := strings.ToLower(strings.TrimSpace(effort.String()))
+			if value != "" {
+				return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}, true
+			}
+		}
+		return ThinkingConfig{Mode: ModeAuto, Budget: -1}, true
+	}
+
+	return ThinkingConfig{}, false
 }
 
 // extractCodexConfig extracts thinking configuration from Codex format request body.

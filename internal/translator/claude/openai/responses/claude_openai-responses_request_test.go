@@ -6,6 +6,62 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIResponsesRequestToClaude_PreservesOpenAIStyleThinkingToggle(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantType   string
+		wantBudget bool
+		wantEffort bool
+	}{
+		{
+			name: "enabled without effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"enabled"},
+				"input":"hi"
+			}`,
+			wantType: "enabled",
+		},
+		{
+			name: "disabled overrides effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"disabled"},
+				"reasoning":{"effort":"high"},
+				"input":"hi"
+			}`,
+			wantType: "disabled",
+		},
+		{
+			name: "enabled with responses effort",
+			input: `{
+				"model":"deepseek-v4-pro",
+				"thinking":{"type":"enabled"},
+				"reasoning":{"effort":"high"},
+				"input":"hi"
+			}`,
+			wantType:   "enabled",
+			wantBudget: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToClaude("deepseek-v4-pro", []byte(tt.input), false)
+			if got := gjson.GetBytes(out, "thinking.type").String(); got != tt.wantType {
+				t.Fatalf("thinking.type = %q, want %q; payload=%s", got, tt.wantType, string(out))
+			}
+			if got := gjson.GetBytes(out, "thinking.budget_tokens").Exists(); got != tt.wantBudget {
+				t.Fatalf("thinking.budget_tokens exists = %v, want %v; payload=%s", got, tt.wantBudget, string(out))
+			}
+			if got := gjson.GetBytes(out, "output_config.effort").Exists(); got != tt.wantEffort {
+				t.Fatalf("output_config.effort exists = %v, want %v; payload=%s", got, tt.wantEffort, string(out))
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_InputArray(t *testing.T) {
 	input := []byte(`{"model":"MiniMax-M2.7","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":false}`)
 

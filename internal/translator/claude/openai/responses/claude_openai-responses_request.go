@@ -54,53 +54,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	root := gjson.ParseBytes(rawJSON)
 
-	// Convert OpenAI Responses reasoning.effort to Claude thinking config.
-	if v := root.Get("reasoning.effort"); v.Exists() {
-		effort := strings.ToLower(strings.TrimSpace(v.String()))
-		if effort != "" {
-			mi := registry.LookupModelInfo(modelName, "claude")
-			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
-			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
-
-			// Claude 4.6 supports adaptive thinking with output_config.effort.
-			// MapToClaudeEffort normalizes levels (e.g. minimal→low, xhigh→high) to avoid
-			// validation errors since validate treats same-provider unsupported levels as errors.
-			if supportsAdaptive {
-				switch effort {
-				case "none":
-					out, _ = sjson.SetBytes(out, "thinking.type", "disabled")
-					out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
-					out, _ = sjson.DeleteBytes(out, "output_config.effort")
-				case "auto":
-					out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
-					out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
-					out, _ = sjson.DeleteBytes(out, "output_config.effort")
-				default:
-					if mapped, ok := thinking.MapToClaudeEffort(effort, supportsMax); ok {
-						effort = mapped
-					}
-					out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
-					out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
-					out, _ = sjson.SetBytes(out, "output_config.effort", effort)
-				}
-			} else {
-				// Legacy/manual thinking (budget_tokens).
-				budget, ok := thinking.ConvertLevelToBudget(effort)
-				if ok {
-					switch budget {
-					case 0:
-						out, _ = sjson.SetBytes(out, "thinking.type", "disabled")
-					case -1:
-						out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
-					default:
-						if budget > 0 {
-							out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
-							out, _ = sjson.SetBytes(out, "thinking.budget_tokens", budget)
-						}
-					}
-				}
-			}
-		}
+	// Convert OpenAI-compatible thinking controls to Claude thinking config.
+	if config, ok := extractOpenAIResponsesThinkingConfig(rawJSON); ok {
+		out = applyOpenAIStyleThinkingConfigToClaude(out, config, modelName)
 	}
 
 	// Helper for generating tool call IDs when missing
@@ -406,6 +362,88 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
+	return out
+}
+
+func extractOpenAIResponsesThinkingConfig(rawJSON []byte) (thinking.ThinkingConfig, bool) {
+	if !gjson.ValidBytes(rawJSON) {
+		return thinking.ThinkingConfig{}, false
+	}
+	openAIConfig, hasOpenAIConfig := thinking.ExtractOpenAIStyleThinkingConfig(rawJSON)
+	if hasOpenAIConfig && openAIConfig.Mode == thinking.ModeNone {
+		return openAIConfig, true
+	}
+	value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(rawJSON, "reasoning.effort").String()))
+	switch value {
+	case "":
+		return openAIConfig, hasOpenAIConfig
+	case string(thinking.LevelNone):
+		return thinking.ThinkingConfig{Mode: thinking.ModeNone, Budget: 0}, true
+	default:
+		return thinking.ThinkingConfig{Mode: thinking.ModeLevel, Level: thinking.ThinkingLevel(value)}, true
+	}
+}
+
+func applyOpenAIStyleThinkingConfigToClaude(out []byte, config thinking.ThinkingConfig, modelName string) []byte {
+	mi := registry.LookupModelInfo(modelName, "claude")
+	supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
+	supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
+
+	switch config.Mode {
+	case thinking.ModeNone:
+		out, _ = sjson.SetBytes(out, "thinking.type", "disabled")
+		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+		out, _ = sjson.DeleteBytes(out, "output_config.effort")
+	case thinking.ModeAuto:
+		if supportsAdaptive {
+			out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
+		} else {
+			out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
+		}
+		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+		out, _ = sjson.DeleteBytes(out, "output_config.effort")
+	case thinking.ModeLevel:
+		effort := strings.ToLower(strings.TrimSpace(string(config.Level)))
+		if effort == "" {
+			return out
+		}
+		if supportsAdaptive {
+			if mapped, ok := thinking.MapToClaudeEffort(effort, supportsMax); ok {
+				effort = mapped
+			}
+			out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
+			out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+			out, _ = sjson.SetBytes(out, "output_config.effort", effort)
+			return out
+		}
+		if budget, ok := thinking.ConvertLevelToBudget(effort); ok {
+			out = applyOpenAIStyleThinkingBudgetToClaude(out, budget)
+		}
+	case thinking.ModeBudget:
+		out = applyOpenAIStyleThinkingBudgetToClaude(out, config.Budget)
+	}
+
+	if oc := gjson.GetBytes(out, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+		out, _ = sjson.DeleteBytes(out, "output_config")
+	}
+	return out
+}
+
+func applyOpenAIStyleThinkingBudgetToClaude(out []byte, budget int) []byte {
+	switch {
+	case budget == 0:
+		out, _ = sjson.SetBytes(out, "thinking.type", "disabled")
+		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+		out, _ = sjson.DeleteBytes(out, "output_config.effort")
+	case budget == -1:
+		out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
+		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+		out, _ = sjson.DeleteBytes(out, "output_config.effort")
+	case budget > 0:
+		out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
+		out, _ = sjson.SetBytes(out, "thinking.budget_tokens", budget)
+		out, _ = sjson.DeleteBytes(out, "output_config.effort")
+	}
 	return out
 }
 
