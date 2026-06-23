@@ -14,11 +14,12 @@ env:
   GH_REPO: ${{ github.repository }}
   GO_VERSION: '1.26.4'
 
+permissions:
+  contents: write
+
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@v6
