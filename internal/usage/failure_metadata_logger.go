@@ -83,6 +83,7 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 	}
 	if status > 0 {
 		fields["upstream_status"] = status
+		fields["status_code"] = status
 	}
 	if errorCode != "" {
 		fields["upstream_error_code"] = errorCode

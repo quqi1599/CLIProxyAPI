@@ -9627,6 +9627,15 @@ func (m *Manager) authMetricFields(auth *Auth, provider, model string) log.Field
 		return fields
 	}
 	fields["auth_index"] = authMetricIndex(auth)
+	if prefix := strings.TrimSpace(auth.Prefix); prefix != "" {
+		fields["prefix"] = prefix
+	}
+	if baseURL := authMetricBaseURL(auth); baseURL != "" {
+		fields["base_url"] = baseURL
+	}
+	if tokenHash := authMetricTokenHash(auth); tokenHash != "" {
+		fields["token_hash"] = tokenHash
+	}
 	if group := authRoutingGroup(auth); group != "" {
 		fields["routing_group"] = group
 	}
@@ -9638,6 +9647,42 @@ func (m *Manager) authMetricFields(auth *Auth, provider, model string) log.Field
 		fields["routing_strategy"] = strategy
 	}
 	return fields
+}
+
+func authMetricBaseURL(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return sanitizeAuthMetricBaseURL(auth.Attributes["base_url"])
+}
+
+func sanitizeAuthMetricBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return strings.TrimRight(parsed.String(), "/")
+	}
+	if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
+}
+
+func authMetricTokenHash(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	token := strings.TrimSpace(auth.Attributes["api_key"])
+	if token == "" {
+		return ""
+	}
+	return stableAuthIndex("token:" + token)
 }
 
 func (m *Manager) logAuthSelectionMetric(ctx context.Context, auth *Auth, provider, model string) {
@@ -9662,6 +9707,7 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 	addRequestAttemptLogFields(ctx, fields)
 	if status := statusCodeFromError(err); status > 0 {
 		fields["status"] = status
+		fields["status_code"] = status
 	}
 	var authErr *Error
 	if errors.As(err, &authErr) && authErr != nil {
@@ -9697,6 +9743,7 @@ func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Re
 	}
 	if status > 0 {
 		fields["status"] = status
+		fields["status_code"] = status
 	}
 	if result.Error != nil {
 		if result.Error.Code != "" {

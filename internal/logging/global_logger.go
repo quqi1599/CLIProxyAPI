@@ -30,7 +30,27 @@ var (
 type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
-var logFieldOrder = []string{"provider", "model", "version", "mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error"}
+var logFieldOrder = []string{
+	"event", "provider", "model", "requested_model", "upstream_model",
+	"auth_index", "routing_strategy", "routing_scope", "routing_group", "prefix", "base_url", "token_hash",
+	"status", "status_code", "success", "error_code", "retryable", "retry_after_ms", "reset_ms", "providers",
+	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "version", "error",
+	"request_path", "attempt_no", "retry_reason", "tool_type", "tool_source", "policy", "reason",
+	"executor", "compat_kind", "compat_kind_source", "compat_mapping", "repairs", "merged_tool_result_messages", "deduped_tool_results",
+	"reordered_tool_results", "removed_tool_uses", "removed_tool_results", "repair_type", "repairs_count",
+	"payload_bytes_before", "payload_bytes_after", "repair_duration_ms",
+	"failure_class", "endpoint_method", "endpoint_path", "endpoint", "client_profile", "payload_bytes", "message_count", "tool_count",
+	"declared_tool_count", "tool_interaction_count", "mcp_tool_count", "builtin_tool_count", "tool_types", "tool_name_hashes",
+	"reasoning_effort", "input_tokens",
+	"attempt_count", "fallback_count", "max_attempts", "max_fallbacks", "translator_run_count",
+	"final_success", "final_status", "final_error_type", "final_error_code", "final_provider", "final_model", "final_executor",
+	"duration_ms", "time_to_first_chunk_ms", "upstream_chunk_wait_ms", "upstream_chunk_wait_count",
+	"stream_duration_ms", "total_duration_ms", "downstream_write_ms", "downstream_write_calls",
+	"downstream_flush_ms", "downstream_flush_calls", "chunks_count", "bytes_out",
+	"stream_output_tokens", "stream_output_tokens_observed", "output_tokens", "tokens_per_second",
+	"client_gone", "finish_reason",
+	"normalized_status", "error_type", "upstream_status", "upstream_error_code", "route_plan",
+}
 
 // Format renders a single log entry with custom formatting.
 func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
