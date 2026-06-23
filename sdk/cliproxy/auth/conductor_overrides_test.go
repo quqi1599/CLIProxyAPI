@@ -1650,7 +1650,7 @@ func TestManager_MaxRetryCredentials_LimitsTransientRoutingFallback(t *testing.T
 	}
 }
 
-func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtFourTotalAttempts(t *testing.T) {
+func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *testing.T) {
 	const model = "gpt-5.5"
 	testCases := []struct {
 		name      string
@@ -1675,10 +1675,12 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtFourTotalAttempts(t *t
 						"ba-codex-3": err,
 						"ca-codex-4": err,
 						"da-codex-5": err,
+						"ea-codex-6": err,
+						"fa-codex-7": err,
 					},
 				}
 			},
-			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5"},
+			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5", "ea-codex-6", "fa-codex-7"},
 		},
 		{
 			name: "execute_count",
@@ -1696,10 +1698,12 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtFourTotalAttempts(t *t
 						"ba-codex-3": err,
 						"ca-codex-4": err,
 						"da-codex-5": err,
+						"ea-codex-6": err,
+						"fa-codex-7": err,
 					},
 				}
 			},
-			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5"},
+			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5", "ea-codex-6", "fa-codex-7"},
 		},
 		{
 			name: "execute_stream",
@@ -1717,10 +1721,12 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtFourTotalAttempts(t *t
 						"ba-codex-3": err,
 						"ca-codex-4": err,
 						"da-codex-5": err,
+						"ea-codex-6": err,
+						"fa-codex-7": err,
 					},
 				}
 			},
-			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5"},
+			wantCalls: []string{"aa-codex-1", "ba-codex-3", "ca-codex-4", "da-codex-5", "ea-codex-6", "fa-codex-7"},
 		},
 	}
 
@@ -1739,7 +1745,7 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtFourTotalAttempts(t *t
 			manager, executor := newGPTLargeToolResponsesFallbackManager(t, model, tc.errorMap(errUpstream))
 
 			if errInvoke := tc.invoke(manager, request, opts); errInvoke == nil {
-				t.Fatalf("expected guarded large tool request to fail after four attempts")
+				t.Fatalf("expected guarded large tool request to fail after six attempts")
 			}
 			if got := tc.getCalls(executor); !stringSlicesEqual(got, tc.wantCalls) {
 				t.Fatalf("calls = %v, want %v", got, tc.wantCalls)
@@ -1797,6 +1803,8 @@ func newGPTLargeToolResponsesFallbackManager(t *testing.T, model string, executo
 		{ID: "ba-codex-3", Provider: "codex", Attributes: map[string]string{"routing_group": "group-b"}},
 		{ID: "ca-codex-4", Provider: "codex", Attributes: map[string]string{"routing_group": "group-c"}},
 		{ID: "da-codex-5", Provider: "codex", Attributes: map[string]string{"routing_group": "group-d"}},
+		{ID: "ea-codex-6", Provider: "codex", Attributes: map[string]string{"routing_group": "group-e"}},
+		{ID: "fa-codex-7", Provider: "codex", Attributes: map[string]string{"routing_group": "group-f"}},
 	}
 
 	reg := registry.GetGlobalRegistry()

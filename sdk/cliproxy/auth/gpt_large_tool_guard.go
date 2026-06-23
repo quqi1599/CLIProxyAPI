@@ -12,7 +12,7 @@ import (
 const (
 	gptLargeToolHistoryMessages            = 100
 	gptLargeToolHistoryTools               = 40
-	gptLargeToolHistoryMaxRetryCredentials = 3 // Four total attempts: initial credential plus three fallbacks.
+	gptLargeToolHistoryMaxRetryCredentials = 5 // Six total attempts: initial credential plus five fallbacks.
 )
 
 type gptLargeToolHistoryFallbackGuard struct {
