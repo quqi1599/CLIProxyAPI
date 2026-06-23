@@ -18,9 +18,9 @@ RUN --mount=type=cache,target=/root/.cache/go-mod \
 # Copy the source tree
 COPY . .
 
-# Static build with CGO disabled.
+# Dynamic build with CGO enabled so the server can load native plugins.
 # -trimpath removes build-path details for better reproducibility.
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/go-mod \
     set -eu; \
@@ -34,16 +34,6 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -ldflags="${ldflags}" \
     -o ./CLIProxyAPI ./cmd/server/ && \
     test -x ./CLIProxyAPI
-
-# Runtime stage
-FROM alpine:3.23
-
-ARG VERSION=dev
-ARG COMMIT=none
-ARG BUILD_DATE=unknown
-ARG REPOSITORY_URL=unknown
-
-RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
 FROM debian:bookworm
 
