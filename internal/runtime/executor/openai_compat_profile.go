@@ -321,7 +321,13 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 }
 
 func scrubKimiPayloadForModel(payload []byte, model string) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) || !requiresKimiK25K26PayloadCompatibility(payload, model) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	if !requiresKimiK25K26PayloadCompatibility(payload, model) {
+		if requiresKimiForCodingPayloadCompatibility(payload, model) {
+			payload = normalizeKimiForCodingTemperature(payload)
+		}
 		return payload
 	}
 	payload = normalizeKimiThinkingConfig(payload, model)
@@ -340,12 +346,16 @@ func scrubKimiPayloadForModel(payload []byte, model string) []byte {
 	return payload
 }
 
-func requiresKimiK25K26Compatibility(model string) bool {
+func normalizedKimiModelName(model string) string {
 	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
 	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
 		modelName = modelName[slash+1:]
 	}
-	modelName = strings.TrimPrefix(modelName, "kimi-")
+	return strings.TrimPrefix(modelName, "kimi-")
+}
+
+func requiresKimiK25K26Compatibility(model string) bool {
+	modelName := normalizedKimiModelName(model)
 	return modelName == "k2.5" ||
 		modelName == "k2.6" ||
 		strings.HasPrefix(modelName, "k2.5-") ||
@@ -358,6 +368,19 @@ func requiresKimiK25K26PayloadCompatibility(payload []byte, model string) bool {
 	}
 	payloadModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 	return payloadModel != "" && requiresKimiK25K26Compatibility(payloadModel)
+}
+
+func requiresKimiForCodingCompatibility(model string) bool {
+	modelName := normalizedKimiModelName(model)
+	return modelName == "for-coding" || strings.HasPrefix(modelName, "for-coding-")
+}
+
+func requiresKimiForCodingPayloadCompatibility(payload []byte, model string) bool {
+	if requiresKimiForCodingCompatibility(model) {
+		return true
+	}
+	payloadModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	return payloadModel != "" && requiresKimiForCodingCompatibility(payloadModel)
 }
 
 func normalizeKimiThinkingConfig(payload []byte, model string) []byte {
@@ -469,6 +492,16 @@ func normalizeKimiFixedSamplingParams(payload []byte) []byte {
 		if updated, err := sjson.SetBytes(payload, path, value); err == nil {
 			payload = updated
 		}
+	}
+	return payload
+}
+
+func normalizeKimiForCodingTemperature(payload []byte) []byte {
+	if !gjson.GetBytes(payload, "temperature").Exists() {
+		return payload
+	}
+	if updated, err := sjson.SetBytes(payload, "temperature", kimiThinkingTemperature); err == nil {
+		payload = updated
 	}
 	return payload
 }

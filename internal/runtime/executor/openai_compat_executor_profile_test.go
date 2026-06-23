@@ -894,6 +894,28 @@ func TestOpenAICompatPayloadKimiK25WebSearchDisablesThinking(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatPayloadKimiForCodingForcesTemperatureOnly(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-for-coding",
+		"messages":[{"role":"user","content":"hi"}],
+		"temperature":0.6,
+		"top_p":0.4,
+		"n":2
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-for-coding", "https://api.kimi.com/coding/v1")
+
+	if got := gjson.GetBytes(out, "temperature").Float(); got != kimiThinkingTemperature {
+		t.Fatalf("temperature = %v, want %v: %s", got, kimiThinkingTemperature, string(out))
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != 0.4 {
+		t.Fatalf("top_p = %v, want 0.4: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "n").Int(); got != 2 {
+		t.Fatalf("n = %v, want 2: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadXiaomiScrubsUnsupportedOpenAIExtras(t *testing.T) {
 	payload := []byte(`{
 		"model":"mimo-v2.5",
