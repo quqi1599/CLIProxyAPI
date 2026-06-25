@@ -4070,62 +4070,74 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		var authErr error
 		countAttempt := false
+	modelLoop:
 		for idx, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, "execute")
-			if trace != nil {
-				trace.recordExecution(provider, resultModel, providerExecutorName(executor))
-			}
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
+			softRetryAttempt := 0
+			for {
+				logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, "execute")
+				if trace != nil {
+					trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 				}
-				result.Error = resultErrorFromCause(errExec)
-				result.Cause = errExec
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
-				}
-				m.MarkResult(execCtx, result)
-				trace.recordFinalStatus(statusCodeFromError(errExec))
-				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
-				if shouldEvictUnauthorizedError(errExec) {
-					if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
-						logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+				resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
 					}
-					authErr = errExec
-					countAttempt = false
-					break
-				}
-				if isRequestInvalidError(errExec) {
-					if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
-						authErr = errExec
-						countAttempt = true
-						if idx < len(models)-1 {
-							trace.recordFallback()
+					result.Error = resultErrorFromCause(errExec)
+					result.Cause = errExec
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					trace.recordFinalStatus(statusCodeFromError(errExec))
+					m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
+					if wait, shouldRetry := m.gptSoftRateLimitRetryWait(errExec, providers, routeModel, softRetryAttempt); shouldRetry {
+						softRetryAttempt++
+						trace.recordFallback()
+						if errWait := waitForCooldown(execCtx, wait); errWait != nil {
+							return cliproxyexecutor.Response{}, errWait
 						}
 						continue
 					}
-					return cliproxyexecutor.Response{}, errExec
+					if shouldEvictUnauthorizedError(errExec) {
+						if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
+							logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+						}
+						authErr = errExec
+						countAttempt = false
+						break modelLoop
+					}
+					if isRequestInvalidError(errExec) {
+						if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
+							authErr = errExec
+							countAttempt = true
+							if idx < len(models)-1 {
+								trace.recordFallback()
+							}
+							continue modelLoop
+						}
+						return cliproxyexecutor.Response{}, errExec
+					}
+					authErr = errExec
+					countAttempt = true
+					if idx < len(models)-1 {
+						trace.recordFallback()
+					}
+					continue modelLoop
 				}
-				authErr = errExec
-				countAttempt = true
-				if idx < len(models)-1 {
-					trace.recordFallback()
+				m.MarkResult(execCtx, result)
+				trace.recordFinalStatus(http.StatusOK)
+				if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
+					resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
 				}
-				continue
+				return resp, nil
 			}
-			m.MarkResult(execCtx, result)
-			trace.recordFinalStatus(http.StatusOK)
-			if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
-				resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
-			}
-			return resp, nil
 		}
 		if authErr != nil {
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, authErr)
@@ -4230,62 +4242,74 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		var authErr error
 		countAttempt := false
+	modelLoop:
 		for idx, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, "count")
-			if trace != nil {
-				trace.recordExecution(provider, resultModel, providerExecutorName(executor))
-			}
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
+			softRetryAttempt := 0
+			for {
+				logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, "count")
+				if trace != nil {
+					trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 				}
-				result.Error = resultErrorFromCause(errExec)
-				result.Cause = errExec
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
-				}
-				m.MarkResult(execCtx, result)
-				trace.recordFinalStatus(statusCodeFromError(errExec))
-				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
-				if shouldEvictUnauthorizedError(errExec) {
-					if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
-						logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+				resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
 					}
-					authErr = errExec
-					countAttempt = false
-					break
-				}
-				if isRequestInvalidError(errExec) {
-					if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
-						authErr = errExec
-						countAttempt = true
-						if idx < len(models)-1 {
-							trace.recordFallback()
+					result.Error = resultErrorFromCause(errExec)
+					result.Cause = errExec
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					trace.recordFinalStatus(statusCodeFromError(errExec))
+					m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
+					if wait, shouldRetry := m.gptSoftRateLimitRetryWait(errExec, providers, routeModel, softRetryAttempt); shouldRetry {
+						softRetryAttempt++
+						trace.recordFallback()
+						if errWait := waitForCooldown(execCtx, wait); errWait != nil {
+							return cliproxyexecutor.Response{}, errWait
 						}
 						continue
 					}
-					return cliproxyexecutor.Response{}, errExec
+					if shouldEvictUnauthorizedError(errExec) {
+						if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
+							logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+						}
+						authErr = errExec
+						countAttempt = false
+						break modelLoop
+					}
+					if isRequestInvalidError(errExec) {
+						if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
+							authErr = errExec
+							countAttempt = true
+							if idx < len(models)-1 {
+								trace.recordFallback()
+							}
+							continue modelLoop
+						}
+						return cliproxyexecutor.Response{}, errExec
+					}
+					authErr = errExec
+					countAttempt = true
+					if idx < len(models)-1 {
+						trace.recordFallback()
+					}
+					continue modelLoop
 				}
-				authErr = errExec
-				countAttempt = true
-				if idx < len(models)-1 {
-					trace.recordFallback()
+				m.MarkResult(execCtx, result)
+				trace.recordFinalStatus(http.StatusOK)
+				if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
+					resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
 				}
-				continue
+				return resp, nil
 			}
-			m.MarkResult(execCtx, result)
-			trace.recordFinalStatus(http.StatusOK)
-			if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
-				resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
-			}
-			return resp, nil
 		}
 		if authErr != nil {
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, authErr)
@@ -4388,7 +4412,20 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			continue
 		}
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		softRetryAttempt := 0
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
+		for errStream != nil {
+			if wait, shouldRetry := m.gptSoftRateLimitRetryWait(errStream, []string{provider}, routeModel, softRetryAttempt); shouldRetry {
+				softRetryAttempt++
+				trace.recordFallback()
+				if errWait := waitForCooldown(execCtx, wait); errWait != nil {
+					return nil, errWait
+				}
+				streamResult, errStream = m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
+				continue
+			}
+			break
+		}
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -5391,6 +5428,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		}
 		return 0, true
 	}
+	if isRetryableGPTSoftRateLimit(err, providers, model) {
+		return 0, false
+	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
 		if wait > maxWait {
@@ -5409,6 +5449,56 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	return *retryAfter, true
+}
+
+func (m *Manager) gptSoftRateLimitRetryWait(err error, providers []string, model string, attempt int) (time.Duration, bool) {
+	if !isRetryableGPTSoftRateLimit(err, providers, model) {
+		return 0, false
+	}
+	_, _, maxWait := m.retrySettings()
+	return transientNetworkRetryDelay(attempt, maxWait)
+}
+
+func isRetryableGPTSoftRateLimit(err error, providers []string, model string) bool {
+	if err == nil || !isGPTRetryRoute(providers, model) {
+		return false
+	}
+	if statusCodeFromError(err) != http.StatusTooManyRequests {
+		return false
+	}
+	if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > 0 {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(errorString(err)))
+	if message == "" || isAccountQuotaExhaustedMessage(message) {
+		return false
+	}
+	patterns := [...]string{
+		"selected model is at capacity",
+		"model is at capacity",
+		"rate limit",
+		"rate_limit",
+		"too many requests",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(message, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGPTRetryRoute(providers []string, model string) bool {
+	modelKey := strings.ToLower(strings.TrimSpace(canonicalModelKey(model)))
+	if strings.HasPrefix(modelKey, "gpt-") {
+		return true
+	}
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			return true
+		}
+	}
+	return false
 }
 
 func transientNetworkRetryDelay(attempt int, maxWait time.Duration) (time.Duration, bool) {

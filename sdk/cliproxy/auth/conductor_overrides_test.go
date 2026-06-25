@@ -122,6 +122,114 @@ func TestManager_ShouldRetryAfterError_EmptyUpstreamResponseUsesConfiguredRetry(
 	}
 }
 
+func TestManager_GPTSoftRateLimitRetryWait_UsesShortBackoffAndStopsOuterRetry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 30*time.Second, 0)
+
+	errCapacity := &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Message:    "Selected model is at capacity. Please try a different model.",
+	}
+	wait, shouldRetry := m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 0)
+	if !shouldRetry {
+		t.Fatalf("expected GPT capacity 429 without retry-after to retry")
+	}
+	if wait != time.Second {
+		t.Fatalf("wait = %v, want %v", wait, time.Second)
+	}
+
+	wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 1)
+	if !shouldRetry {
+		t.Fatalf("expected second GPT capacity retry")
+	}
+	if wait != 2*time.Second {
+		t.Fatalf("wait = %v, want %v", wait, 2*time.Second)
+	}
+
+	wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 2)
+	if !shouldRetry {
+		t.Fatalf("expected third GPT capacity retry")
+	}
+	if wait != 3*time.Second {
+		t.Fatalf("wait = %v, want %v", wait, 3*time.Second)
+	}
+
+	if wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 3); shouldRetry {
+		t.Fatalf("expected GPT capacity retry to stop after three short waits, got wait=%v", wait)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	if wait, shouldRetry = m.shouldRetryAfterError(errCapacity, 0, []string{"openai-compatibility"}, "gpt-5.5", maxWait); shouldRetry {
+		t.Fatalf("expected outer retry loop to stop GPT capacity after credential fallback exhaustion, got wait=%v", wait)
+	}
+}
+
+func TestManager_ShouldRetryAfterError_GPTSoftRateLimitDoesNotRetryQuotaOrNonGPT(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(3, 30*time.Second, 0)
+
+	auths := []*Auth{
+		{ID: "gpt-auth", Provider: "openai-compatibility"},
+		{ID: "kimi-auth", Provider: "kimi"},
+	}
+	for _, auth := range auths {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	_, _, maxWait := m.retrySettings()
+	errQuota := &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Message:    "usage limit reached; quota will be refreshed in the next cycle",
+	}
+	if wait, shouldRetry := m.shouldRetryAfterError(errQuota, 0, []string{"openai-compatibility"}, "gpt-5.5", maxWait); shouldRetry {
+		t.Fatalf("expected quota 429 without retry-after to stop, got wait=%v", wait)
+	}
+
+	errCapacity := &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Message:    "Selected model is at capacity. Please try a different model.",
+	}
+	if wait, shouldRetry := m.shouldRetryAfterError(errCapacity, 0, []string{"kimi"}, "kimi-k2.5", maxWait); shouldRetry {
+		t.Fatalf("expected non-GPT capacity-like 429 to stop, got wait=%v", wait)
+	}
+}
+
+func TestManager_Execute_GPTCapacityRetriesSameAuthBeforeFallback(t *testing.T) {
+	const model = "gpt-5.5"
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 30*time.Second, 0)
+
+	executor := &gptCapacityRetryProbeExecutor{
+		id:                    "gpt-capacity",
+		failuresBeforeSuccess: 1,
+	}
+	manager.RegisterExecutor(executor)
+
+	auth := openAICompatChannelBreakerAuth("capacity-auth", "gpt-capacity", "https://gpt.example.com/v1", 10)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	resp, errExecute := manager.Execute(context.Background(), []string{auth.Provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want same-auth retry success", errExecute)
+	}
+	if string(resp.Payload) != auth.ID {
+		t.Fatalf("payload = %q, want %s", string(resp.Payload), auth.ID)
+	}
+	if got := executor.ExecuteCalls(); !stringSlicesEqual(got, []string{auth.ID, auth.ID}) {
+		t.Fatalf("execute calls = %v, want same auth retried once", got)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_CodexModelCooldownUsesRetryAfter(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
@@ -388,6 +496,58 @@ func (e *sequentialFillRetryProbeExecutor) ExecuteCalls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.executeCalls
+}
+
+type gptCapacityRetryProbeExecutor struct {
+	id                    string
+	failuresBeforeSuccess int
+
+	mu           sync.Mutex
+	executeCalls []string
+}
+
+func (e *gptCapacityRetryProbeExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *gptCapacityRetryProbeExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, auth.ID)
+	callCount := len(e.executeCalls)
+	failuresBeforeSuccess := e.failuresBeforeSuccess
+	e.mu.Unlock()
+
+	if callCount <= failuresBeforeSuccess {
+		return cliproxyexecutor.Response{}, &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    "Selected model is at capacity. Please try a different model.",
+		}
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e *gptCapacityRetryProbeExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *gptCapacityRetryProbeExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *gptCapacityRetryProbeExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *gptCapacityRetryProbeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *gptCapacityRetryProbeExecutor) ExecuteCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.executeCalls))
+	copy(out, e.executeCalls)
+	return out
 }
 
 func TestManager_MarkResult_429StaysSoftBeforeRepeatedQuotaFailures(t *testing.T) {
