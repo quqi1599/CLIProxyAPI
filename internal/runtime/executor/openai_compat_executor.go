@@ -163,6 +163,13 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 		log.Errorf("openai compat executor: request body close error: %v", errClose)
 	}
 	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	path := ""
+	if req.URL != nil {
+		path = req.URL.Path
+	}
+	if errReject := rejectLargeOpenAICompatToolHistory(req.Context(), body, profile, model, path); errReject != nil {
+		return errReject
+	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(req.Context(), updated, profile, model); changed {
 		updated = inlined
@@ -179,6 +186,64 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 		req.Header.Set("Content-Length", strconv.Itoa(len(updated)))
 	}
 	return nil
+}
+
+const (
+	largeOpenAICompatToolHistoryPayloadBytes = 1 * 1024 * 1024
+	largeOpenAICompatToolOutputMessages      = 40
+)
+
+func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
+	if len(body) < largeOpenAICompatToolHistoryPayloadBytes || !hasOpenAICompatToolOutputMarker(body) {
+		return nil
+	}
+	toolOutputs := countOpenAICompatToolOutputMessages(body)
+	if toolOutputs < largeOpenAICompatToolOutputMessages {
+		return nil
+	}
+	fields := log.Fields{
+		"event":                "openai_compat_tool_history_guard",
+		"model":                model,
+		"compat_kind":          config.NormalizeOpenAICompatibilityKind(profile.Kind),
+		"request_path":         path,
+		"payload_bytes":        len(body),
+		"tool_output_messages": toolOutputs,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large OpenAI-compatible tool history rejected before compat repair")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       largeOpenAICompatToolHistoryUserMessage(),
+	}
+}
+
+func hasOpenAICompatToolOutputMarker(body []byte) bool {
+	return bytes.Contains(body, []byte(`"tool`)) ||
+		bytes.Contains(body, []byte(`"function_call_output"`)) ||
+		bytes.Contains(body, []byte(`"custom_tool_call_output"`))
+}
+
+func largeOpenAICompatToolHistoryUserMessage() string {
+	return "request_feature_unsupported: large_openai_tool_history. 历史工具调用过多、文件工具结果过多或上下文过大，当前 GPT/OpenAI-compatible 路由继续携带这些工具结果会显著拖慢或中断。请新开会话、把历史工具调用/文件结果压缩成普通文本摘要、减少重复文件提交，或切换到更适合长文件上下文的模型；原样重复提交不会提高成功率。"
+}
+
+func countOpenAICompatToolOutputMessages(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	count := 0
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		if strings.TrimSpace(msg.Get("role").String()) == "tool" {
+			count++
+		}
+	}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		switch strings.TrimSpace(item.Get("type").String()) {
+		case "function_call_output", "custom_tool_call_output":
+			count++
+		}
+	}
+	return count
 }
 
 func validateOpenAICompatOutboundJSON(payload []byte) error {
@@ -297,10 +362,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	translated = e.overrideModel(translated, baseModel)
 	compatDiagnosticSource := translated
-	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
-
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
+	if errReject := rejectLargeOpenAICompatToolHistory(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+		return resp, errReject
+	}
+	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
+
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 	translated = scrubDeepSeekThinkingBudgetForCompat(translated, baseModel, baseURL, profile.Kind)
@@ -538,10 +606,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	translated = e.overrideModel(translated, baseModel)
 	compatDiagnosticSource := translated
-	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
-
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
+	if errReject := rejectLargeOpenAICompatToolHistory(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+		return nil, errReject
+	}
+	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
+
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = scrubOpenAICompatPayloadForModel(translated, profile, baseModel, baseURL)
 	translated = scrubDeepSeekThinkingBudgetForCompat(translated, baseModel, baseURL, profile.Kind)

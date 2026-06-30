@@ -281,6 +281,7 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Only include it if the client explicitly provides it.
 	key := ""
 	requestPath := ""
+	clientProfile := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
@@ -288,9 +289,13 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 			if requestPath == "" && ginCtx.Request.URL != nil {
 				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
 			}
+			clientProfile = inferClientProfileFromHeaders(ginCtx.Request.Header)
 		}
 	}
 	meta := make(map[string]any)
+	if clientProfile != "" {
+		meta[coreexecutor.ClientProfileMetadataKey] = clientProfile
+	}
 	if key != "" {
 		meta[idempotencyKeyMetadataKey] = key
 	}
@@ -310,6 +315,16 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func inferClientProfileFromHeaders(headers http.Header) string {
+	for _, name := range []string{"User-Agent", "X-Client-Name", "X-App-Name", "X-Title"} {
+		value := strings.ToLower(headers.Get(name))
+		if strings.Contains(value, "workbuddy") || strings.Contains(value, "codebuddy") {
+			return "workbuddy"
+		}
+	}
+	return ""
 }
 
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {

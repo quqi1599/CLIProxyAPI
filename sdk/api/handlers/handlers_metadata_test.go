@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"net/http"
 	"testing"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -16,6 +17,24 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 	}
 	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
 		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
+	}
+}
+
+func TestInferClientProfileFromHeadersDetectsWorkBuddy(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("User-Agent", "WorkBuddy/5.1")
+
+	if got := inferClientProfileFromHeaders(headers); got != "workbuddy" {
+		t.Fatalf("profile = %q, want workbuddy", got)
+	}
+}
+
+func TestInferClientProfileFromHeadersDetectsCodeBuddy(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Client-Name", "CodeBuddy")
+
+	if got := inferClientProfileFromHeaders(headers); got != "workbuddy" {
+		t.Fatalf("profile = %q, want workbuddy", got)
 	}
 }
 

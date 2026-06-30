@@ -193,6 +193,90 @@ func TestOpenAICompatExecutorStreamScrubsUnsupportedFieldsForProfile(t *testing.
 	}
 }
 
+func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T) {
+	body := buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))
+	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
+
+	err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
+	if err == nil {
+		t.Fatal("expected large OpenAI-compatible tool history rejection")
+	}
+	status, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("error type = %T, want statusErr", err)
+	}
+	if status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status.StatusCode(), http.StatusBadRequest)
+	}
+	if !strings.Contains(err.Error(), "large_openai_tool_history") {
+		t.Fatalf("error = %q, want large_openai_tool_history marker", err.Error())
+	}
+}
+
+func TestOpenAICompatExecutorRejectsLargeToolHistoryBeforeUpstream(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("newapi-provider", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "newapi-provider",
+			Kind: "newapi",
+		}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":    server.URL + "/v1",
+		"api_key":     "test",
+		"compat_name": "newapi-provider",
+		"compat_kind": "newapi",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
+
+	_, err := executor.Execute(context.Background(), auth, req, opts)
+	assertLargeOpenAICompatToolHistoryError(t, err)
+	_, err = executor.ExecuteStream(context.Background(), auth, req, opts)
+	assertLargeOpenAICompatToolHistoryError(t, err)
+	if called {
+		t.Fatal("upstream should not be called for large tool history")
+	}
+}
+
+func assertLargeOpenAICompatToolHistoryError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected large OpenAI-compatible tool history rejection")
+	}
+	status, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("error type = %T, want statusErr", err)
+	}
+	if status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status.StatusCode(), http.StatusBadRequest)
+	}
+	if !strings.Contains(err.Error(), "large_openai_tool_history") {
+		t.Fatalf("error = %q, want large_openai_tool_history marker", err.Error())
+	}
+}
+
+func buildOpenAICompatToolHistoryBody(count int, content string) string {
+	var b strings.Builder
+	b.WriteString(`{"model":"gpt-5.5","messages":[{"role":"assistant","content":"read files","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`)
+	for i := 0; i < count; i++ {
+		b.WriteString(`,{"role":"tool","tool_call_id":"call_1","content":"`)
+		b.WriteString(content)
+		b.WriteString(`"}`)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
 func TestOpenAICompatExecutorClaudeSourceNormalizesKimiToolReferences(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -745,6 +829,36 @@ func TestOpenAICompatPayloadZhipuForcesAutoToolChoice(t *testing.T) {
 
 	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("zhipu"), "glm-4.6", "https://open.bigmodel.cn/api/paas/v4")
 
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadZhipuExpandsFunctionDeclarations(t *testing.T) {
+	payload := []byte(`{
+		"model":"glm-5.2",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{
+			"functionDeclarations":[{
+				"name":"read:file",
+				"description":"read a file",
+				"parametersJsonSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+			}]
+		}],
+		"tool_choice":{"type":"function","function":{"name":"read:file"}}
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("zhipu"), "glm-5.2", "https://open.bigmodel.cn/api/paas/v4")
+
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want function: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "read_file" {
+		t.Fatalf("function name = %q, want read_file: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.path.type").String(); got != "string" {
+		t.Fatalf("path type = %q, want string: %s", got, string(out))
+	}
 	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
 		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
 	}

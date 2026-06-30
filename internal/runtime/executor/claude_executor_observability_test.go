@@ -181,6 +181,40 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 	}
 }
 
+func TestRejectLargeClaudeCompatToolHistory_RejectsToolResultPileForCompatProxy(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+
+	body := buildClaudeToolResultPileBody(45, strings.Repeat("x", 24*1024))
+	meta := compatRepairLogMeta{
+		requestedModel: "glm-5.2",
+		upstreamModel:  "glm-5.2",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/chat/completions",
+		compatKind:     "zhipu",
+		messageCount:   46,
+		toolCount:      45,
+	}
+	ctx := logging.WithRequestID(context.Background(), "req-workbuddy-tool-pile")
+
+	err := rejectLargeClaudeCompatToolHistory(ctx, body, meta, newClaudeCompatPreflight(body))
+	if err == nil {
+		t.Fatal("expected tool result pile rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "large_claude_tool_history") {
+		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
+	}
+
+	entry := findCompatRepairGuardEntry(t, hook.AllEntries())
+	if got := entry.Data["reason"]; got != "tool_result_message_pile" {
+		t.Fatalf("reason = %#v, want tool_result_message_pile", got)
+	}
+	if got := entry.Data["tool_result_only_messages"]; got != 45 {
+		t.Fatalf("tool_result_only_messages = %#v, want 45", got)
+	}
+}
+
 func TestRejectLargeClaudeCompatToolHistory_AllowsPreviouslyGuardedMidrangeHistory(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}]}`)
 	meta := compatRepairLogMeta{
@@ -218,6 +252,18 @@ func TestRejectLargeClaudeCompatToolHistory_AllowsSmallToolHistory(t *testing.T)
 	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, claudeCompatPreflight{hasToolUse: true}); err != nil {
 		t.Fatalf("unexpected rejection for small tool history: %v", err)
 	}
+}
+
+func buildClaudeToolResultPileBody(count int, content string) []byte {
+	var b strings.Builder
+	b.WriteString(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}`)
+	for i := 0; i < count; i++ {
+		b.WriteString(`,{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"`)
+		b.WriteString(content)
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`]}`)
+	return []byte(b.String())
 }
 
 func findCompatRepairEntry(t *testing.T, entries []*log.Entry, repairType string) *log.Entry {

@@ -47,13 +47,14 @@ type ClaudeExecutor struct {
 }
 
 type claudeCompatPreflight struct {
-	hasToolUse    bool
-	hasToolResult bool
-	hasCache      bool
-	hasSystemRole bool
-	hasTools      bool
-	hasToolSearch bool
-	hasBetas      bool
+	hasToolUse             bool
+	hasToolResult          bool
+	hasCache               bool
+	hasSystemRole          bool
+	hasTools               bool
+	hasToolSearch          bool
+	hasBetas               bool
+	toolResultOnlyMessages int
 }
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
@@ -166,10 +167,12 @@ const defaultModelMaxTokens = 1024
 
 const (
 	largeClaudeCompatToolHistoryPayloadBytes     = 4 * 1024 * 1024
+	largeClaudeCompatToolResultPilePayloadBytes  = 1 * 1024 * 1024
 	largeClaudeCompatToolHistoryMessages         = 800
 	largeClaudeCompatToolHistoryInteractions     = 500
 	largeClaudeCompatToolHistoryOnlyInteractions = 700
 	largeClaudeCompatToolHistoryMCPTools         = 80
+	largeClaudeCompatToolResultOnlyMessages      = 40
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
@@ -2404,6 +2407,9 @@ func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta c
 		"message_count":   meta.messageCount,
 		"tool_count":      meta.toolCount,
 	}
+	if preflight.toolResultOnlyMessages > 0 {
+		fields["tool_result_only_messages"] = preflight.toolResultOnlyMessages
+	}
 	addCompatRepairToolShapeFields(fields, meta.toolShape)
 	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large Claude tool history rejected before compat repair")
 	return statusErr{
@@ -2414,12 +2420,17 @@ func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta c
 }
 
 func largeClaudeCompatToolHistoryUserMessage() string {
-	return "request_feature_unsupported: large_claude_tool_history. 历史工具调用过多或上下文过大，当前 Claude 兼容路由（MiniMax/Step）无法安全承载并转发该请求。这是请求形态/上下文问题，不是通道宕机。请新开会话、把历史工具调用/MCP 工具结果压缩成普通文本摘要、减少工具使用，或切换到原生支持该能力的 Claude 路由；原样重复提交不会提高成功率。"
+	return "request_feature_unsupported: large_claude_tool_history. 历史工具调用过多、文件工具结果过多或上下文过大，当前非原生 Claude 兼容路由无法安全承载并转发该请求。这是请求形态/上下文问题，不是通道宕机。请新开会话、把历史工具调用/MCP 工具结果压缩成普通文本摘要、减少工具使用，或切换到原生支持该能力的 Claude 路由；原样重复提交不会提高成功率。"
 }
 
 func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogMeta, preflight claudeCompatPreflight) (string, bool) {
 	if !preflight.hasToolUse && !preflight.hasToolResult {
 		return "", false
+	}
+	if isKnownClaudeCompatProxyKind(meta.compatKind) &&
+		len(body) >= largeClaudeCompatToolResultPilePayloadBytes &&
+		preflight.toolResultOnlyMessages >= largeClaudeCompatToolResultOnlyMessages {
+		return "tool_result_message_pile", true
 	}
 	if !isClaudeSonnet46CompatModel(meta.requestedModel) && !isClaudeSonnet46CompatModel(meta.upstreamModel) {
 		return "", false
@@ -2462,6 +2473,15 @@ func isClaudeSonnet46CompatModel(model string) bool {
 func isMiniMaxStepClaudeCompatKind(kind string) bool {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "minimax", "step":
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownClaudeCompatProxyKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "deepseek", "doubao", "minimax", "qianfan", "qwen", "step", "zhipu":
 		return true
 	default:
 		return false
@@ -2561,7 +2581,7 @@ func executorIntMetadataValue(raw any) int {
 }
 
 func newClaudeCompatPreflight(body []byte) claudeCompatPreflight {
-	return claudeCompatPreflight{
+	preflight := claudeCompatPreflight{
 		hasToolUse:    helps.HasClaudeToolUseMarker(body),
 		hasToolResult: helps.HasClaudeToolResultMarker(body),
 		hasCache:      helps.HasClaudeCacheControlMarker(body),
@@ -2570,6 +2590,45 @@ func newClaudeCompatPreflight(body []byte) claudeCompatPreflight {
 		hasToolSearch: helps.HasClaudeToolSearchMarker(body),
 		hasBetas:      helps.HasClaudeBetasMarker(body),
 	}
+	if preflight.hasToolUse && preflight.hasToolResult && len(body) >= largeClaudeCompatToolResultPilePayloadBytes {
+		preflight.toolResultOnlyMessages = countClaudeToolResultOnlyMessages(body)
+	}
+	return preflight
+}
+
+func countClaudeToolResultOnlyMessages(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return 0
+	}
+	count := 0
+	for _, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "user" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		parts := content.Array()
+		if len(parts) == 0 {
+			continue
+		}
+		onlyToolResults := true
+		for _, part := range parts {
+			if strings.TrimSpace(part.Get("type").String()) != "tool_result" {
+				onlyToolResults = false
+				break
+			}
+		}
+		if onlyToolResults {
+			count++
+		}
+	}
+	return count
 }
 
 func repairMiniMaxClaudeToolAdjacencyForCompat(compatKind string, body []byte) ([]byte, error) {

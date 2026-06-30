@@ -1605,34 +1605,40 @@ func scrubOpenAICompatFunctionToolPayload(payload []byte, profile openAICompatPr
 	nameMapping := make(map[string]string)
 	changed := false
 	for _, rawTool := range tools {
-		cleaned, ok := normalizeDeepSeekTool(rawTool, false)
-		if !ok {
-			cleanedTools = append(cleanedTools, rawTool)
-			continue
-		}
-		if profileKind == "kimi" {
-			if function, okFunction := cleaned["function"].(map[string]any); okFunction {
-				function["strict"] = false
-				if parameters, okParameters := function["parameters"].(map[string]any); okParameters {
-					function["parameters"] = normalizeMoonshotSchemaCombiners(parameters)
-				}
-			}
-		}
-		if profileKind == "xiaomi" {
-			if function, okFunction := cleaned["function"].(map[string]any); okFunction {
-				if parameters, okParameters := function["parameters"]; okParameters {
-					function["parameters"] = normalizeXiaomiToolSchema(parameters)
-				}
-			}
-		}
-		if originalName := openAICompatOriginalFunctionName(rawTool); originalName != "" {
-			if normalizedName := openAICompatNormalizedFunctionName(cleaned); normalizedName != "" && normalizedName != originalName {
-				nameMapping[originalName] = normalizedName
-			}
-		}
-		cleanedTools = append(cleanedTools, cleaned)
-		if !jsonValuesEqual(rawTool, cleaned) {
+		candidates := openAICompatFunctionToolCandidates(rawTool)
+		if len(candidates) != 1 || !jsonValuesEqual(candidates[0], rawTool) {
 			changed = true
+		}
+		for _, rawCandidate := range candidates {
+			cleaned, ok := normalizeDeepSeekTool(rawCandidate, false)
+			if !ok {
+				cleanedTools = append(cleanedTools, rawCandidate)
+				continue
+			}
+			if profileKind == "kimi" {
+				if function, okFunction := cleaned["function"].(map[string]any); okFunction {
+					function["strict"] = false
+					if parameters, okParameters := function["parameters"].(map[string]any); okParameters {
+						function["parameters"] = normalizeMoonshotSchemaCombiners(parameters)
+					}
+				}
+			}
+			if profileKind == "xiaomi" {
+				if function, okFunction := cleaned["function"].(map[string]any); okFunction {
+					if parameters, okParameters := function["parameters"]; okParameters {
+						function["parameters"] = normalizeXiaomiToolSchema(parameters)
+					}
+				}
+			}
+			if originalName := openAICompatOriginalFunctionName(rawCandidate); originalName != "" {
+				if normalizedName := openAICompatNormalizedFunctionName(cleaned); normalizedName != "" && normalizedName != originalName {
+					nameMapping[originalName] = normalizedName
+				}
+			}
+			cleanedTools = append(cleanedTools, cleaned)
+			if !jsonValuesEqual(rawCandidate, cleaned) {
+				changed = true
+			}
 		}
 	}
 	if rewriteOpenAICompatFunctionNameReferences(root, nameMapping) {
@@ -1701,6 +1707,25 @@ func scrubXiaomiToolSchemas(payload []byte) []byte {
 		return payload
 	}
 	return out
+}
+
+func openAICompatFunctionToolCandidates(rawTool any) []any {
+	tool, ok := rawTool.(map[string]any)
+	if !ok {
+		return []any{rawTool}
+	}
+	for _, key := range []string{"functionDeclarations", "function_declarations"} {
+		declarations, ok := tool[key].([]any)
+		if !ok || len(declarations) == 0 {
+			continue
+		}
+		out := make([]any, 0, len(declarations))
+		for _, declaration := range declarations {
+			out = append(out, declaration)
+		}
+		return out
+	}
+	return []any{rawTool}
 }
 
 func normalizeXiaomiToolSchema(parameters any) any {
