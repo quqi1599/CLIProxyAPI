@@ -46,8 +46,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
-	status = NormalizeContentSafetyStatus(status, errText)
-	status = NormalizeRequestFeatureUnsupportedStatus(status, errText)
+	status = NormalizeKnownUserErrorStatus(status, errText)
 	if sequenceNumber < 0 {
 		sequenceNumber = 0
 	}
@@ -74,6 +73,14 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		code = requestFeatureUnsupportedErrorCode
 	}
 	isNormalizedError := isContentSafety || isContextWindowExceeded || isRequestFeatureUnsupported
+	if !isNormalizedError {
+		detail, isClientHint := clientHintErrorDetail(status, errText)
+		if isClientHint {
+			message = detail.Message
+			code = detail.Code
+			isNormalizedError = true
+		}
+	}
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {

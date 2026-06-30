@@ -137,6 +137,43 @@ func TestInferAPICallAuthSupportsAuthorizationBearerFallback(t *testing.T) {
 	}
 }
 
+func TestNormalizeAPICallClaudeAuthHeaderUsesBearerForCompatBase(t *testing.T) {
+	t.Parallel()
+
+	parsedURL, errParse := url.Parse("https://api.longcat.chat/anthropic/v1/models")
+	if errParse != nil {
+		t.Fatalf("parse URL: %v", errParse)
+	}
+	headers := map[string]string{"x-api-key": "sk-longcat"}
+	normalizeAPICallClaudeAuthHeader(parsedURL, &coreauth.Auth{Provider: "claude"}, headers)
+	if got := headers["Authorization"]; got != "Bearer sk-longcat" {
+		t.Fatalf("Authorization = %q, want Bearer sk-longcat", got)
+	}
+	if got := apiCallHeaderValue(headers, "x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want empty", got)
+	}
+}
+
+func TestNormalizeAPICallClaudeAuthHeaderKeepsXAPIKeyForAnthropicBase(t *testing.T) {
+	t.Parallel()
+
+	parsedURL, errParse := url.Parse("https://api.anthropic.com/v1/models")
+	if errParse != nil {
+		t.Fatalf("parse URL: %v", errParse)
+	}
+	headers := map[string]string{}
+	normalizeAPICallClaudeAuthHeader(parsedURL, &coreauth.Auth{
+		Provider:   "claude",
+		Attributes: map[string]string{"api_key": "sk-anthropic"},
+	}, headers)
+	if got := headers["x-api-key"]; got != "sk-anthropic" {
+		t.Fatalf("x-api-key = %q, want sk-anthropic", got)
+	}
+	if got := apiCallHeaderValue(headers, "Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want empty", got)
+	}
+}
+
 func TestNormalizeAPICallMiniMaxClaudeMessagesBodyMovesSystemRole(t *testing.T) {
 	t.Parallel()
 

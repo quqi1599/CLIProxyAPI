@@ -332,6 +332,7 @@ func (h *GeminiAPIHandler) forwardGeminiStream(summaryCtx context.Context, c *gi
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
+			status = handlers.NormalizeKnownUserErrorStatus(status, errText)
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 			body := handlers.BuildErrorResponseBody(status, errText)
 			if alt == "" {

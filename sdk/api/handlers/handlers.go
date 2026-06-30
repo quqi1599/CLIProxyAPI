@@ -170,6 +170,7 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	if strings.TrimSpace(errText) == "" {
 		errText = http.StatusText(status)
 	}
+	status = NormalizeKnownUserErrorStatus(status, errText)
 	if body, ok := BuildContentSafetyErrorBody(status, errText); ok {
 		return body
 	}
@@ -177,6 +178,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return body
 	}
 	if body, ok := BuildRequestFeatureUnsupportedErrorBody(status, errText); ok {
+		return body
+	}
+	if body, ok := BuildClientHintErrorBody(status, errText); ok {
 		return body
 	}
 
@@ -218,6 +222,185 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+// NormalizeKnownUserErrorStatus maps deterministic client/request-shape errors away from 5xx.
+func NormalizeKnownUserErrorStatus(status int, errText string) int {
+	normalized, _ := normalizeKnownUserErrorStatus(status, errText)
+	return normalized
+}
+
+// NormalizeKnownUserError also checks a previously captured upstream body for hidden error details.
+func NormalizeKnownUserError(status int, errText string, captured []byte) (int, string) {
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	if strings.TrimSpace(errText) == "" {
+		errText = http.StatusText(status)
+	}
+	if normalized, ok := normalizeKnownUserErrorStatus(status, errText); ok {
+		return normalized, errText
+	}
+	capturedText := strings.TrimSpace(string(captured))
+	if capturedText == "" {
+		return status, errText
+	}
+	if normalized, ok := normalizeKnownUserErrorStatus(status, capturedText); ok {
+		return normalized, capturedText
+	}
+	combined := strings.TrimSpace(errText + "\n" + capturedText)
+	if normalized, ok := normalizeKnownUserErrorStatus(status, combined); ok {
+		return normalized, combined
+	}
+	return status, errText
+}
+
+func normalizeKnownUserErrorStatus(status int, errText string) (int, bool) {
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	if _, ok := contentSafetyDirection(status, errText); ok {
+		return http.StatusBadRequest, true
+	}
+	if IsContextWindowExceededError(status, errText) {
+		return http.StatusBadRequest, true
+	}
+	if IsRequestFeatureUnsupportedError(status, errText) {
+		return http.StatusBadRequest, true
+	}
+	if isInvalidRequestParameterError(status, errText) {
+		return http.StatusBadRequest, true
+	}
+	if isQuotaOrRateLimitError(status, errText) {
+		return http.StatusTooManyRequests, true
+	}
+	return status, false
+}
+
+// KnownUserErrorDetail returns the user-facing detail for known, high-volume error families.
+func KnownUserErrorDetail(status int, errText string) (ErrorDetail, bool) {
+	if direction, ok := contentSafetyDirection(status, errText); ok {
+		return ErrorDetail{
+			Message: UserFacingContentSafetyMessage(direction),
+			Type:    "invalid_request_error",
+			Code:    contentPolicyViolationErrorCode,
+		}, true
+	}
+	if detail, ok := contextWindowExceededErrorDetail(status, errText); ok {
+		return detail, true
+	}
+	if detail, ok := requestFeatureUnsupportedErrorDetail(status, errText); ok {
+		return detail, true
+	}
+	return clientHintErrorDetail(status, errText)
+}
+
+// BuildClientHintErrorBody builds a short Chinese hint for common generic upstream errors.
+func BuildClientHintErrorBody(status int, errText string) ([]byte, bool) {
+	detail, ok := clientHintErrorDetail(status, errText)
+	if !ok {
+		return nil, false
+	}
+	payload, err := json.Marshal(ErrorResponse{Error: detail})
+	if err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+func clientHintErrorDetail(status int, errText string) (ErrorDetail, bool) {
+	if isInvalidRequestParameterError(status, errText) {
+		return ErrorDetail{
+			Message: "请求参数不兼容或格式不正确。请检查模型、接口路径和工具调用历史；移除当前模型不支持的 temperature、reasoning、tool_choice、max_tokens 等参数，或清理失配的 tool_result 后重试。原样重复提交不会提高成功率。",
+			Type:    "invalid_request_error",
+			Code:    "invalid_request_parameters",
+		}, true
+	}
+	if isQuotaOrRateLimitError(status, errText) {
+		return ErrorDetail{
+			Message: "当前模型上游通道额度或速率受限。系统会优先尝试其它可用通道；如果仍失败，请稍后重试或切换模型。",
+			Type:    "rate_limit_error",
+			Code:    "rate_limit_exceeded",
+		}, true
+	}
+	if isUpstreamTemporaryError(status, errText) {
+		return ErrorDetail{
+			Message: "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。",
+			Type:    "server_error",
+			Code:    "upstream_error",
+		}, true
+	}
+	return ErrorDetail{}, false
+}
+
+func isInvalidRequestParameterError(status int, errText string) bool {
+	if status > 0 && status < http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(errText))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"invalidparameter",
+		"invalid parameter",
+		"param incorrect",
+		"invalid params",
+		"invalid temperature",
+		"only 1 is allowed for this model",
+		"tool choice",
+		"not found in 'tools'",
+		"tool result's tool id",
+		"out of supported range",
+		"prompt is required",
+		"does not support image input",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isQuotaOrRateLimitError(status int, errText string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errText))
+	return status == http.StatusTooManyRequests ||
+		strings.Contains(lower, "accountquotaexceeded") ||
+		strings.Contains(lower, "insufficient_quota") ||
+		strings.Contains(lower, "quota exhausted") ||
+		strings.Contains(lower, "rate_limit") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "too many requests")
+}
+
+func isUpstreamTemporaryError(status int, errText string) bool {
+	if status < http.StatusInternalServerError {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(errText))
+	if lower == "" {
+		return true
+	}
+	for _, marker := range []string{
+		"upstream_error",
+		"upstream error",
+		"do_request_failed",
+		"api_error",
+		"openai_error",
+		"bad gateway",
+		"service unavailable",
+		"gateway timeout",
+		"timeout",
+		"socket",
+		"connection reset",
+		"unexpected eof",
+		"internal_server_error",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -2254,16 +2437,15 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			errText = v
 		}
 	}
-	status = NormalizeContentSafetyStatus(status, errText)
-	status = NormalizeRequestFeatureUnsupportedStatus(status, errText)
-
-	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
-	body := BuildErrorResponseBody(status, errText)
-	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existingBytes := currentAPIResponse(c); len(existingBytes) > 0 {
 		previous = existingBytes
 	}
+	status, errText = NormalizeKnownUserError(status, errText, previous)
+
+	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
+	body := BuildErrorResponseBody(status, errText)
+	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	appendAPIResponse(c, body)
 	trimmedErrText := strings.TrimSpace(errText)
 	trimmedBody := bytes.TrimSpace(body)

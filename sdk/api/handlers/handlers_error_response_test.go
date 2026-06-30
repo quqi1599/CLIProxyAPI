@@ -131,6 +131,60 @@ func TestWriteErrorResponse_NormalizesContentSafety1301Status(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponse_NormalizesCapturedKnownUserErrorBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name string
+		body string
+		code string
+	}{
+		{
+			name: "content safety hidden behind api error",
+			body: `{"error":{"message":"[1301] content violates safety policy","code":"1301"}}`,
+			code: contentPolicyViolationErrorCode,
+		},
+		{
+			name: "unsupported request shape hidden behind api error",
+			body: `{"error":{"message":"request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax compatibility","code":"request_feature_unsupported"}}`,
+			code: requestFeatureUnsupportedErrorCode,
+		},
+		{
+			name: "invalid parameter hidden behind api error",
+			body: `{"error":{"message":"InvalidParameter: reasoning_effort xhigh is not supported","code":"InvalidParameter"}}`,
+			code: "invalid_request_parameters",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			c.Set("API_RESPONSE", []byte(tc.body))
+
+			handler := NewBaseAPIHandlers(nil, nil)
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				StatusCode: http.StatusInternalServerError,
+				Error:      errors.New("status_code=500, api_error"),
+			})
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			var payload ErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if payload.Error.Code != tc.code {
+				t.Fatalf("code = %q, want %q", payload.Error.Code, tc.code)
+			}
+			if payload.Error.Type != "invalid_request_error" {
+				t.Fatalf("type = %q, want invalid_request_error", payload.Error.Type)
+			}
+		})
+	}
+}
+
 func TestWriteErrorResponse_NormalizesGenericChineseContentSafety(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -340,6 +394,58 @@ func TestBuildErrorResponseBody_NormalizesRequestFeatureUnsupportedJSON(t *testi
 	}
 	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
 		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_NormalizesGenericClientHints(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		errText string
+		code    string
+		errType string
+	}{
+		{
+			name:    "invalid parameter",
+			status:  http.StatusBadRequest,
+			errText: "InvalidParameter: reasoning_effort xhigh is not supported",
+			code:    "invalid_request_parameters",
+			errType: "invalid_request_error",
+		},
+		{
+			name:    "quota",
+			status:  http.StatusTooManyRequests,
+			errText: "AccountQuotaExceeded",
+			code:    "rate_limit_exceeded",
+			errType: "rate_limit_error",
+		},
+		{
+			name:    "upstream",
+			status:  http.StatusBadGateway,
+			errText: `{"error":{"message":"Upstream request failed","type":"server_error","code":"upstream_error"}}`,
+			code:    "upstream_error",
+			errType: "server_error",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := BuildErrorResponseBody(tc.status, tc.errText)
+
+			var payload ErrorResponse
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if payload.Error.Code != tc.code {
+				t.Fatalf("code = %q, want %q", payload.Error.Code, tc.code)
+			}
+			if payload.Error.Type != tc.errType {
+				t.Fatalf("type = %q, want %q", payload.Error.Type, tc.errType)
+			}
+			if payload.Error.Message == "" || payload.Error.Message == tc.errText {
+				t.Fatalf("message was not normalized: %q", payload.Error.Message)
+			}
+		})
 	}
 }
 

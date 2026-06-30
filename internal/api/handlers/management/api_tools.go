@@ -173,6 +173,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	if auth == nil {
 		auth = h.inferAPICallAuth(parsedURL, reqHeaders)
 	}
+	normalizeAPICallClaudeAuthHeader(parsedURL, auth, reqHeaders)
 	body.Data = normalizeAPICallMiniMaxClaudeMessagesBody(parsedURL, body.Data)
 
 	var requestBody io.Reader
@@ -845,6 +846,47 @@ func apiCallCredentialCandidates(headers map[string]string) map[string]struct{} 
 		return nil
 	}
 	return out
+}
+
+func normalizeAPICallClaudeAuthHeader(parsedURL *url.URL, auth *coreauth.Auth, headers map[string]string) {
+	if parsedURL == nil || auth == nil || headers == nil || !strings.EqualFold(auth.Provider, "claude") {
+		return
+	}
+	if apiCallHeaderValue(headers, "Authorization") != "" {
+		return
+	}
+	apiKey := apiCallHeaderValue(headers, "x-api-key")
+	if apiKey == "" && auth.Attributes != nil {
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	if apiKey == "" {
+		return
+	}
+	if strings.EqualFold(parsedURL.Scheme, "https") && strings.EqualFold(parsedURL.Host, "api.anthropic.com") {
+		if apiCallHeaderValue(headers, "x-api-key") == "" {
+			headers["x-api-key"] = apiKey
+		}
+		return
+	}
+	apiCallDeleteHeader(headers, "x-api-key")
+	headers["Authorization"] = "Bearer " + apiKey
+}
+
+func apiCallHeaderValue(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func apiCallDeleteHeader(headers map[string]string, name string) {
+	for key := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			delete(headers, key)
+		}
+	}
 }
 
 func bearerTokenValue(value string) string {

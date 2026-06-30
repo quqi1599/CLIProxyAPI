@@ -323,13 +323,10 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(summaryCtx context.Context, c
 			if errMsg == nil {
 				return
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
+			status, errText := claudeErrorStatusAndText(errMsg, helps.MaterializeAPIResponse(c))
 			c.Status(status)
 
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			errorBytes, _ := json.Marshal(claudeErrorFromStatusText(status, errText))
 			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
@@ -346,6 +343,11 @@ type claudeErrorResponse struct {
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
+	status, errText := claudeErrorStatusAndText(msg, nil)
+	return claudeErrorFromStatusText(status, errText)
+}
+
+func claudeErrorStatusAndText(msg *interfaces.ErrorMessage, captured []byte) (int, string) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if msg != nil {
@@ -359,6 +361,20 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			}
 		}
 	}
+	return handlers.NormalizeKnownUserError(status, errText, captured)
+}
+
+func claudeErrorFromStatusText(status int, errText string) claudeErrorResponse {
+	if detail, ok := handlers.KnownUserErrorDetail(status, errText); ok {
+		errType := claudeErrorTypeFromStatus(status)
+		return claudeErrorResponse{
+			Type: "error",
+			Error: claudeErrorDetail{
+				Type:    errType,
+				Message: detail.Message,
+			},
+		}
+	}
 	errType, message := claudeErrorDetailFromText(status, errText)
 	return claudeErrorResponse{
 		Type: "error",
@@ -370,10 +386,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 }
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status, errText := claudeErrorStatusAndText(msg, helps.MaterializeAPIResponse(c))
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
@@ -386,7 +399,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		}
 	}
 
-	body, err := json.Marshal(h.toClaudeError(msg))
+	body, err := json.Marshal(claudeErrorFromStatusText(status, errText))
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
 	}

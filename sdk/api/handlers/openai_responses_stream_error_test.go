@@ -15,11 +15,11 @@ func TestBuildOpenAIResponsesStreamErrorChunk(t *testing.T) {
 	if payload["type"] != "error" {
 		t.Fatalf("type = %v, want %q", payload["type"], "error")
 	}
-	if payload["code"] != "internal_server_error" {
-		t.Fatalf("code = %v, want %q", payload["code"], "internal_server_error")
+	if payload["code"] != "upstream_error" {
+		t.Fatalf("code = %v, want %q", payload["code"], "upstream_error")
 	}
-	if payload["message"] != "unexpected EOF" {
-		t.Fatalf("message = %v, want %q", payload["message"], "unexpected EOF")
+	if payload["message"] != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
+		t.Fatalf("message = %v", payload["message"])
 	}
 	if payload["sequence_number"] != float64(0) {
 		t.Fatalf("sequence_number = %v, want %v", payload["sequence_number"], 0)
@@ -39,11 +39,11 @@ func TestBuildOpenAIResponsesStreamErrorChunkExtractsHTTPErrorBody(t *testing.T)
 	if payload["type"] != "error" {
 		t.Fatalf("type = %v, want %q", payload["type"], "error")
 	}
-	if payload["code"] != "internal_server_error" {
-		t.Fatalf("code = %v, want %q", payload["code"], "internal_server_error")
+	if payload["code"] != "upstream_error" {
+		t.Fatalf("code = %v, want %q", payload["code"], "upstream_error")
 	}
-	if payload["message"] != "oops" {
-		t.Fatalf("message = %v, want %q", payload["message"], "oops")
+	if payload["message"] != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
+		t.Fatalf("message = %v", payload["message"])
 	}
 }
 

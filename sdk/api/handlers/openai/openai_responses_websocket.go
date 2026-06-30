@@ -1583,6 +1583,7 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketT
 			errText = errMsg.Error.Error()
 		}
 	}
+	status, errText = handlers.NormalizeKnownUserError(status, errText, nil)
 
 	body := handlers.BuildErrorResponseBody(status, errText)
 	payload := []byte(`{}`)
