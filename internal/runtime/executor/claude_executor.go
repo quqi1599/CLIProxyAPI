@@ -166,13 +166,14 @@ var oauthToolsToRemove = map[string]bool{}
 const defaultModelMaxTokens = 1024
 
 const (
-	largeClaudeCompatToolHistoryPayloadBytes     = 4 * 1024 * 1024
-	largeClaudeCompatToolResultPilePayloadBytes  = 1 * 1024 * 1024
-	largeClaudeCompatToolHistoryMessages         = 800
-	largeClaudeCompatToolHistoryInteractions     = 500
-	largeClaudeCompatToolHistoryOnlyInteractions = 700
-	largeClaudeCompatToolHistoryMCPTools         = 80
-	largeClaudeCompatToolResultOnlyMessages      = 40
+	largeClaudeCompatToolHistoryLimitMultiplier  = 3
+	largeClaudeCompatToolHistoryPayloadBytes     = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
+	largeClaudeCompatToolResultPilePayloadBytes  = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
+	largeClaudeCompatToolHistoryMessages         = largeClaudeCompatToolHistoryLimitMultiplier * 800
+	largeClaudeCompatToolHistoryInteractions     = largeClaudeCompatToolHistoryLimitMultiplier * 500
+	largeClaudeCompatToolHistoryOnlyInteractions = largeClaudeCompatToolHistoryLimitMultiplier * 700
+	largeClaudeCompatToolHistoryMCPTools         = largeClaudeCompatToolHistoryLimitMultiplier * 80
+	largeClaudeCompatToolResultOnlyMessages      = largeClaudeCompatToolHistoryLimitMultiplier * 40
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }

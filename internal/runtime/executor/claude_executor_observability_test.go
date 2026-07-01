@@ -124,12 +124,12 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 		executor:       "ClaudeExecutor",
 		requestPath:    "/v1/messages",
 		compatKind:     "minimax",
-		messageCount:   900,
-		toolCount:      620,
+		messageCount:   2700,
+		toolCount:      1800,
 		toolShape: coreusage.ToolShape{
 			DeclaredToolCount: 78,
-			InteractionCount:  620,
-			MCPToolCount:      90,
+			InteractionCount:  1800,
+			MCPToolCount:      270,
 		},
 	}
 	ctx := logging.WithRequestID(context.Background(), "req-large-tool-history")
@@ -170,11 +170,11 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsBeforeRepair(t *testing.T) {
 	if got := entry.Data["reason"]; got != "message_tool_history" {
 		t.Fatalf("reason = %#v, want message_tool_history", got)
 	}
-	if got := entry.Data["message_count"]; got != 900 {
-		t.Fatalf("message_count = %#v, want 900", got)
+	if got := entry.Data["message_count"]; got != 2700 {
+		t.Fatalf("message_count = %#v, want 2700", got)
 	}
-	if got := entry.Data["tool_interaction_count"]; got != 620 {
-		t.Fatalf("tool_interaction_count = %#v, want 620", got)
+	if got := entry.Data["tool_interaction_count"]; got != 1800 {
+		t.Fatalf("tool_interaction_count = %#v, want 1800", got)
 	}
 	if _, exists := entry.Data["payload"]; exists {
 		t.Fatal("unexpected raw payload field logged")
@@ -185,7 +185,7 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsToolResultPileForCompatProxy(
 	hook := logtest.NewGlobal()
 	hook.Reset()
 
-	body := buildClaudeToolResultPileBody(45, strings.Repeat("x", 24*1024))
+	body := buildClaudeToolResultPileBody(125, strings.Repeat("x", 32*1024))
 	meta := compatRepairLogMeta{
 		requestedModel: "glm-5.2",
 		upstreamModel:  "glm-5.2",
@@ -193,8 +193,8 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsToolResultPileForCompatProxy(
 		executor:       "ClaudeExecutor",
 		requestPath:    "/v1/chat/completions",
 		compatKind:     "zhipu",
-		messageCount:   46,
-		toolCount:      45,
+		messageCount:   126,
+		toolCount:      125,
 	}
 	ctx := logging.WithRequestID(context.Background(), "req-workbuddy-tool-pile")
 
@@ -210,8 +210,8 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsToolResultPileForCompatProxy(
 	if got := entry.Data["reason"]; got != "tool_result_message_pile" {
 		t.Fatalf("reason = %#v, want tool_result_message_pile", got)
 	}
-	if got := entry.Data["tool_result_only_messages"]; got != 45 {
-		t.Fatalf("tool_result_only_messages = %#v, want 45", got)
+	if got := entry.Data["tool_result_only_messages"]; got != 125 {
+		t.Fatalf("tool_result_only_messages = %#v, want 125", got)
 	}
 }
 
