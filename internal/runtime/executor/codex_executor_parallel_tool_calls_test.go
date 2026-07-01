@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
@@ -36,5 +37,27 @@ func TestNormalizeCodexParallelToolCallsForTools_PreservesWhenToolsPresent(t *te
 
 	if !gjson.GetBytes(out, "parallel_tool_calls").Bool() {
 		t.Fatalf("parallel_tool_calls should be preserved when tools are present: %s", string(out))
+	}
+}
+
+func TestNormalizeCodexParallelToolCallsForToolsAndClient_ForcesWorkBuddySerialTools(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true,"input":"hi"}`)
+	metadata := map[string]any{cliproxyexecutor.ClientProfileMetadataKey: "workbuddy"}
+
+	out := normalizeCodexParallelToolCallsForToolsAndClient(body, metadata)
+
+	if gjson.GetBytes(out, "parallel_tool_calls").Bool() {
+		t.Fatalf("parallel_tool_calls should be false for workbuddy: %s", string(out))
+	}
+}
+
+func TestNormalizeCodexParallelToolCallsForToolsAndClient_AddsWorkBuddySerialTools(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"lookup"}],"input":"hi"}`)
+	metadata := map[string]any{cliproxyexecutor.ClientProfileMetadataKey: "workbuddy"}
+
+	out := normalizeCodexParallelToolCallsForToolsAndClient(body, metadata)
+
+	if !gjson.GetBytes(out, "parallel_tool_calls").Exists() || gjson.GetBytes(out, "parallel_tool_calls").Bool() {
+		t.Fatalf("parallel_tool_calls should be explicitly false for workbuddy: %s", string(out))
 	}
 }

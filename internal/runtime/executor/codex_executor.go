@@ -851,7 +851,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForTools(body)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1023,7 +1023,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForTools(body)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -1137,7 +1137,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForTools(body)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -2023,18 +2023,31 @@ func codexUnsupportedImageGenerationToolError() statusErr {
 }
 
 func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
+	return normalizeCodexParallelToolCallsForToolsAndClient(body, nil)
+}
+
+func normalizeCodexParallelToolCallsForToolsAndClient(body []byte, metadata map[string]any) []byte {
 	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
+		if metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey) == "workbuddy" && codexRequestHasCallableTools(body) {
+			body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
+		}
 		return body
 	}
 
-	tools := gjson.GetBytes(body, "tools")
-	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
-	if hasTools {
+	if codexRequestHasCallableTools(body) {
+		if metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey) == "workbuddy" {
+			body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
+		}
 		return body
 	}
 
 	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
 	return body
+}
+
+func codexRequestHasCallableTools(body []byte) bool {
+	tools := gjson.GetBytes(body, "tools")
+	return tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
 }
 
 func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {

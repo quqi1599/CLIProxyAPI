@@ -129,6 +129,85 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 	}
 }
 
+func TestConvertCodexResponseToOpenAI_DropsArgumentsDeltaWithoutToolAnnouncement(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"cmd\":\"pwd\"}"}`), &param)
+	if len(out) != 0 {
+		t.Fatalf("expected orphan arguments delta to be dropped, got %d chunks", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"cmd\":\"pwd\"}"}`), &param)
+	if len(out) != 0 {
+		t.Fatalf("expected orphan arguments done to be dropped, got %d chunks", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_123","name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected fallback tool call chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.index").Int(); got != 0 {
+		t.Fatalf("tool call index = %d, want 0; chunk=%s", got, string(out[0]))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "Bash" {
+		t.Fatalf("tool call name = %q, want Bash; chunk=%s", got, string(out[0]))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_InvalidToolAnnouncementFallsBackToDone(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_123","name":""}}`), &param)
+	if len(out) != 0 {
+		t.Fatalf("expected invalid tool announcement to be dropped, got %d chunks", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"query\":\"OpenAI\"}"}`), &param)
+	if len(out) != 0 {
+		t.Fatalf("expected arguments delta for invalid announcement to be dropped, got %d chunks", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_123","name":"websearch","arguments":"{\"query\":\"OpenAI\"}"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected fallback tool call chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "websearch" {
+		t.Fatalf("tool call name = %q, want websearch; chunk=%s", got, string(out[0]))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_ToolArgumentDeltasUseOutputIndex(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","call_id":"call_a","name":"first"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected first tool call announcement, got %d", len(out))
+	}
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":5,"item":{"type":"function_call","call_id":"call_b","name":"second"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected second tool call announcement, got %d", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","output_index":3,"delta":"{\"a\":1}"}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected first tool call arguments delta, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.index").Int(); got != 0 {
+		t.Fatalf("tool call index = %d, want 0; chunk=%s", got, string(out[0]))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","output_index":5,"delta":"{\"b\":2}"}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected second tool call arguments delta, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.index").Int(); got != 1 {
+		t.Fatalf("tool call index = %d, want 1; chunk=%s", got, string(out[0]))
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_StreamPartialImageEmitsDeltaImages(t *testing.T) {
 	ctx := context.Background()
 	var param any
