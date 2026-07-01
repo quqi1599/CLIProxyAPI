@@ -327,17 +327,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		allowIncrementalInputWithPreviousResponseID := false
 		allowCompactionReplayBypass := false
 		if !useUpstreamWebsocketPassthrough {
+			// Downstream websocket with CPA-mediated HTTP/SSE upstream always uses
+			// merged transcript replay. previous_response_id is only safe for
+			// end-to-end upstream websocket passthrough.
 			if pinnedAuthID != "" {
 				if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && pinnedAuth != nil {
-					allowIncrementalInputWithPreviousResponseID = responsesWebsocketAuthSupportsIncrementalInput(pinnedAuth)
 					allowCompactionReplayBypass = responsesWebsocketAuthSupportsCompactionReplay(pinnedAuth)
 				}
 			} else {
-				allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 				allowCompactionReplayBypass = h.websocketUpstreamSupportsCompactionReplayForModel(requestModelName)
-			}
-			if forceTranscriptReplayNextRequest {
-				allowIncrementalInputWithPreviousResponseID = false
 			}
 		}
 
@@ -423,6 +421,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+		lastAttemptedAuthID := ""
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
@@ -431,6 +430,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if authID == "" || h == nil || h.AuthManager == nil {
 					return
 				}
+				lastAttemptedAuthID = authID
 				selectedAuth, ok := sessionAuthByID(authID)
 				if !ok || selectedAuth == nil {
 					return
@@ -447,6 +447,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
 			return
+		}
+		if forwardErrMsg == nil && !useUpstreamWebsocketPassthrough && lastAttemptedAuthID != "" {
+			if selectedAuth, ok := sessionAuthByID(lastAttemptedAuthID); ok && selectedAuth != nil {
+				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
+					pinnedAuthID = lastAttemptedAuthID
+				}
+			}
 		}
 		if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
 			pinnedAuthID = ""
@@ -1473,11 +1480,28 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 		}
 	}
 	switch status {
-	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+	case http.StatusUnauthorized,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusTooManyRequests,
+		http.StatusRequestTimeout,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
 		return true
-	default:
-		return false
 	}
+	if errMsg.Error != nil {
+		msg := strings.ToLower(errMsg.Error.Error())
+		switch {
+		case strings.Contains(msg, "stream closed before response.completed"),
+			strings.Contains(msg, "previous_response_not_found"),
+			strings.Contains(msg, "ws_failed"),
+			strings.Contains(msg, "upstream stream closed before first payload"),
+			strings.Contains(msg, "empty_stream"):
+			return true
+		}
+	}
+	return false
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {

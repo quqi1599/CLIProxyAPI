@@ -2011,7 +2011,7 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	}
 }
 
-func TestResponsesWebsocketInjectsPreviousResponseIDForWebsocketUpstream(t *testing.T) {
+func TestResponsesWebsocketReplaysTranscriptForSSEUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	executor := &websocketCaptureExecutor{}
@@ -2071,15 +2071,17 @@ func TestResponsesWebsocketInjectsPreviousResponseIDForWebsocketUpstream(t *test
 		t.Fatalf("upstream payload count = %d, want 2", len(executor.payloads))
 	}
 	secondPayload := executor.payloads[1]
-	if got := gjson.GetBytes(secondPayload, "previous_response_id").String(); got != "resp-upstream" {
-		t.Fatalf("previous_response_id = %q, want resp-upstream: %s", got, secondPayload)
+	if gjson.GetBytes(secondPayload, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id must not be sent to CPA-mediated SSE upstream: %s", secondPayload)
 	}
 	input := gjson.GetBytes(secondPayload, "input").Array()
-	if len(input) != 1 {
-		t.Fatalf("second upstream input len = %d, want 1: %s", len(input), secondPayload)
+	if len(input) != 3 {
+		t.Fatalf("second upstream input len = %d, want 3: %s", len(input), secondPayload)
 	}
-	if input[0].Get("id").String() != "msg-2" {
-		t.Fatalf("second upstream input item id = %s, want msg-2", input[0].Get("id").String())
+	for _, id := range []string{"msg-1", "out-1", "msg-2"} {
+		if !bytes.Contains(secondPayload, []byte(`"id":"`+id+`"`)) {
+			t.Fatalf("second upstream input missing %s: %s", id, secondPayload)
+		}
 	}
 }
 
@@ -2151,15 +2153,17 @@ func TestResponsesWebsocketDoesNotInjectPreviousResponseIDWhenPendingToolOutputM
 		t.Fatalf("previous_response_id must not be injected when pending tool output is missing: %s", secondPayload)
 	}
 	input := gjson.GetBytes(secondPayload, "input").Array()
-	if len(input) != 1 {
-		t.Fatalf("second upstream input len = %d, want 1: %s", len(input), secondPayload)
+	if len(input) != 3 {
+		t.Fatalf("second upstream input len = %d, want 3: %s", len(input), secondPayload)
 	}
-	if input[0].Get("id").String() != "summary-1" {
-		t.Fatalf("second upstream input item id = %s, want summary-1", input[0].Get("id").String())
+	for _, id := range []string{"msg-1", "fc-1", "summary-1"} {
+		if !bytes.Contains(secondPayload, []byte(`"id":"`+id+`"`)) {
+			t.Fatalf("second upstream input missing %s: %s", id, secondPayload)
+		}
 	}
 }
 
-func TestResponsesWebsocketStripsGenerateWhenWebsocketAttemptFallsBackToHTTP(t *testing.T) {
+func TestResponsesWebsocketPrewarmThenFallbackUsesFullReplay(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	selector := &orderedWebsocketSelector{order: []string{"auth-ws", "auth-http"}}
@@ -2215,8 +2219,30 @@ func TestResponsesWebsocketStripsGenerateWhenWebsocketAttemptFallsBackToHTTP(t *
 	if errReadMessage != nil {
 		t.Fatalf("read websocket message: %v", errReadMessage)
 	}
+	if got := gjson.GetBytes(payload, "type").String(); got != "response.created" {
+		t.Fatalf("prewarm payload type = %s, want response.created: %s", got, payload)
+	}
+	_, payload, errReadMessage = conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read prewarm completed message: %v", errReadMessage)
+	}
 	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
-		t.Fatalf("payload type = %s, want %s: %s", got, wsEventTypeCompleted, payload)
+		t.Fatalf("prewarm payload type = %s, want %s: %s", got, wsEventTypeCompleted, payload)
+	}
+	if got := executor.AuthIDs(); len(got) != 0 {
+		t.Fatalf("selected auth IDs after local prewarm = %v, want empty", got)
+	}
+
+	followUp := `{"type":"response.create","input":[{"type":"message","id":"msg-2"}]}`
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(followUp)); errWrite != nil {
+		t.Fatalf("write follow-up websocket message: %v", errWrite)
+	}
+	_, payload, errReadMessage = conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read follow-up message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("follow-up payload type = %s, want %s: %s", got, wsEventTypeCompleted, payload)
 	}
 
 	if got := executor.AuthIDs(); len(got) != 2 || got[0] != "auth-ws" || got[1] != "auth-http" {
@@ -2227,8 +2253,8 @@ func TestResponsesWebsocketStripsGenerateWhenWebsocketAttemptFallsBackToHTTP(t *
 	if len(wsPayloads) != 1 {
 		t.Fatalf("auth-ws payload count = %d, want 1", len(wsPayloads))
 	}
-	if !gjson.GetBytes(wsPayloads[0], "generate").Exists() {
-		t.Fatalf("websocket attempt payload unexpectedly stripped generate: %s", wsPayloads[0])
+	if gjson.GetBytes(wsPayloads[0], "generate").Exists() {
+		t.Fatalf("generate leaked into websocket attempt after local prewarm: %s", wsPayloads[0])
 	}
 
 	httpPayloads := executor.Payloads("auth-http")
@@ -2237,6 +2263,14 @@ func TestResponsesWebsocketStripsGenerateWhenWebsocketAttemptFallsBackToHTTP(t *
 	}
 	if gjson.GetBytes(httpPayloads[0], "generate").Exists() {
 		t.Fatalf("generate leaked after HTTP fallback: %s", httpPayloads[0])
+	}
+	if gjson.GetBytes(httpPayloads[0], "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked after HTTP fallback: %s", httpPayloads[0])
+	}
+	for _, id := range []string{"msg-1", "msg-2"} {
+		if !bytes.Contains(httpPayloads[0], []byte(`"id":"`+id+`"`)) {
+			t.Fatalf("HTTP fallback replay input missing %s: %s", id, httpPayloads[0])
+		}
 	}
 }
 
@@ -2425,6 +2459,24 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
 	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
+	}
+}
+
+func TestShouldReleaseResponsesWebsocketPinnedAuthForTransportFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		msg  *interfaces.ErrorMessage
+	}{
+		{name: "request timeout status", msg: &interfaces.ErrorMessage{StatusCode: http.StatusRequestTimeout}},
+		{name: "bad gateway status", msg: &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway}},
+		{name: "stream closed message", msg: &interfaces.ErrorMessage{Error: errors.New("stream closed before response.completed")}},
+		{name: "empty stream message", msg: &interfaces.ErrorMessage{Error: errors.New("empty_stream")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if !shouldReleaseResponsesWebsocketPinnedAuth(tt.msg) {
+				t.Fatalf("expected pinned auth release for %+v", tt.msg)
+			}
+		})
 	}
 }
 

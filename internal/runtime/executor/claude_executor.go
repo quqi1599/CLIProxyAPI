@@ -1056,20 +1056,17 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 }
 
 // normalizeClaudeTemperatureForThinking keeps Anthropic message requests valid when
-// thinking is enabled. Anthropic rejects temperatures other than 1 when
+// thinking is enabled. Anthropic rejects non-default sampling while
 // thinking.type is enabled/adaptive/auto.
 func normalizeClaudeTemperatureForThinking(body []byte) []byte {
-	if !gjson.GetBytes(body, "temperature").Exists() {
-		return body
-	}
-
 	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
 	switch thinkingType {
 	case "enabled", "adaptive", "auto":
-		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() && temp.Type == gjson.Number && temp.Float() == 1 {
-			return body
+		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() && (temp.Type != gjson.Number || temp.Float() != 1) {
+			body, _ = sjson.SetBytes(body, "temperature", 1)
 		}
-		body, _ = sjson.SetBytes(body, "temperature", 1)
+		body, _ = sjson.DeleteBytes(body, "top_p")
+		body, _ = sjson.DeleteBytes(body, "top_k")
 	}
 	return body
 }

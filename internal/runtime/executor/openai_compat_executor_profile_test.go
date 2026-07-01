@@ -484,6 +484,40 @@ func TestOpenAICompatPayloadRepairsInvalidStringEscapesForMiniMax(t *testing.T) 
 	}
 }
 
+func TestOpenAICompatPayloadNormalizesMiniMaxToolCallArguments(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"MiniMax-M3",
+		"messages":[{
+			"role":"assistant",
+			"tool_calls":[
+				{"id":"call_empty","type":"function","function":{"name":"empty","arguments":""}},
+				{"id":"call_text","type":"function","function":{"name":"text","arguments":"not-json"}},
+				{"id":"call_object","type":"function","function":{"name":"object","arguments":{"path":"README.md"}}}
+			]
+		},
+		{"role":"tool","tool_call_id":"call_empty","content":"ok"},
+		{"role":"tool","tool_call_id":"call_text","content":"ok"},
+		{"role":"tool","tool_call_id":"call_object","content":"ok"}]
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("minimax"), "MiniMax-M3", "https://api.minimaxi.com/v1")
+
+	for _, path := range []string{
+		`messages.0.tool_calls.0.function.arguments`,
+		`messages.0.tool_calls.1.function.arguments`,
+		`messages.0.tool_calls.2.function.arguments`,
+	} {
+		if got := gjson.GetBytes(out, path).String(); !gjson.Valid(got) {
+			t.Fatalf("%s = %q, want valid JSON string; payload=%s", path, got, string(out))
+		}
+	}
+	if got := gjson.GetBytes(out, `messages.0.tool_calls.2.function.arguments`).String(); got != `{"path":"README.md"}` {
+		t.Fatalf("object arguments = %q, want serialized object; payload=%s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadGenericKeepsSystemRole(t *testing.T) {
 	payload := []byte(`{
 		"model":"gpt-5.5",

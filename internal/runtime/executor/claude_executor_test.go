@@ -4019,12 +4019,33 @@ func TestNormalizeClaudeTemperatureForThinking_EnabledCoercesToOne(t *testing.T)
 	}
 }
 
+func TestNormalizeClaudeTemperatureForThinking_RemovesTopPAndTopK(t *testing.T) {
+	payload := []byte(`{"temperature":0.2,"top_p":0.9,"top_k":40,"thinking":{"type":"adaptive"}}`)
+	out := normalizeClaudeTemperatureForThinking(payload)
+
+	if got := gjson.GetBytes(out, "temperature").Float(); got != 1 {
+		t.Fatalf("temperature = %v, want 1", got)
+	}
+	if gjson.GetBytes(out, "top_p").Exists() {
+		t.Fatal("top_p should be removed when thinking is active")
+	}
+	if gjson.GetBytes(out, "top_k").Exists() {
+		t.Fatal("top_k should be removed when thinking is active")
+	}
+}
+
 func TestNormalizeClaudeTemperatureForThinking_NoThinkingLeavesTemperatureAlone(t *testing.T) {
-	payload := []byte(`{"temperature":0,"messages":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"temperature":0,"top_p":0.9,"top_k":40,"messages":[{"role":"user","content":"hi"}]}`)
 	out := normalizeClaudeTemperatureForThinking(payload)
 
 	if got := gjson.GetBytes(out, "temperature").Float(); got != 0 {
 		t.Fatalf("temperature = %v, want 0", got)
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != 0.9 {
+		t.Fatalf("top_p = %v, want 0.9", got)
+	}
+	if got := gjson.GetBytes(out, "top_k").Int(); got != 40 {
+		t.Fatalf("top_k = %v, want 40", got)
 	}
 }
 

@@ -302,6 +302,9 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	}
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
+	if compatKind == "minimax" {
+		payload = normalizeOpenAICompatToolCallArguments(payload)
+	}
 	if compatKind == "kimi" {
 		payload = scrubKimiPayloadForModel(payload, model)
 	}

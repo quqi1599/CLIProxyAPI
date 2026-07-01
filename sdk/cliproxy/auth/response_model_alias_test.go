@@ -181,6 +181,41 @@ func TestManagerExecuteStream_OpenAICompatExplicitAliasRewritesSSEModel(t *testi
 	}
 }
 
+func TestRewriteResponseSSEModelAliasSplitsGluedDataFrames(t *testing.T) {
+	payload := []byte(`data: {"model":"upstream","response":{"model":"upstream"}}data: {"model":"upstream","response":{"model":"upstream"}}`)
+
+	rewritten, changed := rewriteResponseSSEModelAlias(payload, "alias")
+	if !changed {
+		t.Fatal("expected glued data frames to be rewritten")
+	}
+	got := string(rewritten)
+	if strings.Count(got, `data: {"model":"alias"`) != 2 {
+		t.Fatalf("rewritten payload = %q, want two rewritten data frames", got)
+	}
+	if strings.Contains(got, `}data:`) {
+		t.Fatalf("rewritten payload still has glued data frames: %q", got)
+	}
+	if !strings.Contains(got, "}\n\ndata:") {
+		t.Fatalf("rewritten payload did not preserve SSE event boundary: %q", got)
+	}
+}
+
+func TestRewriteResponseSSEModelAliasSplitsGluedEventFrames(t *testing.T) {
+	payload := []byte("event: response.output_item.done\ndata: {\"model\":\"upstream\"}event: response.completed\ndata: {\"response\":{\"model\":\"upstream\"}}\n\n")
+
+	rewritten, changed := rewriteResponseSSEModelAlias(payload, "alias")
+	if !changed {
+		t.Fatal("expected glued event frames to be rewritten")
+	}
+	got := string(rewritten)
+	if !strings.Contains(got, "}\n\nevent: response.completed") {
+		t.Fatalf("rewritten payload did not split event frame: %q", got)
+	}
+	if !strings.Contains(got, `"model":"alias"`) {
+		t.Fatalf("rewritten payload = %q, want alias model", got)
+	}
+}
+
 func TestManagerRequestedResponseModelAlias_RequiresExplicitAlias(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{})

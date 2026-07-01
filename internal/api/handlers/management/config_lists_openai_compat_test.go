@@ -464,6 +464,38 @@ func TestPatchOpenAICompat_RejectsAmbiguousName(t *testing.T) {
 	}
 }
 
+func TestPatchOpenAICompat_UpdatesDisableCooling(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	h := &Handler{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "demo",
+				BaseURL: "https://compat.example.com",
+			}},
+		},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/openai-compatibility", strings.NewReader(`{
+		"name":"demo",
+		"value":{"disable-cooling":true}
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchOpenAICompat(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !h.cfg.OpenAICompatibility[0].DisableCooling {
+		t.Fatal("disable-cooling = false, want true")
+	}
+}
+
 func TestGetOpenAICompat_IncludesPersistedFields(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)
@@ -471,10 +503,11 @@ func TestGetOpenAICompat_IncludesPersistedFields(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			OpenAICompatibility: []config.OpenAICompatibility{{
-				Name:         "demo",
-				Kind:         "newapi",
-				RoutingGroup: "compat-group",
-				BaseURL:      "https://compat.example.com",
+				Name:           "demo",
+				Kind:           "newapi",
+				RoutingGroup:   "compat-group",
+				BaseURL:        "https://compat.example.com",
+				DisableCooling: true,
 			}},
 		},
 		configFilePath: writeTestConfigFile(t),
@@ -491,8 +524,9 @@ func TestGetOpenAICompat_IncludesPersistedFields(t *testing.T) {
 	}
 	var body struct {
 		OpenAICompatibility []struct {
-			Kind         string `json:"kind"`
-			RoutingGroup string `json:"routing-group"`
+			Kind           string `json:"kind"`
+			RoutingGroup   string `json:"routing-group"`
+			DisableCooling bool   `json:"disable-cooling"`
 		} `json:"openai-compatibility"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -503,5 +537,8 @@ func TestGetOpenAICompat_IncludesPersistedFields(t *testing.T) {
 	}
 	if got := body.OpenAICompatibility[0].RoutingGroup; got != "compat-group" {
 		t.Fatalf("routing-group = %q, want compat-group", got)
+	}
+	if !body.OpenAICompatibility[0].DisableCooling {
+		t.Fatal("disable-cooling = false, want true")
 	}
 }

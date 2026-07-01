@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -118,8 +119,9 @@ func rewriteResponseJSONModelAlias(payload []byte, alias string) ([]byte, bool) 
 }
 
 func rewriteResponseSSEModelAlias(payload []byte, alias string) ([]byte, bool) {
-	lines := strings.Split(string(payload), "\n")
-	changed := false
+	normalizedPayload := normalizeGluedResponseModelAliasSSE(payload)
+	changed := !bytes.Equal(normalizedPayload, payload)
+	lines := strings.Split(string(normalizedPayload), "\n")
 	for i, line := range lines {
 		trimmedLine := strings.TrimSuffix(line, "\r")
 		if !strings.HasPrefix(trimmedLine, "data:") {
@@ -149,4 +151,54 @@ func rewriteResponseSSEModelAlias(payload []byte, alias string) ([]byte, bool) {
 		return nil, false
 	}
 	return []byte(strings.Join(lines, "\n")), true
+}
+
+func normalizeGluedResponseModelAliasSSE(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	payload = safeReplaceGluedResponseModelAliasSSE(payload, []byte("}event:"), []byte("}\n\nevent:"))
+	payload = safeReplaceGluedResponseModelAliasSSE(payload, []byte("}\r\nevent:"), []byte("}\r\n\r\nevent:"))
+	payload = safeReplaceGluedResponseModelAliasSSE(payload, []byte("}data:"), []byte("}\n\ndata:"))
+	payload = safeReplaceGluedResponseModelAliasSSE(payload, []byte("}\r\ndata:"), []byte("}\r\n\r\ndata:"))
+	return payload
+}
+
+func safeReplaceGluedResponseModelAliasSSE(payload []byte, old []byte, replacement []byte) []byte {
+	if len(payload) == 0 || len(old) == 0 || !bytes.Contains(payload, old) {
+		return payload
+	}
+	var out []byte
+	remaining := payload
+	for {
+		idx := bytes.Index(remaining, old)
+		if idx == -1 {
+			out = append(out, remaining...)
+			break
+		}
+		lineStart := bytes.LastIndexByte(remaining[:idx], '\n')
+		partStart := 0
+		if lineStart >= 0 {
+			partStart = lineStart + 1
+		}
+		part := remaining[partStart : idx+1]
+		if responseModelAliasSSEDataJSONValid(part) {
+			out = append(out, remaining[:idx]...)
+			out = append(out, replacement...)
+			remaining = remaining[idx+len(old):]
+			continue
+		}
+		out = append(out, remaining[:idx+len(old)]...)
+		remaining = remaining[idx+len(old):]
+	}
+	return out
+}
+
+func responseModelAliasSSEDataJSONValid(line []byte) bool {
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	jsonData, ok := bytes.CutPrefix(line, []byte("data: "))
+	if !ok {
+		jsonData, ok = bytes.CutPrefix(line, []byte("data:"))
+	}
+	return ok && len(jsonData) > 0 && gjson.ValidBytes(jsonData)
 }
