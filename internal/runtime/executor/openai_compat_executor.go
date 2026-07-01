@@ -189,8 +189,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 }
 
 const (
-	largeOpenAICompatToolHistoryPayloadBytes = 1 * 1024 * 1024
-	largeOpenAICompatToolOutputMessages      = 40
+	largeOpenAICompatToolHistoryLimitMultiplier = 3
+	largeOpenAICompatToolHistoryPayloadBytes    = largeOpenAICompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
+	largeOpenAICompatToolOutputMessages         = largeOpenAICompatToolHistoryLimitMultiplier * 40
 )
 
 func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {

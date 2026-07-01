@@ -194,7 +194,7 @@ func TestOpenAICompatExecutorStreamScrubsUnsupportedFieldsForProfile(t *testing.
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T) {
-	body := buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))
+	body := buildOpenAICompatToolHistoryBody(125, strings.Repeat("x", 32*1024))
 	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 	err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
@@ -210,6 +210,15 @@ func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "large_openai_tool_history") {
 		t.Fatalf("error = %q, want large_openai_tool_history marker", err.Error())
+	}
+}
+
+func TestSanitizeOpenAICompatHTTPRequestBodyAllowsPreviouslyGuardedToolHistory(t *testing.T) {
+	body := buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))
+	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
+
+	if err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1"); err != nil {
+		t.Fatalf("unexpected rejection for previously guarded OpenAI-compatible tool history: %v", err)
 	}
 }
 
@@ -235,7 +244,7 @@ func TestOpenAICompatExecutorRejectsLargeToolHistoryBeforeUpstream(t *testing.T)
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5.5",
-		Payload: []byte(buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))),
+		Payload: []byte(buildOpenAICompatToolHistoryBody(125, strings.Repeat("x", 32*1024))),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
 
