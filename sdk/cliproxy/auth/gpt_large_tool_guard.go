@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	gptLargeToolHistoryMessages            = 100
-	gptLargeToolHistoryTools               = 40
+	gptLargeToolHistoryMultiplier          = 3
+	gptLargeToolHistoryMessages            = gptLargeToolHistoryMultiplier * 100
+	gptLargeToolHistoryTools               = gptLargeToolHistoryMultiplier * 40
 	gptLargeToolHistoryMaxRetryCredentials = 5 // Six total attempts: initial credential plus five fallbacks.
 )
 

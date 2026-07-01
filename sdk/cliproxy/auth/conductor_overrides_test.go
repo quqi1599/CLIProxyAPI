@@ -1894,8 +1894,8 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *te
 	request := cliproxyexecutor.Request{Model: model}
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{
 		cliproxyexecutor.RequestPathMetadataKey:     "/v1/responses",
-		cliproxyexecutor.MessageCountMetadataKey:    187,
-		cliproxyexecutor.ToolCountMetadataKey:       60,
+		cliproxyexecutor.MessageCountMetadataKey:    327,
+		cliproxyexecutor.ToolCountMetadataKey:       129,
 		cliproxyexecutor.ReasoningEffortMetadataKey: "high",
 	}}
 

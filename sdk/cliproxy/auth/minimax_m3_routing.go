@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	miniMaxM2SafeTotalTokens        int64 = 180000
-	miniMaxM3RequiredMetadataKey          = "__cliproxy_minimax_m3_required"
-	miniMaxM3StandardModel                = "MiniMax-M3"
-	miniMaxLargeToolHistoryMessages       = 100
-	miniMaxLargeToolHistoryTools          = 40
+	miniMaxM2SafeTotalTokens          int64 = 180000
+	miniMaxM3RequiredMetadataKey            = "__cliproxy_minimax_m3_required"
+	miniMaxM3StandardModel                  = "MiniMax-M3"
+	miniMaxLargeToolHistoryMultiplier       = 3
+	miniMaxLargeToolHistoryMessages         = miniMaxLargeToolHistoryMultiplier * 100
+	miniMaxLargeToolHistoryTools            = miniMaxLargeToolHistoryMultiplier * 40
 )
 
 func filterMiniMaxM3RequiredExecutionModels(routeModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, candidates []string) []string {

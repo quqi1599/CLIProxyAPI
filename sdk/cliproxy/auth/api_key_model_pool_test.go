@@ -246,8 +246,8 @@ func TestManagerExecute_MiniMaxLargeToolHistorySkipsM3HighspeedWithAlternatives(
 		Model:   alias,
 		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":1024}`),
 	}, cliproxyexecutor.Options{Metadata: map[string]any{
-		cliproxyexecutor.MessageCountMetadataKey: 127,
-		cliproxyexecutor.ToolCountMetadataKey:    49,
+		cliproxyexecutor.MessageCountMetadataKey: 327,
+		cliproxyexecutor.ToolCountMetadataKey:    129,
 	}})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
