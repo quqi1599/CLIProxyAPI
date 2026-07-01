@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/tidwall/gjson"
 )
 
@@ -130,7 +131,7 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 }
 
 func TestConvertCodexResponseToOpenAI_DropsArgumentsDeltaWithoutToolAnnouncement(t *testing.T) {
-	ctx := context.Background()
+	ctx := internallogging.WithToolStreamRepairTracking(context.Background())
 	var param any
 
 	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"cmd\":\"pwd\"}"}`), &param)
@@ -153,10 +154,14 @@ func TestConvertCodexResponseToOpenAI_DropsArgumentsDeltaWithoutToolAnnouncement
 	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "Bash" {
 		t.Fatalf("tool call name = %q, want Bash; chunk=%s", got, string(out[0]))
 	}
+	stats := internallogging.GetToolStreamRepairStats(ctx)
+	if stats.OrphanToolDeltaDroppedCount != 1 || stats.ToolDoneFallbackEmittedCount != 1 {
+		t.Fatalf("repair stats = %+v, want orphan=1 fallback=1", stats)
+	}
 }
 
 func TestConvertCodexResponseToOpenAI_InvalidToolAnnouncementFallsBackToDone(t *testing.T) {
-	ctx := context.Background()
+	ctx := internallogging.WithToolStreamRepairTracking(context.Background())
 	var param any
 
 	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_123","name":""}}`), &param)
@@ -175,6 +180,10 @@ func TestConvertCodexResponseToOpenAI_InvalidToolAnnouncementFallsBackToDone(t *
 	}
 	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "websearch" {
 		t.Fatalf("tool call name = %q, want websearch; chunk=%s", got, string(out[0]))
+	}
+	stats := internallogging.GetToolStreamRepairStats(ctx)
+	if stats.InvalidToolAnnouncementDroppedCount != 1 || stats.ToolDoneFallbackEmittedCount != 1 {
+		t.Fatalf("repair stats = %+v, want invalid=1 fallback=1", stats)
 	}
 }
 

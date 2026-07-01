@@ -17,6 +17,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -851,7 +852,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1023,7 +1024,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -1137,7 +1138,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(body, opts.Metadata)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -2023,19 +2024,22 @@ func codexUnsupportedImageGenerationToolError() statusErr {
 }
 
 func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
-	return normalizeCodexParallelToolCallsForToolsAndClient(body, nil)
+	return normalizeCodexParallelToolCallsForToolsAndClient(context.Background(), body, nil)
 }
 
-func normalizeCodexParallelToolCallsForToolsAndClient(body []byte, metadata map[string]any) []byte {
+func normalizeCodexParallelToolCallsForToolsAndClient(ctx context.Context, body []byte, metadata map[string]any) []byte {
+	forceSerial := codexShouldForceSerialToolsForClient(body, metadata)
 	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
-		if metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey) == "workbuddy" && codexRequestHasCallableTools(body) {
+		if forceSerial {
+			internallogging.ObserveToolStreamRepair(ctx, internallogging.ToolStreamRepairForceSerial)
 			body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
 		}
 		return body
 	}
 
 	if codexRequestHasCallableTools(body) {
-		if metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey) == "workbuddy" {
+		if forceSerial {
+			internallogging.ObserveToolStreamRepair(ctx, internallogging.ToolStreamRepairForceSerial)
 			body, _ = sjson.SetBytes(body, "parallel_tool_calls", false)
 		}
 		return body
@@ -2048,6 +2052,10 @@ func normalizeCodexParallelToolCallsForToolsAndClient(body []byte, metadata map[
 func codexRequestHasCallableTools(body []byte) bool {
 	tools := gjson.GetBytes(body, "tools")
 	return tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
+}
+
+func codexShouldForceSerialToolsForClient(body []byte, metadata map[string]any) bool {
+	return metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey) == "workbuddy" && codexRequestHasCallableTools(body)
 }
 
 func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {

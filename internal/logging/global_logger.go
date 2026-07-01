@@ -41,6 +41,8 @@ var logFieldOrder = []string{
 	"payload_bytes_before", "payload_bytes_after", "repair_duration_ms",
 	"failure_class", "endpoint_method", "endpoint_path", "endpoint", "client_profile", "payload_bytes", "message_count", "tool_count",
 	"declared_tool_count", "tool_interaction_count", "mcp_tool_count", "builtin_tool_count", "tool_types", "tool_name_hashes",
+	"parallel_tool_calls_forced", "tool_stream_repair_kind", "orphan_tool_delta_dropped_count", "invalid_tool_announcement_dropped_count",
+	"tool_done_fallback_emitted_count",
 	"reasoning_effort", "input_tokens",
 	"attempt_count", "fallback_count", "max_attempts", "max_fallbacks", "translator_run_count",
 	"final_success", "final_status", "final_error_type", "final_error_code", "final_provider", "final_model", "final_executor",

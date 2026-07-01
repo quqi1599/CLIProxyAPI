@@ -770,6 +770,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		newCtx = logging.WithEndpointParts(newCtx, endpointMethod, endpointPath)
 	}
 	newCtx = coreauth.WithStreamSummaryTracking(newCtx)
+	newCtx = logging.WithToolStreamRepairTracking(newCtx)
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
 

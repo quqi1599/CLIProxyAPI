@@ -183,6 +183,7 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 		"finish_reason":                 record.FinishReason,
 	}
 	addToolShapeLogFields(fields, meta.toolShape)
+	addToolStreamRepairLogFields(fields, internallogging.GetToolStreamRepairStats(ctx))
 	addStreamSummaryAttemptFields(fields, attempt)
 	logEntryWithRequestID(ctx).WithFields(fields).Info("stream execution summary")
 
@@ -212,6 +213,25 @@ func addToolShapeLogFields(fields log.Fields, shape coreusage.ToolShape) {
 	}
 	if shape.ToolNameHashes != "" {
 		fields["tool_name_hashes"] = shape.ToolNameHashes
+	}
+}
+
+func addToolStreamRepairLogFields(fields log.Fields, stats internallogging.ToolStreamRepairStats) {
+	if len(fields) == 0 || !stats.HasData() {
+		return
+	}
+	fields["parallel_tool_calls_forced"] = stats.ParallelToolCallsForced
+	if stats.ToolStreamRepairKind != "" {
+		fields["tool_stream_repair_kind"] = stats.ToolStreamRepairKind
+	}
+	if stats.OrphanToolDeltaDroppedCount > 0 {
+		fields["orphan_tool_delta_dropped_count"] = stats.OrphanToolDeltaDroppedCount
+	}
+	if stats.InvalidToolAnnouncementDroppedCount > 0 {
+		fields["invalid_tool_announcement_dropped_count"] = stats.InvalidToolAnnouncementDroppedCount
+	}
+	if stats.ToolDoneFallbackEmittedCount > 0 {
+		fields["tool_done_fallback_emitted_count"] = stats.ToolDoneFallbackEmittedCount
 	}
 }
 

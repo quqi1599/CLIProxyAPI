@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -98,7 +99,7 @@ func codexOpenAIFunctionCallIndex(root gjson.Result, p *ConvertCliToOpenAIParams
 //
 // Returns:
 //   - [][]byte: A slice of OpenAI-compatible JSON responses
-func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+func ConvertCodexResponseToOpenAI(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &ConvertCliToOpenAIParams{
 			Model:                     modelName,
@@ -232,6 +233,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		callID := codexOpenAIToolCallID(itemResult)
 		name := codexOpenAIToolName(originalRequestRawJSON, itemResult)
 		if callID == "" || name == "" {
+			internallogging.ObserveToolStreamRepair(ctx, internallogging.ToolStreamRepairDropInvalidAnnouncement)
 			return [][]byte{}
 		}
 
@@ -260,6 +262,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		p := (*param).(*ConvertCliToOpenAIParams)
 		toolCallIndex, ok := codexOpenAIFunctionCallIndex(rootResult, p)
 		if !ok {
+			internallogging.ObserveToolStreamRepair(ctx, internallogging.ToolStreamRepairDropOrphanDelta)
 			return [][]byte{}
 		}
 		p.HasReceivedArgumentsDelta = true
@@ -351,6 +354,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		// Fallback path: model skipped output_item.added, so emit complete tool call now.
 		p := (*param).(*ConvertCliToOpenAIParams)
 		p.FunctionCallIndex++
+		internallogging.ObserveToolStreamRepair(ctx, internallogging.ToolStreamRepairFallbackDone)
 		if outputIndex, ok := codexOpenAIOutputIndex(rootResult); ok {
 			p.ToolCallIndexByOutput[outputIndex] = p.FunctionCallIndex
 		}

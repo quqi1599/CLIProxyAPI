@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"context"
 	"testing"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
@@ -44,7 +46,7 @@ func TestNormalizeCodexParallelToolCallsForToolsAndClient_ForcesWorkBuddySerialT
 	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true,"input":"hi"}`)
 	metadata := map[string]any{cliproxyexecutor.ClientProfileMetadataKey: "workbuddy"}
 
-	out := normalizeCodexParallelToolCallsForToolsAndClient(body, metadata)
+	out := normalizeCodexParallelToolCallsForToolsAndClient(context.Background(), body, metadata)
 
 	if gjson.GetBytes(out, "parallel_tool_calls").Bool() {
 		t.Fatalf("parallel_tool_calls should be false for workbuddy: %s", string(out))
@@ -55,9 +57,25 @@ func TestNormalizeCodexParallelToolCallsForToolsAndClient_AddsWorkBuddySerialToo
 	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"lookup"}],"input":"hi"}`)
 	metadata := map[string]any{cliproxyexecutor.ClientProfileMetadataKey: "workbuddy"}
 
-	out := normalizeCodexParallelToolCallsForToolsAndClient(body, metadata)
+	out := normalizeCodexParallelToolCallsForToolsAndClient(context.Background(), body, metadata)
 
 	if !gjson.GetBytes(out, "parallel_tool_calls").Exists() || gjson.GetBytes(out, "parallel_tool_calls").Bool() {
 		t.Fatalf("parallel_tool_calls should be explicitly false for workbuddy: %s", string(out))
+	}
+}
+
+func TestNormalizeCodexParallelToolCallsForToolsAndClient_RecordsWorkBuddySerialTools(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true,"input":"hi"}`)
+	metadata := map[string]any{cliproxyexecutor.ClientProfileMetadataKey: "workbuddy"}
+	ctx := internallogging.WithToolStreamRepairTracking(context.Background())
+
+	_ = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, metadata)
+
+	stats := internallogging.GetToolStreamRepairStats(ctx)
+	if !stats.ParallelToolCallsForced {
+		t.Fatalf("parallel tool call repair not recorded: %+v", stats)
+	}
+	if stats.ToolStreamRepairKind != internallogging.ToolStreamRepairForceSerial {
+		t.Fatalf("repair kind = %q, want %q", stats.ToolStreamRepairKind, internallogging.ToolStreamRepairForceSerial)
 	}
 }

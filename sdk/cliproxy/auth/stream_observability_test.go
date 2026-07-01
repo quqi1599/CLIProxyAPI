@@ -52,6 +52,10 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{ID: "auth-stream-1"}
 	ctx := logging.WithRequestID(context.Background(), "req-stream-1")
+	ctx = logging.WithToolStreamRepairTracking(ctx)
+	logging.ObserveToolStreamRepair(ctx, logging.ToolStreamRepairForceSerial)
+	logging.ObserveToolStreamRepair(ctx, logging.ToolStreamRepairDropOrphanDelta)
+	logging.ObserveToolStreamRepair(ctx, logging.ToolStreamRepairFallbackDone)
 	meta := streamExecutionLogMeta{
 		requestedModel: "MiniMax-M3",
 		upstreamModel:  "MiniMax-M3",
@@ -151,6 +155,18 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 	}
 	if got := entry.Data["tool_interaction_count"]; got != 3 {
 		t.Fatalf("tool_interaction_count = %#v, want 3", got)
+	}
+	if got := entry.Data["parallel_tool_calls_forced"]; got != true {
+		t.Fatalf("parallel_tool_calls_forced = %#v, want true", got)
+	}
+	if got := entry.Data["tool_stream_repair_kind"]; got != "force_serial,drop_orphan_delta,fallback_done" {
+		t.Fatalf("tool_stream_repair_kind = %#v, want force_serial,drop_orphan_delta,fallback_done", got)
+	}
+	if got := entry.Data["orphan_tool_delta_dropped_count"]; got != 1 {
+		t.Fatalf("orphan_tool_delta_dropped_count = %#v, want 1", got)
+	}
+	if got := entry.Data["tool_done_fallback_emitted_count"]; got != 1 {
+		t.Fatalf("tool_done_fallback_emitted_count = %#v, want 1", got)
 	}
 }
 
