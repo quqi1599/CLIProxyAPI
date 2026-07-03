@@ -703,6 +703,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
+				line = normalizeClaudeStringMessageSSELine(line)
 				line = restoreClaudeToolNamesFromStreamLine(line, toolNameSanitization)
 				if oauthToken {
 					line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
@@ -745,6 +746,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
+			line = normalizeClaudeStringMessageSSELine(line)
 			line = restoreClaudeToolNamesFromStreamLine(line, toolNameSanitization)
 			if oauthToken {
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
@@ -1682,6 +1684,43 @@ func patchClaudeMessageStartUsageForProgress(line []byte, inputTokens int64) []b
 	updated, err := sjson.SetBytes(payload, "message.usage.input_tokens", inputTokens)
 	if err != nil {
 		return line
+	}
+	return replaceSSEDataPayload(line, updated)
+}
+
+func normalizeClaudeStringMessageSSELine(line []byte) []byte {
+	payload, ok := sseDataPayload(line)
+	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return line
+	}
+	message := gjson.GetBytes(payload, "message")
+	if !message.Exists() || message.Type != gjson.String {
+		return line
+	}
+
+	messageText := strings.TrimSpace(message.String())
+	updated, err := sjson.DeleteBytes(payload, "message")
+	if err != nil {
+		return line
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(updated, "type").String())
+	if eventType == "" || eventType == "message_start" {
+		if next, errSet := sjson.SetBytes(updated, "type", "error"); errSet == nil {
+			updated = next
+			eventType = "error"
+		}
+	}
+	if eventType == "error" {
+		if strings.TrimSpace(gjson.GetBytes(updated, "error.type").String()) == "" {
+			if next, errSet := sjson.SetBytes(updated, "error.type", "api_error"); errSet == nil {
+				updated = next
+			}
+		}
+		if messageText != "" && strings.TrimSpace(gjson.GetBytes(updated, "error.message").String()) == "" {
+			if next, errSet := sjson.SetBytes(updated, "error.message", messageText); errSet == nil {
+				updated = next
+			}
+		}
 	}
 	return replaceSSEDataPayload(line, updated)
 }

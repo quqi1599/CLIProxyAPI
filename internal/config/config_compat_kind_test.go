@@ -109,6 +109,11 @@ func TestInferCompatKindFromBaseURL(t *testing.T) {
 			want:    "qwen",
 		},
 		{
+			name:    "qwen maas workspace anthropic app",
+			baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+			want:    "qwen",
+		},
+		{
 			name:    "doubao coding",
 			baseURL: "https://ark.cn-beijing.volces.com/api/coding",
 			want:    "doubao",

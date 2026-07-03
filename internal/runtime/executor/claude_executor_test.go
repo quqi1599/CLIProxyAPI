@@ -3318,6 +3318,35 @@ func TestPatchClaudeMessageStartUsageForProgressKeepsExistingUsage(t *testing.T)
 	}
 }
 
+func TestNormalizeClaudeStringMessageSSELineConvertsTopLevelMessageToError(t *testing.T) {
+	line := []byte(`data: {"type":"error","message":"upstream failed"}`)
+	out := normalizeClaudeStringMessageSSELine(line)
+	payload, ok := sseDataPayload(out)
+	if !ok {
+		t.Fatal("expected normalized line to remain an SSE data line")
+	}
+	if gjson.GetBytes(payload, "message").Exists() {
+		t.Fatalf("top-level message was not removed: %s", string(payload))
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != "error" {
+		t.Fatalf("type = %q, want error; payload=%s", got, string(payload))
+	}
+	if got := gjson.GetBytes(payload, "error.type").String(); got != "api_error" {
+		t.Fatalf("error.type = %q, want api_error; payload=%s", got, string(payload))
+	}
+	if got := gjson.GetBytes(payload, "error.message").String(); got != "upstream failed" {
+		t.Fatalf("error.message = %q, want upstream failed; payload=%s", got, string(payload))
+	}
+}
+
+func TestNormalizeClaudeStringMessageSSELineKeepsMessageStartObject(t *testing.T) {
+	line := []byte(`data: {"type":"message_start","message":{"id":"msg_1","model":"qwen3.7-plus"}}`)
+	out := normalizeClaudeStringMessageSSELine(line)
+	if string(out) != string(line) {
+		t.Fatalf("line changed unexpectedly:\ngot  %s\nwant %s", string(out), string(line))
+	}
+}
+
 func findClaudeSSEPayload(t *testing.T, stream, eventType string) []byte {
 	t.Helper()
 	for _, line := range strings.Split(stream, "\n") {
