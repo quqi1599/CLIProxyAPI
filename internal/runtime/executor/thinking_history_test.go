@@ -49,6 +49,7 @@ func TestNormalizeOpenAIThinkingHistoryDowngradesWhenUnrepairable(t *testing.T) 
 
 func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsPlainAssistant(t *testing.T) {
 	body := []byte(`{
+		"reasoning_effort":"high",
 		"messages":[
 			{"role":"assistant","content":"previous answer"},
 			{"role":"user","content":"continue"}
@@ -67,6 +68,26 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsPlainAssistant(t *testing.
 	}
 	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "previous answer" {
 		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "previous answer")
+	}
+}
+
+func TestNormalizeOpenAIThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":"previous answer"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if changed || downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() changed DeepSeek history unexpectedly without thinking request: changed=%v downgraded=%v body=%s", changed, downgraded, string(out))
+	}
+	if gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("messages.0.reasoning_content should not be added without thinking request")
 	}
 }
 
@@ -140,6 +161,7 @@ func TestNormalizeClaudeThinkingHistoryDowngradesWhenUnrepairable(t *testing.T) 
 
 func TestNormalizeClaudeThinkingHistoryDeepSeekRepairsPlainTextBlock(t *testing.T) {
 	body := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
 		"messages":[
 			{"role":"assistant","content":[{"type":"text","text":"previous answer"}]},
 			{"role":"user","content":[{"type":"text","text":"continue"}]}
@@ -164,8 +186,29 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekRepairsPlainTextBlock(t *testing.
 	}
 }
 
+func TestNormalizeClaudeThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"text","text":"previous answer"}]},
+			{"role":"user","content":[{"type":"text","text":"continue"}]}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if changed || downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() changed DeepSeek Claude history unexpectedly without thinking request: changed=%v downgraded=%v body=%s", changed, downgraded, string(out))
+	}
+	if gjson.GetBytes(out, "messages.0.content.0.thinking").Exists() {
+		t.Fatalf("messages.0.content.0.thinking should not be added without thinking request")
+	}
+}
+
 func TestNormalizeClaudeThinkingHistoryDeepSeekConvertsStringContent(t *testing.T) {
 	body := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
 		"messages":[
 			{"role":"assistant","content":"previous answer"}
 		]

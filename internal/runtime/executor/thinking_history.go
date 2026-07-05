@@ -15,6 +15,9 @@ func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool,
 }
 
 func normalizeThinkingHistoryForModel(body []byte, provider string, model string) ([]byte, bool, bool, error) {
+	if !thinkingHistoryRequested(body, provider) {
+		return body, false, false, nil
+	}
 	requireCompleteHistory := requiresReturnedThinkingHistory(model)
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
@@ -239,8 +242,24 @@ func assistantOpenAIText(msg gjson.Result) string {
 	return strings.Join(parts, "\n")
 }
 
+func thinkingHistoryRequested(body []byte, provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai":
+		return openAIThinkingEnabled(body)
+	case "claude":
+		return claudeThinkingEnabled(body)
+	default:
+		return false
+	}
+}
+
 func openAIThinkingEnabled(body []byte) bool {
-	return strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()) != ""
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		if strings.TrimSpace(gjson.GetBytes(body, path).String()) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeThinkingEnabled(body []byte) bool {
