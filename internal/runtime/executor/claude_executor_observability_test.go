@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -254,6 +255,45 @@ func TestRejectLargeClaudeCompatToolHistory_AllowsSmallToolHistory(t *testing.T)
 	}
 }
 
+func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46PayloadGuard(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+
+	body := buildClaudeCompatToolHistoryBody(200, strings.Repeat("x", 8192))
+	preflight := newClaudeCompatPreflight(body)
+	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M3",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "minimax",
+	}, preflight)
+	ctx := logging.WithRequestID(context.Background(), "req-sonnet46-body-derived")
+
+	err := rejectLargeClaudeCompatToolHistory(ctx, body, meta, preflight)
+	if err == nil {
+		t.Fatal("expected body-derived payload rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "large_claude_tool_history") {
+		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
+	}
+
+	entry := findCompatRepairGuardEntry(t, hook.AllEntries())
+	if got := entry.Data["reason"]; got != "payload_bytes" {
+		t.Fatalf("reason = %#v, want payload_bytes", got)
+	}
+	if got := entry.Data["message_count"]; got != 400 {
+		t.Fatalf("message_count = %#v, want 400", got)
+	}
+	if got := entry.Data["tool_count"]; got != 400 {
+		t.Fatalf("tool_count = %#v, want 400", got)
+	}
+	if got := entry.Data["tool_interaction_count"]; got != 400 {
+		t.Fatalf("tool_interaction_count = %#v, want 400", got)
+	}
+}
+
 func buildClaudeToolResultPileBody(count int, content string) []byte {
 	var b strings.Builder
 	b.WriteString(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read_file","input":{}}]}`)
@@ -261,6 +301,21 @@ func buildClaudeToolResultPileBody(count int, content string) []byte {
 		b.WriteString(`,{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"`)
 		b.WriteString(content)
 		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`]}`)
+	return []byte(b.String())
+}
+
+func buildClaudeCompatToolHistoryBody(pairs int, content string) []byte {
+	var b strings.Builder
+	b.WriteString(`{"messages":[`)
+	for i := 0; i < pairs; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(fmt.Sprintf(`{"role":"assistant","content":[{"type":"tool_use","id":"call_%d","name":"read_file","input":{"path":"README.md"}}]}`, i))
+		b.WriteByte(',')
+		b.WriteString(fmt.Sprintf(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_%d","content":"%s"}]}`, i, content))
 	}
 	b.WriteString(`]}`)
 	return []byte(b.String())

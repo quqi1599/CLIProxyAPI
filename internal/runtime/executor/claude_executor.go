@@ -54,6 +54,10 @@ type claudeCompatPreflight struct {
 	hasTools               bool
 	hasToolSearch          bool
 	hasBetas               bool
+	messageCount           int
+	toolUseCount           int
+	toolResultCount        int
+	mcpToolCount           int
 	toolResultOnlyMessages int
 }
 
@@ -167,6 +171,7 @@ const defaultModelMaxTokens = 1024
 
 const (
 	largeClaudeCompatToolHistoryLimitMultiplier  = 3
+	largeClaudeCompatSonnet46PayloadBytes        = largeClaudeCompatToolHistoryLimitMultiplier * 512 * 1024
 	largeClaudeCompatToolHistoryPayloadBytes     = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
 	largeClaudeCompatToolResultPilePayloadBytes  = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
 	largeClaudeCompatToolHistoryMessages         = largeClaudeCompatToolHistoryLimitMultiplier * 800
@@ -295,6 +300,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
 	preflight := newClaudeCompatPreflight(body)
+	repairMeta = applyClaudeCompatPreflightStats(repairMeta, preflight)
 	if preflight.hasSystemRole && rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
@@ -539,6 +545,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = ensureModelMaxTokens(body, baseModel)
 	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, true)
 	preflight := newClaudeCompatPreflight(body)
+	repairMeta = applyClaudeCompatPreflightStats(repairMeta, preflight)
 	if preflight.hasSystemRole && rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
@@ -2378,6 +2385,22 @@ func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstr
 	}
 }
 
+func applyClaudeCompatPreflightStats(meta compatRepairLogMeta, preflight claudeCompatPreflight) compatRepairLogMeta {
+	if meta.messageCount <= 0 && preflight.messageCount > 0 {
+		meta.messageCount = preflight.messageCount
+	}
+	if meta.toolCount <= 0 && preflight.interactionCount() > 0 {
+		meta.toolCount = preflight.interactionCount()
+	}
+	if meta.toolShape.InteractionCount <= 0 && preflight.interactionCount() > 0 {
+		meta.toolShape.InteractionCount = preflight.interactionCount()
+	}
+	if meta.toolShape.MCPToolCount <= 0 && preflight.mcpToolCount > 0 {
+		meta.toolShape.MCPToolCount = preflight.mcpToolCount
+	}
+	return meta
+}
+
 func repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx context.Context, body []byte, meta compatRepairLogMeta) ([]byte, error) {
 	if !requiresClaudeToolAdjacencyRepair(meta.compatKind) || !helps.HasClaudeToolResultMarker(body) {
 		return body, nil
@@ -2477,19 +2500,33 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 	}
 	interactions := meta.toolShape.InteractionCount
 	if interactions <= 0 {
+		interactions = preflight.interactionCount()
+	}
+	if interactions <= 0 {
 		interactions = meta.toolCount
 	}
+	messageCount := meta.messageCount
+	if messageCount <= 0 {
+		messageCount = preflight.messageCount
+	}
+	mcpToolCount := meta.toolShape.MCPToolCount
+	if mcpToolCount <= 0 {
+		mcpToolCount = preflight.mcpToolCount
+	}
 	payloadBytes := len(body)
+	if payloadBytes >= largeClaudeCompatSonnet46PayloadBytes && interactions > 0 {
+		return "payload_bytes", true
+	}
 	if payloadBytes >= largeClaudeCompatToolHistoryPayloadBytes {
 		return "payload_bytes", true
 	}
-	if meta.messageCount >= largeClaudeCompatToolHistoryMessages && interactions >= largeClaudeCompatToolHistoryInteractions {
+	if messageCount >= largeClaudeCompatToolHistoryMessages && interactions >= largeClaudeCompatToolHistoryInteractions {
 		return "message_tool_history", true
 	}
 	if interactions >= largeClaudeCompatToolHistoryOnlyInteractions {
 		return "tool_history", true
 	}
-	if meta.toolShape.MCPToolCount >= largeClaudeCompatToolHistoryMCPTools && interactions >= largeClaudeCompatToolHistoryInteractions {
+	if mcpToolCount >= largeClaudeCompatToolHistoryMCPTools && interactions >= largeClaudeCompatToolHistoryInteractions {
 		return "mcp_tool_history", true
 	}
 	return "", false
@@ -2627,10 +2664,37 @@ func newClaudeCompatPreflight(body []byte) claudeCompatPreflight {
 		hasToolSearch: helps.HasClaudeToolSearchMarker(body),
 		hasBetas:      helps.HasClaudeBetasMarker(body),
 	}
-	if preflight.hasToolUse && preflight.hasToolResult && len(body) >= largeClaudeCompatToolResultPilePayloadBytes {
+	if !gjson.ValidBytes(body) {
+		return preflight
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if messages.Exists() && messages.IsArray() {
+		preflight.messageCount = len(messages.Array())
+		for _, msg := range messages.Array() {
+			content := msg.Get("content")
+			if !content.Exists() || !content.IsArray() {
+				continue
+			}
+			for _, part := range content.Array() {
+				switch strings.TrimSpace(part.Get("type").String()) {
+				case "tool_use":
+					preflight.toolUseCount++
+				case "tool_result":
+					preflight.toolResultCount++
+				case "mcp_tool_use", "mcp_tool_result":
+					preflight.mcpToolCount++
+				}
+			}
+		}
+	}
+	if preflight.hasToolUse && preflight.hasToolResult {
 		preflight.toolResultOnlyMessages = countClaudeToolResultOnlyMessages(body)
 	}
 	return preflight
+}
+
+func (p claudeCompatPreflight) interactionCount() int {
+	return p.toolUseCount + p.toolResultCount
 }
 
 func countClaudeToolResultOnlyMessages(body []byte) int {
