@@ -319,7 +319,7 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 				{"role":"system","content":[{"type":"text","text":"system"}]},
 				{"role":"assistant","reasoning_content":"plan","content":[{"type":"text","text":"calling"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"path\":\"README.md\"}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"},
-				{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"https://cdn.example.com/a.png"}}]}
+				{"role":"user","content":[{"type":"text","text":"hi"},{"type":"text","text":"follow up"}]}
 			],
 			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
 			"tool_choice":{"type":"auto"},
@@ -369,11 +369,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if !logFieldContains(entry.Data["message_content_kinds"], "string:1") {
 		t.Fatalf("message_content_kinds should contain string:1, got %#v", entry.Data["message_content_kinds"])
 	}
-	if !logFieldContains(entry.Data["content_part_types"], "text:3") {
-		t.Fatalf("content_part_types should contain text:3, got %#v", entry.Data["content_part_types"])
-	}
-	if !logFieldContains(entry.Data["content_part_types"], "image_url:1") {
-		t.Fatalf("content_part_types should contain image_url:1, got %#v", entry.Data["content_part_types"])
+	if !logFieldContains(entry.Data["content_part_types"], "text:4") {
+		t.Fatalf("content_part_types should contain text:4, got %#v", entry.Data["content_part_types"])
 	}
 	if got := entry.Data["tool_definition_count"]; got != 1 {
 		t.Fatalf("tool_definition_count = %#v, want 1", got)
@@ -446,8 +443,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := failureEntry.Data["message_role_sequence"]; got != "system>assistant>tool>user" {
 		t.Fatalf("failure message_role_sequence = %#v, want system>assistant>tool>user", got)
 	}
-	if got := failureEntry.Data["content_part_types"]; got != "image_url:1,text:3" {
-		t.Fatalf("failure content_part_types = %#v, want image_url:1,text:3", got)
+	if got := failureEntry.Data["content_part_types"]; got != "text:4" {
+		t.Fatalf("failure content_part_types = %#v, want text:4", got)
 	}
 	if got := failureEntry.Data["thinking_type"]; got != "enabled" {
 		t.Fatalf("failure thinking_type = %#v, want enabled", got)
@@ -472,18 +469,16 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *testing.T) {
+func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.T) {
 	hook := logtest.NewGlobal()
 	hook.Reset()
 	t.Cleanup(hook.Reset)
 
-	var gotBody []byte
+	upstreamCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"shape mismatch"}}`))
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
 	}))
 	defer server.Close()
 
@@ -494,7 +489,7 @@ func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *t
 		}},
 	})
 	upstreamAuth := &auth.Auth{
-		ID:       "auth-deepseek-image-1",
+		ID:       "auth-deepseek-image-guard-1",
 		Provider: "openai-compatibility",
 		Attributes: map[string]string{
 			"base_url":     server.URL + "/v1",
@@ -504,8 +499,9 @@ func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *t
 			"provider_key": "deepseek",
 		},
 	}
+	ctx := logging.WithRequestID(context.Background(), "req-deepseek-image-guard-1")
 
-	_, err := executor.Execute(context.Background(), upstreamAuth, cliproxyexecutor.Request{
+	_, err := executor.Execute(ctx, upstreamAuth, cliproxyexecutor.Request{
 		Model: "deepseek-v4-pro",
 		Payload: []byte(`{
 			"model":"deepseek-v4-pro",
@@ -521,41 +517,42 @@ func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *t
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai"),
 		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: "/v1/chat/completions",
+			cliproxyexecutor.RequestPathMetadataKey:  "/v1/chat/completions",
+			cliproxyexecutor.MessageCountMetadataKey: 2,
 		},
 	})
 	if err == nil {
-		t.Fatal("expected upstream 400 error")
+		t.Fatal("expected request_feature_unsupported error")
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+	}
+	status, ok := err.(interface {
+		StatusCode() int
+		ErrorCode() string
+	})
+	if !ok {
+		t.Fatalf("error type %T does not expose status/error code", err)
+	}
+	if got := status.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusBadRequest)
+	}
+	if got := status.ErrorCode(); got != "request_feature_unsupported" {
+		t.Fatalf("ErrorCode() = %q, want request_feature_unsupported", got)
+	}
+	if !strings.Contains(err.Error(), "deepseek_official_image_input") {
+		t.Fatalf("error = %q, want deepseek_official_image_input guidance", err.Error())
 	}
 
-	if got := gjson.GetBytes(gotBody, "messages.0.role").String(); got != "system" {
-		t.Fatalf("messages.0.role = %q, want system; payload=%s", got, string(gotBody))
+	failureEntry := waitForFailureMetadataEntry(t, hook, "req-deepseek-image-guard-1")
+	if got := failureEntry.Data["compat_kind"]; got != "deepseek" {
+		t.Fatalf("failure compat_kind = %#v, want deepseek", got)
 	}
-	if got := gjson.GetBytes(gotBody, "messages.1.role").String(); got != "user" {
-		t.Fatalf("messages.1.role = %q, want user; payload=%s", got, string(gotBody))
+	if got := failureEntry.Data["message_role_sequence"]; got != "system>user" {
+		t.Fatalf("failure message_role_sequence = %#v, want system>user", got)
 	}
-	if got := gjson.GetBytes(gotBody, "messages.1.content.0.type").String(); got != "text" {
-		t.Fatalf("messages.1.content.0.type = %q, want text; payload=%s", got, string(gotBody))
-	}
-	if got := gjson.GetBytes(gotBody, "messages.1.content.1.type").String(); got != "image_url" {
-		t.Fatalf("messages.1.content.1.type = %q, want image_url; payload=%s", got, string(gotBody))
-	}
-
-	entry := findCompatibilityDiagnosticEntry(t, hook.AllEntries())
-	if got := entry.Data["message_count"]; got != 2 {
-		t.Fatalf("message_count = %#v, want 2", got)
-	}
-	if got := entry.Data["message_role_sequence"]; got != "system>user" {
-		t.Fatalf("message_role_sequence = %#v, want system>user", got)
-	}
-	if !logFieldContains(entry.Data["message_content_kinds"], "array:1") {
-		t.Fatalf("message_content_kinds should contain array:1, got %#v", entry.Data["message_content_kinds"])
-	}
-	if !logFieldContains(entry.Data["message_content_kinds"], "string:1") {
-		t.Fatalf("message_content_kinds should contain string:1, got %#v", entry.Data["message_content_kinds"])
-	}
-	if !logFieldContains(entry.Data["content_part_types"], "image_url:1") {
-		t.Fatalf("content_part_types should contain image_url:1, got %#v", entry.Data["content_part_types"])
+	if got := failureEntry.Data["content_part_types"]; got != "image_url:1,text:1" {
+		t.Fatalf("failure content_part_types = %#v, want image_url:1,text:1", got)
 	}
 }
 

@@ -219,6 +219,34 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 	}
 }
 
+func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
+		return nil
+	}
+	imageParts := countOpenAICompatImageParts(body)
+	if imageParts == 0 {
+		return nil
+	}
+	fields := log.Fields{
+		"event":         "openai_compat_image_guard",
+		"model":         model,
+		"compat_kind":   "deepseek",
+		"request_path":  path,
+		"payload_bytes": len(body),
+		"image_parts":   imageParts,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek official route rejected image content before upstream request")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       deepSeekOfficialImageInputUserMessage(),
+	}
+}
+
+func deepSeekOfficialImageInputUserMessage() string {
+	return "request_feature_unsupported: deepseek_official_image_input. 当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容，包括历史消息里的 image_url / input_image。请移除图片输入与图片历史，仅保留文本内容，或切换到原生支持图像输入的模型/路由后重试。原样重复提交不会提高成功率。"
+}
+
 func hasOpenAICompatToolOutputMarker(body []byte) bool {
 	return bytes.Contains(body, []byte(`"tool`)) ||
 		bytes.Contains(body, []byte(`"function_call_output"`)) ||
@@ -227,6 +255,27 @@ func hasOpenAICompatToolOutputMarker(body []byte) bool {
 
 func largeOpenAICompatToolHistoryUserMessage() string {
 	return "request_feature_unsupported: large_openai_tool_history. 历史工具调用过多、文件工具结果过多或上下文过大，当前 GPT/OpenAI-compatible 路由继续携带这些工具结果会显著拖慢或中断。请新开会话、把历史工具调用/文件结果压缩成普通文本摘要、减少重复文件提交，或切换到更适合长文件上下文的模型；原样重复提交不会提高成功率。"
+}
+
+func countOpenAICompatImageParts(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	count := 0
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+			switch partType {
+			case "image", "image_url", "input_image":
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func countOpenAICompatToolOutputMessages(body []byte) int {
@@ -442,6 +491,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
+	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+		return resp, errReject
+	}
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
@@ -691,6 +743,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
+	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+		return nil, errReject
+	}
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
