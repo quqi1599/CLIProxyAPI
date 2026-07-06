@@ -49,6 +49,7 @@ type UsageReporter struct {
 	reasoning    string
 	serviceTier  string
 	shape        usage.RequestShape
+	toolShape    usage.ToolShape
 	requestedAt  time.Time
 	ttftMu       sync.RWMutex
 	ttft         time.Duration
@@ -96,6 +97,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 		serviceTier: usage.ServiceTierFromContext(ctx),
 		shape:       usage.RequestShapeFromContext(ctx),
+		toolShape:   usage.ToolShapeFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -265,8 +267,18 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 }
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
+	ctx = r.contextForPublish(ctx)
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
 	usage.PublishRecord(ctx, record)
+}
+
+func (r *UsageReporter) contextForPublish(ctx context.Context) context.Context {
+	if r == nil {
+		return ctx
+	}
+	ctx = usage.WithRequestShape(ctx, r.shape)
+	ctx = usage.WithToolShape(ctx, r.toolShape)
+	return ctx
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures ...usage.Failure) usage.Record {

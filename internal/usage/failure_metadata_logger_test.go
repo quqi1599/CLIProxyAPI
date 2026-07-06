@@ -130,6 +130,58 @@ func TestFailureMetadataLoggerNormalizesContentSafetyFields(t *testing.T) {
 	requireJSONField(t, payload, "upstream_error_code", "1026")
 }
 
+func TestFailureMetadataLoggerIncludesToolShapeFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOut := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.WarnLevel)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	}()
+
+	ctx := internallogging.WithRequestID(context.Background(), "req-safe-3")
+	ctx = internallogging.WithEndpointParts(ctx, http.MethodPost, "/v1/messages")
+	ctx = coreusage.WithRequestShape(ctx, coreusage.RequestShape{MessageCount: 307, ToolCount: 558})
+	ctx = coreusage.WithToolShape(ctx, coreusage.ToolShape{
+		ToolTypes:         "function:78,mcp:54",
+		DeclaredToolCount: 78,
+		InteractionCount:  558,
+		MCPToolCount:      54,
+	})
+
+	plugin := &FailureMetadataLogger{}
+	plugin.HandleUsage(ctx, coreusage.Record{
+		Model:              "deepseek-v4-pro",
+		Failed:             true,
+		ProviderStatusCode: http.StatusBadRequest,
+		ErrorCode:          "invalid_request_error",
+		Latency:            1450 * time.Millisecond,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  "invalid_request_error",
+		},
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
+	}
+	requireJSONField(t, payload, "endpoint_method", "POST")
+	requireJSONField(t, payload, "endpoint_path", "/v1/messages")
+	requireJSONNumberField(t, payload, "message_count", 307)
+	requireJSONNumberField(t, payload, "tool_count", 558)
+	requireJSONNumberField(t, payload, "declared_tool_count", 78)
+	requireJSONNumberField(t, payload, "tool_interaction_count", 558)
+	requireJSONNumberField(t, payload, "mcp_tool_count", 54)
+	requireJSONField(t, payload, "tool_types", "function:78,mcp:54")
+}
+
 func TestFailureMetadataLoggerSkipsSuccessfulRecords(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.StandardLogger()

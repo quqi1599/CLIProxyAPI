@@ -237,6 +237,31 @@ func TestUsageReporterBuildRecordIncludesServiceTier(t *testing.T) {
 	}
 }
 
+func TestUsageReporterContextForPublishRestoresShapeTelemetry(t *testing.T) {
+	baseCtx := context.Background()
+	reporter := &UsageReporter{
+		shape: usage.RequestShape{
+			MessageCount: 307,
+			ToolCount:    558,
+		},
+		toolShape: usage.ToolShape{
+			DeclaredToolCount: 78,
+			InteractionCount:  558,
+			MCPToolCount:      54,
+		},
+	}
+
+	ctx := reporter.contextForPublish(baseCtx)
+	gotShape := usage.RequestShapeFromContext(ctx)
+	if gotShape.MessageCount != 307 || gotShape.ToolCount != 558 {
+		t.Fatalf("request shape = %+v, want message_count=307 tool_count=558", gotShape)
+	}
+	gotToolShape := usage.ToolShapeFromContext(ctx)
+	if gotToolShape.DeclaredToolCount != 78 || gotToolShape.InteractionCount != 558 || gotToolShape.MCPToolCount != 54 {
+		t.Fatalf("tool shape = %+v, want declared=78 interactions=558 mcp=54", gotToolShape)
+	}
+}
+
 func TestUsageReporterSetTranslatedReasoningEffortUpdatesServiceTier(t *testing.T) {
 	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
 
