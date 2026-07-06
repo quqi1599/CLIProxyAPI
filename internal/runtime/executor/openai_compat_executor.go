@@ -300,20 +300,35 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	if len(diagnostic.MessageRoles) > 0 {
 		fields["message_roles"] = diagnostic.MessageRoles
 	}
+	if diagnostic.MessageRoleSequence != "" {
+		fields["message_role_sequence"] = diagnostic.MessageRoleSequence
+	}
+	if len(diagnostic.MessageContentKinds) > 0 {
+		fields["message_content_kinds"] = diagnostic.MessageContentKinds
+	}
 	if len(diagnostic.ContentPartTypes) > 0 {
 		fields["content_part_types"] = diagnostic.ContentPartTypes
 	}
 	if diagnostic.ToolDefinitionCount > 0 {
 		fields["tool_definition_count"] = diagnostic.ToolDefinitionCount
 	}
+	if len(diagnostic.ToolTypes) > 0 {
+		fields["tool_types"] = diagnostic.ToolTypes
+	}
 	if diagnostic.ToolCallCount > 0 {
 		fields["tool_call_count"] = diagnostic.ToolCallCount
+	}
+	if diagnostic.AssistantToolCalls > 0 {
+		fields["assistant_tool_call_messages"] = diagnostic.AssistantToolCalls
 	}
 	if diagnostic.ToolResultMessages > 0 {
 		fields["tool_result_messages"] = diagnostic.ToolResultMessages
 	}
 	if diagnostic.ReasoningMessages > 0 {
 		fields["reasoning_messages"] = diagnostic.ReasoningMessages
+	}
+	if diagnostic.MaxContentParts > 0 {
+		fields["max_content_parts"] = diagnostic.MaxContentParts
 	}
 	if diagnostic.ToolChoiceType != "" {
 		fields["tool_choice_type"] = diagnostic.ToolChoiceType
@@ -323,6 +338,12 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	}
 	if diagnostic.ReasoningEffort != "" {
 		fields["reasoning_effort"] = diagnostic.ReasoningEffort
+	}
+	if diagnostic.ResponseFormatType != "" {
+		fields["response_format_type"] = diagnostic.ResponseFormatType
+	}
+	if diagnostic.ParallelToolCalls != "" {
+		fields["parallel_tool_calls"] = diagnostic.ParallelToolCalls
 	}
 	if len(diagnostic.InputItemTypes) > 0 {
 		fields["input_item_types"] = diagnostic.InputItemTypes

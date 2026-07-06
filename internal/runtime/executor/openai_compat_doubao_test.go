@@ -322,6 +322,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 			],
 			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
 			"tool_choice":{"type":"auto"},
+			"parallel_tool_calls":false,
+			"response_format":{"type":"json_schema"},
 			"thinking":{"type":"enabled"},
 			"reasoning_effort":"max"
 		}`),
@@ -357,6 +359,15 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if !logFieldContains(entry.Data["message_roles"], "tool:1") {
 		t.Fatalf("message_roles should contain tool:1, got %#v", entry.Data["message_roles"])
 	}
+	if got := entry.Data["message_role_sequence"]; got != "system>assistant>tool>user" {
+		t.Fatalf("message_role_sequence = %#v, want system>assistant>tool>user", got)
+	}
+	if !logFieldContains(entry.Data["message_content_kinds"], "array:3") {
+		t.Fatalf("message_content_kinds should contain array:3, got %#v", entry.Data["message_content_kinds"])
+	}
+	if !logFieldContains(entry.Data["message_content_kinds"], "string:1") {
+		t.Fatalf("message_content_kinds should contain string:1, got %#v", entry.Data["message_content_kinds"])
+	}
 	if !logFieldContains(entry.Data["content_part_types"], "text:3") {
 		t.Fatalf("content_part_types should contain text:3, got %#v", entry.Data["content_part_types"])
 	}
@@ -366,14 +377,23 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := entry.Data["tool_definition_count"]; got != 1 {
 		t.Fatalf("tool_definition_count = %#v, want 1", got)
 	}
+	if !logFieldContains(entry.Data["tool_types"], "function:1") {
+		t.Fatalf("tool_types should contain function:1, got %#v", entry.Data["tool_types"])
+	}
 	if got := entry.Data["tool_call_count"]; got != 1 {
 		t.Fatalf("tool_call_count = %#v, want 1", got)
+	}
+	if got := entry.Data["assistant_tool_call_messages"]; got != 1 {
+		t.Fatalf("assistant_tool_call_messages = %#v, want 1", got)
 	}
 	if got := entry.Data["tool_result_messages"]; got != 1 {
 		t.Fatalf("tool_result_messages = %#v, want 1", got)
 	}
 	if got := entry.Data["reasoning_messages"]; got != 1 {
 		t.Fatalf("reasoning_messages = %#v, want 1", got)
+	}
+	if got := entry.Data["max_content_parts"]; got != 2 {
+		t.Fatalf("max_content_parts = %#v, want 2", got)
 	}
 	if got := entry.Data["tool_choice_type"]; got != "auto" {
 		t.Fatalf("tool_choice_type = %#v, want auto", got)
@@ -383,6 +403,12 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	}
 	if got := entry.Data["reasoning_effort"]; got != "max" {
 		t.Fatalf("reasoning_effort = %#v, want max", got)
+	}
+	if got := entry.Data["response_format_type"]; got != "json_schema" {
+		t.Fatalf("response_format_type = %#v, want json_schema", got)
+	}
+	if got := entry.Data["parallel_tool_calls"]; got != "false" {
+		t.Fatalf("parallel_tool_calls = %#v, want false", got)
 	}
 	if got := entry.Data["upstream_request_id"]; got != "deepseek-log-1" {
 		t.Fatalf("upstream_request_id = %#v, want deepseek-log-1", got)

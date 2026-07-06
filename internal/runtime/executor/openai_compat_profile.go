@@ -1137,14 +1137,21 @@ type openAICompatPayloadDiagnostic struct {
 	ModifiedFields      []string
 	MessageCount        int
 	MessageRoles        []string
+	MessageRoleSequence string
+	MessageContentKinds []string
 	ContentPartTypes    []string
 	ToolDefinitionCount int
+	ToolTypes           []string
 	ToolCallCount       int
+	AssistantToolCalls  int
 	ToolResultMessages  int
 	ReasoningMessages   int
+	MaxContentParts     int
 	ToolChoiceType      string
 	ThinkingType        string
 	ReasoningEffort     string
+	ResponseFormatType  string
+	ParallelToolCalls   string
 	InputItemTypes      []string
 	UpstreamRequestID   string
 }
@@ -1215,8 +1222,11 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 	}
 
 	roleCounts := make(map[string]int)
+	contentKindCounts := make(map[string]int)
 	partCounts := make(map[string]int)
+	toolTypeCounts := make(map[string]int)
 	inputTypeCounts := make(map[string]int)
+	roleSequence := make([]string, 0, 12)
 
 	messages := gjson.GetBytes(payload, "messages")
 	if messages.Exists() && messages.IsArray() {
@@ -1225,6 +1235,9 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 			role := strings.TrimSpace(msg.Get("role").String())
 			if role != "" {
 				roleCounts[role]++
+				if len(roleSequence) < 12 {
+					roleSequence = append(roleSequence, role)
+				}
 			}
 			if role == "tool" {
 				diag.ToolResultMessages++
@@ -1234,10 +1247,32 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 			}
 			if toolCalls := msg.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				diag.ToolCallCount += len(toolCalls.Array())
+				if role == "assistant" {
+					diag.AssistantToolCalls++
+				}
 			}
 			content := msg.Get("content")
+			contentKind := "missing"
+			switch {
+			case !content.Exists():
+				contentKind = "missing"
+			case content.IsArray():
+				contentKind = "array"
+			case content.Type == gjson.String:
+				contentKind = "string"
+			case content.IsObject():
+				contentKind = "object"
+			case content.Type == gjson.Null:
+				contentKind = "null"
+			default:
+				contentKind = content.Type.String()
+			}
+			contentKindCounts[contentKind]++
 			if !content.Exists() || !content.IsArray() {
 				continue
+			}
+			if parts := len(content.Array()); parts > diag.MaxContentParts {
+				diag.MaxContentParts = parts
 			}
 			for _, part := range content.Array() {
 				partType := strings.TrimSpace(part.Get("type").String())
@@ -1252,6 +1287,13 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 	tools := gjson.GetBytes(payload, "tools")
 	if tools.Exists() && tools.IsArray() {
 		diag.ToolDefinitionCount = len(tools.Array())
+		for _, tool := range tools.Array() {
+			toolType := strings.TrimSpace(tool.Get("type").String())
+			if toolType == "" {
+				toolType = "unknown"
+			}
+			toolTypeCounts[toolType]++
+		}
 	}
 
 	if toolChoice := gjson.GetBytes(payload, "tool_choice"); toolChoice.Exists() {
@@ -1268,11 +1310,19 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 		}
 	}
 
+	diag.ResponseFormatType = strings.TrimSpace(gjson.GetBytes(payload, "response_format.type").String())
 	diag.ThinkingType = strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String())
 	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
 		if effort := strings.TrimSpace(gjson.GetBytes(payload, path).String()); effort != "" {
 			diag.ReasoningEffort = effort
 			break
+		}
+	}
+	if parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls"); parallelToolCalls.Exists() {
+		if parallelToolCalls.Type == gjson.True || parallelToolCalls.Type == gjson.False {
+			diag.ParallelToolCalls = parallelToolCalls.Raw
+		} else {
+			diag.ParallelToolCalls = strings.TrimSpace(parallelToolCalls.Raw)
 		}
 	}
 
@@ -1288,8 +1338,22 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 	}
 
 	diag.MessageRoles = sortedCountLabels(roleCounts)
+	diag.MessageRoleSequence = compactRoleSequence(roleSequence, diag.MessageCount)
+	diag.MessageContentKinds = sortedCountLabels(contentKindCounts)
 	diag.ContentPartTypes = sortedCountLabels(partCounts)
+	diag.ToolTypes = sortedCountLabels(toolTypeCounts)
 	diag.InputItemTypes = sortedCountLabels(inputTypeCounts)
+}
+
+func compactRoleSequence(roles []string, total int) string {
+	if len(roles) == 0 || total <= 0 {
+		return ""
+	}
+	sequence := strings.Join(roles, ">")
+	if total > len(roles) {
+		return fmt.Sprintf("%s>(+%d more)", sequence, total-len(roles))
+	}
+	return sequence
 }
 
 func sortedCountLabels(counts map[string]int) []string {
