@@ -91,6 +91,33 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsWhenThinkingTypeEnabled(t *testing.T) {
+	body := []byte(`{
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"messages":[
+			{"role":"assistant","content":"previous answer"},
+			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("normalizeThinkingHistoryForModel() should change DeepSeek history when thinking.type is enabled")
+	}
+	if downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() downgraded unexpectedly")
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "previous answer" {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "previous answer")
+	}
+	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != "previous answer" {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "previous answer")
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryKeepsPlainAssistantForOtherModels(t *testing.T) {
 	body := []byte(`{
 		"messages":[

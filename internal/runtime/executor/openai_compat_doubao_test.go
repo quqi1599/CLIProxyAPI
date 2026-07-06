@@ -395,14 +395,17 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := entry.Data["max_content_parts"]; got != 2 {
 		t.Fatalf("max_content_parts = %#v, want 2", got)
 	}
-	if got := entry.Data["tool_choice_type"]; got != "auto" {
-		t.Fatalf("tool_choice_type = %#v, want auto", got)
+	if _, exists := entry.Data["tool_choice_type"]; exists {
+		t.Fatalf("tool_choice_type should be removed for DeepSeek thinking mode, got %#v", entry.Data["tool_choice_type"])
 	}
 	if got := entry.Data["thinking_type"]; got != "enabled" {
 		t.Fatalf("thinking_type = %#v, want enabled", got)
 	}
 	if got := entry.Data["reasoning_effort"]; got != "max" {
 		t.Fatalf("reasoning_effort = %#v, want max", got)
+	}
+	if !logFieldContains(entry.Data["removed_fields"], "tool_choice") {
+		t.Fatalf("removed_fields should contain tool_choice, got %#v", entry.Data["removed_fields"])
 	}
 	if got := entry.Data["response_format_type"]; got != "json_schema" {
 		t.Fatalf("response_format_type = %#v, want json_schema", got)

@@ -1415,6 +1415,39 @@ func TestOpenAICompatPayloadDeepSeekNormalizesThinkingBudget(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatPayloadDeepSeekThinkingModeStripsToolChoice(t *testing.T) {
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],
+		"tool_choice":{"type":"function","function":{"name":"lookup"}},
+		"thinking":{"type":"enabled"},
+		"thinking_budget":1024
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, genericOpenAICompatProfile(), "deepseek-v4-pro", "https://api.deepseek.com/v1")
+
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be removed for DeepSeek thinking mode: %s", string(out))
+	}
+}
+
+func TestOpenAICompatPayloadDeepSeekKeepsToolChoiceWhenThinkingDisabled(t *testing.T) {
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],
+		"tool_choice":{"type":"function","function":{"name":"lookup"}},
+		"thinking":{"type":"disabled"}
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, genericOpenAICompatProfile(), "deepseek-v4-pro", "https://api.deepseek.com/v1")
+
+	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "lookup" {
+		t.Fatalf("tool_choice.function.name = %q, want lookup: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadDoubaoDeepSeekMapsReasoningEffort(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek-v4-pro",

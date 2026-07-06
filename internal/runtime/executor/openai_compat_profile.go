@@ -302,6 +302,7 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	}
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
+	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
 	if compatKind == "minimax" {
 		payload = normalizeOpenAICompatToolCallArguments(payload)
 	}
@@ -2084,6 +2085,26 @@ func scrubOpenAICompatToolChoice(payload []byte, profile openAICompatProfile) []
 		return payload
 	}
 	out, err := sjson.SetBytes(payload, "tool_choice", "auto")
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+func scrubDeepSeekThinkingToolChoice(payload []byte, model string, baseURL string, compatKind string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	if !requiresDeepSeekThinkingBudgetCompatibility(model, baseURL, compatKind) {
+		return payload
+	}
+	if !deepSeekOpenAIThinkingEnabled(payload) {
+		return payload
+	}
+	if !gjson.GetBytes(payload, "tool_choice").Exists() {
+		return payload
+	}
+	out, err := sjson.DeleteBytes(payload, "tool_choice")
 	if err != nil {
 		return payload
 	}

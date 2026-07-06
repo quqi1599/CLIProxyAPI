@@ -15,7 +15,11 @@ func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool,
 }
 
 func normalizeThinkingHistoryForModel(body []byte, provider string, model string) ([]byte, bool, bool, error) {
-	if !thinkingHistoryRequested(body, provider) {
+	requested := thinkingHistoryRequested(body, provider)
+	if !requested && strings.EqualFold(strings.TrimSpace(provider), "openai") && requiresReturnedThinkingHistory(model) {
+		requested = deepSeekOpenAIThinkingEnabled(body)
+	}
+	if !requested {
 		return body, false, false, nil
 	}
 	requireCompleteHistory := requiresReturnedThinkingHistory(model)
@@ -256,6 +260,29 @@ func thinkingHistoryRequested(body []byte, provider string) bool {
 func openAIThinkingEnabled(body []byte) bool {
 	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
 		if strings.TrimSpace(gjson.GetBytes(body, path).String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func deepSeekOpenAIThinkingEnabled(body []byte) bool {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	switch thinkingType {
+	case "disabled", "disable", "none", "off", "false":
+		return false
+	case "enabled", "enable", "auto", "adaptive", "true", "low", "medium", "high", "max":
+		return true
+	}
+	if openAIThinkingEnabled(body) {
+		return true
+	}
+	for _, path := range []string{"thinking_budget", "thinking.budget_tokens"} {
+		value := gjson.GetBytes(body, path)
+		if !value.Exists() {
+			continue
+		}
+		if budget, ok := deepSeekThinkingBudgetValue(value); ok && budget > 0 {
 			return true
 		}
 	}
