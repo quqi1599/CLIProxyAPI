@@ -219,6 +219,59 @@ func TestOpenAICompatExecutorDeepSeekIntentStripsReasoningWhenFinalModelHasNoThi
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekOfficialReasoningNoneDisablesThinking(t *testing.T) {
+	registerThinkingModelForProvider(t, "deepseek-official-openai-none", "deepseek", "deepseek-v4-pro", []string{"low", "medium", "high", "xhigh", "max"})
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "deepseek-official",
+			Kind: "deepseek",
+		}},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":     server.URL + "/v1",
+			"api_key":      "test",
+			"compat_name":  "deepseek-official",
+			"compat_kind":  "deepseek",
+			"provider_key": "deepseek",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[{"role":"user","content":"hi"}]
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey:          "deepseek-v4-pro",
+			cliproxyexecutor.ReasoningEffortOriginalMetadataKey: "none",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be stripped for DeepSeek official none: %s", string(gotBody))
+	}
+}
+
 func TestOpenAICompatExecutorGenericProviderDoesNotGloballyAllowMax(t *testing.T) {
 	registerThinkingModelForProvider(t, "generic-openai-compat", "openai-compatibility", "generic-openai-model", []string{"low", "medium", "high"})
 

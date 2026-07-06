@@ -1053,6 +1053,12 @@ func normalizeOpenAICompatRouteReasoningEffort(payload []byte, opts cliproxyexec
 	requestedModel := helps.PayloadRequestedModel(opts, finalModel)
 	clientProfile := openAICompatMetadataString(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)
 	deepSeekOfficial := requiresDeepSeekThinkingBudgetCompatibility(finalModel, baseURL, compatKind)
+	if deepSeekOfficial && openAICompatReasoningDisabled(original) {
+		if updated, err := sjson.SetBytes(payload, "thinking.type", "disabled"); err == nil {
+			payload = updated
+		}
+		return stripOpenAICompatReasoningEffort(payload)
+	}
 	if !deepSeekOfficial && !thinking.ShouldNormalizeStrongestReasoningIntent(requestedModel, clientProfile, original) {
 		return payload
 	}
@@ -1078,6 +1084,15 @@ func normalizeOpenAICompatRouteReasoningEffort(payload []byte, opts cliproxyexec
 		updated = cleaned
 	}
 	return updated
+}
+
+func openAICompatReasoningDisabled(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "none", "off", "disabled", "disable", "false":
+		return true
+	default:
+		return false
+	}
 }
 
 func stripOpenAICompatReasoningEffort(payload []byte) []byte {

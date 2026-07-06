@@ -8,6 +8,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type pluginProviderApplier struct {
@@ -271,6 +272,11 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 		"budget":   validated.Budget,
 		"level":    validated.Level,
 	}).Debug("thinking: processed config to apply |")
+
+	if providerFormat == "openai" && providerKey == "deepseek" && validated.Mode == ModeNone {
+		body, _ = sjson.SetBytes(body, "thinking.type", "disabled")
+		return StripThinkingConfig(body, "openai"), nil
+	}
 
 	// 6. Apply configuration using provider-specific applier
 	return applier.Apply(body, *validated, modelInfo)
