@@ -448,6 +448,72 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"shape mismatch"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "deepseek-official",
+			Kind: "deepseek",
+		}},
+	})
+	upstreamAuth := &auth.Auth{
+		ID:       "auth-deepseek-image-1",
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":     server.URL + "/v1",
+			"api_key":      "test",
+			"compat_kind":  "deepseek",
+			"compat_name":  "deepseek-official",
+			"provider_key": "deepseek",
+		},
+	}
+
+	_, err := executor.Execute(context.Background(), upstreamAuth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[
+				{"role":"system","content":"You are helpful."},
+				{"role":"user","content":[
+					{"type":"text","text":"describe this image"},
+					{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+				]}
+			],
+			"reasoning_effort":"auto"
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/chat/completions",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected upstream 400 error")
+	}
+
+	if got := gjson.GetBytes(gotBody, "messages.0.role").String(); got != "system" {
+		t.Fatalf("messages.0.role = %q, want system; payload=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user; payload=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "messages.1.content.0.type").String(); got != "text" {
+		t.Fatalf("messages.1.content.0.type = %q, want text; payload=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "messages.1.content.1.type").String(); got != "image_url" {
+		t.Fatalf("messages.1.content.1.type = %q, want image_url; payload=%s", got, string(gotBody))
+	}
+}
+
 func findCompatibilityDiagnosticEntry(t *testing.T, entries []*log.Entry) *log.Entry {
 	t.Helper()
 	for i := len(entries) - 1; i >= 0; i-- {
