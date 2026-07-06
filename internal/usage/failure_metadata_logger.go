@@ -98,6 +98,7 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 		fields["routing_group"] = routingGroup
 	}
 	addFailureToolShapeFields(fields, coreusage.ToolShapeFromContext(ctx))
+	addFailureDiagnosticFields(fields, coreusage.FailureDiagnosticFromContext(ctx))
 
 	log.WithFields(fields).Warn("failure_metadata")
 }
@@ -163,6 +164,51 @@ func addFailureToolShapeFields(fields log.Fields, shape coreusage.ToolShape) {
 	}
 	if shape.ToolNameHashes != "" {
 		fields["tool_name_hashes"] = safeFailureMetadataString(shape.ToolNameHashes)
+	}
+}
+
+func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnostic) {
+	if len(fields) == 0 || !diag.HasData() {
+		return
+	}
+	if diag.CompatKind != "" {
+		fields["compat_kind"] = safeFailureMetadataString(diag.CompatKind)
+	}
+	if diag.CompatMapping != "" {
+		fields["compat_mapping"] = safeFailureMetadataString(diag.CompatMapping)
+	}
+	if diag.MessageRoleSequence != "" {
+		fields["message_role_sequence"] = safeFailureMetadataString(diag.MessageRoleSequence)
+	}
+	if diag.MessageContentKinds != "" {
+		fields["message_content_kinds"] = safeFailureMetadataString(diag.MessageContentKinds)
+	}
+	if diag.InputItemTypes != "" {
+		fields["input_item_types"] = safeFailureMetadataString(diag.InputItemTypes)
+	}
+	if diag.ToolChoiceType != "" {
+		fields["tool_choice_type"] = safeFailureMetadataString(diag.ToolChoiceType)
+	}
+	if diag.ThinkingType != "" {
+		fields["thinking_type"] = safeFailureMetadataString(diag.ThinkingType)
+	}
+	if diag.ResponseFormatType != "" {
+		fields["response_format_type"] = safeFailureMetadataString(diag.ResponseFormatType)
+	}
+	if diag.ParallelToolCalls != "" {
+		fields["parallel_tool_calls"] = safeFailureMetadataString(diag.ParallelToolCalls)
+	}
+	if diag.AssistantToolCalls > 0 {
+		fields["assistant_tool_call_messages"] = diag.AssistantToolCalls
+	}
+	if diag.ToolResultMessages > 0 {
+		fields["tool_result_messages"] = diag.ToolResultMessages
+	}
+	if diag.ReasoningMessages > 0 {
+		fields["reasoning_messages"] = diag.ReasoningMessages
+	}
+	if diag.MaxContentParts > 0 {
+		fields["max_content_parts"] = diag.MaxContentParts
 	}
 }
 

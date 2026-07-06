@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -1215,6 +1216,24 @@ func openAICompatMapping(profile openAICompatProfile, model string) string {
 
 func (d openAICompatPayloadDiagnostic) relevant() bool {
 	return d.CompatKind == "doubao" || d.CompatKind == "deepseek" || len(d.AddedFields) > 0 || len(d.RemovedFields) > 0 || len(d.ModifiedFields) > 0
+}
+
+func (d openAICompatPayloadDiagnostic) failureDiagnostic() cliproxyusage.FailureDiagnostic {
+	return cliproxyusage.FailureDiagnostic{
+		CompatKind:          d.CompatKind,
+		CompatMapping:       d.CompatMapping,
+		MessageRoleSequence: d.MessageRoleSequence,
+		MessageContentKinds: strings.Join(d.MessageContentKinds, ","),
+		InputItemTypes:      strings.Join(d.InputItemTypes, ","),
+		ToolChoiceType:      d.ToolChoiceType,
+		ThinkingType:        d.ThinkingType,
+		ResponseFormatType:  d.ResponseFormatType,
+		ParallelToolCalls:   d.ParallelToolCalls,
+		AssistantToolCalls:  d.AssistantToolCalls,
+		ToolResultMessages:  d.ToolResultMessages,
+		ReasoningMessages:   d.ReasoningMessages,
+		MaxContentParts:     d.MaxContentParts,
+	}
 }
 
 func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnostic, payload []byte) {

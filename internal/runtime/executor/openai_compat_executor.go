@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -373,7 +374,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	thinkingProviderKey := profile.KindOrFallback(auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
+	failureCtx := ctx
+	defer func() {
+		reporter.TrackFailure(failureCtx, &err)
+	}()
 
 	baseURL, apiKey := e.resolveCredentials(auth)
 	if baseURL == "" {
@@ -437,6 +441,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, errValidate
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
+	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
@@ -620,7 +625,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	thinkingProviderKey := profile.KindOrFallback(auth)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
+	failureCtx := ctx
+	defer func() {
+		reporter.TrackFailure(failureCtx, &err)
+	}()
 
 	baseURL, apiKey := e.resolveCredentials(auth)
 	if baseURL == "" {
@@ -680,6 +688,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, errValidate
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
+	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 	requestLogBody := translated
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(ctx, translated, profile, baseModel); changed {
 		translated = inlined
@@ -783,7 +792,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
 					streamErr := statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					reporter.PublishFailure(failureCtx, streamErr)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 					case <-requestCtx.Done():
@@ -810,7 +819,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			if responseLog != nil {
 				responseLog.RecordError(errScan)
 			}
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailure(failureCtx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-requestCtx.Done():

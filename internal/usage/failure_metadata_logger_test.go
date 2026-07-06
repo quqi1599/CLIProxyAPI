@@ -182,6 +182,69 @@ func TestFailureMetadataLoggerIncludesToolShapeFields(t *testing.T) {
 	requireJSONField(t, payload, "tool_types", "function:78,mcp:54")
 }
 
+func TestFailureMetadataLoggerIncludesFailureDiagnosticFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOut := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.WarnLevel)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	}()
+
+	ctx := internallogging.WithRequestID(context.Background(), "req-safe-4")
+	ctx = internallogging.WithEndpointParts(ctx, http.MethodPost, "/v1/chat/completions")
+	ctx = coreusage.WithFailureDiagnostic(ctx, coreusage.FailureDiagnostic{
+		CompatKind:          "deepseek",
+		CompatMapping:       "deepseek_v4_via_doubao_volcengine",
+		MessageRoleSequence: "system>assistant>tool>user",
+		MessageContentKinds: "array:3,string:1",
+		InputItemTypes:      "message:4",
+		ThinkingType:        "enabled",
+		ResponseFormatType:  "json_schema",
+		ParallelToolCalls:   "false",
+		AssistantToolCalls:  1,
+		ToolResultMessages:  1,
+		ReasoningMessages:   1,
+		MaxContentParts:     2,
+	})
+
+	plugin := &FailureMetadataLogger{}
+	plugin.HandleUsage(ctx, coreusage.Record{
+		Model:              "deepseek-v4-pro",
+		Failed:             true,
+		ProviderStatusCode: http.StatusBadRequest,
+		ErrorCode:          "invalid_request_error",
+		Latency:            2 * time.Second,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  "invalid_request_error",
+		},
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
+	}
+	requireJSONField(t, payload, "compat_kind", "deepseek")
+	requireJSONField(t, payload, "compat_mapping", "deepseek_v4_via_doubao_volcengine")
+	requireJSONField(t, payload, "message_role_sequence", "system>assistant>tool>user")
+	requireJSONField(t, payload, "message_content_kinds", "array:3,string:1")
+	requireJSONField(t, payload, "input_item_types", "message:4")
+	requireJSONField(t, payload, "thinking_type", "enabled")
+	requireJSONField(t, payload, "response_format_type", "json_schema")
+	requireJSONField(t, payload, "parallel_tool_calls", "false")
+	requireJSONNumberField(t, payload, "assistant_tool_call_messages", 1)
+	requireJSONNumberField(t, payload, "tool_result_messages", 1)
+	requireJSONNumberField(t, payload, "reasoning_messages", 1)
+	requireJSONNumberField(t, payload, "max_content_parts", 2)
+}
+
 func TestFailureMetadataLoggerSkipsSuccessfulRecords(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.StandardLogger()

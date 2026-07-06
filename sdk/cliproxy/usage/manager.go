@@ -99,6 +99,24 @@ type ToolShape struct {
 	BuiltinToolCount  int
 }
 
+// FailureDiagnostic stores safe request-shape hints for narrowing failed attempts
+// without logging raw request bodies.
+type FailureDiagnostic struct {
+	CompatKind          string
+	CompatMapping       string
+	MessageRoleSequence string
+	MessageContentKinds string
+	InputItemTypes      string
+	ToolChoiceType      string
+	ThinkingType        string
+	ResponseFormatType  string
+	ParallelToolCalls   string
+	AssistantToolCalls  int
+	ToolResultMessages  int
+	ReasoningMessages   int
+	MaxContentParts     int
+}
+
 // RequestFinal stores the final outcome for one client request.
 type RequestFinal struct {
 	RequestID    string
@@ -112,6 +130,7 @@ type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
 type requestShapeContextKey struct{}
 type toolShapeContextKey struct{}
+type failureDiagnosticContextKey struct{}
 type requestAttemptContextKey struct{}
 type routingGroupContextKey struct{}
 
@@ -310,6 +329,79 @@ func normalizeToolShape(shape ToolShape) ToolShape {
 		shape.BuiltinToolCount = 0
 	}
 	return shape
+}
+
+// WithFailureDiagnostic stores safe failure-only request-shape hints for usage sinks.
+func WithFailureDiagnostic(ctx context.Context, diag FailureDiagnostic) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	diag = normalizeFailureDiagnostic(diag)
+	if !diag.HasData() {
+		return ctx
+	}
+	return context.WithValue(ctx, failureDiagnosticContextKey{}, diag)
+}
+
+// FailureDiagnosticFromContext returns safe failure-only request-shape hints stored in ctx.
+func FailureDiagnosticFromContext(ctx context.Context) FailureDiagnostic {
+	if ctx == nil {
+		return FailureDiagnostic{}
+	}
+	raw := ctx.Value(failureDiagnosticContextKey{})
+	switch value := raw.(type) {
+	case FailureDiagnostic:
+		return normalizeFailureDiagnostic(value)
+	case *FailureDiagnostic:
+		if value == nil {
+			return FailureDiagnostic{}
+		}
+		return normalizeFailureDiagnostic(*value)
+	default:
+		return FailureDiagnostic{}
+	}
+}
+
+// HasData reports whether the diagnostic carries any telemetry.
+func (d FailureDiagnostic) HasData() bool {
+	return d.CompatKind != "" ||
+		d.CompatMapping != "" ||
+		d.MessageRoleSequence != "" ||
+		d.MessageContentKinds != "" ||
+		d.InputItemTypes != "" ||
+		d.ToolChoiceType != "" ||
+		d.ThinkingType != "" ||
+		d.ResponseFormatType != "" ||
+		d.ParallelToolCalls != "" ||
+		d.AssistantToolCalls > 0 ||
+		d.ToolResultMessages > 0 ||
+		d.ReasoningMessages > 0 ||
+		d.MaxContentParts > 0
+}
+
+func normalizeFailureDiagnostic(diag FailureDiagnostic) FailureDiagnostic {
+	diag.CompatKind = strings.TrimSpace(diag.CompatKind)
+	diag.CompatMapping = strings.TrimSpace(diag.CompatMapping)
+	diag.MessageRoleSequence = strings.TrimSpace(diag.MessageRoleSequence)
+	diag.MessageContentKinds = strings.TrimSpace(diag.MessageContentKinds)
+	diag.InputItemTypes = strings.TrimSpace(diag.InputItemTypes)
+	diag.ToolChoiceType = strings.TrimSpace(diag.ToolChoiceType)
+	diag.ThinkingType = strings.TrimSpace(diag.ThinkingType)
+	diag.ResponseFormatType = strings.TrimSpace(diag.ResponseFormatType)
+	diag.ParallelToolCalls = strings.TrimSpace(diag.ParallelToolCalls)
+	if diag.AssistantToolCalls < 0 {
+		diag.AssistantToolCalls = 0
+	}
+	if diag.ToolResultMessages < 0 {
+		diag.ToolResultMessages = 0
+	}
+	if diag.ReasoningMessages < 0 {
+		diag.ReasoningMessages = 0
+	}
+	if diag.MaxContentParts < 0 {
+		diag.MaxContentParts = 0
+	}
+	return diag
 }
 
 // WithRoutingGroup stores the safe routing group selected for the upstream attempt.

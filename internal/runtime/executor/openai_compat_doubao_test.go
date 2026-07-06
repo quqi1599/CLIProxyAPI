@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -422,6 +423,29 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if _, exists := entry.Data["payload"]; exists {
 		t.Fatal("diagnostic log should not include raw payload")
 	}
+
+	failureEntry := waitForFailureMetadataEntry(t, hook, "req-deepseek-1")
+	if got := failureEntry.Data["compat_kind"]; got != "deepseek" {
+		t.Fatalf("failure compat_kind = %#v, want deepseek", got)
+	}
+	if got := failureEntry.Data["message_role_sequence"]; got != "system>assistant>tool>user" {
+		t.Fatalf("failure message_role_sequence = %#v, want system>assistant>tool>user", got)
+	}
+	if got := failureEntry.Data["thinking_type"]; got != "enabled" {
+		t.Fatalf("failure thinking_type = %#v, want enabled", got)
+	}
+	if got := failureEntry.Data["response_format_type"]; got != "json_schema" {
+		t.Fatalf("failure response_format_type = %#v, want json_schema", got)
+	}
+	if got := failureEntry.Data["parallel_tool_calls"]; got != "false" {
+		t.Fatalf("failure parallel_tool_calls = %#v, want false", got)
+	}
+	if got := failureEntry.Data["assistant_tool_call_messages"]; got != 1 {
+		t.Fatalf("failure assistant_tool_call_messages = %#v, want 1", got)
+	}
+	if got := failureEntry.Data["tool_result_messages"]; got != 1 {
+		t.Fatalf("failure tool_result_messages = %#v, want 1", got)
+	}
 }
 
 func findCompatibilityDiagnosticEntry(t *testing.T, entries []*log.Entry) *log.Entry {
@@ -436,6 +460,26 @@ func findCompatibilityDiagnosticEntry(t *testing.T, entries []*log.Entry) *log.E
 		}
 	}
 	t.Fatal("compatibility_diagnostic log entry not found")
+	return nil
+}
+
+func waitForFailureMetadataEntry(t *testing.T, hook *logtest.Hook, requestID string) *log.Entry {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		entries := hook.AllEntries()
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			if entry == nil {
+				continue
+			}
+			if entry.Data["event"] == "failure_metadata" && entry.Data["request_id"] == requestID {
+				return entry
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("failure_metadata log entry not found")
 	return nil
 }
 
