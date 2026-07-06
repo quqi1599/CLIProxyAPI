@@ -46,6 +46,47 @@ func setToolShapeMetadata(meta map[string]any, rawJSON []byte) {
 	}
 }
 
+func setRequestShapeMetadata(meta map[string]any, rawJSON []byte) {
+	if meta == nil || len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+		return
+	}
+	messageCount := requestMessageCount(rawJSON)
+	if messageCount > 0 {
+		meta[coreexecutor.MessageCountMetadataKey] = messageCount
+	}
+	toolCount := requestToolCount(rawJSON)
+	if toolCount > 0 {
+		meta[coreexecutor.ToolCountMetadataKey] = toolCount
+	}
+}
+
+func setRequestShapeAndToolMetadata(meta map[string]any, rawJSON []byte) {
+	if meta == nil {
+		return
+	}
+	setRequestShapeMetadata(meta, rawJSON)
+	setToolShapeMetadata(meta, rawJSON)
+}
+
+func requestMessageCount(rawJSON []byte) int {
+	if messages := gjson.GetBytes(rawJSON, "messages"); messages.IsArray() {
+		return len(messages.Array())
+	}
+	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
+		return len(input.Array())
+	}
+	return 0
+}
+
+func requestToolCount(rawJSON []byte) int {
+	declared := requestDeclaredToolCount(rawJSON)
+	interactions := requestToolInteractionCount(rawJSON)
+	if interactions > declared {
+		return interactions
+	}
+	return declared
+}
+
 func requestToolShapeTelemetry(rawJSON []byte) toolShapeTelemetry {
 	shape := newToolShapeTelemetry()
 	shape.DeclaredToolCount = requestDeclaredToolCount(rawJSON)

@@ -251,6 +251,48 @@ func TestExecuteModelCarriesEntryAndExitProtocols(t *testing.T) {
 	}
 }
 
+func TestExecuteModelIncludesRequestShapeMetadata(t *testing.T) {
+	model := "model-execution-shape-metadata"
+	requestBody := []byte(`{
+		"model":"model-execution-shape-metadata",
+		"messages":[
+			{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"},
+			{"role":"user","content":"hi"}
+		],
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+	}`)
+	executor := &modelExecutionCaptureExecutor{}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+
+	resp, errMsg := handler.ExecuteModel(context.Background(), ModelExecutionRequest{
+		EntryProtocol: "openai",
+		ExitProtocol:  "openai",
+		Model:         model,
+		Body:          requestBody,
+	})
+	if errMsg != nil {
+		t.Fatalf("ExecuteModel() error = %+v", errMsg)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	_, gotOpts := executor.captured()
+	if got := gotOpts.Metadata[coreexecutor.MessageCountMetadataKey]; got != 3 {
+		t.Fatalf("message_count metadata = %#v, want 3", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.ToolCountMetadataKey]; got != 2 {
+		t.Fatalf("tool_count metadata = %#v, want 2", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.DeclaredToolCountMetadataKey]; got != 1 {
+		t.Fatalf("declared_tool_count metadata = %#v, want 1", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.ToolInteractionCountMetadataKey]; got != 2 {
+		t.Fatalf("tool_interaction_count metadata = %#v, want 2", got)
+	}
+}
+
 func TestExecuteModelSkipsOriginatingPluginInterceptors(t *testing.T) {
 	model := "model-execution-skip-origin-model"
 	requestBody := []byte(fmt.Sprintf(`{"model":%q}`, model))
