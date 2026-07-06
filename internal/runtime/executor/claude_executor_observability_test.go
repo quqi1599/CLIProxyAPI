@@ -255,6 +255,45 @@ func TestRejectLargeClaudeCompatToolHistory_AllowsSmallToolHistory(t *testing.T)
 	}
 }
 
+func TestRejectLargeClaudeCompatToolHistory_RejectsHeavyStepHistoryEarlier(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+
+	body := []byte(strings.Repeat("x", largeClaudeCompatStepPayloadBytes+1024))
+	meta := compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "step-3.7-flash",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "step",
+		messageCount:   307,
+		toolCount:      558,
+		toolShape: coreusage.ToolShape{
+			InteractionCount: 558,
+		},
+	}
+
+	err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, claudeCompatPreflight{hasToolUse: true, hasToolResult: true})
+	if err == nil {
+		t.Fatal("expected heavy step tool history rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "large_claude_tool_history") {
+		t.Fatalf("error = %q, want large_claude_tool_history marker", err.Error())
+	}
+
+	entry := findCompatRepairGuardEntry(t, hook.AllEntries())
+	if got := entry.Data["reason"]; got != "step_tool_history" {
+		t.Fatalf("reason = %#v, want step_tool_history", got)
+	}
+	if got := entry.Data["message_count"]; got != 307 {
+		t.Fatalf("message_count = %#v, want 307", got)
+	}
+	if got := entry.Data["tool_interaction_count"]; got != 558 {
+		t.Fatalf("tool_interaction_count = %#v, want 558", got)
+	}
+}
+
 func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46PayloadGuard(t *testing.T) {
 	hook := logtest.NewGlobal()
 	hook.Reset()

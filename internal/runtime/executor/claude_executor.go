@@ -179,6 +179,9 @@ const (
 	largeClaudeCompatToolHistoryOnlyInteractions = largeClaudeCompatToolHistoryLimitMultiplier * 700
 	largeClaudeCompatToolHistoryMCPTools         = largeClaudeCompatToolHistoryLimitMultiplier * 80
 	largeClaudeCompatToolResultOnlyMessages      = largeClaudeCompatToolHistoryLimitMultiplier * 40
+	largeClaudeCompatStepPayloadBytes            = 1 * 1024 * 1024
+	largeClaudeCompatStepMessages                = 250
+	largeClaudeCompatStepInteractions            = 500
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
@@ -2516,6 +2519,14 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 	payloadBytes := len(body)
 	if payloadBytes >= largeClaudeCompatSonnet46PayloadBytes && interactions > 0 {
 		return "payload_bytes", true
+	}
+	if strings.EqualFold(strings.TrimSpace(meta.compatKind), "step") {
+		if payloadBytes >= largeClaudeCompatStepPayloadBytes && interactions >= largeClaudeCompatStepInteractions {
+			return "step_tool_history", true
+		}
+		if messageCount >= largeClaudeCompatStepMessages && interactions >= largeClaudeCompatStepInteractions {
+			return "step_tool_history", true
+		}
 	}
 	if payloadBytes >= largeClaudeCompatToolHistoryPayloadBytes {
 		return "payload_bytes", true
