@@ -200,14 +200,23 @@ func TestFailureMetadataLoggerIncludesFailureDiagnosticFields(t *testing.T) {
 	ctx := internallogging.WithRequestID(context.Background(), "req-safe-4")
 	ctx = internallogging.WithEndpointParts(ctx, http.MethodPost, "/v1/chat/completions")
 	ctx = coreusage.WithFailureDiagnostic(ctx, coreusage.FailureDiagnostic{
+		Channel:             "8",
+		CompatName:          "deepseek-official",
 		CompatKind:          "deepseek",
 		CompatMapping:       "deepseek_v4_via_doubao_volcengine",
+		UpstreamRequestID:   "deepseek-log-1",
+		PayloadFields:       "messages,model,reasoning_effort",
+		MessageRoles:        "assistant:1,system:1,tool:1,user:1",
 		MessageRoleSequence: "system>assistant>tool>user",
 		MessageContentKinds: "array:3,string:1",
+		ContentPartTypes:    "image_url:1,text:3",
 		InputItemTypes:      "message:4",
 		ThinkingType:        "enabled",
 		ResponseFormatType:  "json_schema",
 		ParallelToolCalls:   "false",
+		AddedFields:         "thinking",
+		RemovedFields:       "tool_choice",
+		ModifiedFields:      "messages,tools",
 		AssistantToolCalls:  1,
 		ToolResultMessages:  1,
 		ReasoningMessages:   1,
@@ -231,14 +240,23 @@ func TestFailureMetadataLoggerIncludesFailureDiagnosticFields(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
 		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
 	}
+	requireJSONField(t, payload, "channel", "8")
+	requireJSONField(t, payload, "compat_name", "deepseek-official")
 	requireJSONField(t, payload, "compat_kind", "deepseek")
 	requireJSONField(t, payload, "compat_mapping", "deepseek_v4_via_doubao_volcengine")
+	requireJSONField(t, payload, "upstream_request_id", "deepseek-log-1")
+	requireJSONField(t, payload, "payload_fields", "messages,model,reasoning_effort")
+	requireJSONField(t, payload, "message_roles", "assistant:1,system:1,tool:1,user:1")
 	requireJSONField(t, payload, "message_role_sequence", "system>assistant>tool>user")
 	requireJSONField(t, payload, "message_content_kinds", "array:3,string:1")
+	requireJSONField(t, payload, "content_part_types", "image_url:1,text:3")
 	requireJSONField(t, payload, "input_item_types", "message:4")
 	requireJSONField(t, payload, "thinking_type", "enabled")
 	requireJSONField(t, payload, "response_format_type", "json_schema")
 	requireJSONField(t, payload, "parallel_tool_calls", "false")
+	requireJSONField(t, payload, "added_fields", "thinking")
+	requireJSONField(t, payload, "removed_fields", "tool_choice")
+	requireJSONField(t, payload, "modified_fields", "messages,tools")
 	requireJSONNumberField(t, payload, "assistant_tool_call_messages", 1)
 	requireJSONNumberField(t, payload, "tool_result_messages", 1)
 	requireJSONNumberField(t, payload, "reasoning_messages", 1)

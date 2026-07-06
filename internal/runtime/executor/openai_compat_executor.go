@@ -504,6 +504,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		compatDiagnostic = newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, httpResp.Header)
+		failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, b)
 		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
 		return resp, err
@@ -755,6 +757,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			responseLog.AppendChunk(b)
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		compatDiagnostic = newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, httpResp.Header)
+		failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)

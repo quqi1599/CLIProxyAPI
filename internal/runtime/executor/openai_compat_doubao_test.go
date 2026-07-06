@@ -425,11 +425,29 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	}
 
 	failureEntry := waitForFailureMetadataEntry(t, hook, "req-deepseek-1")
+	if got := failureEntry.Data["channel"]; got != "8" {
+		t.Fatalf("failure channel = %#v, want 8", got)
+	}
+	if got := failureEntry.Data["compat_name"]; got != "deepseek-official" {
+		t.Fatalf("failure compat_name = %#v, want deepseek-official", got)
+	}
 	if got := failureEntry.Data["compat_kind"]; got != "deepseek" {
 		t.Fatalf("failure compat_kind = %#v, want deepseek", got)
 	}
+	if got := failureEntry.Data["upstream_request_id"]; got != "deepseek-log-1" {
+		t.Fatalf("failure upstream_request_id = %#v, want deepseek-log-1", got)
+	}
+	if got := failureEntry.Data["payload_fields"]; got != "messages,model,parallel_tool_calls,reasoning_effort,response_format,thinking,tools" {
+		t.Fatalf("failure payload_fields = %#v", got)
+	}
+	if got := failureEntry.Data["message_roles"]; got != "assistant:1,system:1,tool:1,user:1" {
+		t.Fatalf("failure message_roles = %#v, want assistant:1,system:1,tool:1,user:1", got)
+	}
 	if got := failureEntry.Data["message_role_sequence"]; got != "system>assistant>tool>user" {
 		t.Fatalf("failure message_role_sequence = %#v, want system>assistant>tool>user", got)
+	}
+	if got := failureEntry.Data["content_part_types"]; got != "image_url:1,text:3" {
+		t.Fatalf("failure content_part_types = %#v, want image_url:1,text:3", got)
 	}
 	if got := failureEntry.Data["thinking_type"]; got != "enabled" {
 		t.Fatalf("failure thinking_type = %#v, want enabled", got)
@@ -440,6 +458,12 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := failureEntry.Data["parallel_tool_calls"]; got != "false" {
 		t.Fatalf("failure parallel_tool_calls = %#v, want false", got)
 	}
+	if got := failureEntry.Data["removed_fields"]; got != "tool_choice" {
+		t.Fatalf("failure removed_fields = %#v, want tool_choice", got)
+	}
+	if got := failureEntry.Data["modified_fields"]; got != "messages,tools" {
+		t.Fatalf("failure modified_fields = %#v, want messages,tools", got)
+	}
 	if got := failureEntry.Data["assistant_tool_call_messages"]; got != 1 {
 		t.Fatalf("failure assistant_tool_call_messages = %#v, want 1", got)
 	}
@@ -449,6 +473,10 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 }
 
 func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -511,6 +539,23 @@ func TestOpenAICompatExecutorDeepSeekPreservesChatMessageShapeForImageInput(t *t
 	}
 	if got := gjson.GetBytes(gotBody, "messages.1.content.1.type").String(); got != "image_url" {
 		t.Fatalf("messages.1.content.1.type = %q, want image_url; payload=%s", got, string(gotBody))
+	}
+
+	entry := findCompatibilityDiagnosticEntry(t, hook.AllEntries())
+	if got := entry.Data["message_count"]; got != 2 {
+		t.Fatalf("message_count = %#v, want 2", got)
+	}
+	if got := entry.Data["message_role_sequence"]; got != "system>user" {
+		t.Fatalf("message_role_sequence = %#v, want system>user", got)
+	}
+	if !logFieldContains(entry.Data["message_content_kinds"], "array:1") {
+		t.Fatalf("message_content_kinds should contain array:1, got %#v", entry.Data["message_content_kinds"])
+	}
+	if !logFieldContains(entry.Data["message_content_kinds"], "string:1") {
+		t.Fatalf("message_content_kinds should contain string:1, got %#v", entry.Data["message_content_kinds"])
+	}
+	if !logFieldContains(entry.Data["content_part_types"], "image_url:1") {
+		t.Fatalf("content_part_types should contain image_url:1, got %#v", entry.Data["content_part_types"])
 	}
 }
 

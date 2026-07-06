@@ -171,17 +171,35 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	if len(fields) == 0 || !diag.HasData() {
 		return
 	}
+	if diag.Channel != "" {
+		fields["channel"] = safeFailureMetadataString(diag.Channel)
+	}
+	if diag.CompatName != "" {
+		fields["compat_name"] = safeFailureMetadataString(diag.CompatName)
+	}
 	if diag.CompatKind != "" {
 		fields["compat_kind"] = safeFailureMetadataString(diag.CompatKind)
 	}
 	if diag.CompatMapping != "" {
 		fields["compat_mapping"] = safeFailureMetadataString(diag.CompatMapping)
 	}
+	if diag.UpstreamRequestID != "" {
+		fields["upstream_request_id"] = safeFailureMetadataString(diag.UpstreamRequestID)
+	}
+	if diag.PayloadFields != "" {
+		fields["payload_fields"] = safeFailureMetadataString(diag.PayloadFields)
+	}
+	if diag.MessageRoles != "" {
+		fields["message_roles"] = safeFailureMetadataString(diag.MessageRoles)
+	}
 	if diag.MessageRoleSequence != "" {
 		fields["message_role_sequence"] = safeFailureMetadataString(diag.MessageRoleSequence)
 	}
 	if diag.MessageContentKinds != "" {
 		fields["message_content_kinds"] = safeFailureMetadataString(diag.MessageContentKinds)
+	}
+	if diag.ContentPartTypes != "" {
+		fields["content_part_types"] = safeFailureMetadataString(diag.ContentPartTypes)
 	}
 	if diag.InputItemTypes != "" {
 		fields["input_item_types"] = safeFailureMetadataString(diag.InputItemTypes)
@@ -197,6 +215,15 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	}
 	if diag.ParallelToolCalls != "" {
 		fields["parallel_tool_calls"] = safeFailureMetadataString(diag.ParallelToolCalls)
+	}
+	if diag.AddedFields != "" {
+		fields["added_fields"] = safeFailureMetadataString(diag.AddedFields)
+	}
+	if diag.RemovedFields != "" {
+		fields["removed_fields"] = safeFailureMetadataString(diag.RemovedFields)
+	}
+	if diag.ModifiedFields != "" {
+		fields["modified_fields"] = safeFailureMetadataString(diag.ModifiedFields)
 	}
 	if diag.AssistantToolCalls > 0 {
 		fields["assistant_tool_call_messages"] = diag.AssistantToolCalls

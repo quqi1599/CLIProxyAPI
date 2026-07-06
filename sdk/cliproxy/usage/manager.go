@@ -102,15 +102,24 @@ type ToolShape struct {
 // FailureDiagnostic stores safe request-shape hints for narrowing failed attempts
 // without logging raw request bodies.
 type FailureDiagnostic struct {
+	Channel             string
+	CompatName          string
 	CompatKind          string
 	CompatMapping       string
+	UpstreamRequestID   string
+	PayloadFields       string
+	MessageRoles        string
 	MessageRoleSequence string
 	MessageContentKinds string
+	ContentPartTypes    string
 	InputItemTypes      string
 	ToolChoiceType      string
 	ThinkingType        string
 	ResponseFormatType  string
 	ParallelToolCalls   string
+	AddedFields         string
+	RemovedFields       string
+	ModifiedFields      string
 	AssistantToolCalls  int
 	ToolResultMessages  int
 	ReasoningMessages   int
@@ -364,15 +373,24 @@ func FailureDiagnosticFromContext(ctx context.Context) FailureDiagnostic {
 
 // HasData reports whether the diagnostic carries any telemetry.
 func (d FailureDiagnostic) HasData() bool {
-	return d.CompatKind != "" ||
+	return d.Channel != "" ||
+		d.CompatName != "" ||
+		d.CompatKind != "" ||
 		d.CompatMapping != "" ||
+		d.UpstreamRequestID != "" ||
+		d.PayloadFields != "" ||
+		d.MessageRoles != "" ||
 		d.MessageRoleSequence != "" ||
 		d.MessageContentKinds != "" ||
+		d.ContentPartTypes != "" ||
 		d.InputItemTypes != "" ||
 		d.ToolChoiceType != "" ||
 		d.ThinkingType != "" ||
 		d.ResponseFormatType != "" ||
 		d.ParallelToolCalls != "" ||
+		d.AddedFields != "" ||
+		d.RemovedFields != "" ||
+		d.ModifiedFields != "" ||
 		d.AssistantToolCalls > 0 ||
 		d.ToolResultMessages > 0 ||
 		d.ReasoningMessages > 0 ||
@@ -380,15 +398,24 @@ func (d FailureDiagnostic) HasData() bool {
 }
 
 func normalizeFailureDiagnostic(diag FailureDiagnostic) FailureDiagnostic {
+	diag.Channel = strings.TrimSpace(diag.Channel)
+	diag.CompatName = strings.TrimSpace(diag.CompatName)
 	diag.CompatKind = strings.TrimSpace(diag.CompatKind)
 	diag.CompatMapping = strings.TrimSpace(diag.CompatMapping)
+	diag.UpstreamRequestID = strings.TrimSpace(diag.UpstreamRequestID)
+	diag.PayloadFields = strings.TrimSpace(diag.PayloadFields)
+	diag.MessageRoles = strings.TrimSpace(diag.MessageRoles)
 	diag.MessageRoleSequence = strings.TrimSpace(diag.MessageRoleSequence)
 	diag.MessageContentKinds = strings.TrimSpace(diag.MessageContentKinds)
+	diag.ContentPartTypes = strings.TrimSpace(diag.ContentPartTypes)
 	diag.InputItemTypes = strings.TrimSpace(diag.InputItemTypes)
 	diag.ToolChoiceType = strings.TrimSpace(diag.ToolChoiceType)
 	diag.ThinkingType = strings.TrimSpace(diag.ThinkingType)
 	diag.ResponseFormatType = strings.TrimSpace(diag.ResponseFormatType)
 	diag.ParallelToolCalls = strings.TrimSpace(diag.ParallelToolCalls)
+	diag.AddedFields = strings.TrimSpace(diag.AddedFields)
+	diag.RemovedFields = strings.TrimSpace(diag.RemovedFields)
+	diag.ModifiedFields = strings.TrimSpace(diag.ModifiedFields)
 	if diag.AssistantToolCalls < 0 {
 		diag.AssistantToolCalls = 0
 	}
