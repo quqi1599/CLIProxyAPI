@@ -556,6 +556,19 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	}
 }
 
+func TestResolvedOpenAICompatKind_InferDeepSeekFromBaseURL(t *testing.T) {
+	profile := openAICompatProfile{}
+	auth := &auth.Auth{
+		Attributes: map[string]string{
+			"base_url": "https://api.deepseek.com/v1",
+		},
+	}
+
+	if got := resolvedOpenAICompatKind(profile, auth); got != "deepseek" {
+		t.Fatalf("resolvedOpenAICompatKind() = %q, want deepseek", got)
+	}
+}
+
 func findCompatibilityDiagnosticEntry(t *testing.T, entries []*log.Entry) *log.Entry {
 	t.Helper()
 	for i := len(entries) - 1; i >= 0; i-- {

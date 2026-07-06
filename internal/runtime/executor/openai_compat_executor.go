@@ -219,8 +219,23 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 	}
 }
 
-func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
+func resolvedOpenAICompatKind(profile openAICompatProfile, auth *cliproxyauth.Auth) string {
+	if kind := config.NormalizeOpenAICompatibilityKind(profile.Kind); kind != "" {
+		return kind
+	}
+	if auth != nil && auth.Attributes != nil {
+		if kind := config.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
+			return kind
+		}
+		if kind := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
+			return kind
+		}
+	}
+	return ""
+}
+
+func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, auth *cliproxyauth.Auth, model, path string) error {
+	if resolvedOpenAICompatKind(profile, auth) != "deepseek" {
 		return nil
 	}
 	imageParts := countOpenAICompatImageParts(body)
@@ -491,7 +506,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
-	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, auth, baseModel, requestPath); errReject != nil {
 		return resp, errReject
 	}
 	requestLogBody := translated
@@ -743,7 +758,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	compatDiagnostic := newOpenAICompatPayloadDiagnostic(compatDiagnosticSource, translated, profile, auth, baseModel, endpoint, requestPath, opts.Headers, nil)
 	failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
-	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, baseModel, requestPath); errReject != nil {
+	if errReject := rejectDeepSeekUnsupportedImageInput(ctx, translated, profile, auth, baseModel, requestPath); errReject != nil {
 		return nil, errReject
 	}
 	requestLogBody := translated
