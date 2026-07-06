@@ -397,6 +397,42 @@ func TestBuildErrorResponseBody_NormalizesRequestFeatureUnsupportedJSON(t *testi
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesDeepSeekOfficialImageRequestFeatureUnsupported(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: deepseek_official_image_input. 当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingDeepSeekOfficialImageInputMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekOfficialImageInputMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_NormalizesOpenAICompatToolHistoryRequestFeatureUnsupported(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: large_openai_tool_history. 历史工具调用过多","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingOpenAICompatToolHistoryMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingOpenAICompatToolHistoryMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
 func TestBuildErrorResponseBody_NormalizesGenericClientHints(t *testing.T) {
 	cases := []struct {
 		name    string
