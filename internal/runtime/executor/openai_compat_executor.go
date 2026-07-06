@@ -294,6 +294,39 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	if len(diagnostic.PayloadFields) > 0 {
 		fields["payload_fields"] = diagnostic.PayloadFields
 	}
+	if diagnostic.MessageCount > 0 {
+		fields["message_count"] = diagnostic.MessageCount
+	}
+	if len(diagnostic.MessageRoles) > 0 {
+		fields["message_roles"] = diagnostic.MessageRoles
+	}
+	if len(diagnostic.ContentPartTypes) > 0 {
+		fields["content_part_types"] = diagnostic.ContentPartTypes
+	}
+	if diagnostic.ToolDefinitionCount > 0 {
+		fields["tool_definition_count"] = diagnostic.ToolDefinitionCount
+	}
+	if diagnostic.ToolCallCount > 0 {
+		fields["tool_call_count"] = diagnostic.ToolCallCount
+	}
+	if diagnostic.ToolResultMessages > 0 {
+		fields["tool_result_messages"] = diagnostic.ToolResultMessages
+	}
+	if diagnostic.ReasoningMessages > 0 {
+		fields["reasoning_messages"] = diagnostic.ReasoningMessages
+	}
+	if diagnostic.ToolChoiceType != "" {
+		fields["tool_choice_type"] = diagnostic.ToolChoiceType
+	}
+	if diagnostic.ThinkingType != "" {
+		fields["thinking_type"] = diagnostic.ThinkingType
+	}
+	if diagnostic.ReasoningEffort != "" {
+		fields["reasoning_effort"] = diagnostic.ReasoningEffort
+	}
+	if len(diagnostic.InputItemTypes) > 0 {
+		fields["input_item_types"] = diagnostic.InputItemTypes
+	}
 	if len(diagnostic.AddedFields) > 0 {
 		fields["added_fields"] = diagnostic.AddedFields
 	}

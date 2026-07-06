@@ -1120,22 +1120,33 @@ func normalizeOpenAICompatToolArgumentsValue(raw any) (string, bool) {
 }
 
 type openAICompatPayloadDiagnostic struct {
-	Model             string
-	CompatKind        string
-	Endpoint          string
-	RequestPath       string
-	Channel           string
-	AuthID            string
-	AuthLabel         string
-	CompatName        string
-	CompatKindSource  string
-	CompatMapping     string
-	PayloadSize       int
-	PayloadFields     []string
-	AddedFields       []string
-	RemovedFields     []string
-	ModifiedFields    []string
-	UpstreamRequestID string
+	Model               string
+	CompatKind          string
+	Endpoint            string
+	RequestPath         string
+	Channel             string
+	AuthID              string
+	AuthLabel           string
+	CompatName          string
+	CompatKindSource    string
+	CompatMapping       string
+	PayloadSize         int
+	PayloadFields       []string
+	AddedFields         []string
+	RemovedFields       []string
+	ModifiedFields      []string
+	MessageCount        int
+	MessageRoles        []string
+	ContentPartTypes    []string
+	ToolDefinitionCount int
+	ToolCallCount       int
+	ToolResultMessages  int
+	ReasoningMessages   int
+	ToolChoiceType      string
+	ThinkingType        string
+	ReasoningEffort     string
+	InputItemTypes      []string
+	UpstreamRequestID   string
 }
 
 func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompatProfile, auth *cliproxyauth.Auth, model, endpoint, requestPath string, requestHeaders http.Header, responseHeaders http.Header) openAICompatPayloadDiagnostic {
@@ -1163,6 +1174,7 @@ func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompat
 			diag.CompatName = strings.TrimSpace(auth.Attributes["compat_name"])
 		}
 	}
+	populateOpenAICompatPayloadDiagnosticShape(&diag, after)
 	return diag
 }
 
@@ -1194,7 +1206,106 @@ func openAICompatMapping(profile openAICompatProfile, model string) string {
 }
 
 func (d openAICompatPayloadDiagnostic) relevant() bool {
-	return d.CompatKind == "doubao" || len(d.AddedFields) > 0 || len(d.RemovedFields) > 0 || len(d.ModifiedFields) > 0
+	return d.CompatKind == "doubao" || d.CompatKind == "deepseek" || len(d.AddedFields) > 0 || len(d.RemovedFields) > 0 || len(d.ModifiedFields) > 0
+}
+
+func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnostic, payload []byte) {
+	if diag == nil || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+
+	roleCounts := make(map[string]int)
+	partCounts := make(map[string]int)
+	inputTypeCounts := make(map[string]int)
+
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.Exists() && messages.IsArray() {
+		diag.MessageCount = len(messages.Array())
+		for _, msg := range messages.Array() {
+			role := strings.TrimSpace(msg.Get("role").String())
+			if role != "" {
+				roleCounts[role]++
+			}
+			if role == "tool" {
+				diag.ToolResultMessages++
+			}
+			if strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+				diag.ReasoningMessages++
+			}
+			if toolCalls := msg.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
+				diag.ToolCallCount += len(toolCalls.Array())
+			}
+			content := msg.Get("content")
+			if !content.Exists() || !content.IsArray() {
+				continue
+			}
+			for _, part := range content.Array() {
+				partType := strings.TrimSpace(part.Get("type").String())
+				if partType == "" {
+					partType = "text"
+				}
+				partCounts[partType]++
+			}
+		}
+	}
+
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.Exists() && tools.IsArray() {
+		diag.ToolDefinitionCount = len(tools.Array())
+	}
+
+	if toolChoice := gjson.GetBytes(payload, "tool_choice"); toolChoice.Exists() {
+		switch {
+		case toolChoice.Type == gjson.String:
+			diag.ToolChoiceType = strings.TrimSpace(toolChoice.String())
+		case toolChoice.IsObject():
+			diag.ToolChoiceType = strings.TrimSpace(toolChoice.Get("type").String())
+			if diag.ToolChoiceType == "" {
+				diag.ToolChoiceType = "object"
+			}
+		default:
+			diag.ToolChoiceType = strings.TrimSpace(toolChoice.Raw)
+		}
+	}
+
+	diag.ThinkingType = strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String())
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		if effort := strings.TrimSpace(gjson.GetBytes(payload, path).String()); effort != "" {
+			diag.ReasoningEffort = effort
+			break
+		}
+	}
+
+	input := gjson.GetBytes(payload, "input")
+	if input.Exists() && input.IsArray() {
+		for _, item := range input.Array() {
+			itemType := strings.TrimSpace(item.Get("type").String())
+			if itemType == "" {
+				itemType = "message"
+			}
+			inputTypeCounts[itemType]++
+		}
+	}
+
+	diag.MessageRoles = sortedCountLabels(roleCounts)
+	diag.ContentPartTypes = sortedCountLabels(partCounts)
+	diag.InputItemTypes = sortedCountLabels(inputTypeCounts)
+}
+
+func sortedCountLabels(counts map[string]int) []string {
+	if len(counts) == 0 {
+		return nil
+	}
+	labels := make([]string, 0, len(counts))
+	for key, count := range counts {
+		key = strings.TrimSpace(key)
+		if key == "" || count <= 0 {
+			continue
+		}
+		labels = append(labels, fmt.Sprintf("%s:%d", key, count))
+	}
+	sort.Strings(labels)
+	return labels
 }
 
 func openAICompatTopLevelRawFields(payload []byte) map[string]string {

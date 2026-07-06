@@ -278,6 +278,123 @@ func TestOpenAICompatExecutorDoubaoLogsCompatibilityDiagnosticOn400(t *testing.T
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "deepseek-log-1")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"shape mismatch"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "deepseek-official",
+			Kind: "deepseek",
+		}},
+	})
+	upstreamAuth := &auth.Auth{
+		ID:       "auth-deepseek-1",
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":     server.URL + "/v1",
+			"api_key":      "test",
+			"compat_kind":  "deepseek",
+			"compat_name":  "deepseek-official",
+			"provider_key": "deepseek",
+		},
+	}
+	ctx := logging.WithRequestID(context.Background(), "req-deepseek-1")
+
+	_, err := executor.Execute(ctx, upstreamAuth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[
+				{"role":"system","content":[{"type":"text","text":"system"}]},
+				{"role":"assistant","reasoning_content":"plan","content":[{"type":"text","text":"calling"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"path\":\"README.md\"}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"},
+				{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"https://cdn.example.com/a.png"}}]}
+			],
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+			"tool_choice":{"type":"auto"},
+			"thinking":{"type":"enabled"},
+			"reasoning_effort":"max"
+		}`),
+	}, cliproxyexecutor.Options{
+		Headers: http.Header{
+			"X-Newapi-Channel-Id": []string{"8"},
+		},
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/chat/completions",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected upstream 400 error")
+	}
+
+	entry := findCompatibilityDiagnosticEntry(t, hook.AllEntries())
+	if got := entry.Data["request_id"]; got != "req-deepseek-1" {
+		t.Fatalf("request_id = %#v, want req-deepseek-1", got)
+	}
+	if got := entry.Data["compat_kind"]; got != "deepseek" {
+		t.Fatalf("compat_kind = %#v, want deepseek", got)
+	}
+	if got := entry.Data["channel"]; got != "8" {
+		t.Fatalf("channel = %#v, want 8", got)
+	}
+	if got := entry.Data["message_count"]; got != 4 {
+		t.Fatalf("message_count = %#v, want 4", got)
+	}
+	if !logFieldContains(entry.Data["message_roles"], "assistant:1") {
+		t.Fatalf("message_roles should contain assistant:1, got %#v", entry.Data["message_roles"])
+	}
+	if !logFieldContains(entry.Data["message_roles"], "tool:1") {
+		t.Fatalf("message_roles should contain tool:1, got %#v", entry.Data["message_roles"])
+	}
+	if !logFieldContains(entry.Data["content_part_types"], "text:3") {
+		t.Fatalf("content_part_types should contain text:3, got %#v", entry.Data["content_part_types"])
+	}
+	if !logFieldContains(entry.Data["content_part_types"], "image_url:1") {
+		t.Fatalf("content_part_types should contain image_url:1, got %#v", entry.Data["content_part_types"])
+	}
+	if got := entry.Data["tool_definition_count"]; got != 1 {
+		t.Fatalf("tool_definition_count = %#v, want 1", got)
+	}
+	if got := entry.Data["tool_call_count"]; got != 1 {
+		t.Fatalf("tool_call_count = %#v, want 1", got)
+	}
+	if got := entry.Data["tool_result_messages"]; got != 1 {
+		t.Fatalf("tool_result_messages = %#v, want 1", got)
+	}
+	if got := entry.Data["reasoning_messages"]; got != 1 {
+		t.Fatalf("reasoning_messages = %#v, want 1", got)
+	}
+	if got := entry.Data["tool_choice_type"]; got != "auto" {
+		t.Fatalf("tool_choice_type = %#v, want auto", got)
+	}
+	if got := entry.Data["thinking_type"]; got != "enabled" {
+		t.Fatalf("thinking_type = %#v, want enabled", got)
+	}
+	if got := entry.Data["reasoning_effort"]; got != "max" {
+		t.Fatalf("reasoning_effort = %#v, want max", got)
+	}
+	if got := entry.Data["upstream_request_id"]; got != "deepseek-log-1" {
+		t.Fatalf("upstream_request_id = %#v, want deepseek-log-1", got)
+	}
+	if got := entry.Data["upstream_error_code"]; got != "invalid_request_error" {
+		t.Fatalf("upstream_error_code = %#v, want invalid_request_error", got)
+	}
+	if _, exists := entry.Data["payload"]; exists {
+		t.Fatal("diagnostic log should not include raw payload")
+	}
+}
+
 func findCompatibilityDiagnosticEntry(t *testing.T, entries []*log.Entry) *log.Entry {
 	t.Helper()
 	for i := len(entries) - 1; i >= 0; i-- {
