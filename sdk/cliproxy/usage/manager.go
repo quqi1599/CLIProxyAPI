@@ -105,14 +105,18 @@ type FailureDiagnostic struct {
 	Channel             string
 	CompatName          string
 	CompatKind          string
+	CompatKindSource    string
 	CompatMapping       string
 	UpstreamRequestID   string
+	PayloadBytes        int
 	PayloadFields       string
 	MessageRoles        string
 	MessageRoleSequence string
 	MessageContentKinds string
 	ContentPartTypes    string
 	InputItemTypes      string
+	Temperature         string
+	TopP                string
 	ToolChoiceType      string
 	ThinkingType        string
 	ResponseFormatType  string
@@ -120,10 +124,17 @@ type FailureDiagnostic struct {
 	AddedFields         string
 	RemovedFields       string
 	ModifiedFields      string
+	ToolDefinitionCount int
+	ToolCallCount       int
 	AssistantToolCalls  int
 	ToolResultMessages  int
 	ReasoningMessages   int
+	MaxTokens           int
+	MaxCompletionTokens int
+	MaxOutputTokens     int
+	ThinkingBudget      int
 	MaxContentParts     int
+	StopCount           int
 }
 
 // RequestFinal stores the final outcome for one client request.
@@ -376,14 +387,18 @@ func (d FailureDiagnostic) HasData() bool {
 	return d.Channel != "" ||
 		d.CompatName != "" ||
 		d.CompatKind != "" ||
+		d.CompatKindSource != "" ||
 		d.CompatMapping != "" ||
 		d.UpstreamRequestID != "" ||
+		d.PayloadBytes > 0 ||
 		d.PayloadFields != "" ||
 		d.MessageRoles != "" ||
 		d.MessageRoleSequence != "" ||
 		d.MessageContentKinds != "" ||
 		d.ContentPartTypes != "" ||
 		d.InputItemTypes != "" ||
+		d.Temperature != "" ||
+		d.TopP != "" ||
 		d.ToolChoiceType != "" ||
 		d.ThinkingType != "" ||
 		d.ResponseFormatType != "" ||
@@ -391,16 +406,24 @@ func (d FailureDiagnostic) HasData() bool {
 		d.AddedFields != "" ||
 		d.RemovedFields != "" ||
 		d.ModifiedFields != "" ||
+		d.ToolDefinitionCount > 0 ||
+		d.ToolCallCount > 0 ||
 		d.AssistantToolCalls > 0 ||
 		d.ToolResultMessages > 0 ||
 		d.ReasoningMessages > 0 ||
-		d.MaxContentParts > 0
+		d.MaxTokens > 0 ||
+		d.MaxCompletionTokens > 0 ||
+		d.MaxOutputTokens > 0 ||
+		d.ThinkingBudget > 0 ||
+		d.MaxContentParts > 0 ||
+		d.StopCount > 0
 }
 
 func normalizeFailureDiagnostic(diag FailureDiagnostic) FailureDiagnostic {
 	diag.Channel = strings.TrimSpace(diag.Channel)
 	diag.CompatName = strings.TrimSpace(diag.CompatName)
 	diag.CompatKind = strings.TrimSpace(diag.CompatKind)
+	diag.CompatKindSource = strings.TrimSpace(diag.CompatKindSource)
 	diag.CompatMapping = strings.TrimSpace(diag.CompatMapping)
 	diag.UpstreamRequestID = strings.TrimSpace(diag.UpstreamRequestID)
 	diag.PayloadFields = strings.TrimSpace(diag.PayloadFields)
@@ -409,6 +432,8 @@ func normalizeFailureDiagnostic(diag FailureDiagnostic) FailureDiagnostic {
 	diag.MessageContentKinds = strings.TrimSpace(diag.MessageContentKinds)
 	diag.ContentPartTypes = strings.TrimSpace(diag.ContentPartTypes)
 	diag.InputItemTypes = strings.TrimSpace(diag.InputItemTypes)
+	diag.Temperature = strings.TrimSpace(diag.Temperature)
+	diag.TopP = strings.TrimSpace(diag.TopP)
 	diag.ToolChoiceType = strings.TrimSpace(diag.ToolChoiceType)
 	diag.ThinkingType = strings.TrimSpace(diag.ThinkingType)
 	diag.ResponseFormatType = strings.TrimSpace(diag.ResponseFormatType)
@@ -425,8 +450,32 @@ func normalizeFailureDiagnostic(diag FailureDiagnostic) FailureDiagnostic {
 	if diag.ReasoningMessages < 0 {
 		diag.ReasoningMessages = 0
 	}
+	if diag.PayloadBytes < 0 {
+		diag.PayloadBytes = 0
+	}
+	if diag.ToolDefinitionCount < 0 {
+		diag.ToolDefinitionCount = 0
+	}
+	if diag.ToolCallCount < 0 {
+		diag.ToolCallCount = 0
+	}
+	if diag.MaxTokens < 0 {
+		diag.MaxTokens = 0
+	}
+	if diag.MaxCompletionTokens < 0 {
+		diag.MaxCompletionTokens = 0
+	}
+	if diag.MaxOutputTokens < 0 {
+		diag.MaxOutputTokens = 0
+	}
+	if diag.ThinkingBudget < 0 {
+		diag.ThinkingBudget = 0
+	}
 	if diag.MaxContentParts < 0 {
 		diag.MaxContentParts = 0
+	}
+	if diag.StopCount < 0 {
+		diag.StopCount = 0
 	}
 	return diag
 }

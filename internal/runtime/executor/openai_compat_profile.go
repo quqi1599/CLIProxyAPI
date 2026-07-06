@@ -1134,6 +1134,8 @@ type openAICompatPayloadDiagnostic struct {
 	CompatMapping       string
 	PayloadSize         int
 	PayloadFields       []string
+	Temperature         string
+	TopP                string
 	AddedFields         []string
 	RemovedFields       []string
 	ModifiedFields      []string
@@ -1155,6 +1157,11 @@ type openAICompatPayloadDiagnostic struct {
 	ResponseFormatType  string
 	ParallelToolCalls   string
 	InputItemTypes      []string
+	MaxTokens           int
+	MaxCompletionTokens int
+	MaxOutputTokens     int
+	ThinkingBudget      int
+	StopCount           int
 	UpstreamRequestID   string
 }
 
@@ -1223,14 +1230,18 @@ func (d openAICompatPayloadDiagnostic) failureDiagnostic() cliproxyusage.Failure
 		Channel:             d.Channel,
 		CompatName:          d.CompatName,
 		CompatKind:          d.CompatKind,
+		CompatKindSource:    d.CompatKindSource,
 		CompatMapping:       d.CompatMapping,
 		UpstreamRequestID:   d.UpstreamRequestID,
+		PayloadBytes:        d.PayloadSize,
 		PayloadFields:       strings.Join(d.PayloadFields, ","),
 		MessageRoles:        strings.Join(d.MessageRoles, ","),
 		MessageRoleSequence: d.MessageRoleSequence,
 		MessageContentKinds: strings.Join(d.MessageContentKinds, ","),
 		ContentPartTypes:    strings.Join(d.ContentPartTypes, ","),
 		InputItemTypes:      strings.Join(d.InputItemTypes, ","),
+		Temperature:         d.Temperature,
+		TopP:                d.TopP,
 		ToolChoiceType:      d.ToolChoiceType,
 		ThinkingType:        d.ThinkingType,
 		ResponseFormatType:  d.ResponseFormatType,
@@ -1238,10 +1249,17 @@ func (d openAICompatPayloadDiagnostic) failureDiagnostic() cliproxyusage.Failure
 		AddedFields:         strings.Join(d.AddedFields, ","),
 		RemovedFields:       strings.Join(d.RemovedFields, ","),
 		ModifiedFields:      strings.Join(d.ModifiedFields, ","),
+		ToolDefinitionCount: d.ToolDefinitionCount,
+		ToolCallCount:       d.ToolCallCount,
 		AssistantToolCalls:  d.AssistantToolCalls,
 		ToolResultMessages:  d.ToolResultMessages,
 		ReasoningMessages:   d.ReasoningMessages,
+		MaxTokens:           d.MaxTokens,
+		MaxCompletionTokens: d.MaxCompletionTokens,
+		MaxOutputTokens:     d.MaxOutputTokens,
+		ThinkingBudget:      d.ThinkingBudget,
 		MaxContentParts:     d.MaxContentParts,
+		StopCount:           d.StopCount,
 	}
 }
 
@@ -1297,19 +1315,7 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 				contentKind = content.Type.String()
 			}
 			contentKindCounts[contentKind]++
-			if !content.Exists() || !content.IsArray() {
-				continue
-			}
-			if parts := len(content.Array()); parts > diag.MaxContentParts {
-				diag.MaxContentParts = parts
-			}
-			for _, part := range content.Array() {
-				partType := strings.TrimSpace(part.Get("type").String())
-				if partType == "" {
-					partType = "text"
-				}
-				partCounts[partType]++
-			}
+			collectOpenAICompatContentPartTypes(content, partCounts, &diag.MaxContentParts, false)
 		}
 	}
 
@@ -1363,7 +1369,26 @@ func populateOpenAICompatPayloadDiagnosticShape(diag *openAICompatPayloadDiagnos
 				itemType = "message"
 			}
 			inputTypeCounts[itemType]++
+			collectOpenAICompatInputItemPartTypes(item, itemType, partCounts, &diag.MaxContentParts)
 		}
+	}
+
+	diag.Temperature = openAICompatScalarStringValue(gjson.GetBytes(payload, "temperature"))
+	diag.TopP = openAICompatScalarStringValue(gjson.GetBytes(payload, "top_p"))
+	if value, ok := firstOpenAICompatIntegerValue(payload, "max_tokens"); ok {
+		diag.MaxTokens = int(value)
+	}
+	if value, ok := firstOpenAICompatIntegerValue(payload, "max_completion_tokens"); ok {
+		diag.MaxCompletionTokens = int(value)
+	}
+	if value, ok := firstOpenAICompatIntegerValue(payload, "max_output_tokens"); ok {
+		diag.MaxOutputTokens = int(value)
+	}
+	if value, ok := firstOpenAICompatIntegerValue(payload, "thinking_budget", "thinking.budget_tokens"); ok {
+		diag.ThinkingBudget = int(value)
+	}
+	if stopCount := openAICompatStopCount(gjson.GetBytes(payload, "stop")); stopCount > 0 {
+		diag.StopCount = stopCount
 	}
 
 	diag.MessageRoles = sortedCountLabels(roleCounts)
@@ -1383,6 +1408,86 @@ func compactRoleSequence(roles []string, total int) string {
 		return fmt.Sprintf("%s>(+%d more)", sequence, total-len(roles))
 	}
 	return sequence
+}
+
+func collectOpenAICompatContentPartTypes(content gjson.Result, partCounts map[string]int, maxParts *int, includeScalarText bool) {
+	if partCounts == nil || !content.Exists() {
+		return
+	}
+	switch {
+	case content.IsArray():
+		parts := content.Array()
+		if maxParts != nil && len(parts) > *maxParts {
+			*maxParts = len(parts)
+		}
+		for _, part := range parts {
+			partType := strings.TrimSpace(part.Get("type").String())
+			if partType == "" {
+				partType = "text"
+			}
+			partCounts[partType]++
+		}
+	case includeScalarText && content.Type == gjson.String:
+		if strings.TrimSpace(content.String()) != "" {
+			partCounts["text"]++
+		}
+	case includeScalarText && content.IsObject():
+		partType := strings.TrimSpace(content.Get("type").String())
+		if partType == "" && strings.TrimSpace(content.Get("text").String()) != "" {
+			partType = "text"
+		}
+		if partType != "" {
+			partCounts[partType]++
+		}
+	}
+}
+
+func collectOpenAICompatInputItemPartTypes(item gjson.Result, itemType string, partCounts map[string]int, maxParts *int) {
+	if partCounts == nil || !item.Exists() {
+		return
+	}
+	content := item.Get("content")
+	if content.Exists() {
+		collectOpenAICompatContentPartTypes(content, partCounts, maxParts, true)
+		return
+	}
+	switch itemType {
+	case "input_text", "input_image", "input_audio", "text", "image_url", "audio":
+		partCounts[itemType]++
+	}
+}
+
+func openAICompatScalarStringValue(value gjson.Result) string {
+	if !value.Exists() {
+		return ""
+	}
+	switch value.Type {
+	case gjson.String:
+		return strings.TrimSpace(value.String())
+	case gjson.Number, gjson.True, gjson.False:
+		return strings.TrimSpace(value.Raw)
+	default:
+		return ""
+	}
+}
+
+func openAICompatStopCount(value gjson.Result) int {
+	if !value.Exists() {
+		return 0
+	}
+	switch {
+	case value.IsArray():
+		return len(value.Array())
+	case value.Type == gjson.String:
+		if strings.TrimSpace(value.String()) != "" {
+			return 1
+		}
+	default:
+		if strings.TrimSpace(value.Raw) != "" {
+			return 1
+		}
+	}
+	return 0
 }
 
 func sortedCountLabels(counts map[string]int) []string {

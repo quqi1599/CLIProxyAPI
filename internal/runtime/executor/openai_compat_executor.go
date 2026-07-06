@@ -404,11 +404,32 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	if diagnostic.ReasoningEffort != "" {
 		fields["reasoning_effort"] = diagnostic.ReasoningEffort
 	}
+	if diagnostic.Temperature != "" {
+		fields["payload_temperature"] = diagnostic.Temperature
+	}
+	if diagnostic.TopP != "" {
+		fields["payload_top_p"] = diagnostic.TopP
+	}
 	if diagnostic.ResponseFormatType != "" {
 		fields["response_format_type"] = diagnostic.ResponseFormatType
 	}
 	if diagnostic.ParallelToolCalls != "" {
 		fields["parallel_tool_calls"] = diagnostic.ParallelToolCalls
+	}
+	if diagnostic.MaxTokens > 0 {
+		fields["payload_max_tokens"] = diagnostic.MaxTokens
+	}
+	if diagnostic.MaxCompletionTokens > 0 {
+		fields["payload_max_completion_tokens"] = diagnostic.MaxCompletionTokens
+	}
+	if diagnostic.MaxOutputTokens > 0 {
+		fields["payload_max_output_tokens"] = diagnostic.MaxOutputTokens
+	}
+	if diagnostic.ThinkingBudget > 0 {
+		fields["payload_thinking_budget"] = diagnostic.ThinkingBudget
+	}
+	if diagnostic.StopCount > 0 {
+		fields["payload_stop_count"] = diagnostic.StopCount
 	}
 	if len(diagnostic.InputItemTypes) > 0 {
 		fields["input_item_types"] = diagnostic.InputItemTypes

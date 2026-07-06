@@ -203,24 +203,35 @@ func TestFailureMetadataLoggerIncludesFailureDiagnosticFields(t *testing.T) {
 		Channel:             "8",
 		CompatName:          "deepseek-official",
 		CompatKind:          "deepseek",
+		CompatKindSource:    "base_url_inference",
 		CompatMapping:       "deepseek_v4_via_doubao_volcengine",
 		UpstreamRequestID:   "deepseek-log-1",
+		PayloadBytes:        2048,
 		PayloadFields:       "messages,model,reasoning_effort",
 		MessageRoles:        "assistant:1,system:1,tool:1,user:1",
 		MessageRoleSequence: "system>assistant>tool>user",
 		MessageContentKinds: "array:3,string:1",
 		ContentPartTypes:    "image_url:1,text:3",
 		InputItemTypes:      "message:4",
+		Temperature:         "0.6",
+		TopP:                "0.95",
 		ThinkingType:        "enabled",
 		ResponseFormatType:  "json_schema",
 		ParallelToolCalls:   "false",
 		AddedFields:         "thinking",
 		RemovedFields:       "tool_choice",
 		ModifiedFields:      "messages,tools",
+		ToolDefinitionCount: 4,
+		ToolCallCount:       2,
 		AssistantToolCalls:  1,
 		ToolResultMessages:  1,
 		ReasoningMessages:   1,
+		MaxTokens:           8192,
+		MaxCompletionTokens: 4096,
+		MaxOutputTokens:     2048,
+		ThinkingBudget:      512,
 		MaxContentParts:     2,
+		StopCount:           2,
 	})
 
 	plugin := &FailureMetadataLogger{}
@@ -243,24 +254,35 @@ func TestFailureMetadataLoggerIncludesFailureDiagnosticFields(t *testing.T) {
 	requireJSONField(t, payload, "channel", "8")
 	requireJSONField(t, payload, "compat_name", "deepseek-official")
 	requireJSONField(t, payload, "compat_kind", "deepseek")
+	requireJSONField(t, payload, "compat_kind_source", "base_url_inference")
 	requireJSONField(t, payload, "compat_mapping", "deepseek_v4_via_doubao_volcengine")
 	requireJSONField(t, payload, "upstream_request_id", "deepseek-log-1")
+	requireJSONNumberField(t, payload, "payload_bytes", 2048)
 	requireJSONField(t, payload, "payload_fields", "messages,model,reasoning_effort")
 	requireJSONField(t, payload, "message_roles", "assistant:1,system:1,tool:1,user:1")
 	requireJSONField(t, payload, "message_role_sequence", "system>assistant>tool>user")
 	requireJSONField(t, payload, "message_content_kinds", "array:3,string:1")
 	requireJSONField(t, payload, "content_part_types", "image_url:1,text:3")
 	requireJSONField(t, payload, "input_item_types", "message:4")
+	requireJSONField(t, payload, "payload_temperature", "0.6")
+	requireJSONField(t, payload, "payload_top_p", "0.95")
 	requireJSONField(t, payload, "thinking_type", "enabled")
 	requireJSONField(t, payload, "response_format_type", "json_schema")
 	requireJSONField(t, payload, "parallel_tool_calls", "false")
 	requireJSONField(t, payload, "added_fields", "thinking")
 	requireJSONField(t, payload, "removed_fields", "tool_choice")
 	requireJSONField(t, payload, "modified_fields", "messages,tools")
+	requireJSONNumberField(t, payload, "tool_definition_count", 4)
+	requireJSONNumberField(t, payload, "tool_call_count", 2)
 	requireJSONNumberField(t, payload, "assistant_tool_call_messages", 1)
 	requireJSONNumberField(t, payload, "tool_result_messages", 1)
 	requireJSONNumberField(t, payload, "reasoning_messages", 1)
+	requireJSONNumberField(t, payload, "payload_max_tokens", 8192)
+	requireJSONNumberField(t, payload, "payload_max_completion_tokens", 4096)
+	requireJSONNumberField(t, payload, "payload_max_output_tokens", 2048)
+	requireJSONNumberField(t, payload, "payload_thinking_budget", 512)
 	requireJSONNumberField(t, payload, "max_content_parts", 2)
+	requireJSONNumberField(t, payload, "payload_stop_count", 2)
 }
 
 func TestFailureMetadataLoggerSkipsSuccessfulRecords(t *testing.T) {

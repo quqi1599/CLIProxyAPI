@@ -180,11 +180,17 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	if diag.CompatKind != "" {
 		fields["compat_kind"] = safeFailureMetadataString(diag.CompatKind)
 	}
+	if diag.CompatKindSource != "" {
+		fields["compat_kind_source"] = safeFailureMetadataString(diag.CompatKindSource)
+	}
 	if diag.CompatMapping != "" {
 		fields["compat_mapping"] = safeFailureMetadataString(diag.CompatMapping)
 	}
 	if diag.UpstreamRequestID != "" {
 		fields["upstream_request_id"] = safeFailureMetadataString(diag.UpstreamRequestID)
+	}
+	if diag.PayloadBytes > 0 {
+		fields["payload_bytes"] = diag.PayloadBytes
 	}
 	if diag.PayloadFields != "" {
 		fields["payload_fields"] = safeFailureMetadataString(diag.PayloadFields)
@@ -203,6 +209,12 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	}
 	if diag.InputItemTypes != "" {
 		fields["input_item_types"] = safeFailureMetadataString(diag.InputItemTypes)
+	}
+	if diag.Temperature != "" {
+		fields["payload_temperature"] = safeFailureMetadataString(diag.Temperature)
+	}
+	if diag.TopP != "" {
+		fields["payload_top_p"] = safeFailureMetadataString(diag.TopP)
 	}
 	if diag.ToolChoiceType != "" {
 		fields["tool_choice_type"] = safeFailureMetadataString(diag.ToolChoiceType)
@@ -225,6 +237,12 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	if diag.ModifiedFields != "" {
 		fields["modified_fields"] = safeFailureMetadataString(diag.ModifiedFields)
 	}
+	if diag.ToolDefinitionCount > 0 {
+		fields["tool_definition_count"] = diag.ToolDefinitionCount
+	}
+	if diag.ToolCallCount > 0 {
+		fields["tool_call_count"] = diag.ToolCallCount
+	}
 	if diag.AssistantToolCalls > 0 {
 		fields["assistant_tool_call_messages"] = diag.AssistantToolCalls
 	}
@@ -234,8 +252,23 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 	if diag.ReasoningMessages > 0 {
 		fields["reasoning_messages"] = diag.ReasoningMessages
 	}
+	if diag.MaxTokens > 0 {
+		fields["payload_max_tokens"] = diag.MaxTokens
+	}
+	if diag.MaxCompletionTokens > 0 {
+		fields["payload_max_completion_tokens"] = diag.MaxCompletionTokens
+	}
+	if diag.MaxOutputTokens > 0 {
+		fields["payload_max_output_tokens"] = diag.MaxOutputTokens
+	}
+	if diag.ThinkingBudget > 0 {
+		fields["payload_thinking_budget"] = diag.ThinkingBudget
+	}
 	if diag.MaxContentParts > 0 {
 		fields["max_content_parts"] = diag.MaxContentParts
+	}
+	if diag.StopCount > 0 {
+		fields["payload_stop_count"] = diag.StopCount
 	}
 }
 
