@@ -7302,6 +7302,11 @@ func isRequestScopedFeatureUnsupportedMessage(message string) bool {
 	return false
 }
 
+func isDeepSeekOfficialImageInputMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(lower, "deepseek_official_image_input")
+}
+
 func isLargeClaudeCompatToolHistoryMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	return strings.Contains(lower, "large_claude_tool_history")
@@ -7757,6 +7762,10 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	if isLargeClaudeCompatToolHistoryMessage(err.Error()) {
+		status := statusCodeFromError(err)
+		return status == 0 || status == http.StatusBadRequest
+	}
+	if isDeepSeekOfficialImageInputMessage(err.Error()) {
 		status := statusCodeFromError(err)
 		return status == 0 || status == http.StatusBadRequest
 	}

@@ -3367,6 +3367,21 @@ func TestGenericChineseContentSafetyDoesNotFallbackForConfiguredRouteModels(t *t
 	}
 }
 
+func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
+	err := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    "request_feature_unsupported: deepseek_official_image_input. 当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容",
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected deepseek official image input error to be request invalid")
+	}
+	for _, model := range []string{"deepseek-v4-pro", "claude-sonnet-4-6", "glm-4.7"} {
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected deepseek official image input to stop fallback for %s", model)
+		}
+	}
+}
+
 func TestManager_Execute_ClaudeSonnetAliasContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
