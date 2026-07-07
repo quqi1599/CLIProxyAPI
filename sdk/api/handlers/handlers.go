@@ -519,6 +519,7 @@ func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, 
 		return
 	}
 	meta[coreexecutor.ReasoningEffortMetadataKey] = effort
+	meta[coreexecutor.ReasoningEffortOriginalMetadataKey] = effort
 }
 
 func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {

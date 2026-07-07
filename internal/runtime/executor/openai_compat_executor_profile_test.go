@@ -1526,6 +1526,44 @@ func TestOpenAICompatPayloadDeepSeekReasoningNoneDisablesThinking(t *testing.T) 
 	}
 }
 
+func TestOpenAICompatPayloadDeepSeekResponsesReasoningNoneDisablesThinking(t *testing.T) {
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":"hi",
+		"reasoning":{"effort":"none"}
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, genericOpenAICompatProfile(), "deepseek-v4-pro", "https://api.deepseek.com/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, string(out))
+	}
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be removed when disabling DeepSeek thinking: %s", path, string(out))
+		}
+	}
+}
+
+func TestOpenAICompatPayloadDeepSeekReasoningAutoUsesProviderDefault(t *testing.T) {
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"user","content":"hi"}],
+		"reasoning_effort":"auto"
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, genericOpenAICompatProfile(), "deepseek-v4-pro", "https://api.deepseek.com/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(out))
+	}
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be removed when using DeepSeek provider default effort: %s", path, string(out))
+		}
+	}
+}
+
 func TestOpenAICompatPayloadDeepSeekBudgetScrubSkipsOtherCompatProfiles(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek-v4-pro",

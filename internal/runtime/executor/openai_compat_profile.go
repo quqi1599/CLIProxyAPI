@@ -1681,6 +1681,7 @@ func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL 
 	}
 
 	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()), "disabled") {
+		payload = stripOpenAICompatReasoningEffort(payload)
 		payload = deleteDeepSeekThinkingBudgetPaths(payload)
 		return payload
 	}
@@ -1689,18 +1690,41 @@ func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL 
 		payload = normalizeDeepSeekThinkingBudgetPath(payload, path)
 	}
 
-	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "reasoning_effort").String()))
+	effortPath, effort := deepSeekReasoningEffortPath(payload)
 	normalizedEffort := thinking.NormalizeDeepSeekOfficialReasoningEffort(effort)
 	switch normalizedEffort {
 	case "none", "disabled", "off":
 		payload, _ = sjson.SetBytes(payload, "thinking.type", "disabled")
-		payload, _ = sjson.DeleteBytes(payload, "reasoning_effort")
+		payload = stripOpenAICompatReasoningEffort(payload)
 		payload = deleteDeepSeekThinkingBudgetPaths(payload)
+	case "auto", "adaptive", "enabled", "enable", "true":
+		payload, _ = sjson.SetBytes(payload, "thinking.type", "enabled")
+		payload = stripOpenAICompatReasoningEffort(payload)
 	case "high", "max":
-		payload, _ = sjson.SetBytes(payload, "reasoning_effort", normalizedEffort)
+		switch effortPath {
+		case "reasoning.effort":
+			payload, _ = sjson.SetBytes(payload, effortPath, normalizedEffort)
+		case "thinking.reasoning_effort":
+			payload, _ = sjson.SetBytes(payload, "reasoning_effort", normalizedEffort)
+			if updated, err := sjson.DeleteBytes(payload, effortPath); err == nil {
+				payload = updated
+			}
+		default:
+			payload, _ = sjson.SetBytes(payload, "reasoning_effort", normalizedEffort)
+		}
 	}
 
 	return payload
+}
+
+func deepSeekReasoningEffortPath(payload []byte) (string, string) {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, path).String()))
+		if value != "" {
+			return path, value
+		}
+	}
+	return "", ""
 }
 
 func requiresDeepSeekThinkingBudgetCompatibility(model string, baseURL string, compatKind string) bool {

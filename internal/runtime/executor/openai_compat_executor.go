@@ -1200,7 +1200,7 @@ func openAICompatReasoningDisabled(raw string) bool {
 }
 
 func stripOpenAICompatReasoningEffort(payload []byte) []byte {
-	for _, path := range []string{"reasoning_effort", "thinking.reasoning_effort"} {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
 		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
 			payload = updated
 		}

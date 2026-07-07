@@ -46,6 +46,9 @@ func TestSetReasoningEffortMetadataUsesSuffixOverBody(t *testing.T) {
 	if got := meta[coreexecutor.ReasoningEffortMetadataKey]; got != "high" {
 		t.Fatalf("ReasoningEffortMetadataKey = %v, want %q", got, "high")
 	}
+	if got := meta[coreexecutor.ReasoningEffortOriginalMetadataKey]; got != "high" {
+		t.Fatalf("ReasoningEffortOriginalMetadataKey = %v, want %q", got, "high")
+	}
 }
 
 func TestSetReasoningEffortMetadataSupportsOpenAIResponses(t *testing.T) {
@@ -55,6 +58,9 @@ func TestSetReasoningEffortMetadataSupportsOpenAIResponses(t *testing.T) {
 
 	if got := meta[coreexecutor.ReasoningEffortMetadataKey]; got != "medium" {
 		t.Fatalf("ReasoningEffortMetadataKey = %v, want %q", got, "medium")
+	}
+	if got := meta[coreexecutor.ReasoningEffortOriginalMetadataKey]; got != "medium" {
+		t.Fatalf("ReasoningEffortOriginalMetadataKey = %v, want %q", got, "medium")
 	}
 }
 
