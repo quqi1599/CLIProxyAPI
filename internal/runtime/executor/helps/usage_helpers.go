@@ -826,16 +826,6 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	return parseGeminiFamilyUsageDetail(node), true
 }
 
-func firstExistingUsageNode(root gjson.Result, paths ...string) gjson.Result {
-	for _, path := range paths {
-		node := root.Get(path)
-		if node.Exists() {
-			return node
-		}
-	}
-	return gjson.Result{}
-}
-
 func ParseAntigravityUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data)
 	node := usageNode.Get("response.usageMetadata")

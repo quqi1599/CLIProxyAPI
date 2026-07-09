@@ -195,31 +195,6 @@ func gcdInt64(a int64, b int64) int64 {
 	return a
 }
 
-func buildMiniMaxImageMultipartJSON(c *gin.Context, model string, prompt string, responseFormat string) []byte {
-	raw := []byte(`{"model":"","prompt":""}`)
-	raw, _ = sjson.SetBytes(raw, "model", model)
-	raw, _ = sjson.SetBytes(raw, "prompt", prompt)
-	if strings.TrimSpace(responseFormat) != "" {
-		raw, _ = sjson.SetBytes(raw, "response_format", strings.TrimSpace(responseFormat))
-	}
-	for _, field := range []string{"size", "aspect_ratio"} {
-		if v := strings.TrimSpace(c.PostForm(field)); v != "" {
-			raw, _ = sjson.SetBytes(raw, field, v)
-		}
-	}
-	for _, field := range []string{"n", "seed", "width", "height"} {
-		if v := strings.TrimSpace(c.PostForm(field)); v != "" {
-			raw, _ = sjson.SetBytes(raw, field, parseIntField(v, 0))
-		}
-	}
-	for _, field := range []string{"prompt_optimizer", "aigc_watermark"} {
-		if v := strings.TrimSpace(c.PostForm(field)); v != "" {
-			raw, _ = sjson.SetBytes(raw, field, parseBoolField(v, false))
-		}
-	}
-	return raw
-}
-
 func (h *OpenAIAPIHandler) collectMiniMaxImages(c *gin.Context, miniMaxReq []byte, imageModel string) {
 	c.Header("Content-Type", "application/json")
 

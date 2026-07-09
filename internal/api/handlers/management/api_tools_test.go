@@ -656,7 +656,6 @@ func TestAPICallStreamReturnsErrorEventOnReadFailure(t *testing.T) {
 func performAPICallRequest(t *testing.T, h *Handler, payload apiCallRequest) *httptest.ResponseRecorder {
 	t.Helper()
 
-	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 

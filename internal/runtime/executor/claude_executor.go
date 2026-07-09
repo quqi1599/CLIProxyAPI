@@ -1925,10 +1925,6 @@ func isUnsupportedClaudeServerToolForCompat(compatKind string, toolType string, 
 	return !hasInputSchema
 }
 
-func downgradeClaudeToolSearchContent(content []any) ([]any, bool) {
-	return downgradeClaudeToolSearchContentForCompat("", "", content)
-}
-
 func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, content []any) ([]any, bool) {
 	cleaned := make([]any, 0, len(content))
 	changed := false
@@ -2349,10 +2345,6 @@ func claudeToolResultContentIsEmpty(toolContent gjson.Result) bool {
 		}
 	}
 	return true
-}
-
-func repairMiniMaxClaudeToolAdjacency(baseURL string, body []byte) ([]byte, error) {
-	return repairMiniMaxClaudeToolAdjacencyForCompat(config.InferCompatKindFromBaseURL(baseURL), body)
 }
 
 type compatRepairLogMeta struct {

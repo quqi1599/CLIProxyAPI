@@ -282,16 +282,8 @@ func miniMaxRoutingDeclaredToolCount(payload []byte) int {
 	return len(tools.Array())
 }
 
-func miniMaxRequestHasImageInput(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
-	return requestHasMiniMaxM3ImageInput(miniMaxRoutingPayload(req, opts))
-}
-
 func requestHasMiniMaxM3ImageInput(payload []byte) bool {
 	return requestHasMiniMaxM3PartType(payload, isMiniMaxM3ImagePartType)
-}
-
-func requestHasMiniMaxM3MultimodalInput(payload []byte) bool {
-	return requestHasMiniMaxM3PartType(payload, isMiniMaxM3MultimodalPartType)
 }
 
 func requestHasMiniMaxM3PartType(payload []byte, match func(string) bool) bool {
@@ -339,13 +331,6 @@ func isMiniMaxM3MultimodalPartType(partType string) bool {
 	default:
 		return false
 	}
-}
-
-func miniMaxRequestExceedsM2SafeContext(payload []byte) bool {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return false
-	}
-	return miniMaxParsedRequestExceedsM2SafeContext(payload, gjson.ParseBytes(payload))
 }
 
 func miniMaxParsedRequestExceedsM2SafeContext(payload []byte, root gjson.Result) bool {

@@ -8,12 +8,9 @@ import (
 	"runtime"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/skratchdot/open-golang/open"
 )
 
 // OpenURL opens the specified URL in the default web browser.
-// It first attempts to use a platform-agnostic library and falls back to
-// platform-specific commands if that fails.
 //
 // Parameters:
 //   - url: The URL to open.
@@ -21,18 +18,7 @@ import (
 // Returns:
 //   - An error if the URL cannot be opened, otherwise nil.
 func OpenURL(url string) error {
-	fmt.Printf("Attempting to open URL in browser: %s\n", url)
-
-	// Try using the open-golang library first
-	err := open.Run(url)
-	if err == nil {
-		log.Debug("Successfully opened URL using open-golang library")
-		return nil
-	}
-
-	log.Debugf("open-golang failed: %v, trying platform-specific commands", err)
-
-	// Fallback to platform-specific commands
+	log.Debug("Attempting to open URL in browser")
 	return openURLPlatformSpecific(url)
 }
 
@@ -68,7 +54,8 @@ func openURLPlatformSpecific(url string) error {
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
 
-	log.Debugf("Running command: %s %v", cmd.Path, cmd.Args[1:])
+	// OAuth callback URLs can contain short-lived secrets; never include arguments in logs.
+	log.Debugf("Running browser command: %s", cmd.Path)
 	err := cmd.Start()
 	if err != nil {
 		return fmt.Errorf("failed to start browser command: %w", err)
@@ -84,13 +71,6 @@ func openURLPlatformSpecific(url string) error {
 // Returns:
 //   - true if a browser can be opened, false otherwise.
 func IsAvailable() bool {
-	// First check if open-golang can work
-	testErr := open.Run("about:blank")
-	if testErr == nil {
-		return true
-	}
-
-	// Check platform-specific commands
 	switch runtime.GOOS {
 	case "darwin":
 		_, err := exec.LookPath("open")
@@ -109,38 +89,4 @@ func IsAvailable() bool {
 	default:
 		return false
 	}
-}
-
-// GetPlatformInfo returns a map containing details about the current platform's
-// browser opening capabilities, including the OS, architecture, and available commands.
-//
-// Returns:
-//   - A map with platform-specific browser support information.
-func GetPlatformInfo() map[string]interface{} {
-	info := map[string]interface{}{
-		"os":        runtime.GOOS,
-		"arch":      runtime.GOARCH,
-		"available": IsAvailable(),
-	}
-
-	switch runtime.GOOS {
-	case "darwin":
-		info["default_command"] = "open"
-	case "windows":
-		info["default_command"] = "rundll32"
-	case "linux":
-		browsers := []string{"xdg-open", "x-www-browser", "www-browser", "firefox", "chromium", "google-chrome"}
-		var availableBrowsers []string
-		for _, browser := range browsers {
-			if _, err := exec.LookPath(browser); err == nil {
-				availableBrowsers = append(availableBrowsers, browser)
-			}
-		}
-		info["available_browsers"] = availableBrowsers
-		if len(availableBrowsers) > 0 {
-			info["default_command"] = availableBrowsers[0]
-		}
-	}
-
-	return info
 }

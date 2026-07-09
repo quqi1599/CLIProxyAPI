@@ -13,7 +13,6 @@ import (
 
 func TestPutOpenAICompat_NormalizesKind(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg:            &config.Config{},
@@ -42,7 +41,6 @@ func TestPutOpenAICompat_NormalizesKind(t *testing.T) {
 
 func TestPutClaudeKeys_RemovesOmittedKeysByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -79,7 +77,6 @@ func TestPutClaudeKeys_RemovesOmittedKeysByDefault(t *testing.T) {
 
 func TestPutClaudeKeys_PreservesServerOnlyFieldsByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -142,7 +139,6 @@ func TestMergeClaudeKeysPreservingMissingKeepsDuplicateIdentities(t *testing.T) 
 
 func TestPutClaudeKeys_ReplaceQueryAllowsRemoval(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -176,7 +172,6 @@ func TestPutClaudeKeys_ReplaceQueryAllowsRemoval(t *testing.T) {
 
 func TestPatchClaudeKey_EmptyAPIKeyDeletesEntry(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -211,7 +206,6 @@ func TestPatchClaudeKey_EmptyAPIKeyDeletesEntry(t *testing.T) {
 
 func TestPatchClaudeKey_UpdatesRoutingFields(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -251,7 +245,6 @@ func TestPatchClaudeKey_UpdatesRoutingFields(t *testing.T) {
 
 func TestPutOpenAICompat_PreservesProviderFieldsByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -302,7 +295,6 @@ func TestPutOpenAICompat_PreservesProviderFieldsByDefault(t *testing.T) {
 
 func TestPutOpenAICompat_RemovesOmittedAPIKeyEntriesByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -344,7 +336,6 @@ func TestPutOpenAICompat_RemovesOmittedAPIKeyEntriesByDefault(t *testing.T) {
 
 func TestPatchOpenAICompat_MergesAPIKeyEntriesByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -387,7 +378,6 @@ func TestPatchOpenAICompat_MergesAPIKeyEntriesByDefault(t *testing.T) {
 
 func TestPatchOpenAICompat_ReplacesMultipleAPIKeyEntriesByDefault(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -434,7 +424,6 @@ func TestPatchOpenAICompat_ReplacesMultipleAPIKeyEntriesByDefault(t *testing.T) 
 
 func TestPatchOpenAICompat_RejectsAmbiguousName(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -466,7 +455,6 @@ func TestPatchOpenAICompat_RejectsAmbiguousName(t *testing.T) {
 
 func TestPatchOpenAICompat_UpdatesDisableCooling(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -498,7 +486,6 @@ func TestPatchOpenAICompat_UpdatesDisableCooling(t *testing.T) {
 
 func TestGetOpenAICompat_IncludesPersistedFields(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{

@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -10,7 +9,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -137,39 +135,6 @@ func hasContextWindowExceededSignal(text string) bool {
 	}
 
 	return false
-}
-
-func recordRequestedModelContext(ctx context.Context, modelName string) {
-	ginCtx, _ := ctx.Value("gin").(*gin.Context)
-	if ginCtx == nil {
-		return
-	}
-	modelName = strings.TrimSpace(modelName)
-	if modelName == "" {
-		return
-	}
-	ginCtx.Set(requestedModelContextKey, modelName)
-}
-
-func attachSelectedAuthTrackingCallback(ctx context.Context, meta map[string]any) {
-	if meta == nil {
-		return
-	}
-	ginCtx, _ := ctx.Value("gin").(*gin.Context)
-	if ginCtx == nil {
-		return
-	}
-
-	original, _ := meta[coreexecutor.SelectedAuthCallbackMetadataKey].(func(string))
-	meta[coreexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
-		authID = strings.TrimSpace(authID)
-		if authID != "" {
-			ginCtx.Set(selectedAuthIDContextKey, authID)
-		}
-		if original != nil {
-			original(authID)
-		}
-	}
 }
 
 // LogContextWindowExceededEvent emits a structured log entry when a context-limit rejection is returned to clients.

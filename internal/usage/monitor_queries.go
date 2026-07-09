@@ -940,90 +940,6 @@ func (s *pgUsageStore) QueryMonitorFailureStats(ctx context.Context, filter Moni
 	}, nil
 }
 
-func (s *mirrorUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error) {
-	if s == nil || s.local == nil {
-		return MonitorRequestLogsResult{}, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorRequestLogs(ctx, filter, page, pageSize, recentLimit)
-}
-
-func (s *mirrorUsageStore) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error) {
-	if s == nil || s.local == nil {
-		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorChannelStats(ctx, filter, limit, recentLimit)
-}
-
-func (s *mirrorUsageStore) QueryMonitorFailureStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorFailureStatsResult, error) {
-	if s == nil || s.local == nil {
-		return MonitorFailureStatsResult{}, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorFailureStats(ctx, filter, limit, recentLimit)
-}
-
-func (s *mirrorUsageStore) QueryMonitorClientGoneStats(ctx context.Context, filter MonitorQueryFilter, limit int) ([]MonitorClientGoneStats, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorClientGoneStats(ctx, filter, limit)
-}
-
-func (s *mirrorUsageStore) QueryMonitorRequestDetails(ctx context.Context, filter MonitorRequestDetailFilter) ([]MonitorRequestDetail, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorRequestDetails(ctx, filter)
-}
-
-func (s *mirrorUsageStore) QueryMonitorKpi(ctx context.Context, filter MonitorQueryFilter) (MonitorKpiResult, error) {
-	if s == nil || s.local == nil {
-		return MonitorKpiResult{}, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorKpi(ctx, filter)
-}
-
-func (s *mirrorUsageStore) QueryMonitorModelDistribution(ctx context.Context, filter MonitorQueryFilter, limit int, sortByTokens bool) ([]MonitorModelDistItem, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorModelDistribution(ctx, filter, limit, sortByTokens)
-}
-
-func (s *mirrorUsageStore) QueryMonitorDailyTrend(ctx context.Context, filter MonitorQueryFilter) ([]MonitorDailyTrendItem, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorDailyTrend(ctx, filter)
-}
-
-func (s *mirrorUsageStore) QueryMonitorHourlySlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlySlot, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorHourlySlots(ctx, filter, cutoffUnix, nowUnix, slotSeconds)
-}
-
-func (s *mirrorUsageStore) QueryMonitorHourlyTokenSlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlyTokenSlot, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorHourlyTokenSlots(ctx, filter, cutoffUnix, nowUnix, slotSeconds)
-}
-
-func (s *mirrorUsageStore) QueryMonitorHealthBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorHealthBlock, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorHealthBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
-}
-
-func (s *mirrorUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorKeyStatsRow, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
-}
-
 func (s *pgUsageStore) queryChannelAggregates(ctx context.Context, whereClause string, args []any) (map[string]*MonitorChannelStats, error) {
 	table := s.fullTableName("usage_records")
 	query := fmt.Sprintf(`
@@ -1830,31 +1746,6 @@ func buildGroupWhereClause(groups map[string]monitorGroupEntry) (string, []any) 
 	return strings.Join(clauses, " OR "), args
 }
 
-func buildSourceWhereClause(sources []string) (string, []any) {
-	if len(sources) == 0 {
-		return "", nil
-	}
-	sourceSet := make(map[string]struct{}, len(sources))
-	for _, source := range sources {
-		normalized := normalizeMonitorSource(source)
-		sourceSet[normalized] = struct{}{}
-	}
-	clauses := make([]string, 0, len(sourceSet))
-	args := make([]any, 0, len(sourceSet))
-	for source := range sourceSet {
-		if source == "unknown" {
-			clauses = append(clauses, "(source IS NULL OR source = '')")
-			continue
-		}
-		clauses = append(clauses, "source = ?")
-		args = append(args, source)
-	}
-	if len(clauses) == 0 {
-		return "", nil
-	}
-	return strings.Join(clauses, " OR "), args
-}
-
 func buildChannelWhereClause(channels []monitorChannelIdentity) (string, []any) {
 	if len(channels) == 0 {
 		return "", nil
@@ -2445,32 +2336,6 @@ func copyArgs(args []any) []any {
 	return copied
 }
 
-func toInClause(values []string) (string, []any) {
-	if len(values) == 0 {
-		return "", nil
-	}
-	placeholders := make([]string, 0, len(values))
-	args := make([]any, 0, len(values))
-	for _, value := range values {
-		placeholders = append(placeholders, "?")
-		args = append(args, value)
-	}
-	return strings.Join(placeholders, ","), args
-}
-
-func toPostgresInClause(values []string, startIndex int) (string, []any) {
-	if len(values) == 0 {
-		return "", nil
-	}
-	placeholders := make([]string, 0, len(values))
-	args := make([]any, 0, len(values))
-	for _, value := range values {
-		placeholders = append(placeholders, pgPlaceholder(startIndex+len(args)))
-		args = append(args, value)
-	}
-	return strings.Join(placeholders, ","), args
-}
-
 func buildPostgresGroupWhereClause(groups map[string]monitorGroupEntry, startIndex int) (string, []any) {
 	if len(groups) == 0 {
 		return "", nil
@@ -2486,31 +2351,6 @@ func buildPostgresGroupWhereClause(groups map[string]monitorGroupEntry, startInd
 		}
 		args = append(args, source, strings.TrimSpace(group.AuthIndex), group.Model)
 		clauses = append(clauses, "(source = "+pgPlaceholder(startIndex+len(args)-3)+" AND COALESCE(auth_index, '') = "+pgPlaceholder(startIndex+len(args)-2)+" AND model = "+pgPlaceholder(startIndex+len(args)-1)+")")
-	}
-	if len(clauses) == 0 {
-		return "", nil
-	}
-	return strings.Join(clauses, " OR "), args
-}
-
-func buildPostgresSourceWhereClause(sources []string, startIndex int) (string, []any) {
-	if len(sources) == 0 {
-		return "", nil
-	}
-	sourceSet := make(map[string]struct{}, len(sources))
-	for _, source := range sources {
-		normalized := normalizeMonitorSource(source)
-		sourceSet[normalized] = struct{}{}
-	}
-	clauses := make([]string, 0, len(sourceSet))
-	args := make([]any, 0, len(sourceSet))
-	for source := range sourceSet {
-		if source == "unknown" {
-			clauses = append(clauses, "(source IS NULL OR source = '')")
-			continue
-		}
-		args = append(args, source)
-		clauses = append(clauses, "source = "+pgPlaceholder(startIndex+len(args)-1))
 	}
 	if len(clauses) == 0 {
 		return "", nil

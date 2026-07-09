@@ -297,11 +297,6 @@ func antigravityFunctionResponseContentIndex(payload []byte, callID string) (int
 	return -1, false
 }
 
-func antigravityPayloadHasFunctionCallID(payload []byte, callID string) bool {
-	_, _, ok := antigravityFunctionCallPartLocation(payload, callID)
-	return ok
-}
-
 func antigravityFunctionCallPartLocation(payload []byte, callID string) (contentIndex int, partIndex int, ok bool) {
 	callID = strings.TrimSpace(callID)
 	if callID == "" {

@@ -95,20 +95,3 @@ func HasKnownAntigravityCreditsHint(authID string) bool {
 func antigravityCreditsHintKey(authID string) string {
 	return "cpa:antigravity:credits-hint:" + strings.TrimSpace(authID)
 }
-
-func antigravityCreditsAvailableForModel(auth *Auth, model string) bool {
-	if auth == nil {
-		return false
-	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		return false
-	}
-	if !strings.Contains(strings.ToLower(strings.TrimSpace(model)), "claude") {
-		return false
-	}
-	hint, ok := GetAntigravityCreditsHint(auth.ID)
-	if !ok || !hint.Known {
-		return false
-	}
-	return hint.Available
-}

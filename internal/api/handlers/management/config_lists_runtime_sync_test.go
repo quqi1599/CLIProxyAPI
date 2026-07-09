@@ -44,7 +44,6 @@ func (managementTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http
 
 func TestPutCodexKeys_DisabledEntrySyncsRuntimeImmediately(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte("codex-api-key: []\n"), 0o600); err != nil {

@@ -995,10 +995,6 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 	return available, modelKey
 }
 
-func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesCodexWebsocketPassthrough(modelName string) bool {
-	return h.responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName)
-}
-
 func (h *OpenAIResponsesAPIHandler) responsesWebsocketUsesUpstreamWebsocketPassthrough(modelName string) bool {
 	modelName = strings.TrimSpace(modelName)
 	if h == nil || h.AuthManager == nil || modelName == "" {
@@ -1355,6 +1351,39 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	}
 
 	for {
+		if data == nil && errs == nil {
+			if !completed {
+				errMsg := &interfaces.ErrorMessage{
+					StatusCode: http.StatusRequestTimeout,
+					Error:      fmt.Errorf("stream closed before response.completed"),
+				}
+				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+				markAPIResponseTimestamp(c)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+				log.Infof(
+					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					sessionID,
+					websocket.TextMessage,
+					websocketPayloadEventType(errorPayload),
+					websocketPayloadPreview(errorPayload),
+				)
+				if errWrite != nil {
+					log.Warnf(
+						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+						sessionID,
+						websocketPayloadEventType(errorPayload),
+						errWrite,
+					)
+					cancel(errMsg.Error)
+					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
+				}
+				cancel(errMsg.Error)
+				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
+			}
+			cancel(nil)
+			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
+		}
+
 		select {
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
@@ -1394,36 +1423,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
 		case chunk, ok := <-data:
 			if !ok {
-				if !completed {
-					errMsg := &interfaces.ErrorMessage{
-						StatusCode: http.StatusRequestTimeout,
-						Error:      fmt.Errorf("stream closed before response.completed"),
-					}
-					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-					markAPIResponseTimestamp(c)
-					errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
-					log.Infof(
-						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-						sessionID,
-						websocket.TextMessage,
-						websocketPayloadEventType(errorPayload),
-						websocketPayloadPreview(errorPayload),
-					)
-					if errWrite != nil {
-						log.Warnf(
-							"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-							sessionID,
-							websocketPayloadEventType(errorPayload),
-							errWrite,
-						)
-						cancel(errMsg.Error)
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
-					}
-					cancel(errMsg.Error)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
-				}
-				cancel(nil)
-				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
+				data = nil
+				continue
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)

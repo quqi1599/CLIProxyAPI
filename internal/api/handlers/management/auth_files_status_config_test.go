@@ -19,7 +19,6 @@ import (
 func setupConfigBackedClaudeStatusTest(t *testing.T) (*Handler, *coreauth.Manager, string, string) {
 	t.Helper()
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -51,7 +50,6 @@ func setupConfigBackedClaudeStatusTest(t *testing.T) (*Handler, *coreauth.Manage
 
 func TestSyncRuntimeConfigRemovesDeletedConfigBackedOpenAICompatKey(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -215,7 +213,6 @@ func TestPatchAuthFileStatusConfigBackedRejectsStaleVersion(t *testing.T) {
 
 func TestPatchAuthFileStatusConfigBackedMatchesBaseURL(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -268,7 +265,6 @@ func TestPatchAuthFileStatusConfigBackedMatchesBaseURL(t *testing.T) {
 
 func TestPatchAuthFileStatusConfigBackedMatchesOpenAICompatDuplicateByID(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -330,7 +326,6 @@ func TestPatchAuthFileStatusConfigBackedMatchesOpenAICompatDuplicateByID(t *test
 
 func TestPatchAuthFileStatusConfigBackedEnablesDisabledOpenAICompatProvider(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")

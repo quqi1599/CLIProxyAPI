@@ -15,22 +15,122 @@ const (
 	writeTimeout         = 10 * time.Second
 	maxInboundMessageLen = 64 << 20 // 64 MiB
 	heartbeatInterval    = 30 * time.Second
+	pendingMailboxSize   = 8
 )
 
-var errClosed = errors.New("websocket session closed")
+var (
+	errClosed          = errors.New("websocket session closed")
+	errMailboxOverflow = errors.New("wsrelay: pending request mailbox overflow")
+)
 
 type pendingRequest struct {
-	ch        chan Message
-	closeOnce sync.Once
+	id       string
+	ch       chan Message
+	mailbox  chan Message
+	terminal chan Message
+	abort    chan struct{}
+	done     chan struct{}
+
+	stateMutex sync.Mutex
+	terminated bool
+	abortOnce  sync.Once
 }
 
-func (pr *pendingRequest) close() {
+func newPendingRequest(id string) *pendingRequest {
+	pr := &pendingRequest{
+		id:       id,
+		ch:       make(chan Message),
+		mailbox:  make(chan Message, pendingMailboxSize),
+		terminal: make(chan Message, 1),
+		abort:    make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go pr.drain()
+	return pr
+}
+
+func (pr *pendingRequest) enqueue(msg Message) bool {
+	if pr == nil {
+		return false
+	}
+	pr.stateMutex.Lock()
+	defer pr.stateMutex.Unlock()
+	if pr.terminated {
+		return false
+	}
+	if isTerminalMessage(msg.Type) {
+		pr.terminated = true
+		pr.terminal <- msg
+		return true
+	}
+	select {
+	case pr.mailbox <- msg:
+		return false
+	default:
+		pr.terminated = true
+		pr.terminal <- requestErrorMessage(pr.id, errMailboxOverflow)
+		return true
+	}
+}
+
+func (pr *pendingRequest) terminate(msg Message) {
 	if pr == nil {
 		return
 	}
-	pr.closeOnce.Do(func() {
-		close(pr.ch)
+	pr.stateMutex.Lock()
+	defer pr.stateMutex.Unlock()
+	if pr.terminated {
+		return
+	}
+	pr.terminated = true
+	pr.terminal <- msg
+}
+
+func (pr *pendingRequest) abandon() {
+	if pr == nil {
+		return
+	}
+	pr.abortOnce.Do(func() {
+		close(pr.abort)
 	})
+}
+
+func (pr *pendingRequest) drain() {
+	defer close(pr.done)
+	defer close(pr.ch)
+	for {
+		select {
+		case <-pr.abort:
+			return
+		case msg := <-pr.mailbox:
+			if !pr.deliver(msg) {
+				return
+			}
+		case terminal := <-pr.terminal:
+			for {
+				select {
+				case <-pr.abort:
+					return
+				case msg := <-pr.mailbox:
+					if !pr.deliver(msg) {
+						return
+					}
+				default:
+					_ = pr.deliver(terminal)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (pr *pendingRequest) deliver(msg Message) bool {
+	select {
+	case <-pr.abort:
+		return false
+	case pr.ch <- msg:
+		return true
+	}
 }
 
 type session struct {
@@ -105,18 +205,12 @@ func (s *session) dispatch(msg Message) {
 	}
 	if value, ok := s.pending.Load(msg.ID); ok {
 		req := value.(*pendingRequest)
-		select {
-		case req.ch <- msg:
-		default:
-		}
-		if msg.Type == MessageTypeHTTPResp || msg.Type == MessageTypeError || msg.Type == MessageTypeStreamEnd {
-			if actual, loaded := s.pending.LoadAndDelete(msg.ID); loaded {
-				actual.(*pendingRequest).close()
-			}
+		if req.enqueue(msg) {
+			s.pending.CompareAndDelete(msg.ID, req)
 		}
 		return
 	}
-	if msg.Type == MessageTypeHTTPResp || msg.Type == MessageTypeError || msg.Type == MessageTypeStreamEnd {
+	if isTerminalMessage(msg.Type) && s.manager != nil {
 		s.manager.logDebugf("wsrelay: received terminal message for unknown id %s (provider=%s)", msg.ID, s.provider)
 	}
 }
@@ -142,25 +236,37 @@ func (s *session) request(ctx context.Context, msg Message) (<-chan Message, err
 	if msg.ID == "" {
 		return nil, fmt.Errorf("wsrelay: message id is required")
 	}
-	if _, loaded := s.pending.LoadOrStore(msg.ID, &pendingRequest{ch: make(chan Message, 8)}); loaded {
+	select {
+	case <-s.closed:
+		return nil, errClosed
+	default:
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := newPendingRequest(msg.ID)
+	if _, loaded := s.pending.LoadOrStore(msg.ID, req); loaded {
+		req.abandon()
 		return nil, fmt.Errorf("wsrelay: duplicate message id %s", msg.ID)
 	}
-	value, _ := s.pending.Load(msg.ID)
-	req := value.(*pendingRequest)
+	select {
+	case <-s.closed:
+		s.pending.CompareAndDelete(msg.ID, req)
+		req.abandon()
+		return nil, errClosed
+	default:
+	}
 	if err := s.send(ctx, msg); err != nil {
-		if actual, loaded := s.pending.LoadAndDelete(msg.ID); loaded {
-			req := actual.(*pendingRequest)
-			req.close()
-		}
+		s.pending.CompareAndDelete(msg.ID, req)
+		req.abandon()
 		return nil, err
 	}
 	go func() {
 		select {
 		case <-ctx.Done():
-			if actual, loaded := s.pending.LoadAndDelete(msg.ID); loaded {
-				actual.(*pendingRequest).close()
-			}
-		case <-s.closed:
+			s.pending.CompareAndDelete(msg.ID, req)
+			req.abandon()
+		case <-req.done:
 		}
 	}()
 	return req.ch, nil
@@ -168,21 +274,30 @@ func (s *session) request(ctx context.Context, msg Message) (<-chan Message, err
 
 func (s *session) cleanup(cause error) {
 	s.closeOnce.Do(func() {
+		if cause == nil {
+			cause = errClosed
+		}
 		close(s.closed)
-		s.pending.Range(func(key, value any) bool {
-			req := value.(*pendingRequest)
-			msg := Message{ID: key.(string), Type: MessageTypeError, Payload: map[string]any{"error": cause.Error()}}
-			select {
-			case req.ch <- msg:
-			default:
+		s.pending.Range(func(key, _ any) bool {
+			if value, loaded := s.pending.LoadAndDelete(key); loaded {
+				req := value.(*pendingRequest)
+				req.terminate(requestErrorMessage(key.(string), cause))
 			}
-			req.close()
 			return true
 		})
-		s.pending = sync.Map{}
-		_ = s.conn.Close()
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
 		if s.manager != nil {
 			s.manager.handleSessionClosed(s, cause)
 		}
 	})
+}
+
+func isTerminalMessage(messageType string) bool {
+	return messageType == MessageTypeHTTPResp || messageType == MessageTypeError || messageType == MessageTypeStreamEnd
+}
+
+func requestErrorMessage(id string, err error) Message {
+	return Message{ID: id, Type: MessageTypeError, Payload: map[string]any{"error": err.Error()}}
 }

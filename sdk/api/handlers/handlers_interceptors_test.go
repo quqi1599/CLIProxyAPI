@@ -661,6 +661,8 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	model := "handler-interceptor-stream-header-before-return-model"
 	initStarted := make(chan struct{})
 	allowInit := make(chan struct{})
+	payloadStarted := make(chan struct{})
+	allowPayload := make(chan struct{})
 	executor := &interceptorCaptureExecutor{
 		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 			chunks := make(chan coreexecutor.StreamChunk, 1)
@@ -676,10 +678,15 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	handler.SetPluginHost(&handlerInterceptorTestHost{
 		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
 			headers := cloneHeader(req.ResponseHeaders)
-			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+			switch req.ChunkIndex {
+			case pluginapi.StreamChunkHeaderInitIndex:
 				close(initStarted)
 				<-allowInit
 				headers.Set("X-Init", "plugin")
+			case 0:
+				close(payloadStarted)
+				<-allowPayload
+				headers.Set("X-Chunk", "first")
 			}
 			return pluginapi.StreamChunkInterceptResponse{
 				Headers: headers,
@@ -710,6 +717,17 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	default:
 	}
 	close(allowInit)
+	select {
+	case result := <-resultChan:
+		t.Fatalf("ExecuteStreamWithAuthManager returned before first payload headers: %#v", result.upstreamHeaders)
+	case <-payloadStarted:
+	}
+	select {
+	case result := <-resultChan:
+		t.Fatalf("ExecuteStreamWithAuthManager returned while first payload interceptor was blocked: %#v", result.upstreamHeaders)
+	default:
+	}
+	close(allowPayload)
 
 	result := <-resultChan
 	dataChan := result.dataChan
@@ -717,6 +735,9 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	errChan := result.errChan
 	if upstreamHeaders.Get("X-Init") != "plugin" {
 		t.Fatalf("upstream headers before first payload = %#v, want initialized plugin header", upstreamHeaders)
+	}
+	if upstreamHeaders.Get("X-Chunk") != "first" {
+		t.Fatalf("upstream headers before first payload = %#v, want first payload plugin header", upstreamHeaders)
 	}
 	for range dataChan {
 	}

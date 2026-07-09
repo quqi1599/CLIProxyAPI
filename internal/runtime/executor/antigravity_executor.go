@@ -2600,15 +2600,6 @@ func antigravityShortCooldownKVKey(auth *cliproxyauth.Auth, modelName string) st
 	return "cpa:antigravity:short-cooldown:" + authID + ":" + homekv.HashKeyPart(modelName)
 }
 
-func antigravityIsInShortCooldown(auth *cliproxyauth.Auth, modelName string, now time.Time) (bool, time.Duration) {
-	inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(context.Background(), auth, modelName, now)
-	if errCooldown != nil {
-		log.Errorf("antigravity executor: home kv cooldown read error: %v", errCooldown)
-		return false, 0
-	}
-	return inCooldown, remaining
-}
-
 func antigravityIsInShortCooldownRequired(ctx context.Context, auth *cliproxyauth.Auth, modelName string, now time.Time) (bool, time.Duration, error) {
 	kvKey := antigravityShortCooldownKVKey(auth, modelName)
 	client, homeMode, errClient := currentAntigravityKVClient()
@@ -2656,12 +2647,6 @@ func antigravityIsInShortCooldownRequired(ctx context.Context, auth *cliproxyaut
 		return false, 0, nil
 	}
 	return true, remaining, nil
-}
-
-func markAntigravityShortCooldown(auth *cliproxyauth.Auth, modelName string, now time.Time, duration time.Duration) {
-	if errMark := markAntigravityShortCooldownRequired(context.Background(), auth, modelName, now, duration); errMark != nil {
-		log.Errorf("antigravity executor: home kv cooldown write error: %v", errMark)
-	}
 }
 
 func markAntigravityShortCooldownRequired(ctx context.Context, auth *cliproxyauth.Auth, modelName string, now time.Time, duration time.Duration) error {
@@ -2851,17 +2836,6 @@ func generateRequestID() string {
 
 func generateImageGenRequestID() string {
 	return fmt.Sprintf("image_gen/%d/%s/12", time.Now().UnixMilli(), uuid.NewString())
-}
-
-func generateProjectID() string {
-	adjectives := []string{"useful", "bright", "swift", "calm", "bold"}
-	nouns := []string{"fuze", "wave", "spark", "flow", "core"}
-	randSourceMutex.Lock()
-	adj := adjectives[randSource.Intn(len(adjectives))]
-	noun := nouns[randSource.Intn(len(nouns))]
-	randSourceMutex.Unlock()
-	randomPart := strings.ToLower(uuid.NewString())[:5]
-	return adj + "-" + noun + "-" + randomPart
 }
 
 func generateSessionID() string {

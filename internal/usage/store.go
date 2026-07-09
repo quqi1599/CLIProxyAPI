@@ -11,7 +11,6 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	_ "modernc.org/sqlite"
 )
 
@@ -107,9 +106,8 @@ type UsageStore interface {
 }
 
 const (
-	defaultMirrorSyncBatchSize = 10000
-	defaultLocalUsageFileName  = "usage.db"
-	defaultImportBatchSize     = 1000
+	defaultLocalUsageFileName = "usage.db"
+	defaultImportBatchSize    = 1000
 )
 
 // NewUsageStore creates a UsageStore based on environment configuration.
@@ -170,52 +168,6 @@ func MigrateSQLiteToPostgres(ctx context.Context, pgDSN, pgSchema, legacyAuthDir
 	return nil
 }
 
-type mirrorUsageStore struct {
-	primary *pgUsageStore
-	local   *sqliteUsageStore
-}
-
-func newMirrorUsageStore(ctx context.Context, pgDSN, pgSchema, authDir string) (*mirrorUsageStore, error) {
-	primary, err := newPgUsageStore(ctx, pgDSN, pgSchema)
-	if err != nil {
-		return nil, err
-	}
-
-	localPath := resolveLocalUsageDBPath(authDir)
-	local, err := newSQLiteUsageStoreAtPath(localPath)
-	if err != nil {
-		_ = primary.Close()
-		return nil, err
-	}
-
-	store := &mirrorUsageStore{primary: primary, local: local}
-	if err = store.bootstrapLocalFromPrimary(ctx); err != nil {
-		_ = local.Close()
-		_ = primary.Close()
-		return nil, err
-	}
-	return store, nil
-}
-
-func resolveLocalUsageDBPath(authDir string) string {
-	if localPath := util.GetEnvTrimmed("PGSTORE_LOCAL_PATH", "pgstore_local_path"); localPath != "" {
-		cleaned := filepath.Clean(localPath)
-		if strings.EqualFold(filepath.Ext(cleaned), ".db") {
-			return cleaned
-		}
-		return filepath.Join(cleaned, defaultLocalUsageFileName)
-	}
-	if authDir == "" {
-		if cwd, err := os.Getwd(); err == nil {
-			authDir = cwd
-		}
-	}
-	if authDir == "" {
-		return defaultLocalUsageFileName
-	}
-	return filepath.Join(authDir, defaultLocalUsageFileName)
-}
-
 func legacySQLiteUsageDBPath(authDir string) string {
 	if authDir == "" {
 		if cwd, err := os.Getwd(); err == nil {
@@ -226,189 +178,6 @@ func legacySQLiteUsageDBPath(authDir string) string {
 		return defaultLocalUsageFileName
 	}
 	return filepath.Join(authDir, defaultLocalUsageFileName)
-}
-
-func (s *mirrorUsageStore) bootstrapLocalFromPrimary(ctx context.Context) error {
-	if s == nil || s.primary == nil || s.local == nil {
-		return fmt.Errorf("usage store: mirror store not initialized")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := s.local.Reset(ctx); err != nil {
-		return fmt.Errorf("usage store: reset local sqlite mirror: %w", err)
-	}
-
-	lastID := int64(0)
-	for {
-		records, newLastID, err := s.primary.ListRecordsAfterID(ctx, lastID, defaultMirrorSyncBatchSize)
-		if err != nil {
-			return fmt.Errorf("usage store: sync records from postgres: %w", err)
-		}
-		if len(records) == 0 {
-			break
-		}
-		added, skipped, err := s.local.InsertBatch(ctx, records)
-		if err != nil {
-			return fmt.Errorf("usage store: write mirror sqlite batch: %w", err)
-		}
-		if skipped > 0 || added != int64(len(records)) {
-			return fmt.Errorf("usage store: sqlite mirror batch mismatch (added=%d skipped=%d expected=%d)", added, skipped, len(records))
-		}
-		lastID = newLastID
-	}
-	summaries, err := s.primary.ListAllStreamSummaries(ctx)
-	if err != nil {
-		return fmt.Errorf("usage store: sync stream summaries from postgres: %w", err)
-	}
-	for _, summary := range summaries {
-		if err := s.local.UpsertStreamSummary(ctx, summary); err != nil {
-			return fmt.Errorf("usage store: write sqlite stream summary mirror: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *mirrorUsageStore) Insert(ctx context.Context, record UsageRecord) error {
-	if s == nil || s.primary == nil || s.local == nil {
-		return fmt.Errorf("usage store: mirror store not initialized")
-	}
-	if err := s.primary.Insert(ctx, record); err != nil {
-		return err
-	}
-	if err := s.local.Insert(ctx, record); err != nil {
-		return fmt.Errorf("usage store: insert sqlite mirror: %w", err)
-	}
-	return nil
-}
-
-func (s *mirrorUsageStore) InsertBatch(ctx context.Context, records []UsageRecord) (added, skipped int64, err error) {
-	if len(records) == 0 {
-		return 0, 0, nil
-	}
-	if s == nil || s.primary == nil || s.local == nil {
-		return 0, 0, fmt.Errorf("usage store: mirror store not initialized")
-	}
-
-	var firstErr error
-	for _, record := range records {
-		if err = s.primary.Insert(ctx, record); err != nil {
-			skipped++
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if err = s.local.Insert(ctx, record); err != nil {
-			skipped++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("usage store: insert sqlite mirror: %w", err)
-			}
-			continue
-		}
-		added++
-	}
-
-	if firstErr != nil {
-		return added, skipped, firstErr
-	}
-	return added, skipped, nil
-}
-
-func (s *mirrorUsageStore) UpdateRequestFinal(ctx context.Context, requestID string, finalSuccess bool) error {
-	if s == nil {
-		return fmt.Errorf("usage store: mirror store not initialized")
-	}
-	var errPrimary error
-	if s.primary != nil {
-		errPrimary = s.primary.UpdateRequestFinal(ctx, requestID, finalSuccess)
-	}
-	var errLocal error
-	if s.local != nil {
-		errLocal = s.local.UpdateRequestFinal(ctx, requestID, finalSuccess)
-	}
-	if errPrimary != nil {
-		return errPrimary
-	}
-	return errLocal
-}
-
-func (s *mirrorUsageStore) UpsertStreamSummary(ctx context.Context, record StreamSummaryRecord) error {
-	if s == nil {
-		return fmt.Errorf("usage store: mirror store not initialized")
-	}
-	var errPrimary error
-	if s.primary != nil {
-		errPrimary = s.primary.UpsertStreamSummary(ctx, record)
-	}
-	var errLocal error
-	if s.local != nil {
-		errLocal = s.local.UpsertStreamSummary(ctx, record)
-	}
-	if errPrimary != nil {
-		return errPrimary
-	}
-	return errLocal
-}
-
-func (s *mirrorUsageStore) GetAggregatedStats(ctx context.Context) (AggregatedStats, error) {
-	if s == nil || s.local == nil {
-		return AggregatedStats{}, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.GetAggregatedStats(ctx)
-}
-
-func (s *mirrorUsageStore) GetDetails(ctx context.Context, offset, limit int) ([]DetailRecord, error) {
-	if s == nil || s.local == nil {
-		return nil, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	return s.local.GetDetails(ctx, offset, limit)
-}
-
-func (s *mirrorUsageStore) DeleteOldRecords(ctx context.Context, retentionDays int) (deleted int64, err error) {
-	if s == nil || s.primary == nil || s.local == nil {
-		return 0, fmt.Errorf("usage store: mirror store not initialized")
-	}
-	deletedPG, err := s.primary.DeleteOldRecords(ctx, retentionDays)
-	if err != nil {
-		return 0, err
-	}
-	deletedLocal, err := s.local.DeleteOldRecords(ctx, retentionDays)
-	if err != nil {
-		return 0, fmt.Errorf("usage store: delete old records in sqlite mirror: %w", err)
-	}
-	if deletedPG > deletedLocal {
-		return deletedPG, nil
-	}
-	return deletedLocal, nil
-}
-
-func (s *mirrorUsageStore) EnsureSchema(ctx context.Context) error {
-	if s == nil || s.primary == nil || s.local == nil {
-		return fmt.Errorf("usage store: mirror store not initialized")
-	}
-	if err := s.primary.EnsureSchema(ctx); err != nil {
-		return err
-	}
-	return s.local.EnsureSchema(ctx)
-}
-
-func (s *mirrorUsageStore) Close() error {
-	if s == nil {
-		return nil
-	}
-	var firstErr error
-	if s.local != nil {
-		if err := s.local.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if s.primary != nil {
-		if err := s.primary.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
 
 // pgUsageStore implements UsageStore using PostgreSQL.
@@ -756,64 +525,6 @@ func (s *pgUsageStore) UpdateRequestFinal(ctx context.Context, requestID string,
 	return nil
 }
 
-func (s *pgUsageStore) ListAllStreamSummaries(ctx context.Context) ([]StreamSummaryRecord, error) {
-	if s == nil || s.db == nil {
-		return nil, fmt.Errorf("usage store: postgres store not initialized")
-	}
-	table := s.fullTableName("usage_stream_summaries")
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT request_id, attempt_no, time_to_first_chunk_ms, stream_duration_ms,
-			upstream_chunk_wait_ms, upstream_chunk_wait_count, total_duration_ms,
-			downstream_write_ms, downstream_write_calls, downstream_flush_ms, downstream_flush_calls,
-			chunks_count, bytes_out, stream_output_tokens, stream_output_tokens_observed,
-			client_gone, finish_reason, recorded_at
-		FROM %s
-		ORDER BY recorded_at ASC, request_id ASC, attempt_no ASC
-	`, table))
-	if err != nil {
-		return nil, fmt.Errorf("usage store: list stream summaries: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]StreamSummaryRecord, 0)
-	for rows.Next() {
-		var (
-			record                     StreamSummaryRecord
-			streamOutputTokensObserved int
-			clientGone                 int
-		)
-		if err = rows.Scan(
-			&record.RequestID,
-			&record.AttemptNo,
-			&record.TimeToFirstChunkMs,
-			&record.StreamDurationMs,
-			&record.UpstreamChunkWaitMs,
-			&record.UpstreamChunkWaitCount,
-			&record.TotalDurationMs,
-			&record.DownstreamWriteMs,
-			&record.DownstreamWriteCalls,
-			&record.DownstreamFlushMs,
-			&record.DownstreamFlushCalls,
-			&record.ChunksCount,
-			&record.BytesOut,
-			&record.StreamOutputTokens,
-			&streamOutputTokensObserved,
-			&clientGone,
-			&record.FinishReason,
-			&record.RecordedAt,
-		); err != nil {
-			return nil, fmt.Errorf("usage store: scan stream summary: %w", err)
-		}
-		record.StreamOutputTokensObserved = streamOutputTokensObserved != 0
-		record.ClientGone = clientGone != 0
-		out = append(out, record)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("usage store: iterate stream summaries: %w", err)
-	}
-	return out, nil
-}
-
 func (s *pgUsageStore) UpsertStreamSummary(ctx context.Context, record StreamSummaryRecord) error {
 	record, ok := normalizeStreamSummaryRecord(record)
 	if !ok {
@@ -878,78 +589,6 @@ func (s *pgUsageStore) UpsertStreamSummary(ctx context.Context, record StreamSum
 		return fmt.Errorf("usage store: upsert stream summary: %w", err)
 	}
 	return nil
-}
-
-func (s *pgUsageStore) ListRecordsAfterID(ctx context.Context, afterID int64, limit int) ([]UsageRecord, int64, error) {
-	if limit <= 0 {
-		limit = defaultMirrorSyncBatchSize
-	}
-	if limit > 50000 {
-		limit = 50000
-	}
-	if afterID < 0 {
-		afterID = 0
-	}
-
-	table := s.fullTableName("usage_records")
-	query := fmt.Sprintf(`
-		SELECT id, api_key, model, source, auth_index, failed, requested_at,
-			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
-			method, path, provider_status_code, error_code,
-			request_id, attempt_no, retry_reason, final_success
-		FROM %s
-		WHERE id > $1
-		ORDER BY id ASC
-		LIMIT $2
-	`, table)
-
-	rows, err := s.db.QueryContext(ctx, query, afterID, limit)
-	if err != nil {
-		return nil, afterID, fmt.Errorf("usage store: list records after id: %w", err)
-	}
-	defer rows.Close()
-
-	records := make([]UsageRecord, 0, limit)
-	lastID := afterID
-	for rows.Next() {
-		var (
-			id     int64
-			failed int
-			record UsageRecord
-		)
-		if err = rows.Scan(
-			&id,
-			&record.APIKey,
-			&record.Model,
-			&record.Source,
-			&record.AuthIndex,
-			&failed,
-			&record.RequestedAt,
-			&record.InputTokens,
-			&record.OutputTokens,
-			&record.ReasoningTokens,
-			&record.CachedTokens,
-			&record.TotalTokens,
-			&record.Method,
-			&record.Path,
-			&record.ProviderStatusCode,
-			&record.ErrorCode,
-			&record.RequestID,
-			&record.AttemptNo,
-			&record.RetryReason,
-			&record.FinalSuccess,
-		); err != nil {
-			return nil, afterID, fmt.Errorf("usage store: scan list records after id: %w", err)
-		}
-		record.Failed = failed != 0
-		records = append(records, record)
-		lastID = id
-	}
-	if err = rows.Err(); err != nil {
-		return nil, afterID, fmt.Errorf("usage store: iterate list records after id: %w", err)
-	}
-
-	return records, lastID, nil
 }
 
 func (s *pgUsageStore) GetAggregatedStats(ctx context.Context) (AggregatedStats, error) {
@@ -1313,30 +952,6 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 		return fmt.Errorf("usage store: create stream summary index: %w", err)
 	}
 
-	return nil
-}
-
-func (s *sqliteUsageStore) Reset(ctx context.Context) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("usage store: sqlite store not initialized")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("usage store: begin reset tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err = tx.ExecContext(ctx, "DELETE FROM usage_records"); err != nil {
-		return fmt.Errorf("usage store: reset records: %w", err)
-	}
-	if _, err = tx.ExecContext(ctx, "DELETE FROM usage_stream_summaries"); err != nil {
-		return fmt.Errorf("usage store: reset stream summaries: %w", err)
-	}
-	_, _ = tx.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name = 'usage_records'")
-
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("usage store: commit reset tx: %w", err)
-	}
 	return nil
 }
 

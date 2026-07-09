@@ -1239,6 +1239,13 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	headersReady := make(chan struct{})
+	var headersReadyOnce sync.Once
+	markHeadersReady := func() {
+		headersReadyOnce.Do(func() {
+			close(headersReady)
+		})
+	}
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done()
@@ -1252,6 +1259,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		defer markHeadersReady()
 		chunkIndex := 0
 		var historyChunks [][]byte
 		for {
@@ -1308,6 +1316,8 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 				}
 			}
 			streamHeadersCommitted = true
+			// Freeze the returned header map before publishing the first payload.
+			markHeadersReady()
 			select {
 			case dataChan <- payload:
 				if streamInterceptorsActive {
@@ -1318,6 +1328,9 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 		}
 	}()
+	if streamInterceptorsActive {
+		<-headersReady
+	}
 	return dataChan, upstreamHeaders, errChan
 }
 
@@ -1410,6 +1423,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	headersReady := make(chan struct{})
+	var headersReadyOnce sync.Once
+	markHeadersReady := func() {
+		headersReadyOnce.Do(func() {
+			close(headersReady)
+		})
+	}
 	streamHeaderInitialized := false
 	streamHeadersCommitted := false
 
@@ -1479,6 +1499,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		defer markHeadersReady()
 		if streamCanceledBeforeRead {
 			return
 		}
@@ -1614,6 +1635,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 					sentPayload = true
 					streamHeadersCommitted = true
+					// Freeze the returned header map before publishing the first payload.
+					// sendData may block until the caller receives the returned channels.
+					markHeadersReady()
 					if okSendData := sendData(payload); !okSendData {
 						return
 					}
@@ -1622,10 +1646,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 				}
 			}
-			applyStreamHeaderInit()
-			return
 		}
 	}()
+	<-headersReady
 	return dataChan, upstreamHeaders, errChan
 }
 
@@ -1893,15 +1916,6 @@ func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageMode
 		}
 	}
 	return nil
-}
-
-func isOpenAIImageOnlyModel(model string) bool {
-	switch strings.ToLower(strings.TrimSpace(routeModelBaseName(model))) {
-	case "gpt-image-1.5", "gpt-image-2":
-		return true
-	default:
-		return false
-	}
 }
 
 func routeModelBaseName(model string) string {

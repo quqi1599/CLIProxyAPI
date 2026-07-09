@@ -1511,6 +1511,7 @@ type stubStore struct {
 	authDir         string
 	cfgPersisted    int32
 	authPersisted   int32
+	mu              sync.Mutex
 	lastAuthMessage string
 	lastAuthPaths   []string
 }
@@ -1526,11 +1527,19 @@ func (s *stubStore) PersistConfig(context.Context) error {
 }
 func (s *stubStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {
 	atomic.AddInt32(&s.authPersisted, 1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastAuthMessage = message
-	s.lastAuthPaths = paths
+	s.lastAuthPaths = append([]string(nil), paths...)
 	return nil
 }
 func (s *stubStore) AuthDir() string { return s.authDir }
+
+func (s *stubStore) authSnapshot() (string, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAuthMessage, append([]string(nil), s.lastAuthPaths...)
+}
 
 func TestNewWatcherDetectsPersisterAndAuthDir(t *testing.T) {
 	tmp := t.TempDir()
@@ -1561,17 +1570,20 @@ func TestPersistConfigAndAuthAsyncInvokePersister(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond)
 	store := w.storePersister.(*stubStore)
-	if atomic.LoadInt32(&store.cfgPersisted) != 1 {
-		t.Fatalf("expected PersistConfig to be called once, got %d", store.cfgPersisted)
+	cfgPersisted := atomic.LoadInt32(&store.cfgPersisted)
+	if cfgPersisted != 1 {
+		t.Fatalf("expected PersistConfig to be called once, got %d", cfgPersisted)
 	}
-	if atomic.LoadInt32(&store.authPersisted) != 1 {
-		t.Fatalf("expected PersistAuthFiles to be called once, got %d", store.authPersisted)
+	authPersisted := atomic.LoadInt32(&store.authPersisted)
+	if authPersisted != 1 {
+		t.Fatalf("expected PersistAuthFiles to be called once, got %d", authPersisted)
 	}
-	if store.lastAuthMessage != "msg" {
-		t.Fatalf("unexpected auth message: %s", store.lastAuthMessage)
+	lastAuthMessage, lastAuthPaths := store.authSnapshot()
+	if lastAuthMessage != "msg" {
+		t.Fatalf("unexpected auth message: %s", lastAuthMessage)
 	}
-	if len(store.lastAuthPaths) != 2 || store.lastAuthPaths[0] != "a" || store.lastAuthPaths[1] != "b" {
-		t.Fatalf("unexpected filtered paths: %#v", store.lastAuthPaths)
+	if len(lastAuthPaths) != 2 || lastAuthPaths[0] != "a" || lastAuthPaths[1] != "b" {
+		t.Fatalf("unexpected filtered paths: %#v", lastAuthPaths)
 	}
 }
 
@@ -1599,7 +1611,10 @@ func TestScheduleConfigReloadDebounces(t *testing.T) {
 	if atomic.LoadInt32(&reloads) != 1 {
 		t.Fatalf("expected single debounced reload, got %d", reloads)
 	}
-	if w.lastConfigHash == "" {
+	w.clientsMutex.RLock()
+	lastConfigHash := w.lastConfigHash
+	w.clientsMutex.RUnlock()
+	if lastConfigHash == "" {
 		t.Fatal("expected lastConfigHash to be set after reload")
 	}
 }

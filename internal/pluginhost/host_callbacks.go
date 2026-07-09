@@ -162,9 +162,13 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 		ctx = context.Background()
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
 	if errDo != nil {
-		cancel()
 		return nil, errDo
 	}
 	streamID := ""
@@ -176,19 +180,24 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 		return nil, errOpen
 	}
 	if streamID == "" {
-		cancel()
 		return nil, fmt.Errorf("host http stream bridge is unavailable")
+	}
+	result, errMarshal := marshalRPCResult(rpcHostHTTPStreamResponse{
+		StatusCode: resp.StatusCode,
+		Headers:    httpHeader(resp.Headers),
+		StreamID:   streamID,
+	})
+	if errMarshal != nil {
+		h.httpStreams.close(streamID)
+		return nil, errMarshal
 	}
 	if callbackID != "" {
 		h.addCallbackCleanup(callbackID, func() {
 			h.httpStreams.close(streamID)
 		})
 	}
-	return marshalRPCResult(rpcHostHTTPStreamResponse{
-		StatusCode: resp.StatusCode,
-		Headers:    httpHeader(resp.Headers),
-		StreamID:   streamID,
-	})
+	cancel = nil
+	return result, nil
 }
 
 func (h *Host) callHostHTTPStreamRead(ctx context.Context, request []byte) ([]byte, error) {

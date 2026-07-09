@@ -19,7 +19,6 @@ import (
 )
 
 func TestGetMonitorRequestLogs_TimeRangeAndPagination(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	h := newMonitorTestHandler(
@@ -97,7 +96,6 @@ func TestGetMonitorRequestLogs_TimeRangeAndPagination(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogsGroupsByAuthIndex(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	recordA := testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "shared-source", false)
@@ -146,7 +144,6 @@ func TestGetMonitorRequestLogsGroupsByAuthIndex(t *testing.T) {
 }
 
 func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	h := newMonitorTestHandler(
@@ -202,7 +199,6 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 }
 
 func TestGetMonitorChannelStatsResolvesSharedSourceByAuthIndex(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	activeAuth, err := manager.Register(context.Background(), &coreauth.Auth{
@@ -291,7 +287,6 @@ func TestGetMonitorChannelStatsResolvesSharedSourceByAuthIndex(t *testing.T) {
 }
 
 func TestGetMonitorChannelStatsMergesStaleAuthIndexByResolvedSource(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	activeAuth, err := manager.Register(context.Background(), &coreauth.Auth{
@@ -369,7 +364,6 @@ func TestGetMonitorChannelStatsMergesStaleAuthIndexByResolvedSource(t *testing.T
 }
 
 func TestGetMonitorFailureAnalysisResolvesSharedSourceByAuthIndex(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	activeAuth, err := manager.Register(context.Background(), &coreauth.Auth{
@@ -459,7 +453,6 @@ func TestGetMonitorFailureAnalysisResolvesSharedSourceByAuthIndex(t *testing.T) 
 }
 
 func TestGetMonitorFailureAnalysis_OnlyFailedSources(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	h := newMonitorTestHandler(
@@ -501,7 +494,6 @@ func TestGetMonitorFailureAnalysis_OnlyFailedSources(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogs_InvalidTimeRange(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	h := newMonitorTestHandler(testUsageRecord(time.Now(), "api-1", "model-a", "source-a", false))
 	path := "/monitor/request-logs?start_time=2026-02-07T12:00:00Z&end_time=2026-02-06T12:00:00Z"
@@ -515,7 +507,6 @@ func TestGetMonitorRequestLogs_InvalidTimeRange(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogs_FutureStartWithoutEndIsInvalid(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	h := newMonitorTestHandler(testUsageRecord(time.Now(), "api-1", "model-a", "source-a", false))
 	start := url.QueryEscape(time.Now().Add(24 * time.Hour).Format(time.RFC3339))
@@ -529,7 +520,6 @@ func TestGetMonitorRequestLogs_FutureStartWithoutEndIsInvalid(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogs_ApiFilterContains(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	h := newMonitorTestHandler(
@@ -564,7 +554,6 @@ func TestGetMonitorRequestLogs_ApiFilterContains(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogs_ProviderTypeFilter(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	h := newMonitorTestHandler(
@@ -604,7 +593,6 @@ func TestGetMonitorRequestLogs_ProviderTypeFilter(t *testing.T) {
 }
 
 func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	usage.CloseDatabasePlugin()
 
@@ -723,7 +711,6 @@ func assertStringSliceEqual(t *testing.T, got, want []string) {
 }
 
 func TestGetMonitorServiceHealth_BasicBucketing(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	now := time.Now()
 
@@ -796,7 +783,6 @@ func TestGetMonitorServiceHealth_BasicBucketing(t *testing.T) {
 }
 
 func TestGetMonitorServiceHealth_EmptySnapshot(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	h := newMonitorTestHandler() // no records
 
@@ -827,7 +813,6 @@ func TestGetMonitorServiceHealth_EmptySnapshot(t *testing.T) {
 }
 
 func TestGetMonitorKeyStats_DefaultExcludesDisabledAuth(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	stats := usage.NewRequestStatistics()
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
@@ -912,7 +897,6 @@ func TestGetMonitorKeyStats_DefaultExcludesDisabledAuth(t *testing.T) {
 }
 
 func TestGetMonitorKeyStats_IncludeDisabledOptIn(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	stats := usage.NewRequestStatistics()
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)

@@ -995,28 +995,6 @@ func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
 	return strings.TrimSpace(auth.Attributes["api_key"]) != ""
 }
 
-func ensureHeaderCasePreserved(target http.Header, source http.Header, key, configValue, fallbackValue string) {
-	if target == nil {
-		return
-	}
-	if strings.TrimSpace(headerValueCaseInsensitive(target, key)) != "" {
-		return
-	}
-	if source != nil {
-		if val := strings.TrimSpace(headerValueCaseInsensitive(source, key)); val != "" {
-			setHeaderCasePreserved(target, key, val)
-			return
-		}
-	}
-	if val := strings.TrimSpace(configValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-		return
-	}
-	if val := strings.TrimSpace(fallbackValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-	}
-}
-
 func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	if headers == nil {
 		return
@@ -1542,30 +1520,6 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 	store.mu.Unlock()
 
 	e.closeExecutionSession(sess, "session_closed")
-}
-
-func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
-	if e == nil {
-		return
-	}
-
-	store := e.store
-	if store == nil {
-		store = globalCodexWebsocketSessionStore
-	}
-	store.mu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
-	for sessionID, sess := range store.sessions {
-		delete(store.sessions, sessionID)
-		if sess != nil {
-			sessions = append(sessions, sess)
-		}
-	}
-	store.mu.Unlock()
-
-	for i := range sessions {
-		e.closeExecutionSession(sessions[i], reason)
-	}
 }
 
 func (e *CodexWebsocketsExecutor) closeExecutionSession(sess *codexWebsocketSession, reason string) {

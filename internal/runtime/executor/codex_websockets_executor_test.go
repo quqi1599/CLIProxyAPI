@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -252,7 +253,8 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	defer func() { _ = conn.Close() }()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
-	sessionID := "sess-1"
+	sessionID := uuid.NewString()
+	defer exec.CloseExecutionSession(sessionID)
 	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
 	if disconnectCh == nil {
 		t.Fatal("expected disconnect channel")

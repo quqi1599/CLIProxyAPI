@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -152,6 +153,27 @@ func (h *handlerDirectExecutorInterceptorHost) PluginExecutorRequestToFormat(plu
 	return sdktranslator.FormatCodex
 }
 
+type handlerDirectExecutorStreamInterceptorHost struct {
+	handlerDirectExecutorInterceptorHost
+	chunkStarted chan struct{}
+	allowChunk   chan struct{}
+}
+
+func (h *handlerDirectExecutorStreamInterceptorHost) HasStreamInterceptors() bool { return true }
+
+func (h *handlerDirectExecutorStreamInterceptorHost) InterceptStreamChunk(_ context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+	headers := cloneHeader(req.ResponseHeaders)
+	if req.ChunkIndex == 0 {
+		close(h.chunkStarted)
+		<-h.allowChunk
+		if headers == nil {
+			headers = make(http.Header)
+		}
+		headers.Set("X-Chunk", "first")
+	}
+	return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+}
+
 func TestHandlerModelRouterRoutesBeforeRequestDetails(t *testing.T) {
 	originalModel := "handler-router-original-model"
 	targetPluginID := "websearch-plugin"
@@ -226,6 +248,58 @@ func TestHandlerModelRouterDirectExecutorRunsAfterAuthInterceptor(t *testing.T) 
 	}
 	if string(host.lastOptions.OriginalRequest) != `{"after":true}` {
 		t.Fatalf("original request = %q, want after-auth body", host.lastOptions.OriginalRequest)
+	}
+}
+
+func TestHandlerModelRouterPluginStreamHeadersReadyBeforeReturn(t *testing.T) {
+	originalModel := "handler-router-stream-header-model"
+	targetPluginID := "stream-header-plugin"
+	host := &handlerDirectExecutorStreamInterceptorHost{
+		chunkStarted: make(chan struct{}),
+		allowChunk:   make(chan struct{}),
+	}
+	host.hasRouters = true
+	host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: targetPluginID}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetPluginHost(host)
+
+	type streamResult struct {
+		dataChan <-chan []byte
+		headers  http.Header
+		errChan  <-chan *interfaces.ErrorMessage
+	}
+	resultChan := make(chan streamResult, 1)
+	go func() {
+		dataChan, headers, errChan := handler.ExecuteStreamWithAuthManager(
+			context.Background(),
+			"openai",
+			originalModel,
+			[]byte(fmt.Sprintf(`{"model":%q,"stream":true}`, originalModel)),
+			"",
+		)
+		resultChan <- streamResult{dataChan: dataChan, headers: headers, errChan: errChan}
+	}()
+
+	<-host.chunkStarted
+	select {
+	case result := <-resultChan:
+		t.Fatalf("ExecuteStreamWithAuthManager returned before first plugin chunk headers: %#v", result.headers)
+	default:
+	}
+	close(host.allowChunk)
+
+	result := <-resultChan
+	if got := result.headers.Get("X-Chunk"); got != "first" {
+		t.Fatalf("stream headers X-Chunk = %q, want first", got)
+	}
+	for range result.dataChan {
+	}
+	for errMsg := range result.errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %+v", errMsg)
+		}
 	}
 }
 

@@ -20,7 +20,6 @@ import (
 
 func TestPutRoutingStrategyAcceptsSequentialFillAlias(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -58,7 +57,6 @@ func TestPutRoutingStrategyAcceptsSequentialFillAlias(t *testing.T) {
 
 func TestPutUsageRetentionDaysPersistsAndUpdatesPlugin(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 	usage.CloseDatabasePlugin()
 	t.Cleanup(usage.CloseDatabasePlugin)
 
@@ -107,7 +105,6 @@ func TestPutUsageRetentionDaysPersistsAndUpdatesPlugin(t *testing.T) {
 
 func TestGetConfigYAMLReturnsVersionHeaders(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -135,7 +132,6 @@ func TestGetConfigYAMLReturnsVersionHeaders(t *testing.T) {
 
 func TestGetConfigIncludesAPIKeyAuthIndex(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	cfg := &config.Config{
 		GeminiKey: []config.GeminiKey{{
@@ -278,7 +274,6 @@ func TestGetConfigIncludesAPIKeyAuthIndex(t *testing.T) {
 
 func TestPutConfigYAMLRejectsStaleVersion(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -325,7 +320,6 @@ func TestPutConfigYAMLRejectsStaleVersion(t *testing.T) {
 
 func TestStructuredConfigWriteRejectsStaleVersionAndRestoresMemory(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -362,7 +356,6 @@ func TestStructuredConfigWriteRejectsStaleVersionAndRestoresMemory(t *testing.T)
 
 func TestCleanupMonitorLogsDeletesExpiredRecords(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 	usage.CloseDatabasePlugin()
 	t.Cleanup(usage.CloseDatabasePlugin)
 
