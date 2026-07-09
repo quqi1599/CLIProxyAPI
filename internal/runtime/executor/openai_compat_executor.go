@@ -259,7 +259,7 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 }
 
 func deepSeekOfficialImageInputUserMessage() string {
-	return "request_feature_unsupported: deepseek_official_image_input. 当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容，包括历史消息里的 image_url / input_image。请移除图片输入与图片历史，仅保留文本内容，或切换到原生支持图像输入的模型/路由后重试。原样重复提交不会提高成功率。"
+	return "DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
 }
 
 func hasOpenAICompatToolOutputMarker(body []byte) bool {
