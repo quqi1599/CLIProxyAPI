@@ -8,6 +8,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"sort"
 	"strings"
 
@@ -19,6 +20,18 @@ import (
 
 var (
 	dataTag = []byte("data:")
+	// Chat-completions reasoning_content has no upstream replay token, but
+	// Claude history still needs a stable signature-like marker so the next
+	// Claude request can map the same thinking text back into reasoning_content.
+	syntheticGPTReasoningSignature = func() string {
+		raw := make([]byte, 1+8+16+16+32)
+		raw[0] = 0x80
+		raw[8] = 1
+		for i := 9; i < len(raw); i++ {
+			raw[i] = byte(i)
+		}
+		return "gpt#" + base64.URLEncoding.EncodeToString(raw)
+	}()
 )
 
 // ConvertOpenAIResponseToAnthropicParams holds parameters for response conversion
@@ -55,6 +68,9 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	TextContentBlockIndex int
 	// Index assigned to thinking content block
 	ThinkingContentBlockIndex int
+	// Synthetic GPT-compatible marker for round-tripping Claude thinking blocks
+	// back into OpenAI reasoning_content on the next request.
+	ThinkingSignature string
 	// Next available content block index
 	NextContentBlockIndex int
 }
@@ -99,6 +115,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			ToolCallBlockIndexes:        make(map[int]int),
 			TextContentBlockIndex:       -1,
 			ThinkingContentBlockIndex:   -1,
+			ThinkingSignature:           "",
 			NextContentBlockIndex:       0,
 		}
 	}
@@ -182,6 +199,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					contentBlockStartJSONBytes, _ = sjson.SetBytes(contentBlockStartJSONBytes, "index", param.ThinkingContentBlockIndex)
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSONBytes, 2))
 					param.ThinkingContentBlockStarted = true
+					param.ThinkingSignature = syntheticGPTReasoningSignature
 				}
 
 				thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
@@ -288,14 +306,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			param.FinishReason = reason
 		}
 
-		// Send content_block_stop for thinking content if needed
-		if param.ThinkingContentBlockStarted {
-			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-			contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-			param.ThinkingContentBlockStarted = false
-			param.ThinkingContentBlockIndex = -1
-		}
+		stopThinkingContentBlock(param, &results)
 
 		// Send content_block_stop for text if text content block was started
 		stopTextContentBlock(param, &results)
@@ -364,13 +375,7 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	var results [][]byte
 
 	// Ensure all content blocks are stopped before final events
-	if param.ThinkingContentBlockStarted {
-		contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-		contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-		param.ThinkingContentBlockStarted = false
-		param.ThinkingContentBlockIndex = -1
-	}
+	stopThinkingContentBlock(param, &results)
 
 	stopTextContentBlock(param, &results)
 
@@ -434,6 +439,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			}
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+			block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
 			out, _ = sjson.SetRawBytes(out, "content.-1", block)
 		}
 
@@ -551,11 +557,18 @@ func stopThinkingContentBlock(param *ConvertOpenAIResponseToAnthropicParams, res
 	if !param.ThinkingContentBlockStarted {
 		return
 	}
+	if param.ThinkingSignature != "" {
+		signatureDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}`)
+		signatureDeltaJSON, _ = sjson.SetBytes(signatureDeltaJSON, "index", param.ThinkingContentBlockIndex)
+		signatureDeltaJSON, _ = sjson.SetBytes(signatureDeltaJSON, "delta.signature", param.ThinkingSignature)
+		*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", signatureDeltaJSON, 2))
+	}
 	contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
 	contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
 	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
 	param.ThinkingContentBlockStarted = false
 	param.ThinkingContentBlockIndex = -1
+	param.ThinkingSignature = ""
 }
 
 func emitMessageStopIfNeeded(param *ConvertOpenAIResponseToAnthropicParams, results *[][]byte) {
@@ -631,6 +644,18 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 		}
 
 		if message := choice.Get("message"); message.Exists() {
+			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
+				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
+					if reasoningText == "" {
+						continue
+					}
+					block := []byte(`{"type":"thinking","thinking":""}`)
+					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+					block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
+					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+				}
+			}
+
 			if contentResult := message.Get("content"); contentResult.Exists() {
 				if contentResult.IsArray() {
 					var textBuilder strings.Builder
@@ -652,6 +677,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"thinking","thinking":""}`)
 						block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
+						block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
 						out, _ = sjson.SetRawBytes(out, "content.-1", block)
 						thinkingBuilder.Reset()
 					}
@@ -708,17 +734,6 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						block, _ = sjson.SetBytes(block, "text", textContent)
 						out, _ = sjson.SetRawBytes(out, "content.-1", block)
 					}
-				}
-			}
-
-			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
-				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
-					if reasoningText == "" {
-						continue
-					}
-					block := []byte(`{"type":"thinking","thinking":""}`)
-					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
 				}
 			}
 

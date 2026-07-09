@@ -364,3 +364,63 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
+
+func TestConvertOpenAIResponseToClaude_StreamEmitsThinkingSignatureDelta(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"deepseek-v4-pro","created":1,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"provider state"},"finish_reason":null}]}`,
+		`{"id":"c1","model":"deepseek-v4-pro","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	)
+
+	var signature string
+	for _, e := range events {
+		if e.Type != "content_block_delta" {
+			continue
+		}
+		if gjson.Get(e.Payload, "delta.type").String() != "signature_delta" {
+			continue
+		}
+		signature = gjson.Get(e.Payload, "delta.signature").String()
+		break
+	}
+	if !strings.HasPrefix(signature, "gpt#") {
+		t.Fatalf("signature_delta = %q, want gpt#... (events=%+v)", signature, events)
+	}
+}
+
+func TestConvertOpenAIResponseToClaudeNonStream_RoundTripsReasoningContent(t *testing.T) {
+	raw := []byte(`{
+		"id":"chatcmpl_1",
+		"model":"deepseek-v4-pro",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"visible answer",
+				"reasoning_content":"provider state"
+			},
+			"finish_reason":"stop"
+		}]
+	}`)
+
+	out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "deepseek-v4-pro", nil, nil, raw, nil)
+
+	if got := gjson.GetBytes(out, "content.0.type").String(); got != "thinking" {
+		t.Fatalf("content.0.type = %q, want thinking: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "content.0.signature").String(); !strings.HasPrefix(got, "gpt#") {
+		t.Fatalf("content.0.signature = %q, want gpt#...: %s", got, string(out))
+	}
+
+	roundtripReq := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[{"role":"assistant","content":` + gjson.GetBytes(out, "content").Raw + `}]
+	}`)
+	roundtrip := ConvertClaudeRequestToOpenAI("deepseek-v4-pro", roundtripReq, false)
+
+	if got := gjson.GetBytes(roundtrip, "messages.0.reasoning_content").String(); got != "provider state" {
+		t.Fatalf("messages.0.reasoning_content = %q, want provider state: %s", got, string(roundtrip))
+	}
+	if got := gjson.GetBytes(roundtrip, "messages.0.content.0.text").String(); got != "visible answer" {
+		t.Fatalf("messages.0.content.0.text = %q, want visible answer: %s", got, string(roundtrip))
+	}
+}
