@@ -363,8 +363,10 @@ func requiresKimiK25K26Compatibility(model string) bool {
 	modelName := normalizedKimiModelName(model)
 	return modelName == "k2.5" ||
 		modelName == "k2.6" ||
+		modelName == "k2.7" ||
 		strings.HasPrefix(modelName, "k2.5-") ||
-		strings.HasPrefix(modelName, "k2.6-")
+		strings.HasPrefix(modelName, "k2.6-") ||
+		strings.HasPrefix(modelName, "k2.7-")
 }
 
 func requiresKimiK25K26PayloadCompatibility(payload []byte, model string) bool {

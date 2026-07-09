@@ -1025,6 +1025,48 @@ func TestOpenAICompatPayloadKimiK26NormalizesThinkingToolChoiceAndSampling(t *te
 	}
 }
 
+func TestOpenAICompatPayloadKimiK27NormalizesThinkingToolChoiceAndSampling(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k2.7",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],
+		"tool_choice":{"type":"function","function":{"name":"read_file"}},
+		"thinking":{"type":"high","keep":"all"},
+		"temperature":0.2,
+		"top_p":0.4,
+		"n":2,
+		"presence_penalty":1.0,
+		"frequency_penalty":1.0
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k2.7", "https://api.kimi.com/coding/v1")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "thinking.keep").Exists() {
+		t.Fatalf("thinking.keep should be removed for kimi k2.7 compat payload: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "temperature").Float(); got != kimiThinkingTemperature {
+		t.Fatalf("temperature = %v, want %v: %s", got, kimiThinkingTemperature, string(out))
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != kimiTopP {
+		t.Fatalf("top_p = %v, want %v: %s", got, kimiTopP, string(out))
+	}
+	if got := gjson.GetBytes(out, "n").Int(); got != 1 {
+		t.Fatalf("n = %v, want 1: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "presence_penalty").Float(); got != 0 {
+		t.Fatalf("presence_penalty = %v, want 0: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "frequency_penalty").Float(); got != 0 {
+		t.Fatalf("frequency_penalty = %v, want 0: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadKimiK25WebSearchDisablesThinking(t *testing.T) {
 	payload := []byte(`{
 		"model":"kimi-k2.5",
