@@ -19,9 +19,9 @@ func normalizeThinkingHistoryForModel(body []byte, provider string, model string
 	if !requested && requiresReturnedThinkingHistory(model) {
 		switch strings.ToLower(strings.TrimSpace(provider)) {
 		case "openai":
-			requested = deepSeekOpenAIThinkingEnabled(body) || openAIHistoryHasReasoningContent(body)
+			requested = deepSeekOpenAIThinkingEnabled(body) || openAIHistoryNeedsThinkingNormalization(body)
 		case "claude":
-			requested = claudeHistoryHasThinking(body)
+			requested = claudeHistoryNeedsThinkingNormalization(body)
 		}
 	}
 	if !requested {
@@ -38,17 +38,22 @@ func normalizeThinkingHistoryForModel(body []byte, provider string, model string
 	}
 }
 
-func openAIHistoryHasReasoningContent(body []byte) bool {
+func openAIHistoryNeedsThinkingNormalization(body []byte) bool {
 	for _, msg := range gjson.GetBytes(body, "messages").Array() {
-		if strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") &&
-			strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+		if !strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") {
+			continue
+		}
+		if strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+			return true
+		}
+		if toolCalls := msg.Get("tool_calls"); toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func claudeHistoryHasThinking(body []byte) bool {
+func claudeHistoryNeedsThinkingNormalization(body []byte) bool {
 	for _, msg := range gjson.GetBytes(body, "messages").Array() {
 		if !strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") {
 			continue
@@ -56,6 +61,9 @@ func claudeHistoryHasThinking(body []byte) bool {
 		for _, part := range msg.Get("content").Array() {
 			if strings.EqualFold(strings.TrimSpace(part.Get("type").String()), "thinking") &&
 				strings.TrimSpace(part.Get("thinking").String()) != "" {
+				return true
+			}
+			if strings.EqualFold(strings.TrimSpace(part.Get("type").String()), "tool_use") {
 				return true
 			}
 		}

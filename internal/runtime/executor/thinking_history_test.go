@@ -115,6 +115,29 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsPartialHistoryWithoutThink
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsToolHistoryWithoutReasoning(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"result"}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-flash")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("normalizeThinkingHistoryForModel() should repair DeepSeek tool history")
+	}
+	if downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() downgraded unexpectedly")
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "[reasoning unavailable]" {
+		t.Fatalf("messages.0.reasoning_content = %q, want placeholder", got)
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsWhenThinkingTypeEnabled(t *testing.T) {
 	body := []byte(`{
 		"thinking":{"type":"enabled","budget_tokens":1024},
@@ -278,6 +301,29 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekRepairsPartialHistoryWithoutThink
 	}
 	if got := gjson.GetBytes(out, "messages.2.content.0.thinking").String(); got != "first plan" {
 		t.Fatalf("messages.2.content.0.thinking = %q, want %q", got, "first plan")
+	}
+}
+
+func TestNormalizeClaudeThinkingHistoryDeepSeekRepairsToolHistoryWithoutThinking(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result"}]}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-flash")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("normalizeThinkingHistoryForModel() should repair DeepSeek Claude tool history")
+	}
+	if downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() downgraded unexpectedly")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.thinking").String(); got != "[thinking unavailable]" {
+		t.Fatalf("messages.0.content.0.thinking = %q, want placeholder", got)
 	}
 }
 
