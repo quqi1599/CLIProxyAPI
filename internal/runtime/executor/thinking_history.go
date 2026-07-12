@@ -16,8 +16,13 @@ func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool,
 
 func normalizeThinkingHistoryForModel(body []byte, provider string, model string) ([]byte, bool, bool, error) {
 	requested := thinkingHistoryRequested(body, provider)
-	if !requested && strings.EqualFold(strings.TrimSpace(provider), "openai") && requiresReturnedThinkingHistory(model) {
-		requested = deepSeekOpenAIThinkingEnabled(body)
+	if !requested && requiresReturnedThinkingHistory(model) {
+		switch strings.ToLower(strings.TrimSpace(provider)) {
+		case "openai":
+			requested = deepSeekOpenAIThinkingEnabled(body) || openAIHistoryHasReasoningContent(body)
+		case "claude":
+			requested = claudeHistoryHasThinking(body)
+		}
 	}
 	if !requested {
 		return body, false, false, nil
@@ -31,6 +36,31 @@ func normalizeThinkingHistoryForModel(body []byte, provider string, model string
 	default:
 		return body, false, false, nil
 	}
+}
+
+func openAIHistoryHasReasoningContent(body []byte) bool {
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		if strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") &&
+			strings.TrimSpace(msg.Get("reasoning_content").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeHistoryHasThinking(body []byte) bool {
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		if !strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") {
+			continue
+		}
+		for _, part := range msg.Get("content").Array() {
+			if strings.EqualFold(strings.TrimSpace(part.Get("type").String()), "thinking") &&
+				strings.TrimSpace(part.Get("thinking").String()) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func requiresReturnedThinkingHistory(model string) bool {

@@ -91,6 +91,30 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsPartialHistoryWithoutThinkingRequest(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","reasoning_content":"first plan","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"result"},
+			{"role":"assistant","tool_calls":[{"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("normalizeThinkingHistoryForModel() should repair partial DeepSeek history")
+	}
+	if downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() downgraded unexpectedly")
+	}
+	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != "first plan" {
+		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, "first plan")
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryDeepSeekRepairsWhenThinkingTypeEnabled(t *testing.T) {
 	body := []byte(`{
 		"thinking":{"type":"enabled","budget_tokens":1024},
@@ -230,6 +254,30 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 	}
 	if gjson.GetBytes(out, "messages.0.content.0.thinking").Exists() {
 		t.Fatalf("messages.0.content.0.thinking should not be added without thinking request")
+	}
+}
+
+func TestNormalizeClaudeThinkingHistoryDeepSeekRepairsPartialHistoryWithoutThinkingRequest(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"thinking","thinking":"first plan"},{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result"}]},
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"read_file","input":{}}]}
+		]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("normalizeThinkingHistoryForModel() should repair partial DeepSeek Claude history")
+	}
+	if downgraded {
+		t.Fatalf("normalizeThinkingHistoryForModel() downgraded unexpectedly")
+	}
+	if got := gjson.GetBytes(out, "messages.2.content.0.thinking").String(); got != "first plan" {
+		t.Fatalf("messages.2.content.0.thinking = %q, want %q", got, "first plan")
 	}
 }
 
