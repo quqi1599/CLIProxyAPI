@@ -91,7 +91,7 @@ func CompleteOAuthSession(state string) {
 	internalmanagement.CompleteOAuthSession(state)
 }
 
-// CompleteOAuthSessionsByProvider removes all pending OAuth sessions for a provider.
+// CompleteOAuthSessionsByProvider completes pending OAuth sessions for a provider and retains short-lived tombstones.
 func CompleteOAuthSessionsByProvider(provider string) int {
 	return internalmanagement.CompleteOAuthSessionsByProvider(provider)
 }
