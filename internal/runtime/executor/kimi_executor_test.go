@@ -174,9 +174,16 @@ func TestKimiExecutorHttpRequestSanitizesDirectChatBody(t *testing.T) {
 func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T) {
 	var gotPath string
 	var gotAuth string
+	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"chatcmpl-test",
@@ -198,7 +205,9 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 	}
 	body := []byte(`{
 		"model":"kimi-k2.6",
-		"messages":[{"role":"user","content":"hello"}]
+		"messages":[{"role":"user","content":"hello"}],
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"max"}
 	}`)
 	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "kimi-k2.6",
@@ -216,6 +225,7 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 	if gotAuth != "Bearer test-key" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
 	}
+	assertKimiEnabledThinkingWire(t, gotBody)
 	if len(resp.Payload) == 0 {
 		t.Fatal("expected translated response payload")
 	}
@@ -223,8 +233,15 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 
 func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *testing.T) {
 	var gotPath string
+	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		lines := []string{
@@ -251,7 +268,9 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 	}
 	body := []byte(`{
 		"model":"kimi-k2.6",
-		"messages":[{"role":"user","content":"hello"}]
+		"messages":[{"role":"user","content":"hello"}],
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"max"}
 	}`)
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "kimi-k2.6",
@@ -274,11 +293,24 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 	if gotPath != "/coding/v1/chat/completions" {
 		t.Fatalf("upstream path = %q, want %q", gotPath, "/coding/v1/chat/completions")
 	}
+	assertKimiEnabledThinkingWire(t, gotBody)
 	if !strings.Contains(combined.String(), `"type":"message"`) && !strings.Contains(combined.String(), "message_stop") {
 		t.Fatalf("expected translated stream output, got %q", combined.String())
 	}
 	if strings.Contains(combined.String(), "missing message_start") {
 		t.Fatalf("unexpected missing_message_start failure in translated output: %q", combined.String())
+	}
+}
+
+func assertKimiEnabledThinkingWire(t *testing.T, body []byte) {
+	t.Helper()
+	if got := gjson.GetBytes(body, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(body))
+	}
+	for _, path := range []string{"reasoning_effort", "output_config", "thinking.budget_tokens", "thinking.keep"} {
+		if gjson.GetBytes(body, path).Exists() {
+			t.Fatalf("%s should not be sent to Kimi: %s", path, string(body))
+		}
 	}
 }
 
