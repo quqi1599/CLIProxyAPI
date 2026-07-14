@@ -8,9 +8,11 @@ package gemini
 import (
 	"bytes"
 	"context"
+	"fmt"
 
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -43,6 +45,7 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 			if responseResult.Exists() {
 				chunk = []byte(responseResult.Raw)
 				chunk = restoreUsageMetadata(chunk)
+				chunk = restoreGeminiFunctionNames(chunk, originalRequestRawJSON)
 			}
 		} else {
 			responseResult := gjson.ParseBytes(chunk)
@@ -77,9 +80,30 @@ func ConvertAntigravityResponseToGeminiNonStream(_ context.Context, _ string, or
 	responseResult := gjson.GetBytes(rawJSON, "response")
 	if responseResult.Exists() {
 		chunk := restoreUsageMetadata([]byte(responseResult.Raw))
+		return restoreGeminiFunctionNames(chunk, originalRequestRawJSON)
+	}
+	return restoreGeminiFunctionNames(rawJSON, originalRequestRawJSON)
+}
+
+func restoreGeminiFunctionNames(chunk, originalRequestRawJSON []byte) []byte {
+	nameMap := util.DisambiguatedToolNameMap(originalRequestRawJSON)
+	if len(nameMap) == 0 {
 		return chunk
 	}
-	return rawJSON
+	candidates := gjson.GetBytes(chunk, "candidates")
+	for candidateIndex, candidate := range candidates.Array() {
+		for partIndex, part := range candidate.Get("content.parts").Array() {
+			for _, field := range []string{"functionCall", "functionResponse", "function_call", "function_response"} {
+				name := part.Get(field + ".name").String()
+				if name == "" {
+					continue
+				}
+				path := fmt.Sprintf("candidates.%d.content.parts.%d.%s.name", candidateIndex, partIndex, field)
+				chunk, _ = sjson.SetBytes(chunk, path, util.RestoreSanitizedToolName(nameMap, name))
+			}
+		}
+	}
+	return chunk
 }
 
 func GeminiTokenCount(ctx context.Context, count int64) []byte {

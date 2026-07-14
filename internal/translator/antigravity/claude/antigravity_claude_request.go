@@ -315,6 +315,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	if shouldBuildAntigravityWebSearchRequest(modelName, rawJSON) {
 		return buildAntigravityWebSearchRequest(modelName, rawJSON)
 	}
+	functionNameMap := util.SanitizedFunctionNameMap(rawJSON)
 
 	// system instruction
 	var systemInstructionJSON []byte
@@ -441,12 +442,13 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						// NOTE: Do NOT inject dummy thinking blocks here.
 						// Antigravity API validates signatures, so dummy values are rejected.
 
-						functionName := util.SanitizeFunctionName(contentResult.Get("name").String())
+						originalFunctionName := contentResult.Get("name").String()
+						functionName := util.MapSanitizedFunctionName(functionNameMap, originalFunctionName)
 						argsResult := contentResult.Get("input")
 						functionID := contentResult.Get("id").String()
 
-						if functionID != "" && functionName != "" {
-							toolNameByID[functionID] = functionName
+						if functionID != "" && originalFunctionName != "" {
+							toolNameByID[functionID] = originalFunctionName
 						}
 
 						// Handle both object and string input formats
@@ -499,7 +501,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 							functionResponseJSON := []byte(`{}`)
 							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "id", toolCallID)
-							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "name", util.SanitizeFunctionName(funcName))
+							functionResponseJSON, _ = sjson.SetBytes(functionResponseJSON, "name", util.MapSanitizedFunctionName(functionNameMap, funcName))
 
 							responseData := ""
 							if functionResponseResult.Type == gjson.String {
@@ -642,6 +644,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	// tools
 	var toolsJSON []byte
 	functionDeclarations := make([][]byte, 0)
+	toolDeclCount := 0
 	allowedToolKeys := map[string]bool{"name": true, "description": true, "behavior": true, "parameters": true, "parametersJsonSchema": true, "response": true, "responseJsonSchema": true}
 	toolsResult := gjson.GetBytes(rawJSON, "tools")
 	if toolsResult.IsArray() {
@@ -677,7 +680,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					}
 					switch fieldName {
 					case "name":
-						encodedName, _ := json.Marshal(util.SanitizeFunctionName(toolResult.Get("name").String()))
+						encodedName, _ := json.Marshal(util.MapSanitizedFunctionName(functionNameMap, toolResult.Get("name").String()))
 						appendField(fieldName, encodedName)
 						nameWritten = true
 					case "parametersJsonSchema":
@@ -692,7 +695,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					appendField("parametersJsonSchema", []byte(inputSchema))
 				}
 				if !nameWritten {
-					encodedName, _ := json.Marshal(util.SanitizeFunctionName(toolResult.Get("name").String()))
+					encodedName, _ := json.Marshal(util.MapSanitizedFunctionName(functionNameMap, toolResult.Get("name").String()))
 					appendField("name", encodedName)
 				}
 				tool = append(tool, '}')
@@ -700,12 +703,15 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 		}
 		if len(functionDeclarations) > 0 {
-			functionToolNode := []byte(`{"functionDeclarations":[]}`)
-			functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", internalpayload.BuildRaw(functionDeclarations))
-			toolsJSON = internalpayload.BuildRaw([][]byte{functionToolNode})
+			deduplicated := util.DeduplicateFunctionDeclarations(internalpayload.BuildRaw(functionDeclarations))
+			toolDeclCount = len(gjson.ParseBytes(deduplicated).Array())
+			if toolDeclCount > 0 {
+				functionToolNode := []byte(`{"functionDeclarations":[]}`)
+				functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", deduplicated)
+				toolsJSON = internalpayload.BuildRaw([][]byte{functionToolNode})
+			}
 		}
 	}
-	toolDeclCount := len(functionDeclarations)
 	// Build output Antigravity request JSON
 	out := []byte(`{"model":"","request":{"contents":[]}}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -767,7 +773,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		case "tool":
 			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
 			if toolChoiceName != "" {
-				out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.SanitizeFunctionName(toolChoiceName)})
+				out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.MapSanitizedFunctionName(functionNameMap, toolChoiceName)})
 			}
 		}
 	}
