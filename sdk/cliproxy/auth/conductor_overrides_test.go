@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3554,6 +3555,23 @@ func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
 	}
 }
 
+func TestDeepSeekCompatibilityFallbackIsScopedToV4Models(t *testing.T) {
+	err := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    "invalid_request_error: Thinking mode does not support this tool_choice",
+	}
+	for _, model := range []string{"deepseek-v4-pro", "DeepSeek-算力/deepseek-v4-flash(high)"} {
+		if !shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected DeepSeek compatibility fallback for %s", model)
+		}
+	}
+	for _, model := range []string{"deepseek-v3.1", "claude-sonnet-4-6", "glm-4.7"} {
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("unexpected DeepSeek compatibility fallback for %s", model)
+		}
+	}
+}
+
 func TestManager_Execute_ClaudeSonnetAliasContentSafetyStopsWithoutFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
@@ -3781,6 +3799,162 @@ func TestManager_Execute_GenericContentSafetyStillStopsRetry(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManager_Execute_DeepSeekCompatibilityBadRequestFallsBackAcrossRoutes(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{
+			name:    "thinking tool choice",
+			message: "invalid_request_error: Thinking mode does not support this tool_choice",
+		},
+		{
+			name:    "null tool schema array",
+			message: `invalid_request_error: Invalid schema for function 'get_goal': null is not of type "array"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			m.SetRetryConfig(0, 0, 5)
+			executor := &authFallbackExecutor{
+				id: "claude",
+				executeErrors: map[string]error{
+					"aa-compute-primary": &Error{HTTPStatus: http.StatusBadRequest, Message: tt.message},
+				},
+			}
+			m.RegisterExecutor(executor)
+
+			model := "deepseek-v4-pro"
+			auths := []*Auth{
+				{ID: "aa-compute-primary", Provider: "claude", Attributes: map[string]string{"base_url": "https://compute.example/v1", "priority": "10"}},
+				{ID: "ab-compute-same-route", Provider: "claude", Attributes: map[string]string{"base_url": "https://compute.example/v1", "priority": "10"}},
+				{ID: "ba-official", Provider: "claude", Attributes: map[string]string{"base_url": "https://api.deepseek.com/anthropic", "priority": "0"}},
+			}
+			reg := registry.GetGlobalRegistry()
+			for _, auth := range auths {
+				reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+				if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+					t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+				}
+			}
+			t.Cleanup(func() {
+				for _, auth := range auths {
+					reg.UnregisterClient(auth.ID)
+				}
+			})
+
+			resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			if errExecute != nil {
+				t.Fatalf("execute error = %v, want fallback success", errExecute)
+			}
+			if string(resp.Payload) != "ba-official" {
+				t.Fatalf("payload = %q, want ba-official", string(resp.Payload))
+			}
+			got := executor.ExecuteCalls()
+			want := []string{"aa-compute-primary", "ba-official"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("execute calls = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestManager_ExecuteStream_DeepSeekCompatibilityBadRequestFallsBackAcrossRoutes(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 5)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamFirstErrors: map[string]error{
+			"aa-compute-primary": &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    `invalid_request_error: Invalid schema for function 'get_goal': null is not of type "array"`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "deepseek-v4-pro"
+	auths := []*Auth{
+		{ID: "aa-compute-primary", Provider: "claude", Attributes: map[string]string{"base_url": "https://compute.example/v1", "priority": "10"}},
+		{ID: "ab-compute-same-route", Provider: "claude", Attributes: map[string]string{"base_url": "https://compute.example/v1", "priority": "10"}},
+		{ID: "ba-volcano", Provider: "claude", Attributes: map[string]string{"base_url": "https://ark.cn-beijing.volces.com/api/coding", "priority": "0"}},
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+	})
+
+	result, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want fallback success", errExecute)
+	}
+	var payload []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "ba-volcano" {
+		t.Fatalf("stream payload = %q, want ba-volcano", string(payload))
+	}
+	got := executor.StreamCalls()
+	want := []string{"aa-compute-primary", "ba-volcano"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+}
+
+func TestManager_Execute_DeepSeekGenericBadRequestStillStopsRetry(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 5)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-compute": &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "deepseek-v4-pro"
+	auths := []*Auth{
+		{ID: "aa-compute", Provider: "claude", Attributes: map[string]string{"base_url": "https://compute.example/v1", "priority": "10"}},
+		{ID: "ba-official", Provider: "claude", Attributes: map[string]string{"base_url": "https://api.deepseek.com/anthropic", "priority": "0"}},
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+	})
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected malformed payload error")
+	}
+	got := executor.ExecuteCalls()
+	want := []string{"aa-compute"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
 }
 

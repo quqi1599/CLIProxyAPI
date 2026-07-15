@@ -3985,7 +3985,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	var lastErr error
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
-			!shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, lastErr) {
+			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -4089,6 +4089,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					}
 					if isRequestInvalidError(errExec) {
 						if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
+							if isDeepSeekCompatibilityFallbackError(errExec) {
+								m.markCompatibilityFallbackRouteTried(tried, auth)
+							}
 							authErr = errExec
 							countAttempt = true
 							if idx < len(models)-1 {
@@ -4157,7 +4160,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var lastErr error
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
-			!shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, lastErr) {
+			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -4246,6 +4249,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				continue
 			}
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
+			if routeFallback && isDeepSeekCompatibilityFallbackError(errStream) {
+				m.markCompatibilityFallbackRouteTried(tried, auth)
+			}
 			transientNetworkFallback := isTransientRoutingError(errStream)
 			emptyUpstreamFallback := isRetryableEmptyUpstreamResponseError(errStream)
 			if isRequestInvalidError(errStream) {
@@ -7493,12 +7499,33 @@ func isRetryableEmptyUpstreamResponseError(err error) bool {
 	return status == http.StatusRequestTimeout || isTransientUpstreamStatus(status)
 }
 
-func isRequestScopedRouteFallbackError(err error) bool {
-	return isRequestScopedContextLimitError(err)
+func isDeepSeekCompatibilityFallbackError(err error) bool {
+	if err == nil || statusCodeFromError(err) != http.StatusBadRequest {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(message, "thinking mode does not support this tool_choice") {
+		return true
+	}
+	return strings.Contains(message, "invalid schema for function") &&
+		strings.Contains(message, "null is not of type") &&
+		strings.Contains(message, "array")
+}
+
+func isDeepSeekCompatibilityFallbackModel(model string) bool {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
+		modelName = modelName[slash+1:]
+	}
+	return strings.HasPrefix(modelName, "deepseek-v4")
 }
 
 func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cliproxyexecutor.Options, err error) bool {
-	if !isRequestScopedRouteFallbackError(err) {
+	requestedModel := requestedModelAliasFromOptions(opts, routeModel)
+	if isDeepSeekCompatibilityFallbackError(err) {
+		return isDeepSeekCompatibilityFallbackModel(routeModel) || isDeepSeekCompatibilityFallbackModel(requestedModel)
+	}
+	if !isRequestScopedContextLimitError(err) {
 		return false
 	}
 	if isRequestScopedContentSafetyError(err) {
@@ -7507,7 +7534,43 @@ func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cli
 	if isRequestScopedFallbackModel(routeModel) {
 		return true
 	}
-	return isRequestScopedFallbackModel(requestedModelAliasFromOptions(opts, routeModel))
+	return isRequestScopedFallbackModel(requestedModel)
+}
+
+func shouldBypassCredentialRetryLimitForRequest(routeModel string, opts cliproxyexecutor.Options, err error) bool {
+	return isRequestScopedContextLimitError(err) && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, err)
+}
+
+func compatibilityFallbackRouteKey(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	baseURL := normalizeChannelBreakerURL(auth.Attributes["base_url"])
+	if baseURL == "" {
+		return ""
+	}
+	providerFamily := authProviderFamilyKey(auth)
+	if providerFamily == "" {
+		providerFamily = executorKeyFromAuth(auth)
+	}
+	return providerFamily + "\x00" + baseURL
+}
+
+func (m *Manager) markCompatibilityFallbackRouteTried(tried map[string]struct{}, selected *Auth) {
+	if m == nil || len(tried) == 0 || selected == nil {
+		return
+	}
+	routeKey := compatibilityFallbackRouteKey(selected)
+	if routeKey == "" {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for authID, candidate := range m.auths {
+		if compatibilityFallbackRouteKey(candidate) == routeKey {
+			tried[authID] = struct{}{}
+		}
+	}
 }
 
 func isRequestScopedFallbackModel(model string) bool {
