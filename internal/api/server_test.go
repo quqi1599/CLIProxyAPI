@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,8 +22,52 @@ import (
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+type codexAlphaSearchTestExecutor struct {
+	body    []byte
+	authIDs []string
+}
+
+func (e *codexAlphaSearchTestExecutor) Identifier() string { return "codex" }
+
+func (e *codexAlphaSearchTestExecutor) Execute(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *codexAlphaSearchTestExecutor) ExecuteStream(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *codexAlphaSearchTestExecutor) Refresh(_ context.Context, candidate *auth.Auth) (*auth.Auth, error) {
+	return candidate, nil
+}
+
+func (e *codexAlphaSearchTestExecutor) CountTokens(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *codexAlphaSearchTestExecutor) PrepareRequest(req *http.Request, candidate *auth.Auth) error {
+	token, _ := candidate.Metadata["access_token"].(string)
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
+}
+
+func (e *codexAlphaSearchTestExecutor) HttpRequest(_ context.Context, candidate *auth.Auth, req *http.Request) (*http.Response, error) {
+	e.authIDs = append(e.authIDs, candidate.ID)
+	body, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		return nil, errRead
+	}
+	e.body = body
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"results":[]}`)),
+	}, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -56,6 +102,42 @@ func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	return NewServer(cfg, authManager, accessManager, configPath, opts...)
+}
+
+func TestCodexAlphaSearchUsesOAuthAndSanitizesBody(t *testing.T) {
+	server := newTestServer(t)
+	executor := &codexAlphaSearchTestExecutor{}
+	server.handlers.AuthManager.RegisterExecutor(executor)
+	for _, candidate := range []*auth.Auth{
+		{ID: "codex-api-key", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{auth.AttributeAPIKey: "test-key"}},
+		{ID: "codex-oauth", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "oauth-token"}},
+	} {
+		if _, errRegister := server.handlers.AuthManager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("register %s: %v", candidate.ID, errRegister)
+		}
+	}
+
+	payload := `{"id":"session-123","commands":{"search_query":[{"q":"golang"}]},"prompt_cache_key":"cache","prompt_cache_retention":"24h"}`
+	for _, path := range []string{"/v1/alpha/search", "/backend-api/codex/alpha/search"} {
+		t.Run(path, func(t *testing.T) {
+			executor.authIDs = nil
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(payload))
+			req.Header.Set("Authorization", "Bearer test-key")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+			}
+			if len(executor.authIDs) != 1 || executor.authIDs[0] != "codex-oauth" {
+				t.Fatalf("selected auth IDs = %v, want [codex-oauth]", executor.authIDs)
+			}
+			upstreamBody := string(executor.body)
+			if strings.Contains(upstreamBody, "prompt_cache") || !strings.Contains(upstreamBody, "commands") {
+				t.Fatalf("unexpected upstream body: %s", upstreamBody)
+			}
+		})
+	}
 }
 
 func TestInjectManagementConfigVersionGuard(t *testing.T) {

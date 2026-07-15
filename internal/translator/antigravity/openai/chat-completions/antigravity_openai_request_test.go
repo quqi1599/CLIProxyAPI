@@ -54,3 +54,26 @@ func TestConvertOpenAIRequestToAntigravitySkipsEmptyTextPartsWithoutNulls(t *tes
 		t.Fatalf("functionCall missing. Output: %s", result)
 	}
 }
+
+func TestConvertOpenAIRequestToAntigravityPreservesReasoningAndSkipsEmptyAssistant(t *testing.T) {
+	inputJSON := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":"visible","reasoning_content":"thinking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"{\"output\":\"ok\"}"},
+		{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"","arguments":"{}"}}]},
+		{"role":"user","content":"done"}
+	]}`
+
+	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
+	contents := gjson.GetBytes(result, "request.contents").Array()
+	if len(contents) != 4 {
+		t.Fatalf("contents length = %d, want 4. Output: %s", len(contents), result)
+	}
+	parts := contents[1].Get("parts").Array()
+	if len(parts) != 3 || parts[0].Get("text").String() != "thinking" || !parts[0].Get("thought").Bool() {
+		t.Fatalf("reasoning part was not preserved first. Output: %s", result)
+	}
+	if parts[1].Get("text").String() != "visible" || parts[2].Get("functionCall.name").String() != "read_file" {
+		t.Fatalf("visible content or function call missing. Output: %s", result)
+	}
+}

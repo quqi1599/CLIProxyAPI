@@ -17,6 +17,54 @@ type schedulerTestExecutor struct{}
 
 func (schedulerTestExecutor) Identifier() string { return "test" }
 
+func TestManagerSelectAuthByKind(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	for _, candidate := range []*Auth{
+		{ID: "codex-api-key", Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "test-key"}},
+		{ID: "codex-oauth", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", candidate.ID, errRegister)
+		}
+	}
+
+	selected, errSelect := manager.SelectAuthByKind(context.Background(), "codex", "", AuthKindOAuth, cliproxyexecutor.Options{})
+	if errSelect != nil {
+		t.Fatalf("SelectAuthByKind() error = %v", errSelect)
+	}
+	if selected == nil || selected.ID != "codex-oauth" {
+		t.Fatalf("SelectAuthByKind() auth = %#v, want codex-oauth", selected)
+	}
+}
+
+func TestManagerSelectAuthByKindReturnsNotFound(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	_, _ = manager.Register(context.Background(), &Auth{ID: "codex-api-key", Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "test-key"}})
+
+	selected, errSelect := manager.SelectAuthByKind(context.Background(), "codex", "", AuthKindOAuth, cliproxyexecutor.Options{})
+	if selected != nil {
+		t.Fatalf("SelectAuthByKind() auth = %#v, want nil", selected)
+	}
+	var authErr *Error
+	if !errors.As(errSelect, &authErr) || authErr.Code != "auth_not_found" {
+		t.Fatalf("SelectAuthByKind() error = %#v, want auth_not_found", errSelect)
+	}
+}
+
+func TestManagerSelectAuthByKindRejectsInvalidKind(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	selected, errSelect := manager.SelectAuthByKind(context.Background(), "codex", "", "certificate", cliproxyexecutor.Options{})
+	if selected != nil {
+		t.Fatalf("SelectAuthByKind() auth = %#v, want nil", selected)
+	}
+	var authErr *Error
+	if !errors.As(errSelect, &authErr) || authErr.Code != "invalid_auth_kind" || authErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("SelectAuthByKind() error = %#v, want invalid_auth_kind", errSelect)
+	}
+}
+
 func (schedulerTestExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, nil
 }

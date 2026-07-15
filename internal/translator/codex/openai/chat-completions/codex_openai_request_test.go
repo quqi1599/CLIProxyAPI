@@ -1023,6 +1023,84 @@ func TestNormalizeClaudeStyleToolBlocksInChatMessages(t *testing.T) {
 	}
 }
 
+func TestCustomToolCallHistoryPreservesCallFamily(t *testing.T) {
+	input := []byte(`{"messages":[
+		{"role":"user","content":"Run both tools."},
+		{"role":"assistant","content":null,"tool_calls":[
+			{"id":"call_function","type":"function","function":{"name":"lookup","arguments":"{}"}},
+			{"id":"call_custom","type":"custom","custom":{"name":"apply_patch","input":"patch"}}
+		]},
+		{"role":"tool","tool_call_id":"call_custom","content":"patched"},
+		{"role":"tool","tool_call_id":"call_function","content":"found"}
+	]}`)
+
+	items := gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Array()
+	wantTypes := []string{"message", "function_call", "custom_tool_call", "custom_tool_call_output", "function_call_output"}
+	if len(items) != len(wantTypes) {
+		t.Fatalf("got %d items, want %d", len(items), len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := items[i].Get("type").String(); got != want {
+			t.Fatalf("item %d type = %q, want %q: %s", i, got, want, items[i].Raw)
+		}
+	}
+}
+
+func TestToolCallHistoryAllowsReusedIDAcrossBatches(t *testing.T) {
+	input := []byte(`{"messages":[
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_reused","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_reused","content":"found"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_reused","type":"custom","custom":{"name":"apply_patch","input":"patch"}}]},
+		{"role":"tool","tool_call_id":"call_reused","content":"patched"}
+	]}`)
+
+	items := gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("got %d items, want 4", len(items))
+	}
+	if got := items[1].Get("type").String(); got != "function_call_output" {
+		t.Fatalf("first output type = %q", got)
+	}
+	if got := items[3].Get("type").String(); got != "custom_tool_call_output" {
+		t.Fatalf("second output type = %q", got)
+	}
+}
+
+func TestToolCallHistorySynthesizesMissingID(t *testing.T) {
+	input := []byte(`{"messages":[
+		{"role":"tool","content":"orphan"},
+		{"role":"assistant","content":null,"tool_calls":[{"type":"custom","custom":{"name":"apply_patch","input":"patch"}}]},
+		{"role":"tool","content":"patched"}
+	]}`)
+
+	items := gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	callID := items[0].Get("call_id").String()
+	if callID == "" || items[1].Get("call_id").String() != callID {
+		t.Fatalf("missing or mismatched synthesized call ID: %s", gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Raw)
+	}
+}
+
+func TestToolCallHistoryDropsAmbiguousOrDuplicateOutputs(t *testing.T) {
+	input := []byte(`{"messages":[
+		{"role":"assistant","content":null,"tool_calls":[
+			{"id":"call_duplicate","type":"function","function":{"name":"lookup","arguments":"{}"}},
+			{"id":"call_duplicate","type":"custom","custom":{"name":"apply_patch","input":"patch"}}
+		]},
+		{"role":"tool","tool_call_id":"call_duplicate","content":"ambiguous"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_ok","type":"custom","custom":{"name":"apply_patch","input":"patch"}}]},
+		{"role":"tool","tool_call_id":"call_ok","content":"first"},
+		{"role":"tool","tool_call_id":"call_ok","content":"duplicate"}
+	]}`)
+
+	items := gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Array()
+	if len(items) != 2 || items[0].Get("type").String() != "custom_tool_call" || items[1].Get("output").String() != "first" {
+		t.Fatalf("unexpected items: %s", gjson.GetBytes(ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true), "input").Raw)
+	}
+}
+
 func jsonArrayContains(values []gjson.Result, want string) bool {
 	for _, value := range values {
 		if value.String() == want {

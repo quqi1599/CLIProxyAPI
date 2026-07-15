@@ -51,6 +51,7 @@ const (
 	xaiVideosPath               = "/videos"
 	xaiIdempotencyKeyMetaKey    = "idempotency_key"
 	xaiComposerModelPrefix      = "grok-composer-"
+	xaiSafeFunctionParameters   = `{"type":"object","properties":{},"additionalProperties":true}`
 )
 
 // XAIExecutor is a stateless executor for xAI Grok's Responses API.
@@ -1117,7 +1118,15 @@ func normalizeXAITool(tool gjson.Result) ([]byte, bool, bool) {
 		raw = updatedTool
 		changed = true
 	}
-	if toolType == xaiFunctionToolType && !tool.Get("parameters").Exists() {
+	parsedTool := gjson.ParseBytes(raw)
+	if toolType == xaiFunctionToolType && xaiFunctionParametersNeedSimplification(parsedTool) {
+		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(xaiSafeFunctionParameters))
+		if errSet != nil {
+			return nil, false, false
+		}
+		raw = updatedTool
+		changed = true
+	} else if toolType == xaiFunctionToolType && !parsedTool.Get("parameters").Exists() {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(`{"type":"object","properties":{}}`))
 		if errSet != nil {
 			return nil, false, false
@@ -1126,6 +1135,42 @@ func normalizeXAITool(tool gjson.Result) ([]byte, bool, bool) {
 		changed = true
 	}
 	return raw, changed, true
+}
+
+func xaiFunctionParametersNeedSimplification(tool gjson.Result) bool {
+	toolType := strings.TrimSpace(tool.Get("type").String())
+	if toolType != xaiFunctionToolType && toolType != xaiCustomToolType {
+		return false
+	}
+	parameters := tool.Get("parameters")
+	for _, unionName := range []string{"anyOf", "oneOf"} {
+		union := parameters.Get(unionName)
+		if !union.IsArray() {
+			continue
+		}
+		for _, branch := range union.Array() {
+			branchType := branch.Get("type")
+			if branchType.Type == gjson.String {
+				if !strings.EqualFold(strings.TrimSpace(branchType.String()), "object") {
+					return true
+				}
+				continue
+			}
+			if !branchType.IsArray() {
+				return true
+			}
+			types := branchType.Array()
+			if len(types) == 0 {
+				return true
+			}
+			for _, itemType := range types {
+				if itemType.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(itemType.String()), "object") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func normalizeXAIInputReasoningItems(body []byte) []byte {

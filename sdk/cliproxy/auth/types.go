@@ -608,20 +608,11 @@ func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
 	}
-	// Check metadata for email first (OAuth-style auth)
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["email"].(string); ok {
-			email := strings.TrimSpace(v)
-			if email != "" {
-				return "oauth", email
-			}
-		}
-	}
-	// Fall back to API key (API-key auth)
-	if a.Attributes != nil {
-		if v := a.Attributes["api_key"]; v != "" {
-			return "api_key", v
-		}
+	switch a.AuthKind() {
+	case AuthKindOAuth:
+		return "oauth", authMetadataString(a, "email")
+	case AuthKindAPIKey:
+		return "api_key", authAttribute(a, AttributeAPIKey)
 	}
 	return "", ""
 }

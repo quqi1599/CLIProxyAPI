@@ -934,6 +934,36 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 	}
 }
 
+func TestNormalizeXAIToolsSimplifiesUnsupportedRootUnions(t *testing.T) {
+	tests := []struct {
+		name       string
+		parameters string
+		wantSafe   bool
+	}{
+		{name: "anyOf contains string", parameters: `{"anyOf":[{"type":"object"},{"type":"string"}]}`, wantSafe: true},
+		{name: "oneOf contains reference", parameters: `{"oneOf":[{"type":"object"},{"$ref":"#/$defs/input"}]}`, wantSafe: true},
+		{name: "object-only union", parameters: `{"anyOf":[{"type":"object"},{"type":["object"]}]}`},
+		{name: "plain object", parameters: `{"type":"object","properties":{"query":{"type":"string"}}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"tools":[{"type":"function","name":"search","parameters":` + tt.parameters + `}]}`)
+			out := normalizeXAITools(body)
+			got := gjson.GetBytes(out, "tools.0.parameters").Raw
+			if tt.wantSafe {
+				if got != xaiSafeFunctionParameters {
+					t.Fatalf("parameters = %s, want %s", got, xaiSafeFunctionParameters)
+				}
+				return
+			}
+			if got != tt.parameters {
+				t.Fatalf("parameters changed: got %s, want %s", got, tt.parameters)
+			}
+		})
+	}
+}
+
 func TestNormalizeXAIToolChoiceForTools_DropsWhenToolsEmpty(t *testing.T) {
 	body := []byte(`{"model":"grok-4","tools":[],"tool_choice":"auto","parallel_tool_calls":true,"input":"hi"}`)
 	out := normalizeXAIToolChoiceForTools(body)
