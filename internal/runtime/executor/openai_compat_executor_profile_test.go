@@ -1067,6 +1067,65 @@ func TestOpenAICompatPayloadKimiK27NormalizesThinkingToolChoiceAndSampling(t *te
 	}
 }
 
+func TestOpenAICompatPayloadKimiK3UsesMaxReasoningAndRequiredToolChoice(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k3",
+		"messages":[
+			{"role":"assistant","content":"planning","reasoning_content":"actual reasoning","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		],
+		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],
+		"tool_choice":{"type":"function","function":{"name":"read_file"}},
+		"thinking":{"type":"disabled","budget_tokens":0},
+		"reasoning_effort":"low",
+		"temperature":0.2,
+		"top_p":0.4,
+		"n":2,
+		"presence_penalty":1.0,
+		"frequency_penalty":1.0
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k3", "https://api.moonshot.ai/v1")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
+		t.Fatalf("reasoning_effort = %q, want max: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "thinking").Exists() {
+		t.Fatalf("K2 thinking object should be removed for kimi-k3: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "required" {
+		t.Fatalf("tool_choice = %q, want required: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "actual reasoning" {
+		t.Fatalf("messages.0.reasoning_content = %q, want actual reasoning: %s", got, string(out))
+	}
+	for _, path := range []string{"temperature", "top_p", "n", "presence_penalty", "frequency_penalty"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be omitted for kimi-k3: %s", path, string(out))
+		}
+	}
+}
+
+func TestOpenAICompatPayloadKimiK3PreservesDynamicToolMessage(t *testing.T) {
+	payload := []byte(`{
+		"model":"kimi-k3",
+		"messages":[
+			{"role":"system","tools":[{"type":"function","function":{"name":"calculate","description":"Calculate an expression","parameters":{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}}}]},
+			{"role":"user","content":"Calculate 23 * 47"}
+		],
+		"tool_choice":"required"
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("kimi"), "kimi-k3", "https://api.moonshot.ai/v1")
+
+	if got := gjson.GetBytes(out, "messages.0.tools.0.function.name").String(); got != "calculate" {
+		t.Fatalf("dynamic tool name = %q, want calculate: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "required" {
+		t.Fatalf("tool_choice = %q, want required: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadKimiK25WebSearchDisablesThinking(t *testing.T) {
 	payload := []byte(`{
 		"model":"kimi-k2.5",

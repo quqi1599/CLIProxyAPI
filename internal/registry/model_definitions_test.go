@@ -2,6 +2,23 @@ package registry
 
 import "testing"
 
+func TestGetKimiModelsIncludesK3(t *testing.T) {
+	for _, model := range GetKimiModels() {
+		if model == nil || model.ID != "kimi-k3" {
+			continue
+		}
+		if model.ContextLength != 1048576 || model.MaxCompletionTokens != 65536 {
+			t.Fatalf("kimi-k3 limits = context %d, output %d", model.ContextLength, model.MaxCompletionTokens)
+		}
+		if model.Thinking == nil || model.Thinking.ZeroAllowed || len(model.Thinking.Levels) != 1 || model.Thinking.Levels[0] != "max" {
+			t.Fatalf("kimi-k3 thinking metadata = %#v, want max-only always-on thinking", model.Thinking)
+		}
+		return
+	}
+
+	t.Fatal("expected embedded kimi-k3 model")
+}
+
 func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 

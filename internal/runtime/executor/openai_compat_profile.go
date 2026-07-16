@@ -329,6 +329,11 @@ func scrubKimiPayloadForModel(payload []byte, model string) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
+	if requiresKimiK3PayloadCompatibility(payload, model) {
+		payload = normalizeKimiK3Payload(payload)
+		payload = normalizeOpenAICompatToolCallArguments(payload)
+		return payload
+	}
 	if !requiresKimiK25K26PayloadCompatibility(payload, model) {
 		if requiresKimiForCodingPayloadCompatibility(payload, model) {
 			payload = normalizeKimiForCodingTemperature(payload)
@@ -375,6 +380,89 @@ func requiresKimiK25K26PayloadCompatibility(payload []byte, model string) bool {
 	}
 	payloadModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 	return payloadModel != "" && requiresKimiK25K26Compatibility(payloadModel)
+}
+
+func requiresKimiK3Compatibility(model string) bool {
+	modelName := normalizedKimiModelName(model)
+	return modelName == "k3" || strings.HasPrefix(modelName, "k3[")
+}
+
+func requiresKimiK3PayloadCompatibility(payload []byte, model string) bool {
+	if requiresKimiK3Compatibility(model) {
+		return true
+	}
+	payloadModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+	return payloadModel != "" && requiresKimiK3Compatibility(payloadModel)
+}
+
+func normalizeKimiK3Payload(payload []byte) []byte {
+	for _, path := range []string{
+		"thinking",
+		"reasoning",
+		"thinking_budget",
+		"temperature",
+		"top_p",
+		"n",
+		"presence_penalty",
+		"frequency_penalty",
+	} {
+		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	if updated, err := sjson.SetBytes(payload, "reasoning_effort", "max"); err == nil {
+		payload = updated
+	}
+	return normalizeKimiK3ToolChoice(payload)
+}
+
+func normalizeKimiK3ToolChoice(payload []byte) []byte {
+	toolChoice := gjson.GetBytes(payload, "tool_choice")
+	if !toolChoice.Exists() {
+		return payload
+	}
+	if !kimiK3PayloadHasTools(payload) {
+		if updated, err := sjson.DeleteBytes(payload, "tool_choice"); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	if toolChoice.Type == gjson.Null {
+		if updated, err := sjson.DeleteBytes(payload, "tool_choice"); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	value := ""
+	if toolChoice.Type == gjson.String {
+		value = strings.ToLower(strings.TrimSpace(toolChoice.String()))
+	} else if toolChoice.Type == gjson.JSON {
+		value = strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String()))
+	}
+	switch value {
+	case "auto", "none", "required":
+		if updated, err := sjson.SetBytes(payload, "tool_choice", value); err == nil {
+			payload = updated
+		}
+	default:
+		// K3 cannot force a named tool while its always-on thinking is enabled.
+		if updated, err := sjson.SetBytes(payload, "tool_choice", "required"); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func kimiK3PayloadHasTools(payload []byte) bool {
+	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+		return true
+	}
+	for _, message := range gjson.GetBytes(payload, "messages").Array() {
+		if tools := message.Get("tools"); tools.IsArray() && len(tools.Array()) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func requiresKimiForCodingCompatibility(model string) bool {
@@ -2446,6 +2534,9 @@ func normalizeOpenAICompatHistoryToolCall(rawToolCall any) (any, bool, bool) {
 }
 
 func openAICompatMessageHasContent(message map[string]any) bool {
+	if tools, ok := message["tools"].([]any); ok && len(tools) > 0 {
+		return true
+	}
 	content, ok := message["content"]
 	if !ok || content == nil {
 		return false
