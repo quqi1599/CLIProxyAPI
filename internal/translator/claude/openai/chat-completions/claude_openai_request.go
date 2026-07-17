@@ -234,7 +234,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		if messageIndex == 0 {
 			system := gjson.GetBytes(out, "system")
 			if system.Exists() && system.IsArray() && len(system.Array()) > 0 {
-				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
+				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":"Please follow the system instructions."}]}`)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", fallbackMsg)
 			}
 		}

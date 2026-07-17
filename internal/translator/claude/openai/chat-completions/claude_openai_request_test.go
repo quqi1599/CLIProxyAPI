@@ -304,8 +304,8 @@ func TestConvertOpenAIRequestToClaude_SystemOnlyInputKeepsFallbackUserMessage(t 
 	if got := messages[0].Get("content.0.type").String(); got != "text" {
 		t.Fatalf("Expected fallback content type %q, got %q", "text", got)
 	}
-	if got := messages[0].Get("content.0.text").String(); got != "" {
-		t.Fatalf("Expected fallback text %q, got %q", "", got)
+	if got := messages[0].Get("content.0.text").String(); got != "Please follow the system instructions." {
+		t.Fatalf("Expected fallback text %q, got %q", "Please follow the system instructions.", got)
 	}
 }
 
