@@ -2328,10 +2328,11 @@ func TestDowngradeClaudeUnsupportedBlocksForMiniMaxM3KeepsImageAndVideo(t *testi
 	}
 }
 
-func TestDowngradeClaudeUnsupportedBlocksForXiaomi(t *testing.T) {
+func TestDowngradeClaudeUnsupportedBlocksForXiaomiMimoV25KeepsImages(t *testing.T) {
 	t.Parallel()
 
 	payload := []byte(`{
+		"model":"mimo-v2.5",
 		"tools":[
 			{"type":"web_search_20250305","name":"web_search","max_uses":8},
 			{"name":"read_file","description":"Read files","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}
@@ -2340,6 +2341,7 @@ func TestDowngradeClaudeUnsupportedBlocksForXiaomi(t *testing.T) {
 		"messages":[
 			{"role":"user","content":[
 				{"type":"text","text":"search"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
 				{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
 				{"type":"mcp_tool_result","content":[{"type":"text","text":"mcp ok"}]}
 			]},
@@ -2370,6 +2372,9 @@ func TestDowngradeClaudeUnsupportedBlocksForXiaomi(t *testing.T) {
 	}
 
 	userContent := gjson.GetBytes(out, "messages.0.content").Array()
+	if !hasClaudePartType(userContent, "image") {
+		t.Fatalf("mimo-v2.5 image block should be preserved: %s", string(out))
+	}
 	if hasClaudePartType(userContent, "image_url") || hasClaudePartType(userContent, "mcp_tool_result") {
 		t.Fatalf("Xiaomi unsupported content block remained: %s", string(out))
 	}
@@ -2388,14 +2393,40 @@ func TestDowngradeClaudeUnsupportedBlocksForXiaomi(t *testing.T) {
 	}
 
 	toolResultContent := gjson.GetBytes(out, "messages.2.content.0.content").Array()
-	if hasClaudePartType(toolResultContent, "image") {
-		t.Fatalf("unsupported image inside tool_result should be removed: %s", string(out))
+	if !hasClaudePartType(toolResultContent, "image") {
+		t.Fatalf("mimo-v2.5 image inside tool_result should be preserved: %s", string(out))
 	}
 	if !hasClaudeText(toolResultContent, "file ok") {
 		t.Fatalf("tool_result text should be preserved: %s", string(out))
 	}
 	if err := validateClaudeUpstreamPayload("https://token-plan-cn.xiaomimimo.com/anthropic", out); err != nil {
 		t.Fatalf("downgraded Xiaomi payload should pass validation: %v", err)
+	}
+}
+
+func TestXiaomiClaudeImagesAreEnabledOnlyForMimoV25(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		compatKind string
+		model      string
+		partType   string
+		want       bool
+	}{
+		{name: "mimo v2.5 image", compatKind: "xiaomi", model: "mimo-v2.5", partType: "image", want: true},
+		{name: "mimo v2.5 image url", compatKind: "xiaomi", model: "mimo-v2.5", partType: "image_url", want: false},
+		{name: "mimo v2.5 pro image", compatKind: "xiaomi", model: "mimo-v2.5-pro", partType: "image", want: false},
+		{name: "other xiaomi model image", compatKind: "xiaomi", model: "mimo-v2.4", partType: "image", want: false},
+		{name: "other compat image", compatKind: "deepseek", model: "mimo-v2.5", partType: "image", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := supportsXiaomiMimoV25ClaudeMultimodalPart(tt.compatKind, tt.model, tt.partType); got != tt.want {
+				t.Fatalf("supportsXiaomiMimoV25ClaudeMultimodalPart(%q, %q, %q) = %v, want %v", tt.compatKind, tt.model, tt.partType, got, tt.want)
+			}
+		})
 	}
 }
 

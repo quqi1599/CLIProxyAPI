@@ -415,6 +415,24 @@ func TestBuildErrorResponseBody_NormalizesDeepSeekOfficialImageRequestFeatureUns
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesMiMoV25ProImageRequestFeatureUnsupported(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: mimo_v2_5_pro_image_input. mimo-v2.5-pro does not support image input","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingMiMoV25ProImageInputMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingMiMoV25ProImageInputMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
 func TestBuildErrorResponseBody_NormalizesOpenAICompatToolHistoryRequestFeatureUnsupported(t *testing.T) {
 	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: large_openai_tool_history. 历史工具调用过多","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
 

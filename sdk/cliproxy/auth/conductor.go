@@ -3719,6 +3719,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		})
 		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
 	}()
+	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
+		finalErr = errPreflight
+		return cliproxyexecutor.Response{}, errPreflight
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -3777,6 +3781,10 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		})
 		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
 	}()
+	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
+		finalErr = errPreflight
+		return cliproxyexecutor.Response{}, errPreflight
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -3829,6 +3837,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		})
 		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
 	}()
+	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
+		finalErr = errPreflight
+		return nil, errPreflight
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}

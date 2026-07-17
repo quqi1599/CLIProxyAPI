@@ -1986,7 +1986,8 @@ func isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType strin
 	if !requiresClaudeContentBlockDowngradeForCompat(compatKind) {
 		return false
 	}
-	if supportsMiniMaxM3ClaudeMultimodalPart(compatKind, modelID, partType) {
+	if supportsMiniMaxM3ClaudeMultimodalPart(compatKind, modelID, partType) ||
+		supportsXiaomiMimoV25ClaudeMultimodalPart(compatKind, modelID, partType) {
 		return false
 	}
 	if compatKind == "doubao" {
@@ -2024,6 +2025,17 @@ func supportsMiniMaxM3ClaudeMultimodalPart(compatKind, modelID, partType string)
 func isMiniMaxM3SeriesModel(modelID string) bool {
 	modelID = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelID).ModelName))
 	return modelID == "minimax-m3" || strings.HasPrefix(modelID, "minimax-m3-")
+}
+
+func supportsXiaomiMimoV25ClaudeMultimodalPart(compatKind, modelID, partType string) bool {
+	if compatKind != "xiaomi" || partType != "image" {
+		return false
+	}
+	modelID = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelID).ModelName))
+	if slash := strings.LastIndex(modelID, "/"); slash >= 0 {
+		modelID = modelID[slash+1:]
+	}
+	return modelID == "mimo-v2.5"
 }
 
 func requiresClaudeContentBlockDowngradeForCompat(compatKind string) bool {

@@ -3555,6 +3555,138 @@ func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsMiMoV25ProImageInputBeforeAuthSelection(t *testing.T) {
+	tests := []struct {
+		name           string
+		routeModel     string
+		requestedModel string
+		payload        []byte
+		stream         bool
+	}{
+		{
+			name: "openai chat image",
+			payload: []byte(`{
+				"model":"mimo-v2.5-pro",
+				"messages":[{"role":"user","content":[
+					{"type":"text","text":"describe"},
+					{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+				]}]
+			}`),
+		},
+		{
+			name: "anthropic messages image stream",
+			payload: []byte(`{
+				"model":"mimo-v2.5-pro",
+				"messages":[{"role":"user","content":[
+					{"type":"text","text":"describe"},
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+				]}]
+			}`),
+			stream: true,
+		},
+		{
+			name:           "responses input image after model router",
+			routeModel:     "mimo-v2.5",
+			requestedModel: "mimo-v2.5-pro",
+			payload: []byte(`{
+				"model":"mimo-v2.5-pro",
+				"input":[{"role":"user","content":[
+					{"type":"input_text","text":"describe"},
+					{"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+				]}]
+			}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := tt.routeModel
+			if model == "" {
+				model = "mimo-v2.5-pro"
+			}
+			authID := "mimo-preflight-" + strings.ReplaceAll(tt.name, " ", "-")
+			executor := &authFallbackExecutor{id: "openai-compatibility"}
+			m := NewManager(nil, nil, nil)
+			m.RegisterExecutor(executor)
+
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(authID, executor.id, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				reg.UnregisterClient(authID)
+			})
+			if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: executor.id}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			req := cliproxyexecutor.Request{Model: model, Payload: tt.payload}
+			opts := cliproxyexecutor.Options{OriginalRequest: tt.payload, Stream: tt.stream}
+			if tt.requestedModel != "" {
+				opts.Metadata = map[string]any{
+					cliproxyexecutor.RequestedModelMetadataKey: tt.requestedModel,
+				}
+			}
+			var errExecute error
+			if tt.stream {
+				_, errExecute = m.ExecuteStream(context.Background(), []string{executor.id}, req, opts)
+			} else {
+				_, errExecute = m.Execute(context.Background(), []string{executor.id}, req, opts)
+			}
+
+			if errExecute == nil {
+				t.Fatal("expected local image capability rejection")
+			}
+			if got := statusCodeFromError(errExecute); got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+			}
+			if !strings.Contains(errExecute.Error(), mimoV25ProImageInputSignal) {
+				t.Fatalf("error = %q, want %q signal", errExecute.Error(), mimoV25ProImageInputSignal)
+			}
+			if got := executor.ExecuteCalls(); len(got) != 0 {
+				t.Fatalf("execute calls = %v, want none", got)
+			}
+			if got := executor.StreamCalls(); len(got) != 0 {
+				t.Fatalf("stream calls = %v, want none", got)
+			}
+
+			updated, ok := m.GetByID(authID)
+			if !ok || updated == nil {
+				t.Fatal("expected auth to remain registered")
+			}
+			if updated.Unavailable {
+				t.Fatal("local request rejection must not cool down the auth")
+			}
+			if state := updated.ModelStates[model]; state != nil {
+				t.Fatalf("local request rejection must not create model state, got %+v", *state)
+			}
+		})
+	}
+}
+
+func TestMiMoV25ProImagePreflightIgnoresToolSchemaAndAllowsMimoV25(t *testing.T) {
+	toolSchemaOnly := []byte(`{
+		"model":"mimo-v2.5-pro",
+		"messages":[{"role":"user","content":"generate an image description"}],
+		"tools":[{"type":"image","name":"render","input_schema":{"type":"object","properties":{}}}]
+	}`)
+	if err := rejectMiMoV25ProImageInput(
+		cliproxyexecutor.Request{Model: "mimo-v2.5-pro", Payload: toolSchemaOnly},
+		cliproxyexecutor.Options{OriginalRequest: toolSchemaOnly},
+	); err != nil {
+		t.Fatalf("tool schema without image content should pass preflight: %v", err)
+	}
+
+	mimoV25Image := []byte(`{
+		"model":"mimo-v2.5",
+		"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]
+	}`)
+	if err := rejectMiMoV25ProImageInput(
+		cliproxyexecutor.Request{Model: "mimo-v2.5", Payload: mimoV25Image},
+		cliproxyexecutor.Options{OriginalRequest: mimoV25Image},
+	); err != nil {
+		t.Fatalf("mimo-v2.5 image input should pass preflight: %v", err)
+	}
+}
+
 func TestDeepSeekCompatibilityFallbackIsScopedToV4Models(t *testing.T) {
 	err := &Error{
 		HTTPStatus: http.StatusBadRequest,

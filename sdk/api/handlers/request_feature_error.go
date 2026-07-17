@@ -26,6 +26,10 @@ func userFacingDeepSeekOfficialImageInputMessage() string {
 	return "当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容，包括历史消息里的 image_url / input_image。请移除图片输入与图片历史，仅保留文本内容，或切换到原生支持图像输入的模型/路由后重试。原样重复提交不会提高成功率。"
 }
 
+func userFacingMiMoV25ProImageInputMessage() string {
+	return "mimo-v2.5-pro 不支持图片输入，请将请求中的 model 明确改为 mimo-v2.5 后重试。系统不会自动替换模型，也不会重试或切换其他渠道。"
+}
+
 // NormalizeRequestFeatureUnsupportedStatus converts deterministic request-shape rejections to client errors.
 func NormalizeRequestFeatureUnsupportedStatus(status int, errText string) int {
 	if _, ok := requestFeatureUnsupportedErrorDetail(status, errText); !ok {
@@ -58,6 +62,8 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 			message = userFacingOpenAICompatToolHistoryMessage()
 		case hasDeepSeekOfficialImageInputSignal(candidate):
 			message = userFacingDeepSeekOfficialImageInputMessage()
+		case hasMiMoV25ProImageInputSignal(candidate):
+			message = userFacingMiMoV25ProImageInputMessage()
 		}
 	}
 	return ErrorDetail{
@@ -126,6 +132,9 @@ func hasRequestFeatureUnsupportedSignal(text string) bool {
 	if hasDeepSeekOfficialImageInputSignal(lower) {
 		return true
 	}
+	if hasMiMoV25ProImageInputSignal(lower) {
+		return true
+	}
 	if strings.Contains(lower, "does not support") &&
 		(strings.Contains(lower, "anthropic compatibility") ||
 			strings.Contains(lower, "server tool type") ||
@@ -143,4 +152,9 @@ func hasOpenAICompatToolHistorySignal(text string) bool {
 func hasDeepSeekOfficialImageInputSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "deepseek_official_image_input")
+}
+
+func hasMiMoV25ProImageInputSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "mimo_v2_5_pro_image_input")
 }

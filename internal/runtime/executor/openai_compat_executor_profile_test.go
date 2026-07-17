@@ -1268,6 +1268,25 @@ func TestOpenAICompatPayloadXiaomiClampsMimo25ProTokenFields(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatPayloadXiaomiMimo25PreservesImageURL(t *testing.T) {
+	payload := []byte(`{
+		"model":"mimo-v2.5",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"describe"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+		]}]
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5", "https://token-plan-cn.xiaomimimo.com/v1")
+
+	if got := gjson.GetBytes(out, "messages.0.content.1.type").String(); got != "image_url" {
+		t.Fatalf("image part type = %q, want image_url: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.image_url.url").String(); got != "data:image/png;base64,AAAA" {
+		t.Fatalf("image URL = %q, want original data URL: %s", got, string(out))
+	}
+}
+
 func TestOpenAICompatPayloadXiaomiMimo25ProTokenClampLowerBoundAndInvalid(t *testing.T) {
 	payload := []byte(`{
 		"model":"mimo-v2.5-pro",
