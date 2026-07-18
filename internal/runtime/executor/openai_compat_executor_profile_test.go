@@ -413,7 +413,7 @@ func TestOpenAICompatExecutorClaudeSourceDowngradesToolSearch(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatExecutorMiniMaxClaudeSourceRewritesSystemRole(t *testing.T) {
+func TestOpenAICompatExecutorMiniMaxClaudeSourceRestoresSystemRole(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -455,14 +455,14 @@ func TestOpenAICompatExecutorMiniMaxClaudeSourceRewritesSystemRole(t *testing.T)
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if gjson.GetBytes(gotBody, `messages.#(role=="system")`).Exists() {
-		t.Fatalf("system role should not reach MiniMax: %s", string(gotBody))
+	if got := gjson.GetBytes(gotBody, "messages.0.role").String(); got != "system" {
+		t.Fatalf("messages.0.role = %q, want system: %s", got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "messages.0.role").String(); got != "user" {
-		t.Fatalf("messages.0.role = %q, want user: %s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, "messages.0.content").String(); got != "You are concise." {
+		t.Fatalf("messages.0.content = %q, want restored system instructions: %s", got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "messages.0.content").String(); !strings.Contains(got, "System instructions:\nYou are concise.") {
-		t.Fatalf("messages.0.content = %q, want rewritten system instructions: %s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user: %s", got, string(gotBody))
 	}
 }
 
@@ -484,14 +484,18 @@ func TestOpenAICompatPayloadRepairsInvalidStringEscapesForMiniMax(t *testing.T) 
 	}
 }
 
-func TestOpenAICompatPayloadRemovesUnsupportedMiniMaxPenalties(t *testing.T) {
+func TestOpenAICompatPayloadPreservesMiniMaxSystemRoleAndRemovesUnsupportedPenalties(t *testing.T) {
 	t.Parallel()
 
 	payload := []byte(`{
 		"model":"MiniMax-M3",
-		"messages":[{"role":"user","content":"hi"}],
+		"messages":[
+			{"role":"system","content":"You are a helpful assistant."},
+			{"role":"user","content":"hi"}
+		],
 		"frequency_penalty":1,
 		"presence_penalty":1,
+		"reasoning_effort":"xhigh",
 		"thinking":{"type":"enabled"},
 		"top_p":0.95
 	}`)
@@ -505,6 +509,12 @@ func TestOpenAICompatPayloadRemovesUnsupportedMiniMaxPenalties(t *testing.T) {
 	}
 	if !gjson.GetBytes(out, "thinking").Exists() || !gjson.GetBytes(out, "top_p").Exists() {
 		t.Fatalf("supported MiniMax fields should be preserved: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "system" {
+		t.Fatalf("messages.0.role = %q, want system: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want user: %s", got, string(out))
 	}
 }
 

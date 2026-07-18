@@ -44,7 +44,6 @@ type openAICompatProfile struct {
 	NormalizeToolHistory     bool
 	SupportsMetadata         bool
 	SupportsStore            bool
-	SystemMessagesAsUser     bool
 	DefaultHeaders           map[string]string
 }
 
@@ -79,7 +78,6 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		SupportsReasoning:        false,
 		SupportsMetadata:         false,
 		SupportsStore:            false,
-		SystemMessagesAsUser:     true,
 	},
 	"xiaomi": {
 		Kind:                     "xiaomi",
@@ -288,9 +286,6 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if compatKind == "doubao" {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)
 	}
-	if profile.SystemMessagesAsUser {
-		payload = rewriteOpenAICompatSystemMessagesAsUser(payload)
-	}
 	payload = repairOpenAICompatToolCallHistory(payload)
 	payload = sanitizeOpenAICompatToolSchemas(payload)
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
@@ -305,6 +300,7 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = scrubOpenAICompatToolChoice(payload, profile)
 	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
 	if compatKind == "minimax" {
+		payload = normalizeMiniMaxSystemMessages(payload)
 		for _, path := range []string{"frequency_penalty", "presence_penalty"} {
 			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
 				payload = updated
@@ -1674,7 +1670,7 @@ func firstHeaderValue(headers http.Header, names ...string) string {
 	return ""
 }
 
-func rewriteOpenAICompatSystemMessagesAsUser(payload []byte) []byte {
+func normalizeMiniMaxSystemMessages(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.GetBytes(payload, "messages").IsArray() {
 		return payload
 	}
@@ -1690,25 +1686,17 @@ func rewriteOpenAICompatSystemMessagesAsUser(payload []byte) []byte {
 
 	changed := false
 	for _, rawMessage := range messages {
-		message, ok := rawMessage.(map[string]any)
-		if !ok {
+		message, okMessage := rawMessage.(map[string]any)
+		if !okMessage || !strings.EqualFold(strings.TrimSpace(compatStringValue(message["role"])), "user") {
 			continue
 		}
-		role := strings.TrimSpace(compatStringValue(message["role"]))
-		text := openAICompatTextContent(message["content"])
-		if strings.EqualFold(role, "system") {
-			message["role"] = "user"
-			if text != "" {
-				message["content"] = openAICompatSystemInstructionText(openAICompatUnwrapSystemReminder(text))
-			}
-			changed = true
+		reminder, okReminder := openAICompatSystemReminderText(openAICompatTextContent(message["content"]))
+		if !okReminder {
 			continue
 		}
-		if reminder, okReminder := openAICompatSystemReminderText(text); okReminder {
-			message["role"] = "user"
-			message["content"] = openAICompatSystemInstructionText(reminder)
-			changed = true
-		}
+		message["role"] = "system"
+		message["content"] = reminder
+		changed = true
 	}
 	if !changed {
 		return payload
@@ -1720,14 +1708,6 @@ func rewriteOpenAICompatSystemMessagesAsUser(payload []byte) []byte {
 		return payload
 	}
 	return out
-}
-
-func openAICompatSystemInstructionText(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-	return "System instructions:\n" + text
 }
 
 func openAICompatSystemReminderText(text string) (string, bool) {
