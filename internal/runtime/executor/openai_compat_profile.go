@@ -301,6 +301,7 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
 	if compatKind == "minimax" {
 		payload = normalizeMiniMaxSystemMessages(payload)
+		payload = normalizeMiniMaxM3Thinking(payload, model)
 		for _, path := range []string{"frequency_penalty", "presence_penalty"} {
 			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
 				payload = updated
@@ -1708,6 +1709,20 @@ func normalizeMiniMaxSystemMessages(payload []byte) []byte {
 		return payload
 	}
 	return out
+}
+
+func normalizeMiniMaxM3Thinking(payload []byte, model string) []byte {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "minimax-m3") {
+		return payload
+	}
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String())) {
+	case "enabled", "enable", "on", "true", "auto":
+		updated, err := sjson.SetBytes(payload, "thinking.type", "adaptive")
+		if err == nil {
+			return updated
+		}
+	}
+	return payload
 }
 
 func openAICompatSystemReminderText(text string) (string, bool) {

@@ -510,6 +510,9 @@ func TestOpenAICompatPayloadPreservesMiniMaxSystemRoleAndRemovesUnsupportedPenal
 	if !gjson.GetBytes(out, "thinking").Exists() || !gjson.GetBytes(out, "top_p").Exists() {
 		t.Fatalf("supported MiniMax fields should be preserved: %s", string(out))
 	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive: %s", got, string(out))
+	}
 	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "system" {
 		t.Fatalf("messages.0.role = %q, want system: %s", got, string(out))
 	}
