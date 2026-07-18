@@ -484,6 +484,30 @@ func TestOpenAICompatPayloadRepairsInvalidStringEscapesForMiniMax(t *testing.T) 
 	}
 }
 
+func TestOpenAICompatPayloadRemovesUnsupportedMiniMaxPenalties(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"MiniMax-M3",
+		"messages":[{"role":"user","content":"hi"}],
+		"frequency_penalty":1,
+		"presence_penalty":1,
+		"thinking":{"type":"enabled"},
+		"top_p":0.95
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("minimax"), "MiniMax-M3", "https://api.minimaxi.com/v1")
+
+	for _, path := range []string{"frequency_penalty", "presence_penalty"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be omitted for MiniMax: %s", path, string(out))
+		}
+	}
+	if !gjson.GetBytes(out, "thinking").Exists() || !gjson.GetBytes(out, "top_p").Exists() {
+		t.Fatalf("supported MiniMax fields should be preserved: %s", string(out))
+	}
+}
+
 func TestOpenAICompatPayloadNormalizesMiniMaxToolCallArguments(t *testing.T) {
 	t.Parallel()
 

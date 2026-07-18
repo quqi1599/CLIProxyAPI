@@ -305,6 +305,11 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = scrubOpenAICompatToolChoice(payload, profile)
 	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
 	if compatKind == "minimax" {
+		for _, path := range []string{"frequency_penalty", "presence_penalty"} {
+			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+				payload = updated
+			}
+		}
 		payload = normalizeOpenAICompatToolCallArguments(payload)
 	}
 	if compatKind == "kimi" {
