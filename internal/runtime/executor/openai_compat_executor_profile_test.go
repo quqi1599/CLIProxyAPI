@@ -65,6 +65,51 @@ func TestOpenAICompatExecutorCompactFallsBackToChatCompletionsForProfile(t *test
 	}
 }
 
+func TestOpenAICompatExecutorQwen38ConvertsDisabledThinkingIntent(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-qwen","object":"chat.completion","created":1,"model":"qwen3.8-max-preview","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("qwen-provider", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "qwen-provider",
+			Kind: "qwen",
+		}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":    server.URL + "/compatible-mode/v1",
+		"api_key":     "test",
+		"compat_name": "qwen-provider",
+		"compat_kind": "qwen",
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "qwen3.8-max",
+		Payload: []byte(`{
+			"model":"qwen3.8-max",
+			"messages":[{"role":"user","content":"Reply exactly OK"}],
+			"reasoning_effort":"none",
+			"stream":false
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if !gjson.GetBytes(gotBody, "enable_thinking").Bool() {
+		t.Fatalf("enable_thinking should be forced true: %s", string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "low" {
+		t.Fatalf("reasoning_effort = %q, want low: %s", got, string(gotBody))
+	}
+}
+
 func TestOpenAICompatExecutorParsesRetryAfterHints(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -589,6 +634,8 @@ func TestInferOpenAICompatKindFromBaseURL(t *testing.T) {
 		{name: "xiaomi token plan singapore", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", want: "xiaomi"},
 		{name: "xiaomi token plan europe anthropic", baseURL: "https://token-plan-ams.xiaomimimo.com/anthropic", want: "xiaomi"},
 		{name: "doubao ark openai", baseURL: "https://ark.cn-beijing.volces.com/api/v3", want: "doubao"},
+		{name: "qwen token plan openai", baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", want: "qwen"},
+		{name: "qwen workspace openai", baseURL: "https://workspace-id.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions", want: "qwen"},
 		{name: "unknown", baseURL: "https://example.com/v1", want: ""},
 	}
 
@@ -598,6 +645,110 @@ func TestInferOpenAICompatKindFromBaseURL(t *testing.T) {
 				t.Fatalf("inferOpenAICompatKindFromBaseURL(%q) = %q, want %q", tt.baseURL, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOpenAICompatPayloadQwen38ForcesThinkingOnlyMode(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"qwen3.8-max-preview",
+		"messages":[{"role":"user","content":"hi"}],
+		"enable_thinking":false,
+		"reasoning_effort":"none",
+		"reasoning":{"effort":"none"},
+		"thinking":{"type":"disabled","budget_tokens":0},
+		"thinking_budget":0,
+		"temperature":0.2
+	}`)
+
+	out := scrubOpenAICompatPayloadForModel(
+		payload,
+		openAICompatProfileForKind("qwen"),
+		"qwen3.8-max",
+		"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+	)
+
+	if !gjson.GetBytes(out, "enable_thinking").Bool() {
+		t.Fatalf("enable_thinking should be forced true: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "low" {
+		t.Fatalf("reasoning_effort = %q, want low: %s", got, string(out))
+	}
+	for _, path := range []string{"reasoning", "thinking", "thinking_budget"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s should be removed after normalizing disabled thinking: %s", path, string(out))
+		}
+	}
+	if got := gjson.GetBytes(out, "temperature").Float(); got != 0.2 {
+		t.Fatalf("temperature = %v, want unchanged 0.2: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadQwen38KeepsSingleThinkingControl(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		payload    string
+		wantEffort string
+		wantBudget int64
+	}{
+		{
+			name:       "valid effort wins over budget",
+			payload:    `{"model":"qwen3.8-max-preview","reasoning_effort":"xhigh","thinking_budget":4096}`,
+			wantEffort: "xhigh",
+		},
+		{
+			name:       "nested budget becomes top level",
+			payload:    `{"model":"qwen3.8-max-preview","thinking":{"type":"enabled","budget_tokens":4096}}`,
+			wantBudget: 4096,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := scrubOpenAICompatPayloadForModel(
+				[]byte(tt.payload),
+				openAICompatProfileForKind("qwen"),
+				"qwen3.8-max",
+				"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+			)
+			if !gjson.GetBytes(out, "enable_thinking").Bool() {
+				t.Fatalf("enable_thinking should be true: %s", string(out))
+			}
+			if got := gjson.GetBytes(out, "reasoning_effort").String(); got != tt.wantEffort {
+				t.Fatalf("reasoning_effort = %q, want %q: %s", got, tt.wantEffort, string(out))
+			}
+			if got := gjson.GetBytes(out, "thinking_budget").Int(); got != tt.wantBudget {
+				t.Fatalf("thinking_budget = %d, want %d: %s", got, tt.wantBudget, string(out))
+			}
+			if tt.wantEffort != "" && gjson.GetBytes(out, "thinking_budget").Exists() {
+				t.Fatalf("thinking_budget should be removed when reasoning_effort is present: %s", string(out))
+			}
+			if gjson.GetBytes(out, "thinking").Exists() {
+				t.Fatalf("nested thinking should be removed: %s", string(out))
+			}
+		})
+	}
+}
+
+func TestOpenAICompatPayloadQwen38DoesNotAffectEarlierModels(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{"model":"qwen3.7-max","enable_thinking":false,"reasoning_effort":"none"}`)
+	out := scrubOpenAICompatPayloadForModel(
+		payload,
+		openAICompatProfileForKind("qwen"),
+		"qwen3.7-max",
+		"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+	)
+
+	if gjson.GetBytes(out, "enable_thinking").Bool() {
+		t.Fatalf("qwen3.7 enable_thinking should remain false: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "none" {
+		t.Fatalf("qwen3.7 reasoning_effort = %q, want unchanged none: %s", got, string(out))
 	}
 }
 

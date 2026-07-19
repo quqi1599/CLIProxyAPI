@@ -212,6 +212,11 @@ func inferOpenAICompatKindFromBaseURL(rawBaseURL string) string {
 		if config.IsXiaomiTokenPlanBaseURLHost(host) {
 			return "xiaomi"
 		}
+		path := strings.ToLower(strings.TrimSpace(parsed.Path))
+		if strings.HasSuffix(host, ".maas.aliyuncs.com") &&
+			(path == "/compatible-mode/v1" || strings.HasPrefix(path, "/compatible-mode/v1/")) {
+			return "qwen"
+		}
 		return ""
 	}
 }
@@ -308,6 +313,9 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 			}
 		}
 		payload = normalizeOpenAICompatToolCallArguments(payload)
+	}
+	if compatKind == "qwen" {
+		payload = normalizeQwen38MaxThinking(payload, model)
 	}
 	if compatKind == "kimi" {
 		payload = scrubKimiPayloadForModel(payload, model)
@@ -1723,6 +1731,108 @@ func normalizeMiniMaxM3Thinking(payload []byte, model string) []byte {
 		}
 	}
 	return payload
+}
+
+func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !requiresQwen38MaxThinking(payload, model) {
+		return payload
+	}
+
+	effort, hasEffort, disabledEffort := qwen38MaxReasoningEffort(payload)
+	budget, hasBudget := firstOpenAICompatIntegerValue(payload, "thinking_budget", "thinking.budget_tokens")
+	disabled := disabledEffort || qwen38MaxThinkingDisabled(payload) || (hasBudget && budget <= 0)
+	if disabled {
+		effort = "low"
+		hasEffort = true
+		hasBudget = false
+	}
+
+	for _, path := range []string{
+		"enable_thinking",
+		"reasoning_effort",
+		"reasoning",
+		"thinking",
+		"thinking_budget",
+	} {
+		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+			payload = updated
+		}
+	}
+	if updated, err := sjson.SetBytes(payload, "enable_thinking", true); err == nil {
+		payload = updated
+	}
+	if hasEffort && effort != "" {
+		if updated, err := sjson.SetBytes(payload, "reasoning_effort", effort); err == nil {
+			payload = updated
+		}
+		return payload
+	}
+	if hasBudget && budget > 0 {
+		if updated, err := sjson.SetBytes(payload, "thinking_budget", budget); err == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+func requiresQwen38MaxThinking(payload []byte, model string) bool {
+	return isQwen38MaxThinkingModel(model) || isQwen38MaxThinkingModel(gjson.GetBytes(payload, "model").String())
+}
+
+func isQwen38MaxThinkingModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if slash := strings.LastIndex(model, "/"); slash >= 0 {
+		model = model[slash+1:]
+	}
+	return model == "qwen3.8-max" || model == "qwen3.8-max-preview"
+}
+
+func qwen38MaxReasoningEffort(payload []byte) (effort string, exists bool, disabled bool) {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		exists = true
+		switch strings.ToLower(strings.TrimSpace(value.String())) {
+		case "none", "off", "disabled", "disable", "false":
+			return "low", true, true
+		case "minimal", "low":
+			return "low", true, false
+		case "medium", "high":
+			return "high", true, false
+		case "xhigh", "max":
+			return "xhigh", true, false
+		case "", "default", "auto", "adaptive", "enabled", "enable", "true":
+			return "", true, false
+		default:
+			return "", true, false
+		}
+	}
+	return "", false, false
+}
+
+func qwen38MaxThinkingDisabled(payload []byte) bool {
+	for _, path := range []string{"enable_thinking", "thinking.type"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		switch value.Type {
+		case gjson.False:
+			return true
+		case gjson.String:
+			switch strings.ToLower(strings.TrimSpace(value.String())) {
+			case "none", "off", "disabled", "disable", "false":
+				return true
+			}
+		case gjson.Number:
+			if value.Int() == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func openAICompatSystemReminderText(text string) (string, bool) {

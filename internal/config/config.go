@@ -646,7 +646,7 @@ type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
-	// Kind selects a built-in compatibility profile (for example: kimi, minimax, xiaomi, zhipu, doubao, xfyun, maas, langengyun, newapi).
+	// Kind selects a built-in compatibility profile (for example: kimi, minimax, qwen, xiaomi, zhipu, doubao, xfyun, maas, langengyun, newapi).
 	// Empty keeps the generic compatibility behavior.
 	Kind string `yaml:"kind,omitempty" json:"kind,omitempty"`
 
@@ -782,9 +782,11 @@ func InferCompatKindFromBaseURL(rawBaseURL string) string {
 			return "step"
 		}
 	}
-	if strings.HasSuffix(host, ".maas.aliyuncs.com") &&
-		(path == "/apps/anthropic" || strings.HasPrefix(path, "/apps/anthropic/")) {
-		return "qwen"
+	if strings.HasSuffix(host, ".maas.aliyuncs.com") {
+		if path == "/apps/anthropic" || strings.HasPrefix(path, "/apps/anthropic/") ||
+			path == "/compatible-mode/v1" || strings.HasPrefix(path, "/compatible-mode/v1/") {
+			return "qwen"
+		}
 	}
 	if IsXiaomiTokenPlanBaseURLHost(host) && (path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") || path == "/v1" || strings.HasPrefix(path, "/v1/")) {
 		return "xiaomi"
