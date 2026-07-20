@@ -2532,7 +2532,7 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 }
 
-func TestManager_RequestScopedFeatureUnsupportedBadRequest_FallsBackWithoutSuspendingAuth(t *testing.T) {
+func TestManager_RequestScopedFeatureUnsupportedBadRequest_StopsWithoutSuspendingAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "claude",
@@ -2564,16 +2564,16 @@ func TestManager_RequestScopedFeatureUnsupportedBadRequest_FallsBackWithoutSuspe
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want fallback success", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected request feature unsupported error")
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	if !isRequestInvalidError(errExecute) {
+		t.Fatalf("expected request invalid error, got %v", errExecute)
 	}
 
 	got := executor.ExecuteCalls()
-	want := []string{badAuth.ID, goodAuth.ID}
+	want := []string{badAuth.ID}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls = %v, want %v", got, want)
 	}
@@ -3382,6 +3382,12 @@ func TestManager_MarkResult_RequestScopedContentSafetyDoesNotCooldownAuth(t *tes
 			httpStatus: http.StatusBadRequest,
 			message:    genericChineseContentSafetyMessage,
 		},
+		{
+			name:       "aliyun data inspection bad request",
+			code:       "data_inspection_failed",
+			httpStatus: http.StatusBadRequest,
+			message:    "Input data may contain inappropriate content.",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3462,6 +3468,12 @@ func TestRequestScopedContentSafetyStopsRetry(t *testing.T) {
 			name:       "generic chinese sensitive content bad request",
 			httpStatus: http.StatusBadRequest,
 			message:    genericChineseContentSafetyMessage,
+		},
+		{
+			name:       "aliyun data inspection bad request",
+			code:       "data_inspection_failed",
+			httpStatus: http.StatusBadRequest,
+			message:    "Input data may contain inappropriate content.",
 		},
 	}
 	for _, tt := range tests {
@@ -3883,54 +3895,62 @@ func TestManager_Execute_ClaudeSonnetAliasMetadataContentSafetyStopsWithoutFallb
 	}
 }
 
-func TestManager_Execute_GenericContentSafetyStillStopsRetry(t *testing.T) {
+func TestManager_Execute_DataInspectionFailedStopsBeforeCredentialAndProviderFallback(t *testing.T) {
 	m := NewManager(nil, nil, nil)
-	executor := &authFallbackExecutor{
-		id: "claude",
+	qwenExecutor := &authFallbackExecutor{
+		id: "qwen",
 		executeErrors: map[string]error{
 			"aa-blocked-auth": &Error{
-				HTTPStatus: http.StatusUnavailableForLegalReasons,
-				Message:    requestScopedContentBlockedMessage,
+				Code:       "data_inspection_failed",
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "Input data may contain inappropriate content.",
 			},
 		},
 	}
-	m.RegisterExecutor(executor)
+	claudeExecutor := &authFallbackExecutor{id: "claude"}
+	m.RegisterExecutor(qwenExecutor)
+	m.RegisterExecutor(claudeExecutor)
 
-	model := "claude-opus-4-6"
-	blockedAuth := &Auth{ID: "aa-blocked-auth", Provider: "claude"}
-	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+	model := "qwen3.8-max"
+	auths := []*Auth{
+		{ID: "aa-blocked-auth", Provider: "qwen"},
+		{ID: "bb-qwen-auth", Provider: "qwen"},
+		{ID: "cc-qwen-auth", Provider: "qwen"},
+		{ID: "dd-claude-fallback", Provider: "claude"},
+	}
 
 	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(blockedAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
-	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
 	t.Cleanup(func() {
-		reg.UnregisterClient(blockedAuth.ID)
-		reg.UnregisterClient(goodAuth.ID)
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
 	})
 
-	if _, errRegister := m.Register(context.Background(), blockedAuth); errRegister != nil {
-		t.Fatalf("register blocked auth: %v", errRegister)
-	}
-	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
-		t.Fatalf("register good auth: %v", errRegister)
-	}
-
-	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	_, errExecute := m.Execute(context.Background(), []string{"qwen", "claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
 	if errExecute == nil {
-		t.Fatal("expected content safety error")
+		t.Fatal("expected data inspection content safety error")
 	}
-	if statusCodeFromError(errExecute) != http.StatusUnavailableForLegalReasons {
-		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusUnavailableForLegalReasons)
+	if statusCodeFromError(errExecute) != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", statusCodeFromError(errExecute), http.StatusBadRequest)
 	}
-	got := executor.ExecuteCalls()
-	want := []string{blockedAuth.ID}
+	got := qwenExecutor.ExecuteCalls()
+	want := []string{"aa-blocked-auth"}
 	if len(got) != len(want) {
-		t.Fatalf("execute calls = %v, want %v", got, want)
+		t.Fatalf("qwen execute calls = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+			t.Fatalf("qwen execute call %d auth = %q, want %q", i, got[i], want[i])
 		}
+	}
+	if gotClaude := claudeExecutor.ExecuteCalls(); len(gotClaude) != 0 {
+		t.Fatalf("claude fallback calls = %v, want none", gotClaude)
 	}
 }
 

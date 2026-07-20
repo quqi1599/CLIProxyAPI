@@ -108,6 +108,15 @@ func contentSafetySignalDirection(text string) (string, bool) {
 		return contentSafetyInputDirection, true
 	}
 
+	if strings.Contains(lower, "output data may contain inappropriate content") {
+		return contentSafetyOutputDirection, true
+	}
+	if strings.Contains(lower, "data_inspection_failed") ||
+		strings.Contains(lower, "datainspectionfailed") ||
+		strings.Contains(lower, "input data may contain inappropriate content") {
+		return contentSafetyInputDirection, true
+	}
+
 	if strings.Contains(lower, "input new_sensitive") {
 		if isInputImageContentSafetyText(lower) {
 			return contentSafetyInputImageDirection, true

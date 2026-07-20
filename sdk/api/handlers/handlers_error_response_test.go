@@ -144,6 +144,11 @@ func TestWriteErrorResponse_NormalizesCapturedKnownUserErrorBody(t *testing.T) {
 			code: contentPolicyViolationErrorCode,
 		},
 		{
+			name: "aliyun data inspection hidden behind api error",
+			body: `{"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed"}}`,
+			code: contentPolicyViolationErrorCode,
+		},
+		{
 			name: "unsupported request shape hidden behind api error",
 			body: `{"error":{"message":"request_feature_unsupported: large_claude_tool_history cannot be safely routed through MiniMax compatibility","code":"request_feature_unsupported"}}`,
 			code: requestFeatureUnsupportedErrorCode,

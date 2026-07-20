@@ -7120,7 +7120,7 @@ func isRequestScopedFeatureUnsupportedMessage(message string) bool {
 		return false
 	}
 	patterns := [...]string{
-		"request_feature_unsupported:",
+		"request_feature_unsupported",
 		"minimax anthropic compatibility does not support output_config.format",
 	}
 	for _, pattern := range patterns {
@@ -7200,7 +7200,7 @@ func isRequestScopedFeatureUnsupportedResultError(err *Error) bool {
 	if err == nil || statusCodeFromResult(err) != http.StatusBadRequest {
 		return false
 	}
-	return isRequestScopedFeatureUnsupportedMessage(err.Message)
+	return isRequestScopedFeatureUnsupportedMessage(err.Code + ": " + err.Message)
 }
 
 func isRequestScopedContentSafetySignal(code, message string) bool {
@@ -7218,14 +7218,19 @@ func isRequestScopedContentSafetySignal(code, message string) bool {
 
 func isGenericContentSafetySignal(code, message string) bool {
 	normalizedCode := strings.Trim(strings.ToLower(strings.TrimSpace(code)), `"'(),:;[]{}<>`)
-	if normalizedCode == "content_policy_violation" {
+	if normalizedCode == "content_policy_violation" ||
+		normalizedCode == "data_inspection_failed" ||
+		normalizedCode == "datainspectionfailed" {
 		return true
 	}
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if lower == "" {
 		return false
 	}
-	if strings.Contains(lower, "content_policy_violation") {
+	if strings.Contains(lower, "content_policy_violation") ||
+		strings.Contains(lower, "data_inspection_failed") ||
+		strings.Contains(lower, "datainspectionfailed") ||
+		strings.Contains(lower, "data may contain inappropriate content") {
 		return true
 	}
 	if strings.Contains(lower, "有敏感内容") ||
@@ -7613,10 +7618,11 @@ func isSpecificFallbackModel(model string, target string) bool {
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
 // "invalid_request_error"/"InvalidParameter", guarded oversized Claude compat
-// tool-history requests, request-scoped content safety/context-window rejections,
-// request-scoped 404 item misses caused by `store=false`, and all 422 responses
-// as request-shape failures for the generic retry loop. Model-support errors are
-// excluded so routing can fall through to another auth or upstream.
+// tool-history requests, unsupported request features, request-scoped content
+// safety/context-window rejections, request-scoped 404 item misses caused by
+// `store=false`, and all 422 responses as request-shape failures for the generic
+// retry loop. Model-support errors are excluded so routing can fall through to
+// another auth or upstream.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -7639,7 +7645,8 @@ func isRequestInvalidError(err error) bool {
 		return status == 0 || status == http.StatusBadRequest
 	}
 	if isRequestScopedFeatureUnsupportedMessage(err.Error()) {
-		return false
+		status := statusCodeFromError(err)
+		return status == 0 || status == http.StatusBadRequest
 	}
 	if isRequestScopedContentSafetyError(err) {
 		return true
