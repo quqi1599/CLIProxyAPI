@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if ! command -v go >/dev/null 2>&1; then
+  exec docker run --rm \
+    --volume "$PWD:/workspace:ro" \
+    --workdir /workspace \
+    golang:1.26-bookworm \
+    bash -lc 'git config --global --add safe.directory /workspace && .ci/ci.sh'
+fi
+
 unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
 if [[ -n $unformatted ]]; then
   echo "gofmt required for:" >&2
