@@ -2,15 +2,11 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -29,26 +25,25 @@ const (
 	CodexReasoningReplayCacheEvictBatchSize = 128
 )
 
-type codexReasoningReplayEntry struct {
-	Items     [][]byte
-	Timestamp time.Time
-}
-
-var (
-	codexReasoningReplayMu      sync.Mutex
-	codexReasoningReplayEntries = make(map[string]codexReasoningReplayEntry)
-)
-
-type codexReasoningReplayKVClient interface {
-	KVGet(ctx context.Context, key string) ([]byte, bool, error)
-	KVSet(ctx context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error)
-	KVDel(ctx context.Context, keys ...string) (int64, error)
-	KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
-}
+type codexReasoningReplayKVClient = reasoningReplayKVClient
 
 var currentCodexReasoningReplayKVClient = func() (codexReasoningReplayKVClient, bool, error) {
 	return homekv.CurrentKVClient()
 }
+
+var codexReasoningReplayStore = newReasoningReplayStore(reasoningReplayStoreConfig{
+	ttl:             CodexReasoningReplayCacheTTL,
+	maxEntries:      CodexReasoningReplayCacheMaxEntries,
+	evictBatchSize:  CodexReasoningReplayCacheEvictBatchSize,
+	maxBytes:        reasoningReplayCacheMaxBytes,
+	maxSessionBytes: reasoningReplayCacheMaxSessionBytes,
+	maxEncodedBytes: reasoningReplayCacheMaxEncodedBytes,
+	logLabel:        "codex reasoning replay",
+	currentKVClient: func() (reasoningReplayKVClient, bool, error) {
+		return currentCodexReasoningReplayKVClient()
+	},
+	normalizeItems: normalizeCodexReasoningReplayItems,
+})
 
 // CacheCodexReasoningReplayItem stores a final GPT/Codex reasoning item for
 // stateless replay. The stored item is normalized to the minimal shape accepted
@@ -65,44 +60,7 @@ func CacheCodexReasoningReplayItems(modelName, sessionKey string, items [][]byte
 
 // CacheCodexReasoningReplayItemsBestEffort stores replay items for completed response paths.
 func CacheCodexReasoningReplayItemsBestEffort(ctx context.Context, modelName, sessionKey string, items [][]byte) bool {
-	key := codexReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return false
-	}
-	normalized, ok := normalizeCodexReasoningReplayItems(items)
-	if !ok {
-		return false
-	}
-	if client, homeMode, errClient := currentCodexReasoningReplayKVClient(); homeMode {
-		if errClient != nil {
-			log.Errorf("home kv best-effort codex reasoning replay set failed prefix=cpa:codex:*: %v", errClient)
-			return false
-		}
-		raw, errMarshal := json.Marshal(normalized)
-		if errMarshal != nil {
-			log.Errorf("home kv best-effort codex reasoning replay set failed prefix=cpa:codex:*: %v", errMarshal)
-			return false
-		}
-		written, errSet := client.KVSet(ctx, codexReasoningReplayKVKey(modelName, sessionKey), raw, homekv.KVSetOptions{EX: CodexReasoningReplayCacheTTL})
-		if errSet != nil {
-			log.Errorf("home kv best-effort codex reasoning replay set failed prefix=cpa:codex:*: %v", errSet)
-			return false
-		}
-		return written
-	}
-
-	cacheCleanupOnce.Do(startCacheCleanup)
-	now := time.Now()
-	codexReasoningReplayMu.Lock()
-	defer codexReasoningReplayMu.Unlock()
-	codexReasoningReplayEntries[key] = codexReasoningReplayEntry{
-		Items:     normalized,
-		Timestamp: now,
-	}
-	if len(codexReasoningReplayEntries) > CodexReasoningReplayCacheMaxEntries {
-		evictOldestCodexReasoningReplayEntries(CodexReasoningReplayCacheEvictBatchSize)
-	}
-	return true
+	return codexReasoningReplayStore.SaveBestEffort(ctx, codexReasoningReplayStoreScope(modelName, sessionKey), items)
 }
 
 // GetCodexReasoningReplayItem retrieves a normalized reasoning replay item.
@@ -125,44 +83,7 @@ func GetCodexReasoningReplayItems(modelName, sessionKey string) ([][]byte, bool)
 
 // GetCodexReasoningReplayItemsRequired retrieves replay items for request-time paths.
 func GetCodexReasoningReplayItemsRequired(ctx context.Context, modelName, sessionKey string) ([][]byte, bool, error) {
-	key := codexReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return nil, false, nil
-	}
-	client, homeMode, errClient := currentCodexReasoningReplayKVClient()
-	if homeMode {
-		if errClient != nil {
-			return nil, false, errClient
-		}
-		raw, found, errGet := client.KVGet(ctx, codexReasoningReplayKVKey(modelName, sessionKey))
-		if errGet != nil || !found {
-			return nil, false, errGet
-		}
-		var homeItems [][]byte
-		if errUnmarshal := json.Unmarshal(raw, &homeItems); errUnmarshal != nil {
-			return nil, false, errUnmarshal
-		}
-		if _, errExpire := client.KVExpire(ctx, codexReasoningReplayKVKey(modelName, sessionKey), CodexReasoningReplayCacheTTL); errExpire != nil {
-			return nil, false, errExpire
-		}
-		return cloneCodexReasoningReplayItems(homeItems), true, nil
-	}
-
-	cacheCleanupOnce.Do(startCacheCleanup)
-	now := time.Now()
-	codexReasoningReplayMu.Lock()
-	defer codexReasoningReplayMu.Unlock()
-	entry, ok := codexReasoningReplayEntries[key]
-	if !ok {
-		return nil, false, nil
-	}
-	if now.Sub(entry.Timestamp) > CodexReasoningReplayCacheTTL {
-		delete(codexReasoningReplayEntries, key)
-		return nil, false, nil
-	}
-	entry.Timestamp = now
-	codexReasoningReplayEntries[key] = entry
-	return cloneCodexReasoningReplayItems(entry.Items), true, nil
+	return codexReasoningReplayStore.LoadRequired(ctx, codexReasoningReplayStoreScope(modelName, sessionKey))
 }
 
 // DeleteCodexReasoningReplayItem removes one replay item after upstream rejects
@@ -175,29 +96,12 @@ func DeleteCodexReasoningReplayItem(modelName, sessionKey string) {
 
 // DeleteCodexReasoningReplayItemRequired removes one replay item for request-time paths.
 func DeleteCodexReasoningReplayItemRequired(ctx context.Context, modelName, sessionKey string) error {
-	key := codexReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return nil
-	}
-	client, homeMode, errClient := currentCodexReasoningReplayKVClient()
-	if homeMode {
-		if errClient != nil {
-			return errClient
-		}
-		_, errDel := client.KVDel(ctx, codexReasoningReplayKVKey(modelName, sessionKey))
-		return errDel
-	}
-	codexReasoningReplayMu.Lock()
-	delete(codexReasoningReplayEntries, key)
-	codexReasoningReplayMu.Unlock()
-	return nil
+	return codexReasoningReplayStore.DeleteRequired(ctx, codexReasoningReplayStoreScope(modelName, sessionKey))
 }
 
 // ClearCodexReasoningReplayCache clears all Codex reasoning replay state.
 func ClearCodexReasoningReplayCache() {
-	codexReasoningReplayMu.Lock()
-	codexReasoningReplayEntries = make(map[string]codexReasoningReplayEntry)
-	codexReasoningReplayMu.Unlock()
+	codexReasoningReplayStore.Clear()
 }
 
 func codexReasoningReplayCacheKey(modelName, sessionKey string) string {
@@ -213,6 +117,17 @@ func codexReasoningReplayCacheKey(modelName, sessionKey string) string {
 
 func codexReasoningReplayKVKey(modelName, sessionKey string) string {
 	return "cpa:codex:reasoning-replay:" + homekv.HashKeyPart(strings.TrimSpace(modelName)) + ":" + homekv.HashKeyPart(strings.TrimSpace(sessionKey))
+}
+
+func codexReasoningReplayStoreScope(modelName, sessionKey string) reasoningReplayScope {
+	localKey := codexReasoningReplayCacheKey(modelName, sessionKey)
+	if localKey == "" {
+		return reasoningReplayScope{}
+	}
+	return reasoningReplayScope{
+		localKey: localKey,
+		kvKey:    codexReasoningReplayKVKey(modelName, sessionKey),
+	}
 }
 
 func normalizeCodexReasoningReplayItems(items [][]byte) ([][]byte, bool) {
@@ -295,43 +210,6 @@ func normalizeCodexReasoningReplayCustomToolCallItem(itemResult gjson.Result) ([
 	return normalized, true
 }
 
-func cloneCodexReasoningReplayItems(items [][]byte) [][]byte {
-	cloned := make([][]byte, 0, len(items))
-	for _, item := range items {
-		cloned = append(cloned, append([]byte(nil), item...))
-	}
-	return cloned
-}
-
-func evictOldestCodexReasoningReplayEntries(count int) {
-	if count <= 0 || len(codexReasoningReplayEntries) == 0 {
-		return
-	}
-	type candidate struct {
-		key       string
-		timestamp time.Time
-	}
-	candidates := make([]candidate, 0, len(codexReasoningReplayEntries))
-	for key, entry := range codexReasoningReplayEntries {
-		candidates = append(candidates, candidate{key: key, timestamp: entry.Timestamp})
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].timestamp.Before(candidates[j].timestamp)
-	})
-	if count > len(candidates) {
-		count = len(candidates)
-	}
-	for i := 0; i < count; i++ {
-		delete(codexReasoningReplayEntries, candidates[i].key)
-	}
-}
-
 func purgeExpiredCodexReasoningReplayCache(now time.Time) {
-	codexReasoningReplayMu.Lock()
-	for key, entry := range codexReasoningReplayEntries {
-		if now.Sub(entry.Timestamp) > CodexReasoningReplayCacheTTL {
-			delete(codexReasoningReplayEntries, key)
-		}
-	}
-	codexReasoningReplayMu.Unlock()
+	codexReasoningReplayStore.PurgeExpired(now)
 }

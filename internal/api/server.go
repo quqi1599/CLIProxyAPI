@@ -458,7 +458,7 @@ func (s *Server) setupRoutes() {
 	readinessHandler := func(c *gin.Context) {
 		status := http.StatusOK
 		bodyStatus := "ready"
-		if !s.ready.Load() {
+		if !s.ready.Load() || (s.handlers != nil && !s.handlers.AdmissionReady()) {
 			status = http.StatusServiceUnavailable
 			bodyStatus = "not_ready"
 		}

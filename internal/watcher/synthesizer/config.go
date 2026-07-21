@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -130,6 +131,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		}
 		if kind := internalconfig.InferCompatKindFromBaseURL(base); kind != "" {
 			attrs["compat_kind"] = kind
+			attrs[provideridentity.KindSourceAttribute] = string(provideridentity.SourceBaseURL)
 		}
 		metadata := map[string]any{}
 		if ck.DisableCooling {
@@ -257,6 +259,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 		internalProviderKey := util.OpenAICompatibleProviderKey(providerName)
 		base := strings.TrimSpace(compat.BaseURL)
+		identity := provideridentity.Resolve(provideridentity.Input{ExplicitKind: compat.Kind, BaseURL: base})
 		disableCooling := compat.DisableCooling
 
 		// Handle new APIKeyEntries format (preferred)
@@ -281,8 +284,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if routingGroup != "" {
 				attrs["routing_group"] = routingGroup
 			}
-			if kind := internalconfig.NormalizeOpenAICompatibilityKind(compat.Kind); kind != "" {
-				attrs["compat_kind"] = kind
+			if identity.Kind != "" {
+				attrs[provideridentity.KindSourceAttribute] = string(identity.Source)
+				if identity.Source == provideridentity.SourceCompatConfig {
+					attrs["compat_kind"] = identity.Kind
+				}
 			}
 			metadata := map[string]any{}
 			if disableCooling {
@@ -336,8 +342,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if routingGroup := strings.TrimSpace(compat.RoutingGroup); routingGroup != "" {
 				attrs["routing_group"] = routingGroup
 			}
-			if kind := internalconfig.NormalizeOpenAICompatibilityKind(compat.Kind); kind != "" {
-				attrs["compat_kind"] = kind
+			if identity.Kind != "" {
+				attrs[provideridentity.KindSourceAttribute] = string(identity.Source)
+				if identity.Source == provideridentity.SourceCompatConfig {
+					attrs["compat_kind"] = identity.Kind
+				}
 			}
 			metadata := map[string]any{}
 			if disableCooling {

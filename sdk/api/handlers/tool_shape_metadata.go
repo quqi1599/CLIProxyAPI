@@ -86,6 +86,13 @@ func setRequestShapeAndToolMetadata(meta map[string]any, rawJSON []byte) {
 	if !ok {
 		return
 	}
+	setRequestShapeAndToolMetadataFromComplexity(meta, vector)
+}
+
+func setRequestShapeAndToolMetadataFromComplexity(meta map[string]any, vector complexityVector) {
+	if meta == nil {
+		return
+	}
 	setRequestShapeMetadata(meta, vector)
 	setToolShapeMetadata(meta, vector)
 }

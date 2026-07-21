@@ -213,9 +213,14 @@ nonstream-keepalive-interval: 0
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 #   flush-interval-ms: 25   # Default: 0 (disabled). Coalesces chunk flushes up to this delay.
 
-# Optional narrow guards for abusive traffic patterns that should not affect
-# normal long-context coding or analysis requests.
+# Optional traffic safety guards. Global admission is disabled by default;
+# calibrate it against production traffic before enabling it.
 # request-guards:
+#   global-admission:
+#     enabled: true                  # Default: false. Opt in after calibrating limits for this deployment.
+#     capacity: 128                  # Total weighted in-flight request capacity. <= 0 uses 128.
+#     max-queue: 64                  # Maximum local waiters. <= 0 uses 64.
+#     saturation-grace-seconds: 5   # Sustained full-queue time before /readyz returns 503. <= 0 uses 5.
 #   minimax-m27-highspeed-narrative:
 #     enabled: true
 #     max-concurrent: 4      # Matching requests above this wait before upstream execution.

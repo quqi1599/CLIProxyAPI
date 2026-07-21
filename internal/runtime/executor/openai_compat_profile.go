@@ -168,6 +168,7 @@ func (e *OpenAICompatExecutor) resolveProfile(auth *cliproxyauth.Auth) openAICom
 	}
 	if auth != nil && auth.Attributes != nil {
 		input.AttributeKind = auth.Attributes["compat_kind"]
+		input.AttributeSource = provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute])
 		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
 			input.BaseURL = baseURL
 		}
@@ -1268,8 +1269,9 @@ func openAICompatKindSource(profile openAICompatProfile, auth *cliproxyauth.Auth
 	}
 	if auth != nil && auth.Attributes != nil {
 		identity := provideridentity.Resolve(provideridentity.Input{
-			AttributeKind: auth.Attributes["compat_kind"],
-			BaseURL:       auth.Attributes["base_url"],
+			AttributeKind:   auth.Attributes["compat_kind"],
+			AttributeSource: provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute]),
+			BaseURL:         auth.Attributes["base_url"],
 		})
 		if identity.Kind == kind && identity.Source != provideridentity.SourceGeneric {
 			return string(identity.Source)
@@ -3547,12 +3549,14 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 	if errorCode == "" && strings.TrimSpace(string(body)) == "" {
 		errorCode = openAICompatEmptyUpstreamResponseCode
 	}
+	normalizedStatus := normalizeOpenAICompatStatus(statusCode, message)
 	return statusErr{
-		code:               normalizeOpenAICompatStatus(statusCode, message),
+		code:               normalizedStatus,
 		providerStatusCode: statusCode,
 		msg:                message,
 		errorCode:          errorCode,
 		retryAfter:         retryAfter,
+		failure:            classifyOpenAICompatFailure(normalizedStatus, statusCode, message, errorCode, retryAfter),
 	}
 }
 

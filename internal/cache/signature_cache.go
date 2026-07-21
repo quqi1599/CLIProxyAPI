@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,14 +12,9 @@ import (
 	"time"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	signaturevalidation "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	log "github.com/sirupsen/logrus"
 )
-
-// SignatureEntry holds a cached thinking signature with timestamp
-type SignatureEntry struct {
-	Signature string
-	Timestamp time.Time
-}
 
 const (
 	// SignatureCacheTTL is how long signatures are valid
@@ -32,10 +28,30 @@ const (
 
 	// CacheCleanupInterval controls how often stale entries are purged
 	CacheCleanupInterval = 10 * time.Minute
+
+	// Local limits bound retained signatures independently of periodic cleanup.
+	signatureCacheMaxEntries           = 10240
+	signatureCacheEvictBatchSize       = 1
+	signatureCacheMaxBytes       int64 = 32 << 20
+	signatureCacheMaxValueBytes        = signaturevalidation.MaxClaudeThinkingSignatureLen
 )
 
-// signatureCache stores signatures by model group -> textHash -> SignatureEntry
-var signatureCache sync.Map
+var errSignatureKVUnavailable = errors.New("signature home kv client is unavailable")
+
+type signatureLocalKey struct {
+	group    string
+	textHash string
+}
+
+var (
+	signatureLocalCache = newBoundedLRU[signatureLocalKey, string](
+		SignatureCacheTTL,
+		signatureCacheMaxEntries,
+		signatureCacheEvictBatchSize,
+		signatureCacheMaxBytes,
+	)
+	signatureCacheNow = time.Now
+)
 
 // cacheCleanupOnce ensures the background cleanup goroutine starts only once
 var cacheCleanupOnce sync.Once
@@ -51,29 +67,28 @@ var currentSignatureKVClient = func() (signatureKVClient, bool, error) {
 	return homekv.CurrentKVClient()
 }
 
-// groupCache is the inner map type
-type groupCache struct {
-	mu      sync.RWMutex
-	entries map[string]SignatureEntry
-}
-
 // hashText creates a stable, Unicode-safe key from text content
 func hashText(text string) string {
 	h := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(h[:])[:SignatureTextHashLen]
 }
 
-// getOrCreateGroupCache gets or creates a cache bucket for a model group
-func getOrCreateGroupCache(groupKey string) *groupCache {
-	// Start background cleanup on first access
-	cacheCleanupOnce.Do(startCacheCleanup)
-
-	if val, ok := signatureCache.Load(groupKey); ok {
-		return val.(*groupCache)
+func newSignatureLocalKey(modelName, text string) signatureLocalKey {
+	return signatureLocalKey{
+		group:    GetModelGroup(modelName),
+		textHash: hashText(text),
 	}
-	sc := &groupCache{entries: make(map[string]SignatureEntry)}
-	actual, _ := signatureCache.LoadOrStore(groupKey, sc)
-	return actual.(*groupCache)
+}
+
+func signatureLocalEntrySize(key signatureLocalKey, signature string) int64 {
+	return int64(len(key.group) + 1 + len(key.textHash) + len(signature))
+}
+
+func signatureCacheMiss(group string) string {
+	if group == "gemini" {
+		return "skip_thought_signature_validator"
+	}
+	return ""
 }
 
 // startCacheCleanup launches a background goroutine that periodically
@@ -88,26 +103,10 @@ func startCacheCleanup() {
 	}()
 }
 
-// purgeExpiredCaches removes caches with no valid (non-expired) entries.
+// purgeExpiredCaches removes expired entries from local caches.
 func purgeExpiredCaches() {
 	now := time.Now()
-	signatureCache.Range(func(key, value any) bool {
-		sc := value.(*groupCache)
-		sc.mu.Lock()
-		// Remove expired entries
-		for k, entry := range sc.entries {
-			if now.Sub(entry.Timestamp) > SignatureCacheTTL {
-				delete(sc.entries, k)
-			}
-		}
-		isEmpty := len(sc.entries) == 0
-		sc.mu.Unlock()
-		// Remove cache bucket if empty
-		if isEmpty {
-			signatureCache.Delete(key)
-		}
-		return true
-	})
+	signatureLocalCache.PurgeExpired(now)
 	purgeExpiredCodexReasoningReplayCache(now)
 	purgeExpiredAntigravityReasoningReplayCache(now)
 }
@@ -123,13 +122,17 @@ func CacheSignatureBestEffort(ctx context.Context, modelName, text, signature st
 	if text == "" || signature == "" {
 		return false
 	}
-	if len(signature) < MinValidSignatureLen {
+	if len(signature) < MinValidSignatureLen || len(signature) > signatureCacheMaxValueBytes {
 		return false
 	}
 
 	if client, homeMode, errClient := currentSignatureKVClient(); homeMode {
 		if errClient != nil {
 			log.Errorf("home kv best-effort signature set failed prefix=cpa:signature:*: %v", errClient)
+			return false
+		}
+		if isNilInterface(client) {
+			log.Errorf("home kv best-effort signature set failed prefix=cpa:signature:*: %v", errSignatureKVUnavailable)
 			return false
 		}
 		written, errSet := client.KVSet(ctx, signatureKVKey(modelName, text), []byte(signature), homekv.KVSetOptions{EX: SignatureCacheTTL})
@@ -140,17 +143,13 @@ func CacheSignatureBestEffort(ctx context.Context, modelName, text, signature st
 		return written
 	}
 
-	groupKey := GetModelGroup(modelName)
-	textHash := hashText(text)
-	sc := getOrCreateGroupCache(groupKey)
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	sc.entries[textHash] = SignatureEntry{
-		Signature: signature,
-		Timestamp: time.Now(),
+	cacheCleanupOnce.Do(startCacheCleanup)
+	key := newSignatureLocalKey(modelName, text)
+	entrySize := signatureLocalEntrySize(key, signature)
+	if !signatureLocalCache.CanStore(entrySize) {
+		return false
 	}
-	return true
+	return signatureLocalCache.Set(key, strings.Clone(signature), entrySize, signatureCacheNow())
 }
 
 // GetCachedSignature retrieves a cached signature for a given model group and text.
@@ -168,15 +167,15 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 	groupKey := GetModelGroup(modelName)
 
 	if text == "" {
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
-		return "", nil
+		return signatureCacheMiss(groupKey), nil
 	}
 
 	if client, homeMode, errClient := currentSignatureKVClient(); homeMode {
 		if errClient != nil {
 			return "", errClient
+		}
+		if isNilInterface(client) {
+			return "", errSignatureKVUnavailable
 		}
 		key := signatureKVKey(modelName, text)
 		raw, found, errGet := client.KVGet(ctx, key)
@@ -184,67 +183,44 @@ func GetCachedSignatureRequired(ctx context.Context, modelName, text string) (st
 			return "", errGet
 		}
 		if !found {
-			if groupKey == "gemini" {
-				return "skip_thought_signature_validator", nil
+			return signatureCacheMiss(groupKey), nil
+		}
+		var signature string
+		valid := len(raw) <= signatureCacheMaxValueBytes
+		if valid {
+			signature = string(raw)
+			valid = HasValidSignature(modelName, signature)
+		}
+		if !valid {
+			if _, errDelete := client.KVDel(ctx, key); errDelete != nil {
+				return "", errDelete
 			}
-			return "", nil
+			return signatureCacheMiss(groupKey), nil
 		}
 		if _, errExpire := client.KVExpire(ctx, key, SignatureCacheTTL); errExpire != nil {
 			return "", errExpire
 		}
-		return string(raw), nil
+		return signature, nil
 	}
 
-	val, ok := signatureCache.Load(groupKey)
+	cacheCleanupOnce.Do(startCacheCleanup)
+	signature, ok := signatureLocalCache.Get(newSignatureLocalKey(modelName, text), signatureCacheNow())
 	if !ok {
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
-		return "", nil
+		return signatureCacheMiss(groupKey), nil
 	}
-	sc := val.(*groupCache)
-
-	textHash := hashText(text)
-
-	now := time.Now()
-
-	sc.mu.Lock()
-	entry, exists := sc.entries[textHash]
-	if !exists {
-		sc.mu.Unlock()
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
-		return "", nil
-	}
-	if now.Sub(entry.Timestamp) > SignatureCacheTTL {
-		delete(sc.entries, textHash)
-		sc.mu.Unlock()
-		if groupKey == "gemini" {
-			return "skip_thought_signature_validator", nil
-		}
-		return "", nil
-	}
-
-	// Refresh TTL on access (sliding expiration).
-	entry.Timestamp = now
-	sc.entries[textHash] = entry
-	sc.mu.Unlock()
-
-	return entry.Signature, nil
+	return strings.Clone(signature), nil
 }
 
 // ClearSignatureCache clears signature cache for a specific model group or all groups.
 func ClearSignatureCache(modelName string) {
 	if modelName == "" {
-		signatureCache.Range(func(key, _ any) bool {
-			signatureCache.Delete(key)
-			return true
-		})
+		signatureLocalCache.Clear()
 		return
 	}
 	groupKey := GetModelGroup(modelName)
-	signatureCache.Delete(groupKey)
+	signatureLocalCache.DeleteIf(func(key signatureLocalKey) bool {
+		return key.group == groupKey
+	})
 }
 
 // DeleteCachedSignatureRequired removes one exact cached signature.
@@ -256,23 +232,13 @@ func DeleteCachedSignatureRequired(ctx context.Context, modelName, text string) 
 		if errClient != nil {
 			return errClient
 		}
+		if isNilInterface(client) {
+			return errSignatureKVUnavailable
+		}
 		_, errDel := client.KVDel(ctx, signatureKVKey(modelName, text))
 		return errDel
 	}
-	groupKey := GetModelGroup(modelName)
-	textHash := hashText(text)
-	val, ok := signatureCache.Load(groupKey)
-	if !ok {
-		return nil
-	}
-	sc := val.(*groupCache)
-	sc.mu.Lock()
-	delete(sc.entries, textHash)
-	isEmpty := len(sc.entries) == 0
-	sc.mu.Unlock()
-	if isEmpty {
-		signatureCache.Delete(groupKey)
-	}
+	signatureLocalCache.Delete(newSignatureLocalKey(modelName, text))
 	return nil
 }
 

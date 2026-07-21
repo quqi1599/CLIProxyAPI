@@ -32,6 +32,62 @@ func resetClaudeDeviceProfileCache() {
 	helps.ResetClaudeDeviceProfileCache()
 }
 
+func TestPrepareClaudeRequest_StreamAndNonStreamShareCommonFixture(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "test-key",
+		"base_url": "https://api.anthropic.com",
+	}}
+	req := cliproxyexecutor.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Payload: []byte(`{
+			"model":"client-alias",
+			"max_tokens":128,
+			"betas":["prompt-caching-2024-07-31"],
+			"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],
+			"tools":[{"name":"skill:pet_animals","description":"pets","input_schema":{"type":"object"}}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	nonStream, err := executor.prepareClaudeRequest(context.Background(), auth, req, opts, req.Model, false)
+	if err != nil {
+		t.Fatalf("prepareClaudeRequest(non-stream) error = %v", err)
+	}
+	stream, err := executor.prepareClaudeRequest(context.Background(), auth, req, opts, req.Model, true)
+	if err != nil {
+		t.Fatalf("prepareClaudeRequest(stream) error = %v", err)
+	}
+
+	if nonStream.upstreamStream {
+		t.Fatal("non-stream plan unexpectedly requests an upstream stream")
+	}
+	if !stream.upstreamStream {
+		t.Fatal("stream plan does not request an upstream stream")
+	}
+	if !bytes.Equal(nonStream.bodyForTranslation, stream.bodyForTranslation) {
+		t.Fatalf("translation bodies differ:\nnon-stream: %s\nstream: %s", nonStream.bodyForTranslation, stream.bodyForTranslation)
+	}
+	if !bytes.Equal(nonStream.bodyForUpstream, stream.bodyForUpstream) {
+		t.Fatalf("upstream bodies differ:\nnon-stream: %s\nstream: %s", nonStream.bodyForUpstream, stream.bodyForUpstream)
+	}
+	if got := nonStream.extraBetas; len(got) != 1 || got[0] != "prompt-caching-2024-07-31" {
+		t.Fatalf("extraBetas = %v, want prompt-caching beta", got)
+	}
+	if !strings.EqualFold(strings.Join(nonStream.extraBetas, ","), strings.Join(stream.extraBetas, ",")) {
+		t.Fatalf("beta header intent differs: non-stream=%v stream=%v", nonStream.extraBetas, stream.extraBetas)
+	}
+	if got := gjson.GetBytes(nonStream.bodyForUpstream, "model").String(); got != req.Model {
+		t.Fatalf("upstream model = %q, want %q", got, req.Model)
+	}
+	if gjson.GetBytes(nonStream.bodyForUpstream, "betas").Exists() {
+		t.Fatalf("upstream body still contains betas: %s", nonStream.bodyForUpstream)
+	}
+	if got := gjson.GetBytes(nonStream.bodyForUpstream, "tools.0.name").String(); strings.Contains(got, ":") {
+		t.Fatalf("upstream tool name was not sanitized: %q", got)
+	}
+}
+
 func malformedClaudeTreeSignatureForClaudeExecutorTest() string {
 	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
 }

@@ -42,6 +42,25 @@ func TestOpenAICompatResolveProfileUsesProviderIdentityPrecedence(t *testing.T) 
 			wantSource: provideridentity.SourceAttribute,
 		},
 		{
+			name: "persisted explicit source stays aligned with conductor",
+			auth: &cliproxyauth.Auth{Attributes: map[string]string{
+				"compat_kind":                        "minimax",
+				provideridentity.KindSourceAttribute: string(provideridentity.SourceCompatConfig),
+				"base_url":                           "https://api.deepseek.com/v1",
+			}},
+			wantKind:   "minimax",
+			wantSource: provideridentity.SourceCompatConfig,
+		},
+		{
+			name: "stale URL-derived attribute does not override current URL",
+			auth: &cliproxyauth.Auth{Attributes: map[string]string{
+				"compat_kind":                        "minimax",
+				provideridentity.KindSourceAttribute: string(provideridentity.SourceBaseURL),
+				"base_url":                           "https://example.com/v1",
+			}},
+			wantSource: provideridentity.SourceGeneric,
+		},
+		{
 			name: "base URL fallback",
 			auth: &cliproxyauth.Auth{Attributes: map[string]string{
 				"base_url": "https://api.deepseek.com/v1",
@@ -51,8 +70,10 @@ func TestOpenAICompatResolveProfileUsesProviderIdentityPrecedence(t *testing.T) 
 		},
 		{
 			name: "generic fallback",
-			auth: &cliproxyauth.Auth{Attributes: map[string]string{
-				"base_url": "https://example.com/v1",
+			auth: &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+				"provider_key": "pool",
+				"compat_name":  "pool",
+				"base_url":     "https://example.com/v1",
 			}},
 			wantSource: provideridentity.SourceGeneric,
 		},

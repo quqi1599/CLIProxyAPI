@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -473,6 +475,61 @@ func TestExecuteModelStreamStartupError(t *testing.T) {
 	}
 }
 
+func TestExecuteModelStreamCancelBeforeFirstByte(t *testing.T) {
+	model := "model-execution-stream-cancel-before-first-byte"
+	started := make(chan struct{})
+	executor := &modelExecutionCaptureExecutor{
+		stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			close(started)
+			return &coreexecutor.StreamResult{Chunks: make(chan coreexecutor.StreamChunk)}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan *interfaces.ErrorMessage, 1)
+
+	go func() {
+		_, errMsg := handler.ExecuteModelStream(ctx, ModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         model,
+			Stream:        true,
+			Body:          []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model)),
+		})
+		result <- errMsg
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("stream producer did not start")
+	}
+	cancel()
+	select {
+	case errMsg := <-result:
+		if errMsg == nil || !errors.Is(errMsg.Error, context.Canceled) {
+			t.Fatalf("ExecuteModelStream() error = %+v, want context canceled", errMsg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ExecuteModelStream() did not return after cancellation")
+	}
+}
+
+func TestReceiveInitialModelExecutionChunkChecksCanceledContextAfterProducerClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage)
+	close(dataChan)
+	close(errChan)
+
+	_, _, _, errMsg := receiveInitialModelExecutionChunk(ctx, dataChan, errChan)
+	if errMsg == nil || !errors.Is(errMsg.Error, context.Canceled) {
+		t.Fatalf("receiveInitialModelExecutionChunk() error = %+v, want context canceled", errMsg)
+	}
+}
+
 func TestExecuteModelStreamTerminalError(t *testing.T) {
 	model := "model-execution-stream-terminal-error-model"
 	requestBody := []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model))
@@ -538,6 +595,67 @@ func TestExecuteModelStreamTerminalError(t *testing.T) {
 	}
 	if chunk, ok = <-stream.Chunks; ok {
 		t.Fatalf("unexpected extra stream chunk: %+v", chunk)
+	}
+}
+
+func TestExecuteModelStreamTerminalWrappedErrorStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{
+			name: "legacy",
+			err: fmt.Errorf("executor: %w", modelExecutionStatusHeaderError{
+				statusCode: http.StatusTooManyRequests,
+				message:    "rate limited",
+			}),
+			status: http.StatusTooManyRequests,
+		},
+		{
+			name: "typed",
+			err: fmt.Errorf("executor: %w", &failurecontract.Failure{
+				Kind:          failurecontract.ProviderUnavailable,
+				Scope:         failurecontract.ScopeProvider,
+				HTTPStatus:    http.StatusServiceUnavailable,
+				PublicMessage: "provider unavailable",
+			}),
+			status: http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := "model-execution-stream-terminal-wrapped-" + tc.name
+			executor := &modelExecutionCaptureExecutor{
+				stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+					chunks := make(chan coreexecutor.StreamChunk, 2)
+					chunks <- coreexecutor.StreamChunk{Payload: []byte("partial")}
+					chunks <- coreexecutor.StreamChunk{Err: tc.err}
+					close(chunks)
+					return &coreexecutor.StreamResult{Chunks: chunks}, nil
+				},
+			}
+			handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+
+			stream, errMsg := handler.ExecuteModelStream(context.Background(), ModelExecutionRequest{
+				EntryProtocol: "openai",
+				ExitProtocol:  "openai",
+				Model:         model,
+				Stream:        true,
+				Body:          []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model)),
+			})
+			if errMsg != nil {
+				t.Fatalf("ExecuteModelStream() error = %+v", errMsg)
+			}
+			if chunk := <-stream.Chunks; string(chunk.Payload) != "partial" || chunk.Err != nil {
+				t.Fatalf("first chunk = %+v, want partial payload", chunk)
+			}
+			chunk := <-stream.Chunks
+			if chunk.Err == nil || chunk.Err.StatusCode != tc.status {
+				t.Fatalf("terminal chunk = %+v, want status %d", chunk, tc.status)
+			}
+		})
 	}
 }
 

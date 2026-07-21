@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	log "github.com/sirupsen/logrus"
@@ -89,6 +92,23 @@ func useFakeSignatureKVClient(t *testing.T, client *fakeSignatureKVClient, homeM
 	})
 }
 
+func useTestSignatureLocalCache(t *testing.T, maxEntries int, maxBytes int64, now func() time.Time) {
+	t.Helper()
+	previousCache := signatureLocalCache
+	previousNow := signatureCacheNow
+	previousClient := currentSignatureKVClient
+	signatureLocalCache = newBoundedLRU[signatureLocalKey, string](SignatureCacheTTL, maxEntries, 1, maxBytes)
+	signatureCacheNow = now
+	currentSignatureKVClient = func() (signatureKVClient, bool, error) {
+		return nil, false, nil
+	}
+	t.Cleanup(func() {
+		signatureLocalCache = previousCache
+		signatureCacheNow = previousNow
+		currentSignatureKVClient = previousClient
+	})
+}
+
 func TestCacheSignature_BasicStorageAndRetrieval(t *testing.T) {
 	ClearSignatureCache("")
 
@@ -122,6 +142,112 @@ func TestGetCachedSignatureRequiredHomeReadAndSlidingExpire(t *testing.T) {
 	}
 	if client.expireCount != 1 || client.lastExpireTTL != SignatureCacheTTL {
 		t.Fatalf("KVExpire count/ttl = %d/%v, want 1/%v", client.expireCount, client.lastExpireTTL, SignatureCacheTTL)
+	}
+}
+
+func TestCacheSignatureBestEffortHomeUsesRawValueAndTTL(t *testing.T) {
+	text := "thinking text"
+	signature := strings.Repeat("s", MinValidSignatureLen)
+	client := newFakeSignatureKVClient()
+	useFakeSignatureKVClient(t, client, true, nil)
+
+	if !CacheSignatureBestEffort(context.Background(), testModelName, text, signature) {
+		t.Fatal("CacheSignatureBestEffort() = false, want true")
+	}
+	if got := client.values[signatureKVKey(testModelName, text)]; !bytes.Equal(got, []byte(signature)) {
+		t.Fatalf("Home value = %q, want raw signature %q", got, signature)
+	}
+	if client.setCount != 1 || client.lastSetTTL != SignatureCacheTTL {
+		t.Fatalf("KVSet count/ttl = %d/%v, want 1/%v", client.setCount, client.lastSetTTL, SignatureCacheTTL)
+	}
+}
+
+func TestCacheSignatureBestEffortRejectsOversizedValueBeforeHomeWrite(t *testing.T) {
+	client := newFakeSignatureKVClient()
+	useFakeSignatureKVClient(t, client, true, nil)
+
+	if CacheSignatureBestEffort(context.Background(), testModelName, "thinking text", strings.Repeat("s", signatureCacheMaxValueBytes+1)) {
+		t.Fatal("oversized signature write unexpectedly succeeded")
+	}
+	if client.setCount != 0 {
+		t.Fatalf("oversized signature KVSet count = %d, want 0", client.setCount)
+	}
+}
+
+func TestSignatureHomeAcceptsValueAtExistingValidationLimit(t *testing.T) {
+	client := newFakeSignatureKVClient()
+	useFakeSignatureKVClient(t, client, true, nil)
+	value := strings.Repeat("s", signatureCacheMaxValueBytes)
+
+	if !CacheSignatureBestEffort(context.Background(), testModelName, "thinking text", value) {
+		t.Fatal("exact-limit signature write failed")
+	}
+	got, errGet := GetCachedSignatureRequired(context.Background(), testModelName, "thinking text")
+	if errGet != nil || got != value {
+		t.Fatalf("exact-limit Home signature length/error = %d/%v, want %d/nil", len(got), errGet, len(value))
+	}
+	if client.setCount != 1 || client.expireCount != 1 {
+		t.Fatalf("exact-limit Home signature set/expire = %d/%d, want 1/1", client.setCount, client.expireCount)
+	}
+}
+
+func TestGetCachedSignatureRequiredDeletesOutOfBoundsHomeValues(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		modelName string
+		value     []byte
+		want      string
+	}{
+		{name: "short claude", modelName: testModelName, value: []byte("short")},
+		{name: "oversized claude", modelName: testModelName, value: bytes.Repeat([]byte{'s'}, signatureCacheMaxValueBytes+1)},
+		{name: "invalid gemini", modelName: "gemini-3-pro-preview", value: []byte("short"), want: "skip_thought_signature_validator"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeSignatureKVClient()
+			key := signatureKVKey(tc.modelName, "thinking text")
+			client.values[key] = tc.value
+			useFakeSignatureKVClient(t, client, true, nil)
+
+			got, errGet := GetCachedSignatureRequired(context.Background(), tc.modelName, "thinking text")
+			if errGet != nil || got != tc.want {
+				t.Fatalf("invalid Home signature = %q, %v; want %q, nil", got, errGet, tc.want)
+			}
+			if client.delCount != 1 || client.expireCount != 0 {
+				t.Fatalf("invalid Home signature del/expire = %d/%d, want 1/0", client.delCount, client.expireCount)
+			}
+		})
+	}
+}
+
+func TestGetCachedSignatureRequiredPreservesGeminiSentinelInHome(t *testing.T) {
+	const modelName = "gemini-3-pro-preview"
+	const sentinel = "skip_thought_signature_validator"
+	client := newFakeSignatureKVClient()
+	client.values[signatureKVKey(modelName, "thinking text")] = []byte(sentinel)
+	useFakeSignatureKVClient(t, client, true, nil)
+
+	got, errGet := GetCachedSignatureRequired(context.Background(), modelName, "thinking text")
+	if errGet != nil || got != sentinel {
+		t.Fatalf("Gemini Home sentinel = %q, %v; want %q, nil", got, errGet, sentinel)
+	}
+	if client.delCount != 0 || client.expireCount != 1 {
+		t.Fatalf("Gemini Home sentinel del/expire = %d/%d, want 0/1", client.delCount, client.expireCount)
+	}
+}
+
+func TestSignatureHomeTypedNilClientDoesNotPanic(t *testing.T) {
+	useFakeSignatureKVClient(t, nil, true, nil)
+	text := "thinking text"
+	signature := strings.Repeat("s", MinValidSignatureLen)
+
+	if CacheSignatureBestEffort(context.Background(), testModelName, text, signature) {
+		t.Fatal("CacheSignatureBestEffort() = true with typed-nil Home client")
+	}
+	if _, errGet := GetCachedSignatureRequired(context.Background(), testModelName, text); !errors.Is(errGet, errSignatureKVUnavailable) {
+		t.Fatalf("GetCachedSignatureRequired() error = %v, want %v", errGet, errSignatureKVUnavailable)
+	}
+	if errDelete := DeleteCachedSignatureRequired(context.Background(), testModelName, text); !errors.Is(errDelete, errSignatureKVUnavailable) {
+		t.Fatalf("DeleteCachedSignatureRequired() error = %v, want %v", errDelete, errSignatureKVUnavailable)
 	}
 }
 
@@ -224,6 +350,22 @@ func TestGetCachedSignatureRequiredGeminiEmptyThinkingSentinel(t *testing.T) {
 	}
 	if client.getCount != 0 {
 		t.Fatalf("KVGet count = %d, want 0", client.getCount)
+	}
+}
+
+func TestGetCachedSignatureRequiredGeminiNonEmptyMissAndExpirationSentinel(t *testing.T) {
+	now := time.Unix(100, 0)
+	useTestSignatureLocalCache(t, 10, 1<<20, func() time.Time { return now })
+	modelName := "gemini-3-pro-preview"
+	const sentinel = "skip_thought_signature_validator"
+
+	if got := GetCachedSignature(modelName, "missing"); got != sentinel {
+		t.Fatalf("non-empty Gemini miss = %q, want sentinel", got)
+	}
+	CacheSignature(modelName, "expired", strings.Repeat("s", MinValidSignatureLen))
+	now = now.Add(SignatureCacheTTL + time.Nanosecond)
+	if got := GetCachedSignature(modelName, "expired"); got != sentinel {
+		t.Fatalf("expired Gemini signature = %q, want sentinel", got)
 	}
 }
 
@@ -391,26 +533,195 @@ func TestCacheSignature_Overwrite(t *testing.T) {
 	}
 }
 
-// Note: TTL expiration test is tricky to test without mocking time
-// We test the logic path exists but actual expiration would require time manipulation
 func TestCacheSignature_ExpirationLogic(t *testing.T) {
-	ClearSignatureCache("")
-
-	// This test verifies the expiration check exists
-	// In a real scenario, we'd mock time.Now()
+	now := time.Unix(100, 0)
+	useTestSignatureLocalCache(t, 10, 1<<20, func() time.Time { return now })
 	text := "text"
-	sig := "validSig1234567890123456789012345678901234567890123456"
+	sig := strings.Repeat("s", MinValidSignatureLen)
 
 	CacheSignature(testModelName, text, sig)
-
-	// Fresh entry should be retrievable
+	now = now.Add(SignatureCacheTTL)
 	if got := GetCachedSignature(testModelName, text); got != sig {
-		t.Errorf("Fresh entry should be retrievable, got '%s'", got)
+		t.Fatalf("signature at exact TTL = %q, want hit", got)
+	}
+	now = now.Add(SignatureCacheTTL)
+	if got := GetCachedSignature(testModelName, text); got != sig {
+		t.Fatalf("signature at exact sliding TTL = %q, want hit", got)
+	}
+	now = now.Add(SignatureCacheTTL + time.Nanosecond)
+	if got := GetCachedSignature(testModelName, text); got != "" {
+		t.Fatalf("expired signature = %q, want miss", got)
+	}
+	if entries, bytes := signatureLocalCache.Stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("stats after expiration = %d/%d, want 0/0", entries, bytes)
+	}
+}
+
+func TestSignatureLocalCacheEvictsLeastRecentlyUsedByEntryLimit(t *testing.T) {
+	now := time.Unix(100, 0)
+	useTestSignatureLocalCache(t, 2, 1<<20, func() time.Time { return now })
+	signature := strings.Repeat("s", MinValidSignatureLen)
+
+	CacheSignature(testModelName, "a", signature)
+	now = now.Add(time.Second)
+	CacheSignature(testModelName, "b", signature)
+	now = now.Add(time.Second)
+	if got := GetCachedSignature(testModelName, "a"); got != signature {
+		t.Fatalf("touch a = %q, want hit", got)
+	}
+	now = now.Add(time.Second)
+	CacheSignature(testModelName, "c", signature)
+
+	if got := GetCachedSignature(testModelName, "b"); got != "" {
+		t.Fatalf("least recently used b = %q, want eviction", got)
+	}
+	for _, text := range []string{"a", "c"} {
+		if got := GetCachedSignature(testModelName, text); got != signature {
+			t.Fatalf("signature %s = %q, want hit", text, got)
+		}
+	}
+	if entries, _ := signatureLocalCache.Stats(); entries != 2 {
+		t.Fatalf("entries after eviction = %d, want 2", entries)
+	}
+}
+
+func TestSignatureLocalCacheByteBudgetAndAccounting(t *testing.T) {
+	now := time.Unix(100, 0)
+	signature := strings.Repeat("s", MinValidSignatureLen)
+	key := newSignatureLocalKey(testModelName, "a")
+	entrySize := signatureLocalEntrySize(key, signature)
+	useTestSignatureLocalCache(t, 10, entrySize*2, func() time.Time { return now })
+
+	CacheSignature(testModelName, "a", signature)
+	now = now.Add(time.Second)
+	CacheSignature(testModelName, "b", signature)
+	now = now.Add(time.Second)
+	if got := GetCachedSignature(testModelName, "a"); got != signature {
+		t.Fatalf("touch a = %q, want hit", got)
+	}
+	now = now.Add(time.Second)
+	CacheSignature(testModelName, "c", signature)
+
+	if got := GetCachedSignature(testModelName, "b"); got != "" {
+		t.Fatalf("byte-budget LRU b = %q, want eviction", got)
+	}
+	if entries, bytes := signatureLocalCache.Stats(); entries != 2 || bytes != entrySize*2 {
+		t.Fatalf("stats after byte eviction = %d/%d, want 2/%d", entries, bytes, entrySize*2)
+	}
+	if errDelete := DeleteCachedSignatureRequired(context.Background(), testModelName, "c"); errDelete != nil {
+		t.Fatalf("delete c: %v", errDelete)
 	}
 
-	// We can't easily test actual expiration without time mocking
-	// but the logic is verified by the implementation
-	_ = time.Now() // Acknowledge we're not testing time passage
+	overwrite := strings.Repeat("x", MinValidSignatureLen+10)
+	if !CacheSignatureBestEffort(context.Background(), testModelName, "a", overwrite) {
+		t.Fatal("overwrite failed")
+	}
+	overwriteSize := signatureLocalEntrySize(key, overwrite)
+	if entries, bytes := signatureLocalCache.Stats(); entries != 1 || bytes != overwriteSize {
+		t.Fatalf("stats after overwrite = %d/%d, want 1/%d", entries, bytes, overwriteSize)
+	}
+	if errDelete := DeleteCachedSignatureRequired(context.Background(), testModelName, "a"); errDelete != nil {
+		t.Fatalf("delete: %v", errDelete)
+	}
+	if entries, bytes := signatureLocalCache.Stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("stats after delete = %d/%d, want 0/0", entries, bytes)
+	}
+
+	CacheSignature(testModelName, "a", signature)
+	now = now.Add(SignatureCacheTTL + time.Nanosecond)
+	signatureLocalCache.PurgeExpired(now)
+	if entries, bytes := signatureLocalCache.Stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("stats after purge = %d/%d, want 0/0", entries, bytes)
+	}
+}
+
+func TestSignatureLocalCacheRejectsOversizedOverwriteWithoutDataLoss(t *testing.T) {
+	now := time.Unix(100, 0)
+	signature := strings.Repeat("s", MinValidSignatureLen)
+	key := newSignatureLocalKey(testModelName, "a")
+	useTestSignatureLocalCache(t, 10, signatureLocalEntrySize(key, signature), func() time.Time { return now })
+
+	if !CacheSignatureBestEffort(context.Background(), testModelName, "a", signature) {
+		t.Fatal("exact-budget save failed")
+	}
+	if CacheSignatureBestEffort(context.Background(), testModelName, "a", signature+"x") {
+		t.Fatal("oversized overwrite unexpectedly succeeded")
+	}
+	if got := GetCachedSignature(testModelName, "a"); got != signature {
+		t.Fatalf("signature after rejected overwrite = %q, want original", got)
+	}
+}
+
+func TestSignatureLocalCacheClearGroupAndAllAccounting(t *testing.T) {
+	now := time.Unix(100, 0)
+	useTestSignatureLocalCache(t, 10, 1<<20, func() time.Time { return now })
+	signature := strings.Repeat("s", MinValidSignatureLen)
+
+	CacheSignature(testModelName, "a", signature)
+	CacheSignature(testModelName, "b", signature)
+	CacheSignature("gemini-3-pro-preview", "c", signature)
+	ClearSignatureCache("claude-opus")
+
+	if got := GetCachedSignature(testModelName, "a"); got != "" {
+		t.Fatalf("cleared Claude signature = %q, want miss", got)
+	}
+	if got := GetCachedSignature("gemini-3-pro-preview", "c"); got != signature {
+		t.Fatalf("Gemini signature after Claude clear = %q, want hit", got)
+	}
+	geminiKey := newSignatureLocalKey("gemini-3-pro-preview", "c")
+	if entries, bytes := signatureLocalCache.Stats(); entries != 1 || bytes != signatureLocalEntrySize(geminiKey, signature) {
+		t.Fatalf("stats after group clear = %d/%d, want 1/%d", entries, bytes, signatureLocalEntrySize(geminiKey, signature))
+	}
+
+	ClearSignatureCache("")
+	if entries, bytes := signatureLocalCache.Stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("stats after clear all = %d/%d, want 0/0", entries, bytes)
+	}
+}
+
+func TestSignatureLocalCacheOwnsStoredAndReturnedStrings(t *testing.T) {
+	now := time.Unix(100, 0)
+	useTestSignatureLocalCache(t, 10, 1<<20, func() time.Time { return now })
+	inputBytes := []byte(strings.Repeat("s", MinValidSignatureLen))
+	input := unsafe.String(unsafe.SliceData(inputBytes), len(inputBytes))
+
+	CacheSignature(testModelName, "a", input)
+	inputBytes[0] = 'x'
+	first := GetCachedSignature(testModelName, "a")
+	second := GetCachedSignature(testModelName, "a")
+	if first != strings.Repeat("s", MinValidSignatureLen) || second != first {
+		t.Fatalf("stored signature changed with caller backing storage: first=%q second=%q", first, second)
+	}
+	if unsafe.StringData(input) == unsafe.StringData(first) || unsafe.StringData(first) == unsafe.StringData(second) {
+		t.Fatal("stored or returned signature reused caller-visible backing storage")
+	}
+}
+
+func TestSignatureLocalCacheConcurrentAccess(t *testing.T) {
+	useTestSignatureLocalCache(t, 64, 4096, time.Now)
+	signature := strings.Repeat("s", MinValidSignatureLen)
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				text := fmt.Sprintf("%d-%d", worker, iteration%16)
+				CacheSignature(testModelName, text, signature)
+				_ = GetCachedSignature(testModelName, text)
+				if iteration%3 == 0 {
+					_ = DeleteCachedSignatureRequired(context.Background(), testModelName, text)
+				}
+				if iteration%17 == 0 {
+					ClearSignatureCache(testModelName)
+				}
+			}
+		}(worker)
+	}
+	workers.Wait()
+	if entries, bytes := signatureLocalCache.Stats(); entries > 64 || bytes > 4096 {
+		t.Fatalf("stats exceed limits after concurrent access = %d/%d", entries, bytes)
+	}
 }
 
 func TestSignatureModeSetters_LogAtInfoLevel(t *testing.T) {

@@ -13,46 +13,99 @@ const (
 	SourceCompatConfig Source = "compat_config"
 	SourceAttribute    Source = "auth_attribute:compat_kind"
 	SourceBaseURL      Source = "base_url_inference"
+	SourceDefault      Source = "default"
 	SourceGeneric      Source = "generic"
 )
 
+// KindSourceAttribute is the auth attribute that preserves compatibility
+// identity provenance across configuration synthesis and request execution.
+const KindSourceAttribute = "compat_kind_source"
+
 // Input contains the values used to resolve a provider compatibility identity.
 type Input struct {
-	ExplicitKind  string
-	AttributeKind string
-	BaseURL       string
+	Provider        string
+	ProviderKey     string
+	ProviderFamily  string
+	CompatName      string
+	ExplicitKind    string
+	AttributeKind   string
+	AttributeSource Source
+	BaseURL         string
 }
 
-// Identity is the canonical compatibility identity used by current consumers.
-// An empty Kind with SourceGeneric represents the generic compatibility profile.
+// Identity keeps the canonical provider separate from compatibility metadata.
+// An empty Kind keeps native/default provider metadata separate from compatibility identity.
 type Identity struct {
-	Kind     string
-	Source   Source
-	BaseHost string
+	CanonicalProvider string
+	ExecutorKey       string
+	ProviderFamily    string
+	CompatName        string
+	Kind              string
+	Source            Source
+	BaseHost          string
 }
 
 // Resolve returns one deterministic compatibility identity. Explicit configuration
-// wins over a derived attribute, which wins over path-aware base URL inference.
+// wins over an auth attribute, which wins over base URL inference.
 func Resolve(input Input) Identity {
 	host, path := parseBaseURL(input.BaseURL)
-	identity := Identity{BaseHost: host}
-	if kind := NormalizeKind(input.ExplicitKind); kind != "" {
-		identity.Kind = kind
-		identity.Source = SourceCompatConfig
-		return identity
+	provider := NormalizeKind(input.Provider)
+	providerKey := NormalizeKind(input.ProviderKey)
+	identity := Identity{
+		ExecutorKey:    firstNonEmpty(providerKey, provider),
+		ProviderFamily: NormalizeKind(input.ProviderFamily),
+		CompatName:     strings.TrimSpace(input.CompatName),
+		BaseHost:       host,
 	}
-	if kind := NormalizeKind(input.AttributeKind); kind != "" {
-		identity.Kind = kind
-		identity.Source = SourceAttribute
-		return identity
+	if kind := NormalizeKind(input.ExplicitKind); kind != "" {
+		return resolveKind(identity, kind, SourceCompatConfig)
+	}
+	attributeKind := NormalizeKind(input.AttributeKind)
+	attributeSource := normalizeAttributeSource(input.AttributeSource)
+	if attributeKind != "" && attributeSource != SourceBaseURL {
+		return resolveKind(identity, attributeKind, attributeSource)
 	}
 	if kind := inferIdentityKind(host, path); kind != "" {
-		identity.Kind = kind
-		identity.Source = SourceBaseURL
-		return identity
+		return resolveKind(identity, kind, SourceBaseURL)
 	}
-	identity.Source = SourceGeneric
+	identity.CanonicalProvider = provider
+	if identity.ExecutorKey == "" {
+		identity.ExecutorKey = identity.CanonicalProvider
+	}
+	if identity.CanonicalProvider == "" {
+		identity.Source = SourceGeneric
+	} else {
+		identity.Source = SourceDefault
+	}
 	return identity
+}
+
+func resolveKind(identity Identity, kind string, source Source) Identity {
+	identity.CanonicalProvider = kind
+	identity.Kind = kind
+	identity.Source = source
+	if identity.ExecutorKey == "" {
+		identity.ExecutorKey = kind
+	}
+	return identity
+}
+
+func normalizeAttributeSource(source Source) Source {
+	switch source {
+	case SourceCompatConfig, SourceAttribute, SourceBaseURL:
+		return source
+	default:
+		return SourceAttribute
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // NormalizeKind canonicalizes a compatibility kind for matching and logging.

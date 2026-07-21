@@ -20,6 +20,8 @@ type modelExecutionOptions struct {
 	InternalSource          bool
 	SkipInterceptorPluginID string
 	SkipRouterPluginID      string
+	complexity              *complexityVector
+	complexityValid         bool
 }
 
 // ModelExecutionRequest describes an internal model execution request.
@@ -202,7 +204,16 @@ func receiveInitialModelExecutionChunk(ctx context.Context, dataChan <-chan []by
 				return nil, dataChan, errChan, errMsg
 			}
 		case <-done:
-			return nil, dataChan, errChan, nil
+			err := ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			return nil, dataChan, errChan, admissionErrorMessage(err)
+		}
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, dataChan, errChan, admissionErrorMessage(err)
 		}
 	}
 	return nil, dataChan, errChan, nil

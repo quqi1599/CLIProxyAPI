@@ -22,6 +22,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
@@ -448,7 +449,11 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 	effortOriginal := metadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortOriginalMetadataKey)
 	requestedModel := routePlanRequestedModel(opts, routeModel)
 	clientProfile := metadataString(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)
-	compatKind, compatKindSource := routePlanCompatKindWithSource(auth)
+	identity := routePlanProviderIdentity(auth, provider)
+	compatKindSource := ""
+	if identity.Kind != "" {
+		compatKindSource = string(identity.Source)
+	}
 	return routePlanSummary{
 		RequestedModel:   requestedModel,
 		ResolvedModel:    strings.TrimSpace(resolvedModel),
@@ -462,10 +467,10 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 		RoutingGroup:     routingGroup,
 		FallbackFrom:     routePlanFallbackFrom(previous),
 		FallbackReason:   strings.TrimSpace(attempt.RetryReason),
-		CompatKind:       compatKind,
+		CompatKind:       identity.Kind,
 		CompatKindSource: compatKindSource,
-		CompatMapping:    routePlanCompatMapping(requestedModel, resolvedModel, compatKind),
-		CompatBaseHost:   routePlanCompatBaseHost(auth),
+		CompatMapping:    routePlanCompatMapping(requestedModel, resolvedModel, identity.Kind),
+		CompatBaseHost:   identity.BaseHost,
 		ClientProfile:    clientProfile,
 		ContextHint:      metadataString(opts.Metadata, cliproxyexecutor.ModelContextHintMetadataKey),
 		EffortSource:     metadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortSourceMetadataKey),
@@ -474,20 +479,31 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 	}
 }
 
+func routePlanProviderIdentity(auth *Auth, provider string) provideridentity.Identity {
+	input := provideridentity.Input{Provider: provider}
+	if auth == nil {
+		return provideridentity.Resolve(input)
+	}
+	if strings.TrimSpace(input.Provider) == "" {
+		input.Provider = auth.Provider
+	}
+	if auth.Attributes != nil {
+		input.ProviderKey = auth.Attributes["provider_key"]
+		input.ProviderFamily = auth.Attributes["provider_family"]
+		input.CompatName = auth.Attributes["compat_name"]
+		input.AttributeKind = auth.Attributes["compat_kind"]
+		input.AttributeSource = provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute])
+		input.BaseURL = auth.Attributes["base_url"]
+	}
+	return provideridentity.Resolve(input)
+}
+
 func routePlanCompatKindWithSource(auth *Auth) (string, string) {
-	if auth == nil || auth.Attributes == nil {
+	identity := routePlanProviderIdentity(auth, "")
+	if identity.Kind == "" {
 		return "", ""
 	}
-	if kind := internalconfig.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
-		return kind, "auth_attribute:compat_kind"
-	}
-	if kind := internalconfig.InferCompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
-		return kind, "base_url_inference"
-	}
-	if providerKey := internalconfig.NormalizeOpenAICompatibilityKind(auth.Attributes["provider_key"]); providerKey != "" {
-		return providerKey, "auth_attribute:provider_key"
-	}
-	return "", ""
+	return identity.Kind, string(identity.Source)
 }
 
 func routePlanCompatMapping(requestedModel, resolvedModel, compatKind string) string {
@@ -506,18 +522,7 @@ func isDeepSeekV4RouteModel(model string) bool {
 }
 
 func routePlanCompatBaseHost(auth *Auth) string {
-	if auth == nil || auth.Attributes == nil {
-		return ""
-	}
-	baseURL := strings.TrimSpace(auth.Attributes["base_url"])
-	if baseURL == "" {
-		return ""
-	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return routePlanProviderIdentity(auth, "").BaseHost
 }
 
 func routePlanNormalizedReasoningEffort(auth *Auth, provider string, requestedModel string, clientProfile string, resolvedModel string, effortOriginal string) string {
@@ -548,29 +553,18 @@ func isDeepSeekOfficialRoute(auth *Auth, resolvedModel string) bool {
 	if !isDeepSeekV4RouteModel(resolvedModel) {
 		return false
 	}
-	if auth.Attributes != nil {
-		for _, key := range []string{"provider_key", "compat_name", "compat_kind"} {
-			if strings.EqualFold(strings.TrimSpace(auth.Attributes[key]), "deepseek") {
-				return true
-			}
-		}
-	}
-	return strings.EqualFold(routePlanCompatBaseHost(auth), "api.deepseek.com")
+	return routePlanProviderIdentity(auth, "").CanonicalProvider == "deepseek"
 }
 
 func routePlanThinkingProviderKey(auth *Auth, provider string) string {
-	if auth != nil && auth.Attributes != nil {
-		if value := strings.TrimSpace(auth.Attributes["provider_key"]); value != "" {
-			return strings.ToLower(value)
-		}
-		if kind := internalconfig.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
-			return kind
-		}
-		if kind := internalconfig.InferCompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
-			return kind
-		}
+	identity := routePlanProviderIdentity(auth, provider)
+	if identity.ExecutorKey != "" {
+		return identity.ExecutorKey
 	}
-	return strings.ToLower(strings.TrimSpace(provider))
+	if identity.Kind != "" {
+		return identity.Kind
+	}
+	return identity.CanonicalProvider
 }
 
 func routePlanRequestedModel(opts cliproxyexecutor.Options, routeModel string) string {
@@ -3315,9 +3309,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			requestedModel = routeModel
 		}
 		compatKind, compatKindSource := routePlanCompatKindWithSource(auth)
-		if compatKind == "" {
-			compatKind = routePlanThinkingProviderKey(auth, provider)
-		}
 		streamMeta := streamExecutionLogMeta{
 			requestedModel:   requestedModel,
 			upstreamModel:    execModel,

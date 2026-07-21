@@ -11,11 +11,13 @@ func TestResolvePrecedence(t *testing.T) {
 		{
 			name: "explicit config wins",
 			input: Input{
+				Provider:      "openai-compatibility",
+				ProviderKey:   "openai-compatible-qwen-route",
 				ExplicitKind:  " KIMI ",
 				AttributeKind: "minimax",
 				BaseURL:       "https://api.deepseek.com/v1",
 			},
-			want: Identity{Kind: "kimi", Source: SourceCompatConfig, BaseHost: "api.deepseek.com"},
+			want: Identity{CanonicalProvider: "kimi", ExecutorKey: "openai-compatible-qwen-route", Kind: "kimi", Source: SourceCompatConfig, BaseHost: "api.deepseek.com"},
 		},
 		{
 			name: "attribute wins over URL",
@@ -23,12 +25,33 @@ func TestResolvePrecedence(t *testing.T) {
 				AttributeKind: " MiniMax ",
 				BaseURL:       "https://api.deepseek.com/v1",
 			},
-			want: Identity{Kind: "minimax", Source: SourceAttribute, BaseHost: "api.deepseek.com"},
+			want: Identity{CanonicalProvider: "minimax", ExecutorKey: "minimax", Kind: "minimax", Source: SourceAttribute, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name: "persisted URL source is re-resolved",
+			input: Input{
+				ProviderKey:     "openai-compatible-route",
+				AttributeKind:   "minimax",
+				AttributeSource: SourceBaseURL,
+				BaseURL:         "https://api.deepseek.com/v1",
+			},
+			want: Identity{CanonicalProvider: "deepseek", ExecutorKey: "openai-compatible-route", Kind: "deepseek", Source: SourceBaseURL, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name: "stale persisted URL kind is not reused",
+			input: Input{
+				Provider:        "openai-compatibility",
+				ProviderKey:     "openai-compatible-route",
+				AttributeKind:   "minimax",
+				AttributeSource: SourceBaseURL,
+				BaseURL:         "https://example.com/v1",
+			},
+			want: Identity{CanonicalProvider: "openai-compatibility", ExecutorKey: "openai-compatible-route", Source: SourceDefault, BaseHost: "example.com"},
 		},
 		{
 			name:  "URL inference",
 			input: Input{BaseURL: "https://API.DEEPSEEK.COM:443/v1/chat/completions"},
-			want:  Identity{Kind: "deepseek", Source: SourceBaseURL, BaseHost: "api.deepseek.com"},
+			want:  Identity{CanonicalProvider: "deepseek", ExecutorKey: "deepseek", Kind: "deepseek", Source: SourceBaseURL, BaseHost: "api.deepseek.com"},
 		},
 		{
 			name:  "generic",
@@ -38,7 +61,73 @@ func TestResolvePrecedence(t *testing.T) {
 		{
 			name:  "invalid URL keeps explicit identity",
 			input: Input{ExplicitKind: "QWEN", BaseURL: "://bad"},
-			want:  Identity{Kind: "qwen", Source: SourceCompatConfig},
+			want:  Identity{CanonicalProvider: "qwen", ExecutorKey: "qwen", Kind: "qwen", Source: SourceCompatConfig},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Resolve(tt.input); got != tt.want {
+				t.Fatalf("Resolve(%+v) = %+v, want %+v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveCarriesCanonicalRouteMetadata(t *testing.T) {
+	identity := Resolve(Input{
+		Provider:        "openai-compatible-configured-route",
+		ProviderKey:     "openai-compatible-configured-route",
+		ProviderFamily:  " OpenAI-Compatibility ",
+		CompatName:      " Configured Route ",
+		AttributeKind:   " KIMI ",
+		AttributeSource: SourceCompatConfig,
+		BaseURL:         "https://api.deepseek.com/v1",
+	})
+	want := Identity{
+		CanonicalProvider: "kimi",
+		ExecutorKey:       "openai-compatible-configured-route",
+		ProviderFamily:    "openai-compatibility",
+		CompatName:        "Configured Route",
+		Kind:              "kimi",
+		Source:            SourceCompatConfig,
+		BaseHost:          "api.deepseek.com",
+	}
+	if identity != want {
+		t.Fatalf("Resolve() = %+v, want %+v", identity, want)
+	}
+}
+
+func TestResolvePreservesFallbackBehavior(t *testing.T) {
+	tests := []struct {
+		name  string
+		input Input
+		want  Identity
+	}{
+		{
+			name:  "provider key stays executor metadata",
+			input: Input{Provider: "openai-compatibility", ProviderKey: "custom-route"},
+			want:  Identity{CanonicalProvider: "openai-compatibility", ExecutorKey: "custom-route", Source: SourceDefault},
+		},
+		{
+			name:  "compat name stays diagnostic metadata",
+			input: Input{Provider: "openai-compatibility", ProviderKey: "pool", CompatName: "pool"},
+			want:  Identity{CanonicalProvider: "openai-compatibility", ExecutorKey: "pool", CompatName: "pool", Source: SourceDefault},
+		},
+		{
+			name:  "compat name cannot create a provider identity",
+			input: Input{CompatName: "pool"},
+			want:  Identity{CompatName: "pool", Source: SourceGeneric},
+		},
+		{
+			name:  "legacy provider key does not become compatibility identity",
+			input: Input{Provider: "openai-compatibility", ProviderKey: "deepseek"},
+			want:  Identity{CanonicalProvider: "openai-compatibility", ExecutorKey: "deepseek", Source: SourceDefault},
+		},
+		{
+			name:  "non compatibility provider",
+			input: Input{Provider: " Claude "},
+			want:  Identity{CanonicalProvider: "claude", ExecutorKey: "claude", Source: SourceDefault},
 		},
 	}
 

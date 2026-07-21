@@ -60,7 +60,7 @@ type SDKConfig struct {
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
 
-	// RequestGuards configures narrow request-shaping guards for abusive traffic patterns.
+	// RequestGuards configures opt-in request shaping and admission guards.
 	RequestGuards RequestGuardsConfig `yaml:"request-guards" json:"request-guards"`
 }
 
@@ -80,10 +80,19 @@ type StreamingConfig struct {
 	FlushIntervalMilliseconds int `yaml:"flush-interval-ms,omitempty" json:"flush-interval-ms,omitempty"`
 }
 
-// RequestGuardsConfig holds optional request guards for traffic patterns that
-// are too specific for model-wide payload overrides.
+// RequestGuardsConfig holds optional traffic safety guards.
 type RequestGuardsConfig struct {
 	MiniMaxHighspeedNarrative MiniMaxHighspeedNarrativeGuardConfig `yaml:"minimax-m27-highspeed-narrative,omitempty" json:"minimax-m27-highspeed-narrative,omitempty"`
+	GlobalAdmission           GlobalAdmissionConfig                `yaml:"global-admission,omitempty" json:"global-admission,omitempty"`
+}
+
+// GlobalAdmissionConfig bounds aggregate request complexity before upstream execution.
+// It is disabled by default for backward compatibility.
+type GlobalAdmissionConfig struct {
+	Enabled                bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Capacity               int  `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	MaxQueue               int  `yaml:"max-queue,omitempty" json:"max-queue,omitempty"`
+	SaturationGraceSeconds int  `yaml:"saturation-grace-seconds,omitempty" json:"saturation-grace-seconds,omitempty"`
 }
 
 // MiniMaxHighspeedNarrativeGuardConfig limits large narrative-roleplay workloads

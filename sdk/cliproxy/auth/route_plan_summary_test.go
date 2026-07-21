@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -170,6 +171,107 @@ func TestRoutePlanHelperMappings(t *testing.T) {
 				t.Fatalf("routePlanTranslator() = %q, want %q", got, tc.wantTrans)
 			}
 		})
+	}
+}
+
+func TestRoutePlanProviderIdentityUsesCanonicalPrecedence(t *testing.T) {
+	auth := &Auth{
+		Provider: "openai-compatible-configured-route",
+		Attributes: map[string]string{
+			"provider_key":                       "openai-compatible-configured-route",
+			"provider_family":                    "openai-compatibility",
+			"compat_name":                        "Configured Route",
+			"compat_kind":                        "kimi",
+			provideridentity.KindSourceAttribute: string(provideridentity.SourceCompatConfig),
+			"base_url":                           "https://api.deepseek.com/v1",
+		},
+	}
+
+	identity := routePlanProviderIdentity(auth, "openai-compatibility")
+	if identity.CanonicalProvider != "kimi" || identity.Kind != "kimi" {
+		t.Fatalf("identity provider/kind = %q/%q, want kimi/kimi", identity.CanonicalProvider, identity.Kind)
+	}
+	if identity.ExecutorKey != "openai-compatible-configured-route" {
+		t.Fatalf("identity executor_key = %q", identity.ExecutorKey)
+	}
+	if identity.ProviderFamily != "openai-compatibility" || identity.CompatName != "Configured Route" {
+		t.Fatalf("identity metadata = %+v", identity)
+	}
+	if identity.Source != provideridentity.SourceCompatConfig || identity.BaseHost != "api.deepseek.com" {
+		t.Fatalf("identity source/base_host = %q/%q", identity.Source, identity.BaseHost)
+	}
+
+	kind, source := routePlanCompatKindWithSource(auth)
+	if kind != identity.Kind || source != string(identity.Source) {
+		t.Fatalf("route compat identity = %q/%q, want %q/%q", kind, source, identity.Kind, identity.Source)
+	}
+	if got := routePlanCompatBaseHost(auth); got != identity.BaseHost {
+		t.Fatalf("route base host = %q, want %q", got, identity.BaseHost)
+	}
+	if got := routePlanThinkingProviderKey(auth, "openai-compatibility"); got != identity.ExecutorKey {
+		t.Fatalf("thinking provider key = %q, want %q", got, identity.ExecutorKey)
+	}
+	if isDeepSeekOfficialRoute(auth, "deepseek-v4-pro") {
+		t.Fatal("explicit Kimi identity must win over the DeepSeek URL")
+	}
+
+	plan := buildRoutePlanSummary(requestExecutionSummary{}, auth, "openai-compatibility", "kimi-k2.6", "kimi-k2.6", "kimi-k2.6", cliproxyexecutor.Options{}, nil, "execute", coreusage.RequestAttempt{})
+	if plan.CompatKind != identity.Kind || plan.CompatKindSource != string(identity.Source) || plan.CompatBaseHost != identity.BaseHost {
+		t.Fatalf("route plan identity = %+v, want %+v", plan, identity)
+	}
+}
+
+func TestRoutePlanProviderIdentityPreservesNativeProvider(t *testing.T) {
+	auth := &Auth{Provider: "vertex", Attributes: map[string]string{"provider_key": "vertex"}}
+	identity := routePlanProviderIdentity(auth, "vertex")
+	if identity.CanonicalProvider != "vertex" || identity.ExecutorKey != "vertex" || identity.Kind != "" || identity.Source != provideridentity.SourceDefault {
+		t.Fatalf("identity = %+v", identity)
+	}
+	if kind, source := routePlanCompatKindWithSource(auth); kind != "" || source != "" {
+		t.Fatalf("native compat identity = %q/%q, want empty", kind, source)
+	}
+	if got := routePlanThinkingProviderKey(auth, "vertex"); got != "vertex" {
+		t.Fatalf("thinking provider key = %q, want vertex", got)
+	}
+}
+
+func TestRoutePlanProviderIdentityKeepsCompatNameDiagnostic(t *testing.T) {
+	auth := &Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"provider_key": "pool",
+			"compat_name":  "pool",
+			"base_url":     "https://example.com/v1",
+		},
+	}
+	identity := routePlanProviderIdentity(auth, "")
+	if identity.CanonicalProvider != "openai-compatibility" || identity.ExecutorKey != "pool" {
+		t.Fatalf("identity provider/executor = %q/%q, want openai-compatibility/pool", identity.CanonicalProvider, identity.ExecutorKey)
+	}
+	if identity.CompatName != "pool" || identity.Kind != "" || identity.Source != provideridentity.SourceDefault {
+		t.Fatalf("identity compatibility metadata = %+v", identity)
+	}
+}
+
+func TestRoutePlanProviderIdentityUsesURLFallbackWithoutReplacingExecutorKey(t *testing.T) {
+	auth := &Auth{
+		Provider: "openai-compatible-deepseek-route",
+		Attributes: map[string]string{
+			"provider_key":                       "openai-compatible-deepseek-route",
+			"provider_family":                    "openai-compatibility",
+			provideridentity.KindSourceAttribute: string(provideridentity.SourceBaseURL),
+			"base_url":                           "https://api.deepseek.com/v1",
+		},
+	}
+	identity := routePlanProviderIdentity(auth, "openai-compatible-deepseek-route")
+	if identity.Kind != "deepseek" || identity.Source != provideridentity.SourceBaseURL || identity.BaseHost != "api.deepseek.com" {
+		t.Fatalf("identity = %+v", identity)
+	}
+	if got := routePlanThinkingProviderKey(auth, auth.Provider); got != "openai-compatible-deepseek-route" {
+		t.Fatalf("thinking provider key = %q", got)
+	}
+	if kind, source := routePlanCompatKindWithSource(auth); kind != "deepseek" || source != string(provideridentity.SourceBaseURL) {
+		t.Fatalf("route compat identity = %q/%q", kind, source)
 	}
 }
 

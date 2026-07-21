@@ -2,14 +2,10 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -28,26 +24,25 @@ const (
 	AntigravityReasoningReplayCacheEvictBatchSize = 128
 )
 
-type antigravityReasoningReplayEntry struct {
-	Items     [][]byte
-	Timestamp time.Time
-}
-
-var (
-	antigravityReasoningReplayMu      sync.Mutex
-	antigravityReasoningReplayEntries = make(map[string]antigravityReasoningReplayEntry)
-)
-
-type antigravityReasoningReplayKVClient interface {
-	KVGet(ctx context.Context, key string) ([]byte, bool, error)
-	KVSet(ctx context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error)
-	KVDel(ctx context.Context, keys ...string) (int64, error)
-	KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
-}
+type antigravityReasoningReplayKVClient = reasoningReplayKVClient
 
 var currentAntigravityReasoningReplayKVClient = func() (antigravityReasoningReplayKVClient, bool, error) {
 	return homekv.CurrentKVClient()
 }
+
+var antigravityReasoningReplayStore = newReasoningReplayStore(reasoningReplayStoreConfig{
+	ttl:             AntigravityReasoningReplayCacheTTL,
+	maxEntries:      AntigravityReasoningReplayCacheMaxEntries,
+	evictBatchSize:  AntigravityReasoningReplayCacheEvictBatchSize,
+	maxBytes:        reasoningReplayCacheMaxBytes,
+	maxSessionBytes: reasoningReplayCacheMaxSessionBytes,
+	maxEncodedBytes: reasoningReplayCacheMaxEncodedBytes,
+	logLabel:        "antigravity reasoning replay",
+	currentKVClient: func() (reasoningReplayKVClient, bool, error) {
+		return currentAntigravityReasoningReplayKVClient()
+	},
+	normalizeItems: normalizeAntigravityReasoningReplayItems,
+})
 
 // CacheAntigravityReasoningReplayItem stores a final GPT/Codex reasoning item for
 // stateless replay. The stored item is normalized to the minimal shape accepted
@@ -64,44 +59,7 @@ func CacheAntigravityReasoningReplayItems(modelName, sessionKey string, items []
 
 // CacheAntigravityReasoningReplayItemsBestEffort stores replay items for completed response paths.
 func CacheAntigravityReasoningReplayItemsBestEffort(ctx context.Context, modelName, sessionKey string, items [][]byte) bool {
-	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return false
-	}
-	normalized, ok := normalizeAntigravityReasoningReplayItems(items)
-	if !ok {
-		return false
-	}
-	if client, homeMode, errClient := currentAntigravityReasoningReplayKVClient(); homeMode {
-		if errClient != nil {
-			log.Errorf("home kv best-effort antigravity reasoning replay set failed prefix=cpa:antigravity:*: %v", errClient)
-			return false
-		}
-		raw, errMarshal := json.Marshal(normalized)
-		if errMarshal != nil {
-			log.Errorf("home kv best-effort antigravity reasoning replay set failed prefix=cpa:antigravity:*: %v", errMarshal)
-			return false
-		}
-		written, errSet := client.KVSet(ctx, antigravityReasoningReplayKVKey(modelName, sessionKey), raw, homekv.KVSetOptions{EX: AntigravityReasoningReplayCacheTTL})
-		if errSet != nil {
-			log.Errorf("home kv best-effort antigravity reasoning replay set failed prefix=cpa:antigravity:*: %v", errSet)
-			return false
-		}
-		return written
-	}
-
-	cacheCleanupOnce.Do(startCacheCleanup)
-	now := time.Now()
-	antigravityReasoningReplayMu.Lock()
-	defer antigravityReasoningReplayMu.Unlock()
-	antigravityReasoningReplayEntries[key] = antigravityReasoningReplayEntry{
-		Items:     normalized,
-		Timestamp: now,
-	}
-	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
-		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
-	}
-	return true
+	return antigravityReasoningReplayStore.SaveBestEffort(ctx, antigravityReasoningReplayStoreScope(modelName, sessionKey), items)
 }
 
 // GetAntigravityReasoningReplayItem retrieves a normalized reasoning replay item.
@@ -124,44 +82,7 @@ func GetAntigravityReasoningReplayItems(modelName, sessionKey string) ([][]byte,
 
 // GetAntigravityReasoningReplayItemsRequired retrieves replay items for request-time paths.
 func GetAntigravityReasoningReplayItemsRequired(ctx context.Context, modelName, sessionKey string) ([][]byte, bool, error) {
-	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return nil, false, nil
-	}
-	client, homeMode, errClient := currentAntigravityReasoningReplayKVClient()
-	if homeMode {
-		if errClient != nil {
-			return nil, false, errClient
-		}
-		raw, found, errGet := client.KVGet(ctx, antigravityReasoningReplayKVKey(modelName, sessionKey))
-		if errGet != nil || !found {
-			return nil, false, errGet
-		}
-		var homeItems [][]byte
-		if errUnmarshal := json.Unmarshal(raw, &homeItems); errUnmarshal != nil {
-			return nil, false, errUnmarshal
-		}
-		if _, errExpire := client.KVExpire(ctx, antigravityReasoningReplayKVKey(modelName, sessionKey), AntigravityReasoningReplayCacheTTL); errExpire != nil {
-			return nil, false, errExpire
-		}
-		return cloneAntigravityReasoningReplayItems(homeItems), true, nil
-	}
-
-	cacheCleanupOnce.Do(startCacheCleanup)
-	now := time.Now()
-	antigravityReasoningReplayMu.Lock()
-	defer antigravityReasoningReplayMu.Unlock()
-	entry, ok := antigravityReasoningReplayEntries[key]
-	if !ok {
-		return nil, false, nil
-	}
-	if now.Sub(entry.Timestamp) > AntigravityReasoningReplayCacheTTL {
-		delete(antigravityReasoningReplayEntries, key)
-		return nil, false, nil
-	}
-	entry.Timestamp = now
-	antigravityReasoningReplayEntries[key] = entry
-	return cloneAntigravityReasoningReplayItems(entry.Items), true, nil
+	return antigravityReasoningReplayStore.LoadRequired(ctx, antigravityReasoningReplayStoreScope(modelName, sessionKey))
 }
 
 // DeleteAntigravityReasoningReplayItem removes one replay item after upstream rejects
@@ -174,29 +95,12 @@ func DeleteAntigravityReasoningReplayItem(modelName, sessionKey string) {
 
 // DeleteAntigravityReasoningReplayItemRequired removes one replay item for request-time paths.
 func DeleteAntigravityReasoningReplayItemRequired(ctx context.Context, modelName, sessionKey string) error {
-	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
-	if key == "" {
-		return nil
-	}
-	client, homeMode, errClient := currentAntigravityReasoningReplayKVClient()
-	if homeMode {
-		if errClient != nil {
-			return errClient
-		}
-		_, errDel := client.KVDel(ctx, antigravityReasoningReplayKVKey(modelName, sessionKey))
-		return errDel
-	}
-	antigravityReasoningReplayMu.Lock()
-	delete(antigravityReasoningReplayEntries, key)
-	antigravityReasoningReplayMu.Unlock()
-	return nil
+	return antigravityReasoningReplayStore.DeleteRequired(ctx, antigravityReasoningReplayStoreScope(modelName, sessionKey))
 }
 
 // ClearAntigravityReasoningReplayCache clears all Antigravity reasoning replay state.
 func ClearAntigravityReasoningReplayCache() {
-	antigravityReasoningReplayMu.Lock()
-	antigravityReasoningReplayEntries = make(map[string]antigravityReasoningReplayEntry)
-	antigravityReasoningReplayMu.Unlock()
+	antigravityReasoningReplayStore.Clear()
 }
 
 func antigravityReasoningReplayCacheKey(modelName, sessionKey string) string {
@@ -212,6 +116,17 @@ func antigravityReasoningReplayCacheKey(modelName, sessionKey string) string {
 
 func antigravityReasoningReplayKVKey(modelName, sessionKey string) string {
 	return "cpa:antigravity:reasoning-replay:" + homekv.HashKeyPart(strings.TrimSpace(modelName)) + ":" + homekv.HashKeyPart(strings.TrimSpace(sessionKey))
+}
+
+func antigravityReasoningReplayStoreScope(modelName, sessionKey string) reasoningReplayScope {
+	localKey := antigravityReasoningReplayCacheKey(modelName, sessionKey)
+	if localKey == "" {
+		return reasoningReplayScope{}
+	}
+	return reasoningReplayScope{
+		localKey: localKey,
+		kvKey:    antigravityReasoningReplayKVKey(modelName, sessionKey),
+	}
 }
 
 func normalizeAntigravityReasoningReplayItems(items [][]byte) ([][]byte, bool) {
@@ -303,43 +218,6 @@ func normalizeAntigravityFunctionCallPartReplayItem(itemResult gjson.Result) ([]
 	return normalized, true
 }
 
-func cloneAntigravityReasoningReplayItems(items [][]byte) [][]byte {
-	cloned := make([][]byte, 0, len(items))
-	for _, item := range items {
-		cloned = append(cloned, append([]byte(nil), item...))
-	}
-	return cloned
-}
-
-func evictOldestAntigravityReasoningReplayEntries(count int) {
-	if count <= 0 || len(antigravityReasoningReplayEntries) == 0 {
-		return
-	}
-	type candidate struct {
-		key       string
-		timestamp time.Time
-	}
-	candidates := make([]candidate, 0, len(antigravityReasoningReplayEntries))
-	for key, entry := range antigravityReasoningReplayEntries {
-		candidates = append(candidates, candidate{key: key, timestamp: entry.Timestamp})
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].timestamp.Before(candidates[j].timestamp)
-	})
-	if count > len(candidates) {
-		count = len(candidates)
-	}
-	for i := 0; i < count; i++ {
-		delete(antigravityReasoningReplayEntries, candidates[i].key)
-	}
-}
-
 func purgeExpiredAntigravityReasoningReplayCache(now time.Time) {
-	antigravityReasoningReplayMu.Lock()
-	for key, entry := range antigravityReasoningReplayEntries {
-		if now.Sub(entry.Timestamp) > AntigravityReasoningReplayCacheTTL {
-			delete(antigravityReasoningReplayEntries, key)
-		}
-	}
-	antigravityReasoningReplayMu.Unlock()
+	antigravityReasoningReplayStore.PurgeExpired(now)
 }

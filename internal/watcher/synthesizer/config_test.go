@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -252,6 +253,9 @@ func TestConfigSynthesizer_ClaudeKeys_AutoDetectsMiniMaxCompatKind(t *testing.T)
 		if got := auths[i].Attributes["compat_kind"]; got != "minimax" {
 			t.Fatalf("auth %d compat_kind = %q, want %q", i, got, "minimax")
 		}
+		if got := auths[i].Attributes[provideridentity.KindSourceAttribute]; got != string(provideridentity.SourceBaseURL) {
+			t.Fatalf("auth %d compat_kind_source = %q, want %q", i, got, provideridentity.SourceBaseURL)
+		}
 	}
 }
 
@@ -431,6 +435,9 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 				if got := auths[0].Attributes["compat_kind"]; got != "newapi" {
 					t.Fatalf("compat_kind = %q, want %q", got, "newapi")
 				}
+				if got := auths[0].Attributes[provideridentity.KindSourceAttribute]; got != string(provideridentity.SourceCompatConfig) {
+					t.Fatalf("compat_kind_source = %q, want %q", got, provideridentity.SourceCompatConfig)
+				}
 				for i := range auths {
 					if v, ok := auths[i].Metadata["disable_cooling"].(bool); !ok || !v {
 						t.Fatalf("expected auth[%d].disable_cooling=true, got %v", i, auths[i].Metadata["disable_cooling"])
@@ -438,6 +445,39 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConfigSynthesizer_OpenAICompat_PersistsURLIdentitySource(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{OpenAICompatibility: []config.OpenAICompatibility{
+			{
+				Name:    "deepseek-entry-route",
+				BaseURL: "https://api.deepseek.com/v1",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+					{APIKey: "test-key"},
+				},
+			},
+			{Name: "deepseek-fallback-route", BaseURL: "https://api.deepseek.com/v1"},
+		}},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("auth count = %d, want 2", len(auths))
+	}
+	for i := range auths {
+		attrs := auths[i].Attributes
+		if got := attrs[provideridentity.KindSourceAttribute]; got != string(provideridentity.SourceBaseURL) {
+			t.Fatalf("auth %d compat_kind_source = %q, want %q", i, got, provideridentity.SourceBaseURL)
+		}
+		if got := attrs["compat_kind"]; got != "" {
+			t.Fatalf("auth %d compat_kind = %q, want URL identity to remain inferred", i, got)
+		}
 	}
 }
 

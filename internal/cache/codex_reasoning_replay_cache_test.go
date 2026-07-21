@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -142,6 +143,120 @@ func TestCodexReasoningReplayRequiredHomeReadAndSlidingExpire(t *testing.T) {
 	}
 }
 
+func TestCodexReasoningReplayHomeNormalizesLegacyPayload(t *testing.T) {
+	client := newFakeCodexReasoningReplayKVClient()
+	key := codexReasoningReplayKVKey("gpt-5.4", "session-legacy")
+	encryptedContent := validCodexReasoningReplayEncryptedContentForTest(4)
+	legacyItem := []byte(`{"type":"reasoning","summary":[{"type":"summary_text","text":"old"}],"content":"old","encrypted_content":"` + encryptedContent + `","extra":true}`)
+	client.values[key] = mustCodexReasoningReplayJSON(t, [][]byte{legacyItem})
+	useFakeCodexReasoningReplayKVClient(t, client, true, nil)
+
+	items, found, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-legacy")
+	if errGet != nil || !found || len(items) != 1 {
+		t.Fatalf("legacy home replay = %q, %v, %v; want one normalized item", items, found, errGet)
+	}
+	want := `{"type":"reasoning","summary":[],"content":null,"encrypted_content":"` + encryptedContent + `"}`
+	if got := string(items[0]); got != want {
+		t.Fatalf("normalized legacy item = %s, want %s", got, want)
+	}
+	if client.setCount != 1 || client.expireCount != 0 || client.lastSetTTL != CodexReasoningReplayCacheTTL {
+		t.Fatalf("legacy replay set/expire/ttl = %d/%d/%v, want 1/0/%v", client.setCount, client.expireCount, client.lastSetTTL, CodexReasoningReplayCacheTTL)
+	}
+	if got := client.values[key]; !bytes.Equal(got, mustCodexReasoningReplayJSON(t, [][]byte{[]byte(want)})) {
+		t.Fatalf("legacy replay Home value = %s, want canonical collection", got)
+	}
+}
+
+func TestCodexReasoningReplayHomeDeletesInvalidCollections(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		items [][]byte
+	}{
+		{name: "empty", items: [][]byte{}},
+		{name: "invalid", items: [][]byte{[]byte(`{"type":"reasoning","encrypted_content":"bad"}`)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeCodexReasoningReplayKVClient()
+			key := codexReasoningReplayKVKey("gpt-5.4", "session-"+tc.name)
+			client.values[key] = mustCodexReasoningReplayJSON(t, tc.items)
+			useFakeCodexReasoningReplayKVClient(t, client, true, nil)
+
+			items, found, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-"+tc.name)
+			if errGet != nil || found || items != nil {
+				t.Fatalf("invalid home replay = %q, %v, %v; want nil, false, nil", items, found, errGet)
+			}
+			if client.delCount != 1 || client.expireCount != 0 {
+				t.Fatalf("invalid replay del/expire = %d/%d, want 1/0", client.delCount, client.expireCount)
+			}
+		})
+	}
+}
+
+func TestCodexReasoningReplayHomeFiltersMixedCollection(t *testing.T) {
+	client := newFakeCodexReasoningReplayKVClient()
+	key := codexReasoningReplayKVKey("gpt-5.4", "session-mixed")
+	validItem := validCodexReasoningReplayItemForTest(5)
+	client.values[key] = mustCodexReasoningReplayJSON(t, [][]byte{
+		validItem,
+		[]byte(`{"type":"message","content":"ignored"}`),
+	})
+	useFakeCodexReasoningReplayKVClient(t, client, true, nil)
+
+	items, found, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-mixed")
+	if errGet != nil || !found || len(items) != 1 || string(items[0]) != string(validItem) {
+		t.Fatalf("mixed home replay = %q, %v, %v; want valid subset", items, found, errGet)
+	}
+	if client.delCount != 0 || client.setCount != 1 || client.expireCount != 0 || client.lastSetTTL != CodexReasoningReplayCacheTTL {
+		t.Fatalf("mixed replay del/set/expire/ttl = %d/%d/%d/%v, want 0/1/0/%v", client.delCount, client.setCount, client.expireCount, client.lastSetTTL, CodexReasoningReplayCacheTTL)
+	}
+	if got := client.values[key]; !bytes.Equal(got, mustCodexReasoningReplayJSON(t, [][]byte{validItem})) {
+		t.Fatalf("mixed replay Home value = %s, want canonical valid subset", got)
+	}
+}
+
+func TestCodexReasoningReplayHomeDeletesMalformedPayload(t *testing.T) {
+	client := newFakeCodexReasoningReplayKVClient()
+	key := codexReasoningReplayKVKey("gpt-5.4", "session-malformed")
+	client.values[key] = []byte(`{"broken"`)
+	useFakeCodexReasoningReplayKVClient(t, client, true, nil)
+
+	if _, found, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-malformed"); errGet == nil || found {
+		t.Fatalf("malformed home replay = found %v err %v, want error and miss", found, errGet)
+	}
+	if client.delCount != 1 || client.expireCount != 0 {
+		t.Fatalf("malformed replay del/expire = %d/%d, want 1/0", client.delCount, client.expireCount)
+	}
+}
+
+func TestCodexReasoningReplayHomeRejectsOversizedEncodedPayloadBeforeDecode(t *testing.T) {
+	client := newFakeCodexReasoningReplayKVClient()
+	key := codexReasoningReplayKVKey("gpt-5.4", "session-oversized-encoded")
+	client.values[key] = bytes.Repeat([]byte{'x'}, int(reasoningReplayCacheMaxEncodedBytes)+1)
+	useFakeCodexReasoningReplayKVClient(t, client, true, nil)
+
+	items, found, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-oversized-encoded")
+	if errGet != nil || found || items != nil {
+		t.Fatalf("oversized encoded replay = %q, %v, %v; want nil, false, nil", items, found, errGet)
+	}
+	if client.delCount != 1 || client.expireCount != 0 {
+		t.Fatalf("oversized replay del/expire = %d/%d, want 1/0", client.delCount, client.expireCount)
+	}
+}
+
+func TestCodexReasoningReplayHomeNilClientDoesNotPanic(t *testing.T) {
+	useFakeCodexReasoningReplayKVClient(t, nil, true, nil)
+	item := validCodexReasoningReplayItemForTest(6)
+	if CacheCodexReasoningReplayItemsBestEffort(context.Background(), "gpt-5.4", "session-nil", [][]byte{item}) {
+		t.Fatal("save with nil home client unexpectedly succeeded")
+	}
+	if _, _, errGet := GetCodexReasoningReplayItemsRequired(context.Background(), "gpt-5.4", "session-nil"); !errors.Is(errGet, errReasoningReplayKVUnavailable) {
+		t.Fatalf("load with nil home client error = %v", errGet)
+	}
+	if errDelete := DeleteCodexReasoningReplayItemRequired(context.Background(), "gpt-5.4", "session-nil"); !errors.Is(errDelete, errReasoningReplayKVUnavailable) {
+		t.Fatalf("delete with nil home client error = %v", errDelete)
+	}
+}
+
 func TestCodexReasoningReplayRequiredHomeFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -240,9 +355,7 @@ func TestCodexReasoningReplayCacheBatchEvictsWhenFull(t *testing.T) {
 		}
 	}
 
-	codexReasoningReplayMu.Lock()
-	gotLen := len(codexReasoningReplayEntries)
-	codexReasoningReplayMu.Unlock()
+	gotLen, _ := codexReasoningReplayStore.stats()
 	if gotLen >= CodexReasoningReplayCacheMaxEntries {
 		t.Fatalf("cache entries = %d, want batch eviction below max %d", gotLen, CodexReasoningReplayCacheMaxEntries)
 	}

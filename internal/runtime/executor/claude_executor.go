@@ -232,25 +232,32 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	return resp, nil
 }
 
-func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if opts.Alt == "responses/compact" {
-		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
-	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+type claudeRequestPlan struct {
+	apiKey                   string
+	baseURL                  string
+	compatKind               string
+	upstreamFormat           sdktranslator.Format
+	responseFormat           sdktranslator.Format
+	upstreamStream           bool
+	bodyForTranslation       []byte
+	bodyForUpstream          []byte
+	extraBetas               []string
+	oauthToken               bool
+	oauthToolNamesReverseMap map[string]string
+	toolNameSanitization     *claudeToolNameSanitization
+}
 
-	apiKey, baseURL := claudeCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
+func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, streamResponse bool) (plan claudeRequestPlan, err error) {
+	plan.apiKey, plan.baseURL = claudeCreds(auth)
+	if plan.baseURL == "" {
+		plan.baseURL = "https://api.anthropic.com"
 	}
-	compatKind := claudeCompatKind(auth, baseURL)
+	plan.compatKind = claudeCompatKind(auth, plan.baseURL)
 
-	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
 	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("claude")
-	// Use streaming translation to preserve function calling, except for claude.
-	stream := from != to
+	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
+	plan.upstreamFormat = sdktranslator.FromString("claude")
+	plan.upstreamStream = streamResponse || from != plan.upstreamFormat
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -262,9 +269,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payloadSource); ok {
 		payloadSource = repaired
 	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, payloadSource, stream)
+	originalTranslated := sdktranslator.TranslateRequest(from, plan.upstreamFormat, baseModel, originalPayloadSource, plan.upstreamStream)
+	body := sdktranslator.TranslateRequest(from, plan.upstreamFormat, baseModel, payloadSource, plan.upstreamStream)
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(originalTranslated); ok {
 		originalTranslated = repaired
 	}
@@ -272,101 +278,112 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		body = repaired
 	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier())
 	if err != nil {
-		return resp, err
+		return plan, err
 	}
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
-
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, plan.apiKey)
 	if err != nil {
-		return resp, err
+		return plan, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, compatKind)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
-	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, compatKind)
+	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.compatKind)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, plan.baseURL, plan.compatKind)
+	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, plan.compatKind)
 	body = ensureModelMaxTokens(body, baseModel)
+	if streamResponse {
+		body = applyMiniMaxStreamingThinkingDefaultForCompat(plan.compatKind, body, true)
+	}
 	preflight := newClaudeCompatPreflight(body)
 	repairMeta = applyClaudeCompatPreflightStats(repairMeta, preflight)
 	if preflight.hasSystemRole && rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 	body, _, _, err = normalizeThinkingHistoryForModel(body, "claude", baseModel)
 	if err != nil {
-		return resp, err
+		return plan, err
 	}
 	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
-		return resp, err
+		return plan, err
 	}
 	if shouldRepairClaudeToolUseHistoryForCompat(preflight, repairMeta.compatKind) {
 		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
 		if err != nil {
-			return resp, err
+			return plan, err
 		}
 	}
 	if preflight.hasToolResult {
 		body, _, err = normalizeClaudeEmptyToolResults(body)
 		if err != nil {
-			return resp, err
+			return plan, err
 		}
 	}
 	if preflight.hasTools || preflight.hasToolSearch {
-		body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
+		body = downgradeClaudeToolSearchForCompatKind(plan.compatKind, plan.baseURL, body)
 	}
 
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
+	if streamResponse {
+		if preflight.hasCache {
+			body = applyCacheControlPipeline(body, 4, true)
+		}
+		if preflight.hasToolResult {
+			body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
+			if err != nil {
+				return plan, err
+			}
+		}
+	} else {
+		body = enforceCacheControlLimit(body, 4)
+		body = normalizeCacheControlTTL(body)
+	}
 
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header
-	var extraBetas []string
 	if preflight.hasBetas {
-		extraBetas, body = extractAndRemoveBetas(body)
+		plan.extraBetas, body = extractAndRemoveBetas(body)
 	}
-	bodyForTranslation := body
-	bodyForUpstream := body
-	bodyForUpstream = downgradeClaudeStructuredOutputForCompat(baseURL, bodyForUpstream)
-	oauthToken := isClaudeOAuthToken(apiKey)
-	var oauthToolNamesReverseMap map[string]string
-	if preflight.hasTools && oauthToken {
-		bodyForUpstream, oauthToolNamesReverseMap = remapOAuthToolNames(bodyForUpstream)
+	plan.bodyForTranslation = body
+	plan.bodyForUpstream = downgradeClaudeStructuredOutputForCompat(plan.baseURL, body)
+	plan.oauthToken = isClaudeOAuthToken(plan.apiKey)
+	if preflight.hasTools && plan.oauthToken {
+		plan.bodyForUpstream, plan.oauthToolNamesReverseMap = remapOAuthToolNames(plan.bodyForUpstream)
 	}
-	var toolNameSanitization *claudeToolNameSanitization
 	if preflight.hasTools {
-		bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
+		plan.bodyForUpstream, plan.toolNameSanitization = sanitizeClaudeToolNamesForUpstream(plan.bodyForUpstream)
 	}
-	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
+	plan.bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, plan.bodyForUpstream, baseModel)
+	if plan.oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
+		plan.bodyForUpstream = signAnthropicMessagesBody(plan.bodyForUpstream)
 	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
+	return plan, nil
+}
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.Alt == "responses/compact" {
+		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
+	plan, err := e.prepareClaudeRequest(ctx, auth, req, opts, baseModel, false)
 	if err != nil {
 		return resp, err
 	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
+	reporter.SetTranslatedReasoningEffort(plan.bodyForUpstream, plan.upstreamFormat.String())
+
+	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
+	if err != nil {
+		return resp, err
+	}
+	if errHeaders := applyClaudeHeaders(httpReq, auth, plan.apiKey, false, plan.extraBetas, e.cfg); errHeaders != nil {
 		return resp, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -379,7 +396,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
-		Body:      bodyForUpstream,
+		Body:      plan.bodyForUpstream,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -445,7 +462,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if responseLog != nil {
 		responseLog.AppendChunk(data)
 	}
-	if stream {
+	if plan.upstreamStream {
 		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
 			return resp, errValidate
@@ -459,18 +476,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 	}
-	data = restoreClaudeToolNamesFromResponse(data, toolNameSanitization)
-	if oauthToken {
-		data = reverseRemapOAuthToolNames(data, oauthToolNamesReverseMap)
+	data = restoreClaudeToolNamesFromResponse(data, plan.toolNameSanitization)
+	if plan.oauthToken {
+		data = reverseRemapOAuthToolNames(data, plan.oauthToolNamesReverseMap)
 	}
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
-		to,
-		responseFormat,
+		plan.upstreamFormat,
+		plan.responseFormat,
 		req.Model,
 		opts.OriginalRequest,
-		bodyForTranslation,
+		plan.bodyForTranslation,
 		data,
 		&param,
 	)
@@ -484,142 +501,24 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := claudeCreds(auth)
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com"
-	}
-	compatKind := claudeCompatKind(auth, baseURL)
-
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("claude")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	payloadSource := req.Payload
-	if repaired, ok := helps.RepairInvalidJSONStringEscapes(originalPayloadSource); ok {
-		originalPayloadSource = repaired
-	}
-	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payloadSource); ok {
-		payloadSource = repaired
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, payloadSource, true)
-	if repaired, ok := helps.RepairInvalidJSONStringEscapes(originalTranslated); ok {
-		originalTranslated = repaired
-	}
-	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
-		body = repaired
-	}
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	plan, err := e.prepareClaudeRequest(ctx, auth, req, opts, baseModel, true)
 	if err != nil {
 		return nil, err
 	}
-	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
-	}
-
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
-	if err != nil {
-		return nil, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, compatKind)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, compatKind)
-	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, compatKind)
-	body = ensureModelMaxTokens(body, baseModel)
-	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, true)
-	preflight := newClaudeCompatPreflight(body)
-	repairMeta = applyClaudeCompatPreflightStats(repairMeta, preflight)
-	if preflight.hasSystemRole && rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = normalizeClaudeSystemRoleMessages(body)
-	}
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeTemperatureForThinking(body)
-	body, _, _, err = normalizeThinkingHistoryForModel(body, "claude", baseModel)
-	if err != nil {
-		return nil, err
-	}
-	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
-		return nil, err
-	}
-	if shouldRepairClaudeToolUseHistoryForCompat(preflight, repairMeta.compatKind) {
-		body, err = repairClaudeToolUseHistoryWithCompatLog(ctx, body, repairMeta)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if preflight.hasToolResult {
-		body, _, err = normalizeClaudeEmptyToolResults(body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if preflight.hasTools || preflight.hasToolSearch {
-		body = downgradeClaudeToolSearchForCompatKind(compatKind, baseURL, body)
-	}
-
-	// Apply cache_control phases sharing a single payload scan (byte-equivalent
-	// to the legacy inject → enforce → normalize sequence): auto-inject when
-	// missing, enforce the max-4-breakpoint limit, then normalize TTL ordering
-	// under prompt-caching-scope-2026-01-05.
-	if preflight.hasCache {
-		body = applyCacheControlPipeline(body, 4, true)
-	}
-	if preflight.hasToolResult {
-		body, err = repairMiniMaxClaudeToolAdjacencyForCompatWithLog(ctx, body, repairMeta)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Extract betas from body and convert to header
-	var extraBetas []string
-	if preflight.hasBetas {
-		extraBetas, body = extractAndRemoveBetas(body)
-	}
-	bodyForTranslation := body
-	bodyForUpstream := body
-	bodyForUpstream = downgradeClaudeStructuredOutputForCompat(baseURL, bodyForUpstream)
-	oauthToken := isClaudeOAuthToken(apiKey)
-	var oauthToolNamesReverseMap map[string]string
-	if preflight.hasTools && oauthToken {
-		bodyForUpstream, oauthToolNamesReverseMap = remapOAuthToolNames(bodyForUpstream)
-	}
-	var toolNameSanitization *claudeToolNameSanitization
-	if preflight.hasTools {
-		bodyForUpstream, toolNameSanitization = sanitizeClaudeToolNamesForUpstream(bodyForUpstream)
-	}
-	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
+	reporter.SetTranslatedReasoningEffort(plan.bodyForUpstream, plan.upstreamFormat.String())
 	progressStartInputTokens := int64(0)
-	if shouldPatchClaudeStartUsageForProgress(compatKind, baseURL) {
-		progressStartInputTokens = estimateClaudeProgressInputTokens(baseModel, bodyForUpstream)
+	if shouldPatchClaudeStartUsageForProgress(plan.compatKind, plan.baseURL) {
+		progressStartInputTokens = estimateClaudeProgressInputTokens(baseModel, plan.bodyForUpstream)
 	}
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
 	if err != nil {
 		return nil, err
 	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, plan.apiKey, true, plan.extraBetas, e.cfg); errHeaders != nil {
 		return nil, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -632,7 +531,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
-		Body:      bodyForUpstream,
+		Body:      plan.bodyForUpstream,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -695,7 +594,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}()
 
 		// If the response target is Claude, directly forward the SSE stream without translation.
-		if responseFormat == to {
+		if plan.responseFormat == plan.upstreamFormat {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
@@ -707,9 +606,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					reporter.Publish(ctx, detail)
 				}
 				line = normalizeClaudeStringMessageSSELine(line)
-				line = restoreClaudeToolNamesFromStreamLine(line, toolNameSanitization)
-				if oauthToken {
-					line = reverseRemapOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
+				line = restoreClaudeToolNamesFromStreamLine(line, plan.toolNameSanitization)
+				if plan.oauthToken {
+					line = reverseRemapOAuthToolNamesFromStreamLine(line, plan.oauthToolNamesReverseMap)
 				}
 				if progressStartInputTokens > 0 {
 					line = patchClaudeMessageStartUsageForProgress(line, progressStartInputTokens)
@@ -750,17 +649,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				reporter.Publish(ctx, detail)
 			}
 			line = normalizeClaudeStringMessageSSELine(line)
-			line = restoreClaudeToolNamesFromStreamLine(line, toolNameSanitization)
-			if oauthToken {
-				line = reverseRemapOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
+			line = restoreClaudeToolNamesFromStreamLine(line, plan.toolNameSanitization)
+			if plan.oauthToken {
+				line = reverseRemapOAuthToolNamesFromStreamLine(line, plan.oauthToolNamesReverseMap)
 			}
 			chunks := sdktranslator.TranslateStream(
 				ctx,
-				to,
-				responseFormat,
+				plan.upstreamFormat,
+				plan.responseFormat,
 				req.Model,
 				opts.OriginalRequest,
-				bodyForTranslation,
+				plan.bodyForTranslation,
 				bytes.Clone(line),
 				&param,
 			)
