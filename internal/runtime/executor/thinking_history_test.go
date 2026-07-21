@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -24,6 +26,31 @@ func TestNormalizeOpenAIThinkingHistoryRepairsFromPreviousReasoning(t *testing.T
 	}
 	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != "r1" {
 		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "r1")
+	}
+}
+
+func TestNormalizeOpenAIThinkingHistoryBoundsSyntheticReasoning(t *testing.T) {
+	largeReasoning := strings.Repeat("r", maxSyntheticThinkingHistoryBytes+1)
+	body := []byte(fmt.Sprintf(`{
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"assistant","content":"plan","reasoning_content":%q},
+			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]}
+		]
+	}`, largeReasoning))
+
+	out, changed, downgraded, err := normalizeThinkingHistory(body, "openai")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistory() error = %v", err)
+	}
+	if !changed || downgraded {
+		t.Fatalf("normalizeThinkingHistory() changed=%v downgraded=%v", changed, downgraded)
+	}
+	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != "[reasoning unavailable]" {
+		t.Fatalf("messages.1.reasoning_content = %q, want bounded placeholder", got)
+	}
+	if len(out) > len(body)+256 {
+		t.Fatalf("normalized body expanded unexpectedly: input=%d output=%d", len(body), len(out))
 	}
 }
 

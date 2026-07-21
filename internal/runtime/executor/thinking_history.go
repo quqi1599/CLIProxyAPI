@@ -9,6 +9,10 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// Synthetic history only satisfies upstream compatibility checks. Bounding it
+// prevents one large reasoning block from being copied into every later turn.
+const maxSyntheticThinkingHistoryBytes = 8 * 1024
+
 func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool, error) {
 	return normalizeThinkingHistoryForModel(body, provider, "")
 }
@@ -90,6 +94,7 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		normalizedMessages[idx] = msg.Raw
 	}
 	latestReasoning := ""
+	latestReasoningAvailable := false
 	patched := 0
 	unrepaired := 0
 
@@ -99,7 +104,8 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}
 		reasoning := strings.TrimSpace(msg.Get("reasoning_content").String())
 		if reasoning != "" {
-			latestReasoning = reasoning
+			latestReasoning = boundedSyntheticThinkingHistory(reasoning)
+			latestReasoningAvailable = true
 		}
 		hasToolCalls := false
 		if toolCalls := msg.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
@@ -112,10 +118,14 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			continue
 		}
 		fallback := latestReasoning
+		fallbackAvailable := latestReasoningAvailable
 		if fallback == "" {
-			fallback = assistantOpenAIText(msg)
+			if assistantText := assistantOpenAIText(msg); assistantText != "" {
+				fallback = boundedSyntheticThinkingHistory(assistantText)
+				fallbackAvailable = true
+			}
 		}
-		if fallback == "" && requireCompleteHistory {
+		if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
 			fallback = "[reasoning unavailable]"
 		}
 		if fallback == "" {
@@ -128,6 +138,7 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}
 		normalizedMessages[idx] = string(next)
 		latestReasoning = fallback
+		latestReasoningAvailable = true
 		patched++
 	}
 
@@ -169,6 +180,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		normalizedMessages[idx] = msg.Raw
 	}
 	latestThinking := ""
+	latestThinkingAvailable := false
 	patched := 0
 	unrepaired := 0
 
@@ -185,11 +197,13 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 				continue
 			}
 			fallback := latestThinking
+			fallbackAvailable := latestThinkingAvailable
 			text := strings.TrimSpace(content.String())
-			if fallback == "" {
-				fallback = text
+			if fallback == "" && text != "" {
+				fallback = boundedSyntheticThinkingHistory(text)
+				fallbackAvailable = true
 			}
-			if fallback == "" {
+			if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
 				fallback = "[thinking unavailable]"
 			}
 			block := []byte(`{"type":"thinking","thinking":""}`)
@@ -206,6 +220,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			}
 			normalizedMessages[idx] = string(next)
 			latestThinking = fallback
+			latestThinkingAvailable = true
 			patched++
 			continue
 		}
@@ -221,7 +236,8 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			case "thinking":
 				thinkingText := strings.TrimSpace(part.Get("thinking").String())
 				if thinkingText != "" {
-					latestThinking = thinkingText
+					latestThinking = boundedSyntheticThinkingHistory(thinkingText)
+					latestThinkingAvailable = true
 					hasThinking = true
 				}
 			case "text":
@@ -240,10 +256,12 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			continue
 		}
 		fallback := latestThinking
+		fallbackAvailable := latestThinkingAvailable
 		if fallback == "" && len(textParts) > 0 {
-			fallback = strings.Join(textParts, "\n")
+			fallback = boundedSyntheticThinkingHistory(strings.Join(textParts, "\n"))
+			fallbackAvailable = true
 		}
-		if fallback == "" && requireCompleteHistory {
+		if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
 			fallback = "[thinking unavailable]"
 		}
 		if fallback == "" {
@@ -263,6 +281,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}
 		normalizedMessages[idx] = string(next)
 		latestThinking = fallback
+		latestThinkingAvailable = true
 		patched++
 	}
 
@@ -287,6 +306,13 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}).Debug("executor: normalized claude thinking history")
 	}
 	return out, patched > 0 || downgraded, downgraded, nil
+}
+
+func boundedSyntheticThinkingHistory(value string) string {
+	if len(value) > maxSyntheticThinkingHistoryBytes {
+		return ""
+	}
+	return value
 }
 
 func assistantOpenAIText(msg gjson.Result) string {
