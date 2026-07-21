@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -34,6 +34,7 @@ const kimiTopP = 0.95
 
 type openAICompatProfile struct {
 	Kind                     string
+	KindSource               provideridentity.Source
 	SupportsResponses        bool
 	SupportsNativeResponses  bool
 	SupportsStreamUsage      bool
@@ -159,66 +160,29 @@ func openAICompatProfileForKind(kind string) openAICompatProfile {
 }
 
 func (e *OpenAICompatExecutor) resolveProfile(auth *cliproxyauth.Auth) openAICompatProfile {
-	profile := genericOpenAICompatProfile()
-	profile.Kind = ""
 	compat := e.resolveCompatConfig(auth)
-	if compat == nil {
-		if auth != nil && auth.Attributes != nil {
-			if kind := config.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
-				return openAICompatProfileForKind(kind)
-			}
-			if kind := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
-				return openAICompatProfileForKind(kind)
-			}
-		}
-		return profile
+	input := provideridentity.Input{}
+	if compat != nil {
+		input.ExplicitKind = compat.Kind
+		input.BaseURL = compat.BaseURL
 	}
-	resolved := openAICompatProfileForKind(compat.Kind)
-	if resolved.Kind == "" && auth != nil && auth.Attributes != nil {
-		if kind := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
-			resolved = openAICompatProfileForKind(kind)
+	if auth != nil && auth.Attributes != nil {
+		input.AttributeKind = auth.Attributes["compat_kind"]
+		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
+			input.BaseURL = baseURL
 		}
 	}
-	if len(compat.Headers) > 0 {
+	identity := provideridentity.Resolve(input)
+	resolved := openAICompatProfileForKind(identity.Kind)
+	resolved.KindSource = identity.Source
+	if compat != nil && len(compat.Headers) > 0 {
 		resolved.DefaultHeaders = config.NormalizeHeaders(compat.Headers)
 	}
 	return resolved
 }
 
 func inferOpenAICompatKindFromBaseURL(rawBaseURL string) string {
-	baseURL := strings.TrimSpace(rawBaseURL)
-	if baseURL == "" {
-		return ""
-	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return ""
-	}
-	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	switch host {
-	case "api.moonshot.ai", "api.moonshot.cn", "api.kimi.com":
-		return "kimi"
-	case "api.minimax.io", "api.minimaxi.io", "api.minimaxi.com":
-		return "minimax"
-	case "api.z.ai", "open.bigmodel.cn", "maas-api.lanyun.net":
-		return "zhipu"
-	case "api.deepseek.com":
-		return "deepseek"
-	case "api.xiaomimimo.com":
-		return "xiaomi"
-	case "ark.cn-beijing.volces.com":
-		return "doubao"
-	default:
-		if config.IsXiaomiTokenPlanBaseURLHost(host) {
-			return "xiaomi"
-		}
-		path := strings.ToLower(strings.TrimSpace(parsed.Path))
-		if strings.HasSuffix(host, ".maas.aliyuncs.com") &&
-			(path == "/compatible-mode/v1" || strings.HasPrefix(path, "/compatible-mode/v1/")) {
-			return "qwen"
-		}
-		return ""
-	}
+	return provideridentity.Resolve(provideridentity.Input{BaseURL: rawBaseURL}).Kind
 }
 
 func applyOpenAICompatDefaultHeaders(req *http.Request, profile openAICompatProfile) {
@@ -1299,15 +1263,19 @@ func openAICompatKindSource(profile openAICompatProfile, auth *cliproxyauth.Auth
 	if kind == "" {
 		return ""
 	}
+	if profile.KindSource != "" && profile.KindSource != provideridentity.SourceGeneric {
+		return string(profile.KindSource)
+	}
 	if auth != nil && auth.Attributes != nil {
-		if attrKind := config.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); attrKind == kind {
-			return "auth_attribute:compat_kind"
-		}
-		if inferred := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); inferred == kind {
-			return "base_url_inference"
+		identity := provideridentity.Resolve(provideridentity.Input{
+			AttributeKind: auth.Attributes["compat_kind"],
+			BaseURL:       auth.Attributes["base_url"],
+		})
+		if identity.Kind == kind && identity.Source != provideridentity.SourceGeneric {
+			return string(identity.Source)
 		}
 	}
-	return "compat_config"
+	return string(provideridentity.SourceCompatConfig)
 }
 
 func openAICompatMapping(profile openAICompatProfile, model string) string {

@@ -9,11 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"syscall"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -717,98 +717,20 @@ func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 
 // NormalizeOpenAICompatibilityKind trims and lowercases a compatibility provider profile identifier.
 func NormalizeOpenAICompatibilityKind(kind string) string {
-	return strings.ToLower(strings.TrimSpace(kind))
+	return provideridentity.NormalizeKind(kind)
 }
 
 // InferCompatKindFromBaseURL detects known provider profiles from an upstream base URL.
 // It is intentionally conservative and only returns a non-empty kind for well-known
 // official host patterns.
 func InferCompatKindFromBaseURL(rawBaseURL string) string {
-	baseURL := strings.TrimSpace(rawBaseURL)
-	if baseURL == "" {
-		return ""
-	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return ""
-	}
-	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	path := strings.ToLower(strings.TrimSpace(parsed.Path))
-	switch host {
-	case "api.deepseek.com":
-		if path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") {
-			return "deepseek"
-		}
-	case "api.minimaxi.com", "api.minimaxi.io", "api.minimax.io":
-		if path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") {
-			return "minimax"
-		}
-	case "api.kimi.com":
-		if path == "/coding" || strings.HasPrefix(path, "/coding/") {
-			return "kimi"
-		}
-	case "open.bigmodel.cn", "maas-api.lanyun.net", "api.z.ai":
-		if isZhipuCompatPath(path) {
-			return "zhipu"
-		}
-	case "maas-coding-api.cn-huabei-1.xf-yun.com":
-		if path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") {
-			return "xfyun"
-		}
-	case "token-plan-cn.xiaomimimo.com":
-		if path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") || path == "/v1" || strings.HasPrefix(path, "/v1/") {
-			return "xiaomi"
-		}
-	case "api.xiaomimimo.com":
-		if path == "/v1" || strings.HasPrefix(path, "/v1/") || path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") {
-			return "xiaomi"
-		}
-	case "coding.dashscope.aliyuncs.com":
-		if path == "/apps/anthropic" || strings.HasPrefix(path, "/apps/anthropic/") {
-			return "qwen"
-		}
-	case "ark.cn-beijing.volces.com":
-		if path == "/api/coding" || strings.HasPrefix(path, "/api/coding/") ||
-			path == "/api/v3" || strings.HasPrefix(path, "/api/v3/") {
-			return "doubao"
-		}
-	case "qianfan.baidubce.com":
-		if path == "/anthropic/coding" || strings.HasPrefix(path, "/anthropic/coding/") ||
-			path == "/v2/coding" || strings.HasPrefix(path, "/v2/coding/") {
-			return "qianfan"
-		}
-	case "api.stepfun.com":
-		if path == "/step_plan" || strings.HasPrefix(path, "/step_plan/") {
-			return "step"
-		}
-	}
-	if strings.HasSuffix(host, ".maas.aliyuncs.com") {
-		if path == "/apps/anthropic" || strings.HasPrefix(path, "/apps/anthropic/") ||
-			path == "/compatible-mode/v1" || strings.HasPrefix(path, "/compatible-mode/v1/") {
-			return "qwen"
-		}
-	}
-	if IsXiaomiTokenPlanBaseURLHost(host) && (path == "/anthropic" || strings.HasPrefix(path, "/anthropic/") || path == "/v1" || strings.HasPrefix(path, "/v1/")) {
-		return "xiaomi"
-	}
-	return ""
-}
-
-func isZhipuCompatPath(path string) bool {
-	return path == "/api/anthropic" ||
-		path == "/anthropic" ||
-		path == "/api/coding/paas/v4" ||
-		path == "/api/paas/v4" ||
-		strings.HasPrefix(path, "/api/anthropic/") ||
-		strings.HasPrefix(path, "/anthropic/") ||
-		strings.HasPrefix(path, "/api/coding/paas/v4/") ||
-		strings.HasPrefix(path, "/api/paas/v4/")
+	return provideridentity.InferEndpointKind(rawBaseURL)
 }
 
 // IsXiaomiTokenPlanBaseURLHost reports whether host is an official MiMo Token
 // Plan cluster host.
 func IsXiaomiTokenPlanBaseURLHost(host string) bool {
-	return strings.HasSuffix(host, ".xiaomimimo.com") && (host == "token-plan.xiaomimimo.com" || strings.HasPrefix(host, "token-plan-"))
+	return provideridentity.IsXiaomiTokenPlanHost(host)
 }
 
 // LoadConfig reads a YAML configuration file from the given path,

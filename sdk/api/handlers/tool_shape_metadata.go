@@ -26,11 +26,21 @@ type toolShapeTelemetry struct {
 	toolNameHashesSeen map[string]struct{}
 }
 
-func setToolShapeMetadata(meta map[string]any, rawJSON []byte) {
-	if meta == nil || len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+// complexityVector contains the request-shape metrics available from the same
+// gjson walk. Maximum depth is intentionally omitted because gjson does not
+// expose it without a separate recursive parse.
+type complexityVector struct {
+	BodyBytes        int
+	MessageCount     int
+	ContentPartCount int
+	toolShapeTelemetry
+}
+
+func setToolShapeMetadata(meta map[string]any, vector complexityVector) {
+	if meta == nil {
 		return
 	}
-	shape := requestToolShapeTelemetry(rawJSON)
+	shape := vector.toolShapeTelemetry
 	if !shape.hasData() {
 		return
 	}
@@ -46,15 +56,23 @@ func setToolShapeMetadata(meta map[string]any, rawJSON []byte) {
 	}
 }
 
-func setRequestShapeMetadata(meta map[string]any, rawJSON []byte) {
-	if meta == nil || len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+func setRequestShapeMetadata(meta map[string]any, vector complexityVector) {
+	if meta == nil {
 		return
 	}
-	messageCount := requestMessageCount(rawJSON)
-	if messageCount > 0 {
-		meta[coreexecutor.MessageCountMetadataKey] = messageCount
+	if vector.BodyBytes > 0 {
+		meta[coreexecutor.RequestBodyBytesMetadataKey] = vector.BodyBytes
 	}
-	toolCount := requestToolCount(rawJSON)
+	if vector.MessageCount > 0 {
+		meta[coreexecutor.MessageCountMetadataKey] = vector.MessageCount
+	}
+	if vector.ContentPartCount > 0 {
+		meta[coreexecutor.ContentPartCountMetadataKey] = vector.ContentPartCount
+	}
+	toolCount := vector.DeclaredToolCount
+	if vector.InteractionCount > toolCount {
+		toolCount = vector.InteractionCount
+	}
 	if toolCount > 0 {
 		meta[coreexecutor.ToolCountMetadataKey] = toolCount
 	}
@@ -64,52 +82,71 @@ func setRequestShapeAndToolMetadata(meta map[string]any, rawJSON []byte) {
 	if meta == nil {
 		return
 	}
-	setRequestShapeMetadata(meta, rawJSON)
-	setToolShapeMetadata(meta, rawJSON)
+	vector, ok := inspectRequestComplexity(rawJSON)
+	if !ok {
+		return
+	}
+	setRequestShapeMetadata(meta, vector)
+	setToolShapeMetadata(meta, vector)
 }
 
-func requestMessageCount(rawJSON []byte) int {
-	if messages := gjson.GetBytes(rawJSON, "messages"); messages.IsArray() {
-		return len(messages.Array())
+func inspectRequestComplexity(rawJSON []byte) (complexityVector, bool) {
+	vector := complexityVector{
+		BodyBytes:          len(rawJSON),
+		toolShapeTelemetry: newToolShapeTelemetry(),
 	}
-	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
-		return len(input.Array())
+	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+		return vector, false
 	}
-	return 0
-}
 
-func requestToolCount(rawJSON []byte) int {
-	declared := requestDeclaredToolCount(rawJSON)
-	interactions := requestToolInteractionCount(rawJSON)
-	if interactions > declared {
-		return interactions
-	}
-	return declared
-}
-
-func requestToolShapeTelemetry(rawJSON []byte) toolShapeTelemetry {
-	shape := newToolShapeTelemetry()
-	shape.DeclaredToolCount = requestDeclaredToolCount(rawJSON)
-	shape.InteractionCount = requestToolInteractionCount(rawJSON)
-
-	if tools := gjson.GetBytes(rawJSON, "tools"); tools.IsArray() {
-		for _, tool := range tools.Array() {
-			shape.addToolShape(toolShapeType(tool, "tool"), toolShapeName(tool), true)
+	var messages, input, tools gjson.Result
+	var messagesSeen, inputSeen, toolsSeen bool
+	gjson.ParseBytes(rawJSON).ForEach(func(key, value gjson.Result) bool {
+		switch key.String() {
+		case "messages":
+			if !messagesSeen {
+				messages, messagesSeen = value, true
+			}
+		case "input":
+			if !inputSeen {
+				input, inputSeen = value, true
+			}
+		case "tools":
+			if !toolsSeen {
+				tools, toolsSeen = value, true
+			}
 		}
-	}
-	if messages := gjson.GetBytes(rawJSON, "messages"); messages.IsArray() {
-		for _, message := range messages.Array() {
-			shape.addMessageToolShapes(message)
-		}
-	}
-	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
-		for _, item := range input.Array() {
-			shape.addInputToolShapes(item)
-		}
+		return true
+	})
+
+	if tools.IsArray() {
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			vector.DeclaredToolCount++
+			vector.addToolShape(toolShapeType(tool, "tool"), toolShapeName(tool), true)
+			return true
+		})
 	}
 
-	shape.finish()
-	return shape
+	hasMessages := messages.IsArray()
+	if hasMessages {
+		messages.ForEach(func(_, message gjson.Result) bool {
+			vector.MessageCount++
+			vector.addMessage(message, true)
+			return true
+		})
+	}
+	if input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			if !hasMessages {
+				vector.MessageCount++
+			}
+			vector.addInput(item)
+			return true
+		})
+	}
+
+	vector.finish()
+	return vector, true
 }
 
 func newToolShapeTelemetry() toolShapeTelemetry {
@@ -128,55 +165,6 @@ func (s toolShapeTelemetry) hasData() bool {
 		len(s.ToolNameHashes) > 0
 }
 
-func requestDeclaredToolCount(rawJSON []byte) int {
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.IsArray() {
-		return 0
-	}
-	return len(tools.Array())
-}
-
-func requestToolInteractionCount(rawJSON []byte) int {
-	count := 0
-	if messages := gjson.GetBytes(rawJSON, "messages"); messages.IsArray() {
-		for _, message := range messages.Array() {
-			count += toolInteractionsInObject(message)
-			role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
-			if role == "tool" || role == "function" {
-				count++
-			}
-		}
-	}
-	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
-		for _, item := range input.Array() {
-			count += toolInteractionsInObject(item)
-			if isResponsesToolItemType(item.Get("type").String()) {
-				count++
-			}
-		}
-	}
-	return count
-}
-
-func toolInteractionsInObject(value gjson.Result) int {
-	count := 0
-	if toolCalls := value.Get("tool_calls"); toolCalls.IsArray() {
-		count += len(toolCalls.Array())
-	}
-	if functionCall := value.Get("function_call"); functionCall.Exists() && functionCall.Raw != "null" {
-		count++
-	}
-	content := value.Get("content")
-	if content.IsArray() {
-		for _, item := range content.Array() {
-			if isResponsesToolItemType(item.Get("type").String()) {
-				count++
-			}
-		}
-	}
-	return count
-}
-
 func isResponsesToolItemType(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "function_call", "function_call_output", "tool_call", "tool_result",
@@ -191,45 +179,61 @@ func isResponsesToolItemType(value string) bool {
 	}
 }
 
-func (s *toolShapeTelemetry) addMessageToolShapes(message gjson.Result) {
-	if s == nil {
+func (v *complexityVector) addMessage(message gjson.Result, countRoleInteraction bool) {
+	if v == nil {
 		return
 	}
 	if toolCalls := message.Get("tool_calls"); toolCalls.IsArray() {
-		for _, call := range toolCalls.Array() {
+		toolCalls.ForEach(func(_, call gjson.Result) bool {
+			v.InteractionCount++
 			callType := normalizeToolShapeType(toolShapeType(call, "tool_call"))
 			if callType == "function" {
 				callType = "tool_call"
 			}
-			s.addToolShape(callType, toolShapeName(call), false)
-		}
+			v.addToolShape(callType, toolShapeName(call), false)
+			return true
+		})
 	}
 	if functionCall := message.Get("function_call"); functionCall.Exists() && functionCall.Raw != "null" {
-		s.addToolShape("function_call", toolShapeName(functionCall), false)
+		v.InteractionCount++
+		v.addToolShape("function_call", toolShapeName(functionCall), false)
 	}
 	role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
 	if role == "tool" || role == "function" {
-		s.addToolShape(role+"_result", toolShapeName(message), false)
+		if countRoleInteraction {
+			v.InteractionCount++
+		}
+		v.addToolShape(role+"_result", toolShapeName(message), false)
 	}
 	content := message.Get("content")
 	if content.IsArray() {
-		for _, item := range content.Array() {
-			if itemType := toolShapeType(item, ""); isToolShapeInteractionType(itemType) {
-				s.addToolShape(itemType, toolShapeName(item), false)
+		content.ForEach(func(_, item gjson.Result) bool {
+			v.ContentPartCount++
+			if isResponsesToolItemType(item.Get("type").String()) {
+				v.InteractionCount++
 			}
-		}
+			if itemType := toolShapeType(item, ""); isToolShapeInteractionType(itemType) {
+				v.addToolShape(itemType, toolShapeName(item), false)
+			}
+			return true
+		})
+	} else if content.Exists() && content.Type != gjson.Null {
+		v.ContentPartCount++
 	}
 }
 
-func (s *toolShapeTelemetry) addInputToolShapes(item gjson.Result) {
-	if s == nil {
+func (v *complexityVector) addInput(item gjson.Result) {
+	if v == nil {
 		return
 	}
 	itemType := toolShapeType(item, "")
-	if isToolShapeInteractionType(itemType) {
-		s.addToolShape(itemType, toolShapeName(item), false)
+	if isResponsesToolItemType(item.Get("type").String()) {
+		v.InteractionCount++
 	}
-	s.addMessageToolShapes(item)
+	if isToolShapeInteractionType(itemType) {
+		v.addToolShape(itemType, toolShapeName(item), false)
+	}
+	v.addMessage(item, false)
 }
 
 func (s *toolShapeTelemetry) addToolShape(toolType, toolName string, declared bool) {

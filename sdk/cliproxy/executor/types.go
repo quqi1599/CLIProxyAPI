@@ -21,8 +21,14 @@ const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 // ReasoningEffortMetadataKey stores the client-requested reasoning effort for usage logs.
 const ReasoningEffortMetadataKey = "reasoning_effort"
 
-// MessageCountMetadataKey stores the inbound request message item count for safe failure logs.
+// MessageCountMetadataKey stores the inbound request message/input item count for safe failure logs.
 const MessageCountMetadataKey = "message_count"
+
+// RequestBodyBytesMetadataKey stores the inbound JSON request body size.
+const RequestBodyBytesMetadataKey = "request_body_bytes"
+
+// ContentPartCountMetadataKey stores the inbound content part count.
+const ContentPartCountMetadataKey = "content_part_count"
 
 // ToolCountMetadataKey stores the inbound request tool/tool-call item count for safe failure logs.
 const ToolCountMetadataKey = "tool_count"

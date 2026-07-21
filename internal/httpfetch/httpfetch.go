@@ -15,6 +15,34 @@ type Doer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// ResponseTooLargeError reports a bounded response read overflow.
+type ResponseTooLargeError struct {
+	Limit int64
+}
+
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("response exceeds maximum allowed size of %d bytes", e.Limit)
+}
+
+// ReadBytes reads at most maxSize+1 bytes so oversized responses are rejected
+// without buffering the complete body. It does not close reader.
+func ReadBytes(reader io.Reader, maxSize int64) ([]byte, error) {
+	if reader == nil {
+		return nil, nil
+	}
+	if maxSize <= 0 {
+		return io.ReadAll(reader)
+	}
+	data, errRead := io.ReadAll(io.LimitReader(reader, maxSize+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if int64(len(data)) > maxSize {
+		return nil, &ResponseTooLargeError{Limit: maxSize}
+	}
+	return data, nil
+}
+
 // GetBytes performs a GET request with the supplied headers, requires a
 // success status, and returns the response body. When maxSize is positive
 // the body is rejected once it exceeds maxSize bytes.
@@ -47,16 +75,9 @@ func GetBytes(ctx context.Context, client Doer, requestURL string, headers map[s
 		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	reader := io.Reader(resp.Body)
-	if maxSize > 0 {
-		reader = io.LimitReader(resp.Body, maxSize+1)
-	}
-	data, errRead := io.ReadAll(reader)
+	data, errRead := ReadBytes(resp.Body, maxSize)
 	if errRead != nil {
 		return nil, fmt.Errorf("read response: %w", errRead)
-	}
-	if maxSize > 0 && int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("response exceeds maximum allowed size of %d bytes", maxSize)
 	}
 	return data, nil
 }

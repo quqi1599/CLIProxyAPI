@@ -15,7 +15,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t *testing.T) {
+func TestManager_RecordContentSafetyRequest_WritesMetadataOnly(t *testing.T) {
 	logDir := t.TempDir()
 	t.Setenv(contentSafetyLogDirEnv, logDir)
 
@@ -60,7 +60,7 @@ func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t
 			{"role": "system", "content": "system prompt for file search"},
 			{"role": "user", "content": largePrompt},
 		},
-		"image": "data:image/png;base64," + strings.Repeat("A", contentSafetyLogMaxStringLen+32),
+		"image": "data:image/png;base64," + strings.Repeat("A", 2048),
 	})
 	originalRequest := mustMarshalContentSafetyTestPayload(t, map[string]any{
 		"model":        model,
@@ -100,14 +100,27 @@ func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t
 	if got := len(bytes.TrimSpace(rawLog)); got > contentSafetyLogMaxRecordBytes {
 		t.Fatalf("content safety log line = %d bytes, want <= %d: %s", got, contentSafetyLogMaxRecordBytes, string(rawLog))
 	}
-	for _, forbidden := range []string{"sk-test-secret", "Bearer hidden-token", "original-secret-token", "data:image/png;base64"} {
+	for _, forbidden := range []string{
+		"sk-test-secret",
+		"Bearer hidden-token",
+		"original-secret-token",
+		"data:image/png;base64",
+		"system prompt for file search",
+		"please inspect these files carefully.",
+		"original client prompt",
+		miniMaxNewSensitiveMessage,
+	} {
 		if bytes.Contains(rawLog, []byte(forbidden)) {
 			t.Fatalf("content safety log leaked %q: %s", forbidden, string(rawLog))
 		}
 	}
-	for _, required := range []string{"system prompt for file search", "please inspect these files carefully.", "original client prompt", "[redacted]"} {
-		if !bytes.Contains(rawLog, []byte(required)) {
-			t.Fatalf("content safety log missing %q: %s", required, string(rawLog))
+	var fields map[string]any
+	if errUnmarshal := json.Unmarshal(bytes.TrimSpace(rawLog), &fields); errUnmarshal != nil {
+		t.Fatalf("unmarshal content safety fields: %v", errUnmarshal)
+	}
+	for _, forbiddenField := range []string{"auth_id", "auth_label", "auth_prefix", "error", "payload_preview", "original_request_preview"} {
+		if _, exists := fields[forbiddenField]; exists {
+			t.Fatalf("content safety log contains forbidden field %q: %s", forbiddenField, string(rawLog))
 		}
 	}
 
@@ -142,12 +155,6 @@ func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t
 	if record.PayloadSHA256 != contentSafetySHA256Hex(payload) {
 		t.Fatalf("payload_sha256 = %q, want %q", record.PayloadSHA256, contentSafetySHA256Hex(payload))
 	}
-	if record.PayloadPreview == "" {
-		t.Fatal("payload_preview should be recorded")
-	}
-	if !record.PayloadTruncated {
-		t.Fatal("payload_truncated should be true for oversized payload preview")
-	}
 	if !record.OriginalRequestPresent {
 		t.Fatal("original request should be recorded when it differs from submitted payload")
 	}
@@ -156,9 +163,6 @@ func TestManager_RecordContentSafetyRequest_RejectsAndWritesSanitizedPromptLog(t
 	}
 	if record.OriginalRequestSHA256 != contentSafetySHA256Hex(originalRequest) {
 		t.Fatalf("original_request_sha256 = %q, want %q", record.OriginalRequestSHA256, contentSafetySHA256Hex(originalRequest))
-	}
-	if record.OriginalRequestPreview == "" {
-		t.Fatal("original_request_preview should be recorded")
 	}
 }
 

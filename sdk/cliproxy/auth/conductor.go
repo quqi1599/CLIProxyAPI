@@ -3021,6 +3021,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			if cancelUpstream != nil {
 				cancelUpstream()
 			}
+			if releaseSlot != nil {
+				releaseSlot()
+			}
 		})
 	}
 	trackerID := uint64(0)
@@ -3030,9 +3033,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 	runtime := newStreamRequestRuntime(ctx, meta, responseModelAlias, trackerID)
 	go func() {
 		defer close(out)
-		if releaseSlot != nil {
-			defer releaseSlot()
-		}
+		defer cancel()
 		if m != nil && m.activeStreams != nil {
 			defer m.activeStreams.stop(runtime.trackerID)
 		}
@@ -3174,9 +3175,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 		}
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		var streamResult *cliproxyexecutor.StreamResult
+		var cleanupOnce sync.Once
+		cleanupAttempt := func() {
+			cleanupOnce.Do(func() {
+				attemptCancel()
+				closeStreamResult(streamResult)
+				releaseSlot()
+			})
+		}
+		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		if errStream != nil {
-			releaseSlot()
+			cleanupAttempt()
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -3212,11 +3223,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, firstPayloadDelay, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks, startedAt)
+		buffered, closed, firstPayloadDelay, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks, startedAt)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
-				closeStreamResult(streamResult)
-				releaseSlot()
+				cleanupAttempt()
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
@@ -3228,8 +3238,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
 				}
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
-				closeStreamResult(streamResult)
-				releaseSlot()
+				cleanupAttempt()
 				if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr) {
 					lastErr = bootstrapErr
 					if idx < len(execModels)-1 {
@@ -3249,8 +3258,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
 				}
-				closeStreamResult(streamResult)
-				releaseSlot()
+				cleanupAttempt()
 				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 			}
 			if idx < len(execModels)-1 {
@@ -3262,8 +3270,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
 					trace.recordFallback()
 				}
-				closeStreamResult(streamResult)
-				releaseSlot()
+				cleanupAttempt()
 				lastErr = bootstrapErr
 				continue
 			}
@@ -3274,8 +3281,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
 			}
-			closeStreamResult(streamResult)
-			releaseSlot()
+			cleanupAttempt()
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
@@ -3286,7 +3292,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(statusCodeFromError(emptyErr))
 			}
-			releaseSlot()
+			cleanupAttempt()
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
@@ -3323,7 +3329,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
 			toolShape:        toolShapeFromOptions(opts),
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), streamMeta, responseModelAlias, streamResult.Headers, buffered, remaining, streamResult.Close, startedAt, firstPayloadDelay, releaseSlot), nil
+		return m.wrapStreamResult(attemptCtx, auth.Clone(), streamMeta, responseModelAlias, streamResult.Headers, buffered, remaining, cleanupAttempt, startedAt, firstPayloadDelay, nil), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

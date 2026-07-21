@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -52,7 +52,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+const (
+	oauthCallbackSuccessHTML               = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+	codexAlphaSearchRequestMaxBytes  int64 = 16 << 20
+	codexAlphaSearchResponseMaxBytes int64 = 32 << 20
+)
 
 var corsExposedResponseHeaders = []string{
 	"X-CPA-VERSION",
@@ -629,9 +633,9 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 16<<20))
+	body, err := handlers.ReadRequestBodyWithLimits(c, codexAlphaSearchRequestMaxBytes, codexAlphaSearchRequestMaxBytes)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read search request"})
+		handlers.WriteRequestBodyError(c, err)
 		return
 	}
 	var routing struct {
@@ -708,9 +712,14 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		}
 	}()
 	helps.RecordAPIResponseMetadata(ctx, s.cfg, resp.StatusCode, resp.Header.Clone())
-	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	upstreamBody, err := httpfetch.ReadBytes(resp.Body, codexAlphaSearchResponseMaxBytes)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, s.cfg, err)
+		var tooLarge *httpfetch.ResponseTooLargeError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Codex search response exceeds the allowed size"})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to read Codex search response"})
 		return
 	}

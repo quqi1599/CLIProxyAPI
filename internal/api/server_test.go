@@ -27,8 +27,9 @@ import (
 )
 
 type codexAlphaSearchTestExecutor struct {
-	body    []byte
-	authIDs []string
+	body         []byte
+	authIDs      []string
+	responseBody io.Reader
 }
 
 func (e *codexAlphaSearchTestExecutor) Identifier() string { return "codex" }
@@ -62,10 +63,14 @@ func (e *codexAlphaSearchTestExecutor) HttpRequest(_ context.Context, candidate 
 		return nil, errRead
 	}
 	e.body = body
+	responseBody := e.responseBody
+	if responseBody == nil {
+		responseBody = strings.NewReader(`{"results":[]}`)
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(`{"results":[]}`)),
+		Body:       io.NopCloser(responseBody),
 	}, nil
 }
 
@@ -107,15 +112,7 @@ func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 func TestCodexAlphaSearchUsesOAuthAndSanitizesBody(t *testing.T) {
 	server := newTestServer(t)
 	executor := &codexAlphaSearchTestExecutor{}
-	server.handlers.AuthManager.RegisterExecutor(executor)
-	for _, candidate := range []*auth.Auth{
-		{ID: "codex-api-key", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{auth.AttributeAPIKey: "test-key"}},
-		{ID: "codex-oauth", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "oauth-token"}},
-	} {
-		if _, errRegister := server.handlers.AuthManager.Register(context.Background(), candidate); errRegister != nil {
-			t.Fatalf("register %s: %v", candidate.ID, errRegister)
-		}
-	}
+	registerCodexAlphaSearchTestExecutor(t, server, executor)
 
 	payload := `{"id":"session-123","commands":{"search_query":[{"q":"golang"}]},"prompt_cache_key":"cache","prompt_cache_retention":"24h"}`
 	for _, path := range []string{"/v1/alpha/search", "/backend-api/codex/alpha/search"} {
@@ -138,6 +135,70 @@ func TestCodexAlphaSearchUsesOAuthAndSanitizesBody(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexAlphaSearchRejectsOversizedRequest(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/alpha/search", strings.NewReader(`{}`))
+	req.ContentLength = codexAlphaSearchRequestMaxBytes + 1
+	req.Header.Set("Authorization", "Bearer test-key")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusRequestEntityTooLarge, rr.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(rr.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatalf("parse response: %v", errUnmarshal)
+	}
+	if response.Error.Code != "request_too_large" {
+		t.Fatalf("error code = %q, want request_too_large", response.Error.Code)
+	}
+}
+
+func TestCodexAlphaSearchRejectsOversizedUpstreamResponse(t *testing.T) {
+	server := newTestServer(t)
+	executor := &codexAlphaSearchTestExecutor{
+		responseBody: io.LimitReader(zeroReader{}, codexAlphaSearchResponseMaxBytes+1),
+	}
+	registerCodexAlphaSearchTestExecutor(t, server, executor)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/alpha/search", strings.NewReader(`{"commands":{}}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusBadGateway, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "exceeds the allowed size") {
+		t.Fatalf("response body = %s, want size limit error", rr.Body.String())
+	}
+}
+
+func registerCodexAlphaSearchTestExecutor(t *testing.T, server *Server, executor *codexAlphaSearchTestExecutor) {
+	t.Helper()
+	server.handlers.AuthManager.RegisterExecutor(executor)
+	for _, candidate := range []*auth.Auth{
+		{ID: "codex-api-key", Provider: "codex", Status: auth.StatusActive, Attributes: map[string]string{auth.AttributeAPIKey: "test-key"}},
+		{ID: "codex-oauth", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "oauth-token"}},
+	} {
+		if _, errRegister := server.handlers.AuthManager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("register %s: %v", candidate.ID, errRegister)
+		}
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 func TestInjectManagementConfigVersionGuard(t *testing.T) {
