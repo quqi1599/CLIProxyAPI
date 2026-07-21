@@ -24,6 +24,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -1515,11 +1516,11 @@ func rebuildMidSystemMessagesToTopLevel(payload []byte) []byte {
 	systemParts := claudeSystemTextParts(gjson.GetBytes(payload, "system"))
 	systemParts = append(systemParts, movedSystemParts...)
 	if len(systemParts) > 0 {
-		if updated, errSetSystem := sjson.SetRawBytes(payload, "system", rawJSONArray(systemParts)); errSetSystem == nil {
+		if updated, errSetSystem := sjson.SetRawBytes(payload, "system", internalpayload.BuildRaw(systemParts)); errSetSystem == nil {
 			payload = updated
 		}
 	}
-	if updated, errSetMessages := sjson.SetRawBytes(payload, "messages", rawJSONArray(keptMessages)); errSetMessages == nil {
+	if updated, errSetMessages := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(keptMessages)); errSetMessages == nil {
 		payload = updated
 	}
 	return payload
@@ -1559,27 +1560,6 @@ func claudeSystemTextParts(content gjson.Result) []string {
 		return true
 	})
 	return parts
-}
-
-func rawJSONArray(items []string) []byte {
-	size := 2
-	if len(items) > 1 {
-		size += len(items) - 1
-	}
-	for _, item := range items {
-		size += len(item)
-	}
-
-	out := make([]byte, 0, size)
-	out = append(out, '[')
-	for idx, item := range items {
-		if idx > 0 {
-			out = append(out, ',')
-		}
-		out = append(out, item...)
-	}
-	out = append(out, ']')
-	return out
 }
 
 func applyMiniMaxStreamingThinkingDefaultForCompat(compatKind string, body []byte, stream bool) []byte {

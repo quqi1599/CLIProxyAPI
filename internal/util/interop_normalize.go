@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -97,7 +98,7 @@ func normalizeResponsesInputArray(items []gjson.Result) []byte {
 	if !changed {
 		return nil
 	}
-	return rawJSONArray(normalizedItems)
+	return internalpayload.BuildRaw(normalizedItems)
 }
 
 func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
@@ -187,7 +188,7 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 	if encryptedContent := item.Get("encrypted_content"); encryptedContent.Exists() {
 		msg, _ = sjson.SetRawBytes(msg, "encrypted_content", []byte(encryptedContent.Raw))
 	}
-	msg, _ = sjson.SetRawBytes(msg, "content", rawJSONArray(contentItems))
+	msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentItems))
 	return string(msg), extra
 }
 
@@ -216,7 +217,7 @@ func normalizeChatMessagesArray(messages []gjson.Result) []byte {
 	if !changed {
 		return nil
 	}
-	return rawJSONArray(normalizedMessages)
+	return internalpayload.BuildRaw(normalizedMessages)
 }
 
 func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
@@ -307,7 +308,7 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		return nil, string(msg), nil
 	}
 	if hasContentParts {
-		msg, _ = sjson.SetRawBytes(msg, "content", rawJSONArray(normalizedContentItems))
+		msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(normalizedContentItems))
 	} else if role == "assistant" && hasToolCalls {
 		// OpenAI-compatible backends often expect assistant tool-call messages
 		// to keep an explicit empty content field instead of an empty array.
@@ -316,33 +317,12 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		msg = nil
 	}
 	if hasToolCalls {
-		msg, _ = sjson.SetRawBytes(msg, "tool_calls", rawJSONArray(toolCallItems))
+		msg, _ = sjson.SetRawBytes(msg, "tool_calls", internalpayload.BuildRaw(toolCallItems))
 	}
 	if reasoning != "" {
 		msg, _ = sjson.SetBytes(msg, "reasoning_content", reasoning)
 	}
 	return before, string(msg), nil
-}
-
-func rawJSONArray(items []string) []byte {
-	size := 2
-	if len(items) > 1 {
-		size += len(items) - 1
-	}
-	for _, item := range items {
-		size += len(item)
-	}
-
-	out := make([]byte, 0, size)
-	out = append(out, '[')
-	for idx, item := range items {
-		if idx > 0 {
-			out = append(out, ',')
-		}
-		out = append(out, item...)
-	}
-	out = append(out, ']')
-	return out
 }
 
 func buildResponsesFunctionCall(callID, name, args string) string {

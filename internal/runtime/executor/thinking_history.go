@@ -3,6 +3,7 @@ package executor
 import (
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -145,7 +146,7 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 	out := body
 	if patched > 0 {
 		var err error
-		out, err = sjson.SetRawBytes(body, "messages", rawJSONArray(normalizedMessages))
+		out, err = sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(normalizedMessages))
 		if err != nil {
 			return body, false, false, err
 		}
@@ -214,7 +215,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 				textBlock, _ = sjson.SetBytes(textBlock, "text", text)
 				rebuiltItems = append(rebuiltItems, string(textBlock))
 			}
-			next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", rawJSONArray(rebuiltItems))
+			next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(rebuiltItems))
 			if err != nil {
 				return body, false, false, err
 			}
@@ -275,7 +276,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		for _, part := range content.Array() {
 			rebuiltItems = append(rebuiltItems, part.Raw)
 		}
-		next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", rawJSONArray(rebuiltItems))
+		next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(rebuiltItems))
 		if err != nil {
 			return body, false, false, err
 		}
@@ -288,7 +289,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 	out := body
 	if patched > 0 {
 		var err error
-		out, err = sjson.SetRawBytes(body, "messages", rawJSONArray(normalizedMessages))
+		out, err = sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(normalizedMessages))
 		if err != nil {
 			return body, false, false, err
 		}

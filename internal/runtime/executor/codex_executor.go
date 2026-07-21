@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -137,29 +138,7 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	}
 	items = append(items, outputItemsFallback...)
 
-	outputArray := []byte("[]")
-	if len(items) > 0 {
-		var buf bytes.Buffer
-		totalLen := 2
-		for _, item := range items {
-			totalLen += len(item)
-		}
-		if len(items) > 1 {
-			totalLen += len(items) - 1
-		}
-		buf.Grow(totalLen)
-		buf.WriteByte('[')
-		for i, item := range items {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			buf.Write(item)
-		}
-		buf.WriteByte(']')
-		outputArray = buf.Bytes()
-	}
-
-	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
+	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", internalpayload.BuildRaw(items))
 	return completedDataPatched
 }
 
@@ -949,28 +928,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
-		completedData := eventData
-		outputResult := gjson.GetBytes(completedData, "response.output")
-		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-		if shouldPatchOutput {
-			completedDataPatched := completedData
-			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
-
-			indexes := make([]int64, 0, len(outputItemsByIndex))
-			for idx := range outputItemsByIndex {
-				indexes = append(indexes, idx)
-			}
-			sort.Slice(indexes, func(i, j int) bool {
-				return indexes[i] < indexes[j]
-			})
-			for _, idx := range indexes {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
-			}
-			for _, item := range outputItemsFallback {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
-			}
-			completedData = completedDataPatched
-		}
+		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
 		var param any
@@ -1926,7 +1884,7 @@ func normalizeCodexStatelessPayload(body []byte) []byte {
 		}
 	}
 	if changed {
-		body, _ = sjson.SetRawBytes(body, "input", rawJSONArray(normalizedItems))
+		body, _ = sjson.SetRawBytes(body, "input", internalpayload.BuildRaw(normalizedItems))
 	}
 	return body
 }
