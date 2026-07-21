@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -85,12 +84,16 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		return body, false, false, nil
 	}
 
-	out := body
+	messageItems := messages.Array()
+	normalizedMessages := make([]string, len(messageItems))
+	for idx, msg := range messageItems {
+		normalizedMessages[idx] = msg.Raw
+	}
 	latestReasoning := ""
 	patched := 0
 	unrepaired := 0
 
-	for idx, msg := range messages.Array() {
+	for idx, msg := range messageItems {
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
 			continue
 		}
@@ -119,13 +122,22 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			unrepaired++
 			continue
 		}
-		next, err := sjson.SetBytes(out, fmt.Sprintf("messages.%d.reasoning_content", idx), fallback)
+		next, err := sjson.SetBytes([]byte(msg.Raw), "reasoning_content", fallback)
 		if err != nil {
 			return body, false, false, err
 		}
-		out = next
+		normalizedMessages[idx] = string(next)
 		latestReasoning = fallback
 		patched++
+	}
+
+	out := body
+	if patched > 0 {
+		var err error
+		out, err = sjson.SetRawBytes(body, "messages", rawJSONArray(normalizedMessages))
+		if err != nil {
+			return body, false, false, err
+		}
 	}
 
 	downgraded := false
@@ -151,12 +163,16 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		return body, false, false, nil
 	}
 
-	out := body
+	messageItems := messages.Array()
+	normalizedMessages := make([]string, len(messageItems))
+	for idx, msg := range messageItems {
+		normalizedMessages[idx] = msg.Raw
+	}
 	latestThinking := ""
 	patched := 0
 	unrepaired := 0
 
-	for idx, msg := range messages.Array() {
+	for idx, msg := range messageItems {
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
 			continue
 		}
@@ -176,20 +192,19 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			if fallback == "" {
 				fallback = "[thinking unavailable]"
 			}
-			rebuilt := []byte(`[]`)
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", fallback)
-			rebuilt, _ = sjson.SetRawBytes(rebuilt, "-1", block)
+			rebuiltItems := []string{string(block)}
 			if text != "" {
 				textBlock := []byte(`{"type":"text","text":""}`)
 				textBlock, _ = sjson.SetBytes(textBlock, "text", text)
-				rebuilt, _ = sjson.SetRawBytes(rebuilt, "-1", textBlock)
+				rebuiltItems = append(rebuiltItems, string(textBlock))
 			}
-			next, err := sjson.SetRawBytes(out, fmt.Sprintf("messages.%d.content", idx), rebuilt)
+			next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", rawJSONArray(rebuiltItems))
 			if err != nil {
 				return body, false, false, err
 			}
-			out = next
+			normalizedMessages[idx] = string(next)
 			latestThinking = fallback
 			patched++
 			continue
@@ -237,18 +252,27 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}
 		block := []byte(`{"type":"thinking","thinking":""}`)
 		block, _ = sjson.SetBytes(block, "thinking", fallback)
-		rebuilt := []byte(`[]`)
-		rebuilt, _ = sjson.SetRawBytes(rebuilt, "-1", block)
+		rebuiltItems := make([]string, 0, len(content.Array())+1)
+		rebuiltItems = append(rebuiltItems, string(block))
 		for _, part := range content.Array() {
-			rebuilt, _ = sjson.SetRawBytes(rebuilt, "-1", []byte(part.Raw))
+			rebuiltItems = append(rebuiltItems, part.Raw)
 		}
-		next, err := sjson.SetRawBytes(out, fmt.Sprintf("messages.%d.content", idx), rebuilt)
+		next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", rawJSONArray(rebuiltItems))
 		if err != nil {
 			return body, false, false, err
 		}
-		out = next
+		normalizedMessages[idx] = string(next)
 		latestThinking = fallback
 		patched++
+	}
+
+	out := body
+	if patched > 0 {
+		var err error
+		out, err = sjson.SetRawBytes(body, "messages", rawJSONArray(normalizedMessages))
+		if err != nil {
+			return body, false, false, err
+		}
 	}
 
 	downgraded := false

@@ -1,5 +1,6 @@
 services:
   cli-proxy-api:
+    init: true
     image: ${CLI_PROXY_IMAGE:-ghcr.io/quqi1599/cliproxyapi:latest}
     pull_policy: always
     build:

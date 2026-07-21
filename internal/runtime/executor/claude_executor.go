@@ -1562,19 +1562,24 @@ func claudeSystemTextParts(content gjson.Result) []string {
 }
 
 func rawJSONArray(items []string) []byte {
-	if len(items) == 0 {
-		return []byte("[]")
+	size := 2
+	if len(items) > 1 {
+		size += len(items) - 1
 	}
-	var builder strings.Builder
-	builder.WriteByte('[')
-	for i, item := range items {
-		if i > 0 {
-			builder.WriteByte(',')
+	for _, item := range items {
+		size += len(item)
+	}
+
+	out := make([]byte, 0, size)
+	out = append(out, '[')
+	for idx, item := range items {
+		if idx > 0 {
+			out = append(out, ',')
 		}
-		builder.WriteString(item)
+		out = append(out, item...)
 	}
-	builder.WriteByte(']')
-	return []byte(builder.String())
+	out = append(out, ']')
+	return out
 }
 
 func applyMiniMaxStreamingThinkingDefaultForCompat(compatKind string, body []byte, stream bool) []byte {

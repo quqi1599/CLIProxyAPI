@@ -1911,10 +1911,22 @@ func normalizeCodexStatelessPayload(body []byte) []byte {
 		return body
 	}
 
-	for idx, item := range input.Array() {
+	inputItems := input.Array()
+	normalizedItems := make([]string, len(inputItems))
+	changed := false
+	for idx, item := range inputItems {
+		normalizedItems[idx] = item.Raw
 		if item.Get("id").Exists() {
-			body, _ = sjson.DeleteBytes(body, fmt.Sprintf("input.%d.id", idx))
+			next, err := sjson.DeleteBytes([]byte(item.Raw), "id")
+			if err != nil {
+				continue
+			}
+			normalizedItems[idx] = string(next)
+			changed = true
 		}
+	}
+	if changed {
+		body, _ = sjson.SetRawBytes(body, "input", rawJSONArray(normalizedItems))
 	}
 	return body
 }

@@ -19,10 +19,10 @@ func NormalizeOpenAIResponsesRequestJSON(input []byte) []byte {
 	}
 
 	normalized := normalizeResponsesInputArray(in.Array())
-	if normalized == "" || normalized == in.Raw {
+	if len(normalized) == 0 {
 		return input
 	}
-	out, err := sjson.SetRawBytes(input, "input", []byte(normalized))
+	out, err := sjson.SetRawBytes(input, "input", normalized)
 	if err != nil {
 		return input
 	}
@@ -40,18 +40,18 @@ func NormalizeOpenAIChatRequestJSON(input []byte) []byte {
 	}
 
 	normalized := normalizeChatMessagesArray(msgs.Array())
-	if normalized == "" || normalized == msgs.Raw {
+	if len(normalized) == 0 {
 		return input
 	}
-	out, err := sjson.SetRawBytes(input, "messages", []byte(normalized))
+	out, err := sjson.SetRawBytes(input, "messages", normalized)
 	if err != nil {
 		return input
 	}
 	return out
 }
 
-func normalizeResponsesInputArray(items []gjson.Result) string {
-	out := []byte(`[]`)
+func normalizeResponsesInputArray(items []gjson.Result) []byte {
+	normalizedItems := make([]string, 0, len(items))
 	changed := false
 
 	for _, item := range items {
@@ -65,13 +65,13 @@ func normalizeResponsesInputArray(items []gjson.Result) string {
 		case "message":
 			msgRaw, extra := normalizeResponsesMessageItem(item)
 			if msgRaw != "" {
-				out, _ = sjson.SetRawBytes(out, "-1", []byte(msgRaw))
+				normalizedItems = append(normalizedItems, msgRaw)
 				if msgRaw != item.Raw {
 					changed = true
 				}
 			}
 			for _, extraItem := range extra {
-				out, _ = sjson.SetRawBytes(out, "-1", []byte(extraItem))
+				normalizedItems = append(normalizedItems, extraItem)
 				changed = true
 			}
 		case "tool_use":
@@ -80,24 +80,24 @@ func normalizeResponsesInputArray(items []gjson.Result) string {
 				strings.TrimSpace(item.Get("name").String()),
 				jsonValueToString(item.Get("input").Value(), "{}"),
 			)
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(call))
+			normalizedItems = append(normalizedItems, call)
 			changed = true
 		case "tool_result":
 			result := buildResponsesFunctionCallOutput(
 				strings.TrimSpace(item.Get("tool_use_id").String()),
 				toolResultValue(item.Get("content")),
 			)
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(result))
+			normalizedItems = append(normalizedItems, result)
 			changed = true
 		default:
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(item.Raw))
+			normalizedItems = append(normalizedItems, item.Raw)
 		}
 	}
 
 	if !changed {
-		return ""
+		return nil
 	}
-	return string(out)
+	return rawJSONArray(normalizedItems)
 }
 
 func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
@@ -110,23 +110,22 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 	msg, _ = sjson.SetBytes(msg, "role", role)
 
 	content := item.Get("content")
+	contentItems := make([]string, 0)
 	extra := make([]string, 0)
 	reasoning := strings.TrimSpace(item.Get("reasoning_content").String())
-	contentAdded := false
 	if content.IsArray() {
+		contentItems = make([]string, 0, len(content.Array()))
 		for _, part := range content.Array() {
 			partType := strings.TrimSpace(part.Get("type").String())
 			switch partType {
 			case "input_text", "output_text", "input_image", "input_audio", "input_file":
 				if partType == "input_image" {
 					if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", imagePart)
-						contentAdded = true
+						contentItems = append(contentItems, string(imagePart))
 					}
 					break
 				}
-				msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(part.Raw))
-				contentAdded = true
+				contentItems = append(contentItems, part.Raw)
 			case "text":
 				normalizedType := "input_text"
 				if role == "assistant" || role == "model" {
@@ -135,17 +134,14 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 				textPart := []byte(`{}`)
 				textPart, _ = sjson.SetBytes(textPart, "type", normalizedType)
 				textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
-				msg, _ = sjson.SetRawBytes(msg, "content.-1", textPart)
-				contentAdded = true
+				contentItems = append(contentItems, string(textPart))
 			case "image":
 				if dataURL := claudeImageSourceToDataURL(part.Get("source")); dataURL != "" {
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", buildResponsesInputImagePart(dataURL, ""))
-					contentAdded = true
+					contentItems = append(contentItems, string(buildResponsesInputImagePart(dataURL, "")))
 				}
 			case "image_url":
 				if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", imagePart)
-					contentAdded = true
+					contentItems = append(contentItems, string(imagePart))
 				}
 			case "tool_use":
 				callID := strings.TrimSpace(part.Get("id").String())
@@ -170,8 +166,7 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 		}
 		textPart, _ = sjson.SetBytes(textPart, "type", partType)
 		textPart, _ = sjson.SetBytes(textPart, "text", content.String())
-		msg, _ = sjson.SetRawBytes(msg, "content.-1", textPart)
-		contentAdded = true
+		contentItems = append(contentItems, string(textPart))
 	}
 
 	if tc := item.Get("tool_calls"); tc.Exists() && tc.IsArray() {
@@ -192,38 +187,36 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 	if encryptedContent := item.Get("encrypted_content"); encryptedContent.Exists() {
 		msg, _ = sjson.SetRawBytes(msg, "encrypted_content", []byte(encryptedContent.Raw))
 	}
-	if !contentAdded {
-		msg, _ = sjson.SetRawBytes(msg, "content", []byte(`[]`))
-	}
+	msg, _ = sjson.SetRawBytes(msg, "content", rawJSONArray(contentItems))
 	return string(msg), extra
 }
 
-func normalizeChatMessagesArray(messages []gjson.Result) string {
-	out := []byte(`[]`)
+func normalizeChatMessagesArray(messages []gjson.Result) []byte {
+	normalizedMessages := make([]string, 0, len(messages))
 	changed := false
 
 	for _, message := range messages {
 		before, msg, after := normalizeChatMessage(message)
 		for _, extraMsg := range before {
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(extraMsg))
+			normalizedMessages = append(normalizedMessages, extraMsg)
 			changed = true
 		}
 		if msg != "" {
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(msg))
+			normalizedMessages = append(normalizedMessages, msg)
 			if msg != message.Raw {
 				changed = true
 			}
 		}
 		for _, extraMsg := range after {
-			out, _ = sjson.SetRawBytes(out, "-1", []byte(extraMsg))
+			normalizedMessages = append(normalizedMessages, extraMsg)
 			changed = true
 		}
 	}
 
 	if !changed {
-		return ""
+		return nil
 	}
-	return string(out)
+	return rawJSONArray(normalizedMessages)
 }
 
 func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
@@ -234,12 +227,19 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		return nil, string(msg), nil
 	}
 
-	normalizedContent := []byte(`[]`)
+	normalizedContentItems := make([]string, 0, len(content.Array()))
 	before := make([]string, 0)
 	contentChanged := false
 	reasoning := strings.TrimSpace(message.Get("reasoning_content").String())
-	toolCalls := message.Get("tool_calls").Raw
-	hasToolCalls := message.Get("tool_calls").IsArray()
+	toolCalls := message.Get("tool_calls")
+	hasToolCalls := toolCalls.IsArray()
+	toolCallItems := make([]string, 0)
+	if hasToolCalls {
+		toolCallItems = make([]string, 0, len(toolCalls.Array()))
+		for _, call := range toolCalls.Array() {
+			toolCallItems = append(toolCallItems, call.Raw)
+		}
+	}
 	hasContentParts := false
 
 	for _, part := range content.Array() {
@@ -248,7 +248,7 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		case "text", "image_url", "file":
 			if partType == "image_url" {
 				if imagePart := buildChatImageURLPart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-					normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", imagePart)
+					normalizedContentItems = append(normalizedContentItems, string(imagePart))
 					if string(imagePart) != part.Raw {
 						contentChanged = true
 					}
@@ -256,23 +256,23 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 				}
 				break
 			}
-			normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", []byte(part.Raw))
+			normalizedContentItems = append(normalizedContentItems, part.Raw)
 			hasContentParts = true
 		case "input_text", "output_text":
 			textPart := []byte(`{"type":"text","text":""}`)
 			textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
-			normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", textPart)
+			normalizedContentItems = append(normalizedContentItems, string(textPart))
 			contentChanged = true
 			hasContentParts = true
 		case "input_image":
 			if imagePart := buildChatImageURLPart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-				normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", imagePart)
+				normalizedContentItems = append(normalizedContentItems, string(imagePart))
 				contentChanged = true
 				hasContentParts = true
 			}
 		case "image":
 			if imagePart := buildChatImageURLPart(claudeImageSourceToDataURL(part.Get("source")), ""); imagePart != nil {
-				normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", imagePart)
+				normalizedContentItems = append(normalizedContentItems, string(imagePart))
 				contentChanged = true
 				hasContentParts = true
 			}
@@ -282,11 +282,9 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 			call, _ = sjson.SetBytes(call, "function.name", part.Get("name").String())
 			call, _ = sjson.SetBytes(call, "function.arguments", jsonValueToString(part.Get("input").Value(), "{}"))
 			if !hasToolCalls {
-				toolCalls = `[]`
 				hasToolCalls = true
 			}
-			toolCallsBytes, _ := sjson.SetRawBytes([]byte(toolCalls), "-1", call)
-			toolCalls = string(toolCallsBytes)
+			toolCallItems = append(toolCallItems, string(call))
 			contentChanged = true
 		case "tool_result":
 			toolMsg := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
@@ -300,7 +298,7 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 			}
 			contentChanged = true
 		default:
-			normalizedContent, _ = sjson.SetRawBytes(normalizedContent, "-1", []byte(part.Raw))
+			normalizedContentItems = append(normalizedContentItems, part.Raw)
 			hasContentParts = true
 		}
 	}
@@ -309,7 +307,7 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		return nil, string(msg), nil
 	}
 	if hasContentParts {
-		msg, _ = sjson.SetRawBytes(msg, "content", normalizedContent)
+		msg, _ = sjson.SetRawBytes(msg, "content", rawJSONArray(normalizedContentItems))
 	} else if role == "assistant" && hasToolCalls {
 		// OpenAI-compatible backends often expect assistant tool-call messages
 		// to keep an explicit empty content field instead of an empty array.
@@ -318,12 +316,33 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 		msg = nil
 	}
 	if hasToolCalls {
-		msg, _ = sjson.SetRawBytes(msg, "tool_calls", []byte(toolCalls))
+		msg, _ = sjson.SetRawBytes(msg, "tool_calls", rawJSONArray(toolCallItems))
 	}
 	if reasoning != "" {
 		msg, _ = sjson.SetBytes(msg, "reasoning_content", reasoning)
 	}
 	return before, string(msg), nil
+}
+
+func rawJSONArray(items []string) []byte {
+	size := 2
+	if len(items) > 1 {
+		size += len(items) - 1
+	}
+	for _, item := range items {
+		size += len(item)
+	}
+
+	out := make([]byte, 0, size)
+	out = append(out, '[')
+	for idx, item := range items {
+		if idx > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, item...)
+	}
+	out = append(out, ']')
+	return out
 }
 
 func buildResponsesFunctionCall(callID, name, args string) string {

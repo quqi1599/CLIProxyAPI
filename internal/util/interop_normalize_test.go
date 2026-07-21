@@ -1,10 +1,15 @@
 package util
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+var benchmarkNormalizedJSON []byte
 
 func TestNormalizeOpenAIResponsesRequestJSON_ConvertsClaudeBlocks(t *testing.T) {
 	input := []byte(`{
@@ -179,4 +184,96 @@ func TestNormalizeOpenAIResponsesRequestJSON_NormalizesImageVariants(t *testing.
 	if got := content.Get("2.image_url").String(); got != "https://example.com/cat.png" {
 		t.Fatalf("unexpected url alias normalization %q", got)
 	}
+}
+
+func TestNormalizeOpenAIChatRequestJSON_LargeHistoryPreservesMessages(t *testing.T) {
+	const messageCount = 256
+	input := buildChatHistory(messageCount, 1024)
+
+	out := NormalizeOpenAIChatRequestJSON(input)
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != messageCount {
+		t.Fatalf("expected %d messages, got %d", messageCount, len(messages))
+	}
+	if got := messages[0].Get("content.0.type").String(); got != "text" {
+		t.Fatalf("expected normalized text content, got %q", got)
+	}
+	if got := messages[messageCount-1].Get("metadata.index").Int(); got != messageCount-1 {
+		t.Fatalf("expected final metadata index %d, got %d", messageCount-1, got)
+	}
+	if got := len(messages[messageCount-1].Get("content.0.text").String()); got != 1024 {
+		t.Fatalf("expected final text length 1024, got %d", got)
+	}
+}
+
+func TestNormalizeOpenAIChatRequestJSON_NoChangeReturnsInput(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	out := NormalizeOpenAIChatRequestJSON(input)
+	if len(out) == 0 || &out[0] != &input[0] {
+		t.Fatal("unchanged request should reuse the input byte slice")
+	}
+}
+
+func BenchmarkNormalizeOpenAIChatRequestJSON_LongHistory(b *testing.B) {
+	for _, messageCount := range []int{16, 64, 256, 1024} {
+		b.Run(strconv.Itoa(messageCount), func(b *testing.B) {
+			input := buildChatHistory(messageCount, 256)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			b.ResetTimer()
+			for range b.N {
+				benchmarkNormalizedJSON = NormalizeOpenAIChatRequestJSON(input)
+			}
+		})
+	}
+}
+
+func BenchmarkNormalizeOpenAIResponsesRequestJSON_LongHistory(b *testing.B) {
+	for _, itemCount := range []int{16, 64, 256, 1024} {
+		b.Run(strconv.Itoa(itemCount), func(b *testing.B) {
+			input := buildResponsesHistory(itemCount, 256)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			b.ResetTimer()
+			for range b.N {
+				benchmarkNormalizedJSON = NormalizeOpenAIResponsesRequestJSON(input)
+			}
+		})
+	}
+}
+
+func buildChatHistory(messageCount, textSize int) []byte {
+	text := strings.Repeat("x", textSize)
+	var builder strings.Builder
+	builder.Grow(messageCount * (textSize + 96))
+	builder.WriteString(`{"messages":[`)
+	for idx := 0; idx < messageCount; idx++ {
+		if idx > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"role":"user","metadata":{"index":`)
+		builder.WriteString(strconv.Itoa(idx))
+		builder.WriteString(`},"content":[{"type":"input_text","text":`)
+		builder.WriteString(fmt.Sprintf("%q", text))
+		builder.WriteString(`}]}`)
+	}
+	builder.WriteString(`]}`)
+	return []byte(builder.String())
+}
+
+func buildResponsesHistory(itemCount, textSize int) []byte {
+	text := strings.Repeat("x", textSize)
+	var builder strings.Builder
+	builder.Grow(itemCount * (textSize + 80))
+	builder.WriteString(`{"input":[`)
+	for idx := 0; idx < itemCount; idx++ {
+		if idx > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"type":"message","role":"user","content":[{"type":"text","text":`)
+		builder.WriteString(fmt.Sprintf("%q", text))
+		builder.WriteString(`}]}`)
+	}
+	builder.WriteString(`]}`)
+	return []byte(builder.String())
 }
