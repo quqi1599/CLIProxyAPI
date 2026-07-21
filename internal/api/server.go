@@ -256,6 +256,8 @@ type Server struct {
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
 	managementRoutesEnabled atomic.Bool
+	// ready reports whether the server is accepting new traffic.
+	ready atomic.Bool
 
 	// envManagementSecret indicates whether MANAGEMENT_PASSWORD is configured.
 	envManagementSecret bool
@@ -424,7 +426,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if path == "/livez" || path == "/readyz" || path == "/healthz" || strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -441,7 +443,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
-	healthzHandler := func(c *gin.Context) {
+	livenessHandler := func(c *gin.Context) {
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
@@ -449,8 +451,26 @@ func (s *Server) setupRoutes() {
 
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	}
-	s.engine.GET("/healthz", healthzHandler)
-	s.engine.HEAD("/healthz", healthzHandler)
+	readinessHandler := func(c *gin.Context) {
+		status := http.StatusOK
+		bodyStatus := "ready"
+		if !s.ready.Load() {
+			status = http.StatusServiceUnavailable
+			bodyStatus = "not_ready"
+		}
+		if c.Request.Method == http.MethodHead {
+			c.Status(status)
+			return
+		}
+		c.JSON(status, gin.H{"status": bodyStatus})
+	}
+	s.engine.GET("/livez", livenessHandler)
+	s.engine.HEAD("/livez", livenessHandler)
+	// /healthz remains a compatibility alias for liveness only.
+	s.engine.GET("/healthz", livenessHandler)
+	s.engine.HEAD("/healthz", livenessHandler)
+	s.engine.GET("/readyz", readinessHandler)
+	s.engine.HEAD("/readyz", readinessHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
@@ -1602,6 +1622,7 @@ func (s *Server) Start() error {
 	if s == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
+	s.ready.Store(false)
 
 	s.stateMu.Lock()
 	httpServer := s.server
@@ -1655,6 +1676,8 @@ func (s *Server) Start() error {
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+	s.ready.Store(true)
+	defer s.ready.Store(false)
 	s.stateMu.Unlock()
 
 	httpErrCh := make(chan error, 1)
@@ -1712,6 +1735,7 @@ func (s *Server) Start() error {
 // Returns:
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
+	s.ready.Store(false)
 	log.Debug("Stopping API server...")
 
 	if s.keepAliveEnabled {

@@ -13,7 +13,23 @@ import (
 type streamBridge struct {
 	next    atomic.Uint64
 	mu      sync.Mutex
-	streams map[string]chan pluginapi.ExecutorStreamChunk
+	streams map[string]*streamBridgeState
+}
+
+type streamBridgeState struct {
+	id         string
+	emits      chan streamBridgeEmit
+	chunks     chan pluginapi.ExecutorStreamChunk
+	done       chan struct{}
+	finished   chan struct{}
+	closeOnce  sync.Once
+	closeError string
+}
+
+type streamBridgeEmit struct {
+	ctx    context.Context
+	chunk  pluginapi.ExecutorStreamChunk
+	result chan error
 }
 
 type rpcStreamEmitRequest struct {
@@ -28,7 +44,7 @@ type rpcStreamCloseRequest struct {
 }
 
 func newStreamBridge() *streamBridge {
-	return &streamBridge{streams: make(map[string]chan pluginapi.ExecutorStreamChunk)}
+	return &streamBridge{streams: make(map[string]*streamBridgeState)}
 }
 
 func (b *streamBridge) open(ctx context.Context) (string, <-chan pluginapi.ExecutorStreamChunk, func()) {
@@ -38,20 +54,30 @@ func (b *streamBridge) open(ctx context.Context) (string, <-chan pluginapi.Execu
 		return "", chunks, func() {}
 	}
 	id := strconv.FormatUint(b.next.Add(1), 10)
-	chunks := make(chan pluginapi.ExecutorStreamChunk, 16)
+	state := &streamBridgeState{
+		id:       id,
+		emits:    make(chan streamBridgeEmit),
+		chunks:   make(chan pluginapi.ExecutorStreamChunk, 16),
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
 	b.mu.Lock()
-	b.streams[id] = chunks
+	b.streams[id] = state
 	b.mu.Unlock()
+	go state.run()
 	cleanup := func() {
 		b.close(id, "")
 	}
 	if ctx != nil && ctx.Done() != nil {
 		go func() {
-			<-ctx.Done()
-			b.close(id, ctx.Err().Error())
+			select {
+			case <-ctx.Done():
+				b.close(id, ctx.Err().Error())
+			case <-state.finished:
+			}
 		}()
 	}
-	return id, chunks, cleanup
+	return id, state.chunks, cleanup
 }
 
 func (b *streamBridge) emit(ctx context.Context, id string, chunk pluginapi.ExecutorStreamChunk) error {
@@ -59,20 +85,27 @@ func (b *streamBridge) emit(ctx context.Context, id string, chunk pluginapi.Exec
 		return fmt.Errorf("stream id is required")
 	}
 	b.mu.Lock()
-	chunks := b.streams[id]
+	state := b.streams[id]
 	b.mu.Unlock()
-	if chunks == nil {
+	if state == nil {
 		return fmt.Errorf("stream %s is not open", id)
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	emit := streamBridgeEmit{
+		ctx:    ctx,
+		chunk:  chunk,
+		result: make(chan error, 1),
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case chunks <- chunk:
-		return nil
+	case <-state.done:
+		return fmt.Errorf("stream %s is not open", id)
+	case state.emits <- emit:
 	}
+	return <-emit.result
 }
 
 func (b *streamBridge) close(id string, errorMessage string) {
@@ -80,14 +113,57 @@ func (b *streamBridge) close(id string, errorMessage string) {
 		return
 	}
 	b.mu.Lock()
-	chunks := b.streams[id]
-	delete(b.streams, id)
+	state := b.streams[id]
+	if state != nil {
+		delete(b.streams, id)
+	}
 	b.mu.Unlock()
-	if chunks == nil {
+	if state == nil {
 		return
 	}
-	if errorMessage != "" {
-		chunks <- pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("%s", errorMessage)}
+	state.stop(errorMessage)
+}
+
+func (s *streamBridgeState) run() {
+	defer close(s.finished)
+	defer close(s.chunks)
+	for {
+		select {
+		case <-s.done:
+			s.emitCloseError()
+			return
+		case emit := <-s.emits:
+			select {
+			case <-s.done:
+				emit.result <- fmt.Errorf("stream %s is not open", s.id)
+			case <-emit.ctx.Done():
+				emit.result <- emit.ctx.Err()
+			case s.chunks <- emit.chunk:
+				emit.result <- nil
+			}
+		}
 	}
-	close(chunks)
+}
+
+func (s *streamBridgeState) stop(errorMessage string) {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.closeError = errorMessage
+		close(s.done)
+	})
+}
+
+func (s *streamBridgeState) emitCloseError() {
+	if s == nil || s.closeError == "" {
+		return
+	}
+	// Closing must never wait for a saturated output channel. Payloads already
+	// accepted into chunks remain readable; the terminal error is best effort
+	// when the downstream has stopped consuming.
+	select {
+	case s.chunks <- pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("%s", s.closeError)}:
+	default:
+	}
 }

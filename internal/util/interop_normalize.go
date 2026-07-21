@@ -102,18 +102,20 @@ func normalizeResponsesInputArray(items []gjson.Result) []byte {
 }
 
 func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
-	msg := []byte(`{}`)
-	msg, _ = sjson.SetBytes(msg, "type", "message")
-	role := strings.TrimSpace(item.Get("role").String())
+	original := item.Raw
+	itemType := item.Get("type")
+	roleValue := item.Get("role")
+	role := strings.TrimSpace(roleValue.String())
 	if role == "" {
 		role = "user"
 	}
-	msg, _ = sjson.SetBytes(msg, "role", role)
 
 	content := item.Get("content")
 	contentItems := make([]string, 0)
 	extra := make([]string, 0)
-	reasoning := strings.TrimSpace(item.Get("reasoning_content").String())
+	reasoningValue := item.Get("reasoning_content")
+	reasoning := strings.TrimSpace(reasoningValue.String())
+	contentChanged := false
 	if content.IsArray() {
 		contentItems = make([]string, 0, len(content.Array()))
 		for _, part := range content.Array() {
@@ -122,7 +124,11 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 			case "input_text", "output_text", "input_image", "input_audio", "input_file":
 				if partType == "input_image" {
 					if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-						contentItems = append(contentItems, string(imagePart))
+						normalizedPart := string(imagePart)
+						contentItems = append(contentItems, normalizedPart)
+						contentChanged = contentChanged || normalizedPart != part.Raw
+					} else {
+						contentChanged = true
 					}
 					break
 				}
@@ -136,27 +142,35 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 				textPart, _ = sjson.SetBytes(textPart, "type", normalizedType)
 				textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
 				contentItems = append(contentItems, string(textPart))
+				contentChanged = true
 			case "image":
 				if dataURL := claudeImageSourceToDataURL(part.Get("source")); dataURL != "" {
 					contentItems = append(contentItems, string(buildResponsesInputImagePart(dataURL, "")))
 				}
+				contentChanged = true
 			case "image_url":
 				if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
 					contentItems = append(contentItems, string(imagePart))
 				}
+				contentChanged = true
 			case "tool_use":
 				callID := strings.TrimSpace(part.Get("id").String())
 				name := strings.TrimSpace(part.Get("name").String())
 				args := jsonValueToString(part.Get("input").Value(), "{}")
 				extra = append(extra, buildResponsesFunctionCall(callID, name, args))
+				contentChanged = true
 			case "tool_result":
 				callID := strings.TrimSpace(part.Get("tool_use_id").String())
 				output := toolResultValue(part.Get("content"))
 				extra = append(extra, buildResponsesFunctionCallOutput(callID, output))
+				contentChanged = true
 			case "thinking":
 				if reasoning == "" {
 					reasoning = strings.TrimSpace(part.Get("thinking").String())
 				}
+				contentChanged = true
+			default:
+				contentItems = append(contentItems, part.Raw)
 			}
 		}
 	} else if content.Exists() && content.Type == gjson.String {
@@ -168,10 +182,14 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 		textPart, _ = sjson.SetBytes(textPart, "type", partType)
 		textPart, _ = sjson.SetBytes(textPart, "text", content.String())
 		contentItems = append(contentItems, string(textPart))
+		contentChanged = true
+	} else {
+		contentChanged = true
 	}
 
-	if tc := item.Get("tool_calls"); tc.Exists() && tc.IsArray() {
-		for _, call := range tc.Array() {
+	toolCalls := item.Get("tool_calls")
+	if toolCalls.Exists() && toolCalls.IsArray() {
+		for _, call := range toolCalls.Array() {
 			if call.Get("type").String() != "function" {
 				continue
 			}
@@ -182,13 +200,34 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 		}
 	}
 
+	typeChanged := !itemType.Exists() || itemType.String() != "message"
+	roleChanged := !roleValue.Exists() || roleValue.String() != role
+	reasoningChanged := reasoningValue.Exists() && reasoning == "" ||
+		(reasoning != "" && (!reasoningValue.Exists() || reasoningValue.String() != reasoning))
+	if !typeChanged && !roleChanged && !contentChanged && !toolCalls.Exists() && !reasoningChanged && len(extra) == 0 {
+		return original, nil
+	}
+
+	msg := []byte(original)
+	if typeChanged {
+		msg, _ = sjson.SetBytes(msg, "type", "message")
+	}
+	if roleChanged {
+		msg, _ = sjson.SetBytes(msg, "role", role)
+	}
+	if contentChanged {
+		msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentItems))
+	}
+	if toolCalls.Exists() {
+		msg, _ = sjson.DeleteBytes(msg, "tool_calls")
+	}
 	if reasoning != "" {
-		msg, _ = sjson.SetBytes(msg, "reasoning_content", reasoning)
+		if reasoningChanged {
+			msg, _ = sjson.SetBytes(msg, "reasoning_content", reasoning)
+		}
+	} else if reasoningValue.Exists() {
+		msg, _ = sjson.DeleteBytes(msg, "reasoning_content")
 	}
-	if encryptedContent := item.Get("encrypted_content"); encryptedContent.Exists() {
-		msg, _ = sjson.SetRawBytes(msg, "encrypted_content", []byte(encryptedContent.Raw))
-	}
-	msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentItems))
 	return string(msg), extra
 }
 

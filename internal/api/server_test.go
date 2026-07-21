@@ -378,6 +378,55 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestHealthEndpointsTrackReadiness(t *testing.T) {
+	server := newTestServer(t)
+
+	assertHealthStatus := func(path string, wantCode int, wantStatus string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != wantCode {
+			t.Fatalf("%s status code = %d, want %d; body=%s", path, rr.Code, wantCode, rr.Body.String())
+		}
+		var response struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+			t.Fatalf("parse %s response: %v; body=%s", path, err, rr.Body.String())
+		}
+		if response.Status != wantStatus {
+			t.Fatalf("%s response status = %q, want %q", path, response.Status, wantStatus)
+		}
+	}
+
+	assertHealthStatus("/livez", http.StatusOK, "ok")
+	assertHealthStatus("/healthz", http.StatusOK, "ok")
+	assertHealthStatus("/readyz", http.StatusServiceUnavailable, "not_ready")
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !server.ready.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !server.ready.Load() {
+		t.Fatal("server did not become ready")
+	}
+	assertHealthStatus("/readyz", http.StatusOK, "ready")
+
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := <-startErr; err != nil {
+		t.Fatalf("Start() error after Stop = %v", err)
+	}
+	assertHealthStatus("/readyz", http.StatusServiceUnavailable, "not_ready")
+	assertHealthStatus("/livez", http.StatusOK, "ok")
+}
+
 func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

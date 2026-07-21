@@ -16,7 +16,7 @@ import (
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
-const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+const maxCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
@@ -133,7 +133,7 @@ func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
 	if req.ContentLength <= 0 {
 		return false
 	}
-	return req.ContentLength <= maxErrorOnlyCapturedRequestBodyBytes
+	return req.ContentLength <= maxCapturedRequestBodyBytes
 }
 
 // captureRequestInfo extracts relevant information from the incoming HTTP request.
@@ -159,15 +159,20 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	// Capture request body
 	var body []byte
 	if captureBody && c.Request.Body != nil {
-		// Read the body
-		bodyBytes, err := io.ReadAll(c.Request.Body)
+		originalBody := c.Request.Body
+		bodyBytes, err := io.ReadAll(io.LimitReader(originalBody, maxCapturedRequestBodyBytes+1))
 		if err != nil {
 			return nil, err
 		}
 
-		// Restore the body for the actual request processing
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
+		// Replay the captured prefix and leave the unread tail for the handler.
+		c.Request.Body = struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.MultiReader(bytes.NewReader(bodyBytes), originalBody), Closer: originalBody}
+		if int64(len(bodyBytes)) <= maxCapturedRequestBodyBytes {
+			body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
+		}
 	}
 
 	return &RequestInfo{
@@ -185,9 +190,9 @@ func decodeCapturedRequestBodyForLog(raw []byte, encoding string) []byte {
 		return raw
 	}
 
-	decoded, errDecode := sdkhandlers.DecodeRequestBody(raw, encoding)
+	decoded, errDecode := sdkhandlers.DecodeRequestBodyWithLimit(raw, encoding, maxCapturedRequestBodyBytes)
 	if errDecode != nil {
-		return raw
+		return nil
 	}
 	return decoded
 }

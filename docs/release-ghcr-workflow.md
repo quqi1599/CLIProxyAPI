@@ -30,15 +30,12 @@ For a release tag like `fork/v7.10.43`, the Docker workflow publishes:
 - `ghcr.io/quqi1599/cliproxyapi:7`
 - `ghcr.io/quqi1599/cliproxyapi:latest` on tag push
 
-The safest production deployment uses the exact tag form:
+These release tags remain available for compatibility. The default
+`docker-compose.yml` keeps its local build and mutable image fallback for
+development only; production must use the SHA-pinned compose file below.
 
-```bash
-export CLI_PROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:fork-v7.10.43
-docker compose pull
-docker compose up -d --remove-orphans --no-build
-```
-
-For repeatable deployments with readiness timestamps, use:
+For compatibility with existing tag-based deployments, the legacy helper
+continues to use the development compose file and report readiness timestamps:
 
 ```bash
 ./scripts/deploy-ghcr-release.sh fork/v7.10.43
@@ -60,38 +57,39 @@ The script prints:
 The current production host is `x86_64`, so the release workflow only builds `linux/amd64`.
 If you later add ARM servers, you can reintroduce `linux/arm64` to the Docker workflow.
 
-Use the exact release image on the server instead of building from source:
+Use the `sha-<12>` image produced by `ci-builder`. `CLIPROXY_IMAGE` is required,
+so Compose fails before deployment when no immutable image is supplied:
 
 ```bash
 cd /opt/cliproxy
-export CLI_PROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:fork-v7.10.43
-docker compose pull
-docker compose up -d --remove-orphans --no-build
-docker compose ps
-docker compose logs --tail 20 cli-proxy-api
-curl http://127.0.0.1:8317/healthz
+export CLIPROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:sha-7822c9e37aed
+docker compose -f docker-compose.prod.yml config --quiet
+docker compose -f docker-compose.prod.yml config --images
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d --no-build
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs --tail 20 cli-proxy-api
+curl -fsS http://127.0.0.1:8317/livez
 ```
 
-If the compose file already uses `${CLI_PROXY_IMAGE}`, you can replace the manual sequence with:
+The production defaults are an 8 GiB memory hard limit, a 6 GiB
+`GOMEMLIMIT`, 4 CPUs with `GOMAXPROCS=4`, 1024 PIDs, no container swap, and a
+60-second stop grace period. If the memory limit changes, keep `GOMEMLIMIT` at
+approximately 70%-80% of it and keep the memory and memory-plus-swap limits
+equal to leave swap disabled.
 
-```bash
-./scripts/deploy-ghcr-release.sh fork/v7.10.43
-```
+The corresponding overrides are `CLIPROXY_MEMORY_LIMIT`,
+`CLIPROXY_MEMORY_SWAP_LIMIT`, `CLIPROXY_GOMEMLIMIT`, `CLIPROXY_CPUS`,
+`CLIPROXY_GOMAXPROCS`, and `CLIPROXY_PIDS_LIMIT`.
 
 ## Rollback
 
 Rollback is the same process with an older image tag:
 
 ```bash
-export CLI_PROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:fork-v7.10.42
-docker compose pull
-docker compose up -d --remove-orphans --no-build
-```
-
-The same deploy script accepts older tags:
-
-```bash
-./scripts/deploy-ghcr-release.sh fork/v7.10.42
+export CLIPROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:sha-<previous-12-char-sha>
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d --no-build
 ```
 
 ## Debug Image And pprof

@@ -118,7 +118,7 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 			loggerEnabled: false,
 			req: &http.Request{
 				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: maxErrorOnlyCapturedRequestBodyBytes + 1,
+				ContentLength: maxCapturedRequestBodyBytes + 1,
 				Header:        http.Header{"Content-Type": []string{"application/json"}},
 			},
 			want: false,
@@ -247,5 +247,29 @@ func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
 	}
 	if !bytes.Equal(restoredBody, compressedBytes) {
 		t.Fatal("request body was not restored with the original compressed bytes")
+	}
+}
+
+func TestCaptureRequestInfoDoesNotBufferLargeRequestBody(t *testing.T) {
+	t.Parallel()
+
+	payload := bytes.Repeat([]byte("x"), int(maxCapturedRequestBodyBytes)+2)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+
+	info, err := captureRequestInfo(c, true)
+	if err != nil {
+		t.Fatalf("captureRequestInfo: %v", err)
+	}
+	if len(info.Body) != 0 {
+		t.Fatalf("captured body bytes = %d, want 0 for oversized body", len(info.Body))
+	}
+	restored, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		t.Fatalf("read restored request body: %v", err)
+	}
+	if !bytes.Equal(restored, payload) {
+		t.Fatal("request body was not fully replayed after bounded capture")
 	}
 }

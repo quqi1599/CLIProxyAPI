@@ -12,13 +12,70 @@ import (
 
 // Synthetic history only satisfies upstream compatibility checks. Bounding it
 // prevents one large reasoning block from being copied into every later turn.
-const maxSyntheticThinkingHistoryBytes = 8 * 1024
+const (
+	maxSyntheticThinkingHistoryBytes      = 8 * 1024
+	maxSyntheticThinkingHistoryTotalBytes = 64 * 1024
+
+	thinkingHistoryBudgetDowngradeReason  = "synthetic_history_budget_exceeded"
+	thinkingHistoryUnrepairableReason     = "unrepairable_history"
+	openAIReasoningUnavailablePlaceholder = "[reasoning unavailable]"
+	claudeThinkingUnavailablePlaceholder  = "[thinking unavailable]"
+)
+
+type thinkingHistoryTransformReport struct {
+	InputBytes      int
+	OutputBytes     int
+	SyntheticBytes  int
+	PatchedCount    int
+	DowngradeReason string
+}
+
+type syntheticThinkingHistoryBudget struct {
+	used     int
+	exceeded bool
+}
+
+func (b *syntheticThinkingHistoryBudget) add(value, placeholder string, moreMessages bool) (string, bool) {
+	if value == "" {
+		return "", false
+	}
+	if b.exceeded {
+		value = placeholder
+	}
+	if len(value) > maxSyntheticThinkingHistoryBytes {
+		value = placeholder
+	}
+
+	limit := maxSyntheticThinkingHistoryTotalBytes
+	if moreMessages && value != placeholder {
+		limit -= len(placeholder)
+	}
+	if b.used+len(value) > limit {
+		b.exceeded = true
+		value = placeholder
+	}
+	if b.used+len(value) > maxSyntheticThinkingHistoryTotalBytes {
+		return "", false
+	}
+	b.used += len(value)
+	return value, true
+}
 
 func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool, error) {
 	return normalizeThinkingHistoryForModel(body, provider, "")
 }
 
 func normalizeThinkingHistoryForModel(body []byte, provider string, model string) ([]byte, bool, bool, error) {
+	out, changed, downgraded, _, err := normalizeThinkingHistoryForModelWithReport(body, provider, model)
+	return out, changed, downgraded, err
+}
+
+func normalizeThinkingHistoryWithReport(body []byte, provider string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	return normalizeThinkingHistoryForModelWithReport(body, provider, "")
+}
+
+func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, model string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
 	requested := thinkingHistoryRequested(body, provider)
 	if !requested && requiresReturnedThinkingHistory(model) {
 		switch strings.ToLower(strings.TrimSpace(provider)) {
@@ -29,16 +86,16 @@ func normalizeThinkingHistoryForModel(body []byte, provider string, model string
 		}
 	}
 	if !requested {
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 	requireCompleteHistory := requiresReturnedThinkingHistory(model)
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
-		return normalizeOpenAIThinkingHistory(body, requireCompleteHistory)
+		return normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
 	case "claude":
-		return normalizeClaudeThinkingHistory(body, requireCompleteHistory)
+		return normalizeClaudeThinkingHistoryWithReport(body, requireCompleteHistory)
 	default:
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 }
 
@@ -81,12 +138,18 @@ func requiresReturnedThinkingHistory(model string) bool {
 }
 
 func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
+	out, changed, downgraded, _, err := normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
+	return out, changed, downgraded, err
+}
+
+func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
 	if len(body) == 0 || !gjson.ValidBytes(body) {
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 
 	messageItems := messages.Array()
@@ -98,6 +161,7 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 	latestReasoningAvailable := false
 	patched := 0
 	unrepaired := 0
+	budget := syntheticThinkingHistoryBudget{}
 
 	for idx, msg := range messageItems {
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
@@ -127,15 +191,22 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			}
 		}
 		if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
-			fallback = "[reasoning unavailable]"
+			fallback = openAIReasoningUnavailablePlaceholder
 		}
 		if fallback == "" {
 			unrepaired++
 			continue
 		}
+		fallback, ok := budget.add(fallback, openAIReasoningUnavailablePlaceholder, idx+1 < len(messageItems))
+		if !ok {
+			unrepaired++
+			continue
+		}
 		next, err := sjson.SetBytes([]byte(msg.Raw), "reasoning_content", fallback)
 		if err != nil {
-			return body, false, false, err
+			report.SyntheticBytes = budget.used
+			report.PatchedCount = patched
+			return body, false, false, report, err
 		}
 		normalizedMessages[idx] = string(next)
 		latestReasoning = fallback
@@ -148,31 +219,50 @@ func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		var err error
 		out, err = sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(normalizedMessages))
 		if err != nil {
-			return body, false, false, err
+			report.SyntheticBytes = budget.used
+			report.PatchedCount = patched
+			return body, false, false, report, err
 		}
 	}
 
-	downgraded := false
-	if unrepaired > 0 && openAIThinkingEnabled(out) {
+	downgraded := budget.exceeded
+	if budget.exceeded {
+		report.DowngradeReason = thinkingHistoryBudgetDowngradeReason
+	}
+	if (budget.exceeded || unrepaired > 0) && openAIThinkingEnabled(out) {
 		out = thinking.StripThinkingConfig(out, "openai")
 		downgraded = true
+		if report.DowngradeReason == "" {
+			report.DowngradeReason = thinkingHistoryUnrepairableReason
+		}
 	}
+	report.OutputBytes = len(out)
+	report.SyntheticBytes = budget.used
+	report.PatchedCount = patched
 	if patched > 0 || downgraded {
 		log.WithFields(log.Fields{
 			"patched_reasoning_messages": patched,
 			"downgraded_thinking":        downgraded,
+			"synthetic_history_bytes":    report.SyntheticBytes,
+			"downgrade_reason":           report.DowngradeReason,
 		}).Debug("executor: normalized openai thinking history")
 	}
-	return out, patched > 0 || downgraded, downgraded, nil
+	return out, patched > 0 || downgraded, downgraded, report, nil
 }
 
 func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
+	out, changed, downgraded, _, err := normalizeClaudeThinkingHistoryWithReport(body, requireCompleteHistory)
+	return out, changed, downgraded, err
+}
+
+func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
 	if len(body) == 0 || !gjson.ValidBytes(body) {
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
-		return body, false, false, nil
+		return body, false, false, report, nil
 	}
 
 	messageItems := messages.Array()
@@ -184,6 +274,7 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 	latestThinkingAvailable := false
 	patched := 0
 	unrepaired := 0
+	budget := syntheticThinkingHistoryBudget{}
 
 	for idx, msg := range messageItems {
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
@@ -205,7 +296,12 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 				fallbackAvailable = true
 			}
 			if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
-				fallback = "[thinking unavailable]"
+				fallback = claudeThinkingUnavailablePlaceholder
+			}
+			fallback, ok := budget.add(fallback, claudeThinkingUnavailablePlaceholder, idx+1 < len(messageItems))
+			if !ok {
+				unrepaired++
+				continue
 			}
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", fallback)
@@ -217,7 +313,9 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			}
 			next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(rebuiltItems))
 			if err != nil {
-				return body, false, false, err
+				report.SyntheticBytes = budget.used
+				report.PatchedCount = patched
+				return body, false, false, report, err
 			}
 			normalizedMessages[idx] = string(next)
 			latestThinking = fallback
@@ -263,9 +361,14 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 			fallbackAvailable = true
 		}
 		if fallback == "" && (requireCompleteHistory || fallbackAvailable) {
-			fallback = "[thinking unavailable]"
+			fallback = claudeThinkingUnavailablePlaceholder
 		}
 		if fallback == "" {
+			unrepaired++
+			continue
+		}
+		fallback, ok := budget.add(fallback, claudeThinkingUnavailablePlaceholder, idx+1 < len(messageItems))
+		if !ok {
 			unrepaired++
 			continue
 		}
@@ -278,7 +381,9 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		}
 		next, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(rebuiltItems))
 		if err != nil {
-			return body, false, false, err
+			report.SyntheticBytes = budget.used
+			report.PatchedCount = patched
+			return body, false, false, report, err
 		}
 		normalizedMessages[idx] = string(next)
 		latestThinking = fallback
@@ -291,22 +396,35 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 		var err error
 		out, err = sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(normalizedMessages))
 		if err != nil {
-			return body, false, false, err
+			report.SyntheticBytes = budget.used
+			report.PatchedCount = patched
+			return body, false, false, report, err
 		}
 	}
 
-	downgraded := false
-	if unrepaired > 0 && claudeThinkingEnabled(out) {
+	downgraded := budget.exceeded
+	if budget.exceeded {
+		report.DowngradeReason = thinkingHistoryBudgetDowngradeReason
+	}
+	if (budget.exceeded || unrepaired > 0) && claudeThinkingEnabled(out) {
 		out = thinking.StripThinkingConfig(out, "claude")
 		downgraded = true
+		if report.DowngradeReason == "" {
+			report.DowngradeReason = thinkingHistoryUnrepairableReason
+		}
 	}
+	report.OutputBytes = len(out)
+	report.SyntheticBytes = budget.used
+	report.PatchedCount = patched
 	if patched > 0 || downgraded {
 		log.WithFields(log.Fields{
 			"patched_thinking_messages": patched,
 			"downgraded_thinking":       downgraded,
+			"synthetic_history_bytes":   report.SyntheticBytes,
+			"downgrade_reason":          report.DowngradeReason,
 		}).Debug("executor: normalized claude thinking history")
 	}
-	return out, patched > 0 || downgraded, downgraded, nil
+	return out, patched > 0 || downgraded, downgraded, report, nil
 }
 
 func boundedSyntheticThinkingHistory(value string) string {

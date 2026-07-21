@@ -1,6 +1,7 @@
 package util
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
@@ -40,6 +41,74 @@ func TestNormalizeOpenAIResponsesRequestJSON_ConvertsClaudeBlocks(t *testing.T) 
 	}
 	if items[2].Get("type").String() != "message" || items[3].Get("type").String() != "function_call_output" {
 		t.Fatalf("expected message + function_call_output tail: %s", gjson.GetBytes(out, "input").Raw)
+	}
+}
+
+func TestNormalizeOpenAIResponsesRequestJSON_PreservesUnknownMessageFields(t *testing.T) {
+	const vendorExtension = `{"trace_id":"trace-1","nested":{"keep":["a",{"b":2}]},"enabled":true}`
+	input := []byte(`{"model":"test-model","input":[{"type":"message","role":"assistant","vendor_extension":` + vendorExtension + `,"status":"in_progress","content":[{"type":"text","text":"hello"}]}]}`)
+	original := append([]byte(nil), input...)
+
+	out := NormalizeOpenAIResponsesRequestJSON(input)
+	if !bytes.Equal(input, original) {
+		t.Fatal("normalization mutated the input buffer")
+	}
+
+	message := gjson.GetBytes(out, "input.0")
+	if got := message.Get("vendor_extension").Raw; got != vendorExtension {
+		t.Fatalf("vendor_extension changed or was dropped: got %s, want %s", got, vendorExtension)
+	}
+	if got := message.Get("status").String(); got != "in_progress" {
+		t.Fatalf("unknown message-level status changed or was dropped: %q", got)
+	}
+	if got := message.Get("content.0.type").String(); got != "output_text" {
+		t.Fatalf("known text conversion changed: got %q, want output_text", got)
+	}
+
+	again := NormalizeOpenAIResponsesRequestJSON(out)
+	if !bytes.Equal(again, out) {
+		t.Fatalf("normalization is not idempotent:\nfirst:  %s\nsecond: %s", out, again)
+	}
+}
+
+func TestNormalizeOpenAIResponsesRequestJSON_PreservesUnknownContentPart(t *testing.T) {
+	const unknownPart = `{"type":"vendor_blob","payload":{"opaque":"keep-me","items":[1,2,3]},"vendor_flag":true}`
+	input := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"text","text":"hello"},` + unknownPart + `]}]}`)
+
+	out := NormalizeOpenAIResponsesRequestJSON(input)
+	content := gjson.GetBytes(out, "input.0.content").Array()
+	if len(content) != 2 {
+		t.Fatalf("expected 2 content parts, got %d: %s", len(content), gjson.GetBytes(out, "input.0.content").Raw)
+	}
+	if got := content[0].Get("type").String(); got != "input_text" {
+		t.Fatalf("known text conversion changed: got %q, want input_text", got)
+	}
+	if got := content[1].Raw; got != unknownPart {
+		t.Fatalf("unknown content part changed or was dropped: got %s, want %s", got, unknownPart)
+	}
+}
+
+func TestNormalizeOpenAIResponsesRequestJSON_CanonicalInputReturnsOriginalSlice(t *testing.T) {
+	input := []byte(`{"model":"test-model","request_extension":{"keep":true},"input":[{"type":"message","role":"user","message_extension":{"version":1},"content":[{"type":"input_text","text":"hello"},{"type":"vendor_part","payload":{"opaque":"x"}}]}]}`)
+	original := append([]byte(nil), input...)
+
+	out := NormalizeOpenAIResponsesRequestJSON(input)
+	if !bytes.Equal(input, original) {
+		t.Fatal("normalization mutated canonical input")
+	}
+	if !bytes.Equal(out, input) {
+		t.Fatalf("canonical Responses input changed:\ninput:  %s\noutput: %s", input, out)
+	}
+	if len(out) == 0 || &out[0] != &input[0] {
+		t.Fatal("unchanged canonical request should reuse the input byte slice")
+	}
+
+	again := NormalizeOpenAIResponsesRequestJSON(out)
+	if !bytes.Equal(again, out) {
+		t.Fatalf("canonical normalization is not idempotent:\nfirst:  %s\nsecond: %s", out, again)
+	}
+	if len(again) == 0 || &again[0] != &out[0] {
+		t.Fatal("idempotent normalization should reuse the normalized byte slice")
 	}
 }
 

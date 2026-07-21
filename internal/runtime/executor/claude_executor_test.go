@@ -1091,36 +1091,6 @@ func TestClaudeDeviceProfileStabilizationEnabled_DefaultFalse(t *testing.T) {
 	}
 }
 
-func TestApplyClaudeToolPrefix(t *testing.T) {
-	input := []byte(`{"tools":[{"name":"alpha"},{"name":"proxy_bravo"}],"tool_choice":{"type":"tool","name":"charlie"},"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"delta","id":"t1","input":{}}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_alpha" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_alpha")
-	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_bravo" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_bravo")
-	}
-	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "proxy_charlie" {
-		t.Fatalf("tool_choice.name = %q, want %q", got, "proxy_charlie")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_delta" {
-		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_delta")
-	}
-}
-
-func TestApplyClaudeToolPrefix_WithToolReference(t *testing.T) {
-	input := []byte(`{"tools":[{"name":"alpha"}],"messages":[{"role":"user","content":[{"type":"tool_reference","tool_name":"beta"},{"type":"tool_reference","tool_name":"proxy_gamma"}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-
-	if got := gjson.GetBytes(out, "messages.0.content.0.tool_name").String(); got != "proxy_beta" {
-		t.Fatalf("messages.0.content.0.tool_name = %q, want %q", got, "proxy_beta")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != "proxy_gamma" {
-		t.Fatalf("messages.0.content.1.tool_name = %q, want %q", got, "proxy_gamma")
-	}
-}
-
 func TestSanitizeClaudeWebSearchDomains(t *testing.T) {
 	// Mirrors the litellm payload from issue #2681: a non-empty allowed_domains
 	// alongside an empty blocked_domains, which Anthropic rejects as ambiguous.
@@ -1151,175 +1121,6 @@ func TestSanitizeClaudeWebSearchDomains_LeavesNonBuiltinAndNonEmpty(t *testing.T
 	}
 }
 
-func TestApplyClaudeToolPrefix_SkipsBuiltinTools(t *testing.T) {
-	input := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"my_custom_tool","input_schema":{"type":"object"}}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
-		t.Fatalf("tools.0.name = %q, want %q (built-in should not be prefixed)", got, "web_search")
-	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_my_custom_tool" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_my_custom_tool")
-	}
-}
-
-func TestApplyClaudeToolPrefix_BuiltinToolSkipped(t *testing.T) {
-	body := []byte(`{
-		"tools": [
-			{"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
-			{"name": "Read"}
-		],
-		"messages": [
-			{"role": "user", "content": [
-				{"type": "tool_use", "name": "web_search", "id": "ws1", "input": {}},
-				{"type": "tool_use", "name": "Read", "id": "r1", "input": {}}
-			]}
-		]
-	}`)
-	out := applyClaudeToolPrefix(body, "proxy_")
-
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "web_search")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
-		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "web_search")
-	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Read" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Read")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Read" {
-		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Read")
-	}
-}
-
-func TestApplyClaudeToolPrefix_KnownBuiltinInHistoryOnly(t *testing.T) {
-	body := []byte(`{
-		"tools": [
-			{"name": "Read"}
-		],
-		"messages": [
-			{"role": "user", "content": [
-				{"type": "tool_use", "name": "web_search", "id": "ws1", "input": {}}
-			]}
-		]
-	}`)
-	out := applyClaudeToolPrefix(body, "proxy_")
-
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "web_search" {
-		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "web_search")
-	}
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Read")
-	}
-}
-
-func TestApplyClaudeToolPrefix_CustomToolsPrefixed(t *testing.T) {
-	body := []byte(`{
-		"tools": [{"name": "Read"}, {"name": "Write"}],
-		"messages": [
-			{"role": "user", "content": [
-				{"type": "tool_use", "name": "Read", "id": "r1", "input": {}},
-				{"type": "tool_use", "name": "Write", "id": "w1", "input": {}}
-			]}
-		]
-	}`)
-	out := applyClaudeToolPrefix(body, "proxy_")
-
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Read")
-	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Write" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Write")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_Read" {
-		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_Read")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Write" {
-		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Write")
-	}
-}
-
-func TestApplyClaudeToolPrefix_ToolChoiceBuiltin(t *testing.T) {
-	body := []byte(`{
-		"tools": [
-			{"type": "web_search_20250305", "name": "web_search"},
-			{"name": "Read"}
-		],
-		"tool_choice": {"type": "tool", "name": "web_search"}
-	}`)
-	out := applyClaudeToolPrefix(body, "proxy_")
-
-	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "web_search" {
-		t.Fatalf("tool_choice.name = %q, want %q", got, "web_search")
-	}
-}
-
-func TestApplyClaudeToolPrefix_KnownFallbackBuiltinsRemainUnprefixed(t *testing.T) {
-	for _, builtin := range []string{"web_search", "code_execution", "text_editor", "computer"} {
-		t.Run(builtin, func(t *testing.T) {
-			input := []byte(fmt.Sprintf(`{
-				"tools":[{"name":"Read"}],
-				"tool_choice":{"type":"tool","name":%q},
-				"messages":[{"role":"assistant","content":[{"type":"tool_use","name":%q,"id":"toolu_1","input":{}},{"type":"tool_reference","tool_name":%q},{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"tool_reference","tool_name":%q}]}]}]
-			}`, builtin, builtin, builtin, builtin))
-			out := applyClaudeToolPrefix(input, "proxy_")
-
-			if got := gjson.GetBytes(out, "tool_choice.name").String(); got != builtin {
-				t.Fatalf("tool_choice.name = %q, want %q", got, builtin)
-			}
-			if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != builtin {
-				t.Fatalf("messages.0.content.0.name = %q, want %q", got, builtin)
-			}
-			if got := gjson.GetBytes(out, "messages.0.content.1.tool_name").String(); got != builtin {
-				t.Fatalf("messages.0.content.1.tool_name = %q, want %q", got, builtin)
-			}
-			if got := gjson.GetBytes(out, "messages.0.content.2.content.0.tool_name").String(); got != builtin {
-				t.Fatalf("messages.0.content.2.content.0.tool_name = %q, want %q", got, builtin)
-			}
-			if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Read" {
-				t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Read")
-			}
-		})
-	}
-}
-
-func TestStripClaudeToolPrefixFromResponse(t *testing.T) {
-	input := []byte(`{"content":[{"type":"tool_use","name":"proxy_alpha","id":"t1","input":{}},{"type":"tool_use","name":"bravo","id":"t2","input":{}}]}`)
-	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
-
-	if got := gjson.GetBytes(out, "content.0.name").String(); got != "alpha" {
-		t.Fatalf("content.0.name = %q, want %q", got, "alpha")
-	}
-	if got := gjson.GetBytes(out, "content.1.name").String(); got != "bravo" {
-		t.Fatalf("content.1.name = %q, want %q", got, "bravo")
-	}
-}
-
-func TestStripClaudeToolPrefixFromResponse_WithToolReference(t *testing.T) {
-	input := []byte(`{"content":[{"type":"tool_reference","tool_name":"proxy_alpha"},{"type":"tool_reference","tool_name":"bravo"}]}`)
-	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
-
-	if got := gjson.GetBytes(out, "content.0.tool_name").String(); got != "alpha" {
-		t.Fatalf("content.0.tool_name = %q, want %q", got, "alpha")
-	}
-	if got := gjson.GetBytes(out, "content.1.tool_name").String(); got != "bravo" {
-		t.Fatalf("content.1.tool_name = %q, want %q", got, "bravo")
-	}
-}
-
-func TestStripClaudeToolPrefixFromStreamLine(t *testing.T) {
-	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"proxy_alpha","id":"t1"},"index":0}`)
-	out := stripClaudeToolPrefixFromStreamLine(line, "proxy_")
-
-	payload := bytes.TrimSpace(out)
-	if bytes.HasPrefix(payload, []byte("data:")) {
-		payload = bytes.TrimSpace(payload[len("data:"):])
-	}
-	if got := gjson.GetBytes(payload, "content_block.name").String(); got != "alpha" {
-		t.Fatalf("content_block.name = %q, want %q", got, "alpha")
-	}
-}
-
 func TestGeminiToAntigravity_RequestTypeDetectsGoogleSearchAnywhere(t *testing.T) {
 	t.Run("googleSearch at index 1 sets web_search", func(t *testing.T) {
 		input := []byte(`{"model":"gemini-3-flash","request":{"tools":[{"functionDeclarations":[{"name":"f"}]},{"googleSearch":{}}]}}`)
@@ -1336,28 +1137,6 @@ func TestGeminiToAntigravity_RequestTypeDetectsGoogleSearchAnywhere(t *testing.T
 			t.Fatalf("requestType = %q, want %q", got, "agent")
 		}
 	})
-}
-
-func TestStripClaudeToolPrefixFromStreamLine_WithToolReference(t *testing.T) {
-	line := []byte(`data: {"type":"content_block_start","content_block":{"type":"tool_reference","tool_name":"proxy_beta"},"index":0}`)
-	out := stripClaudeToolPrefixFromStreamLine(line, "proxy_")
-
-	payload := bytes.TrimSpace(out)
-	if bytes.HasPrefix(payload, []byte("data:")) {
-		payload = bytes.TrimSpace(payload[len("data:"):])
-	}
-	if got := gjson.GetBytes(payload, "content_block.tool_name").String(); got != "beta" {
-		t.Fatalf("content_block.tool_name = %q, want %q", got, "beta")
-	}
-}
-
-func TestApplyClaudeToolPrefix_NestedToolReference(t *testing.T) {
-	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"mcp__nia__manage_resource"}]}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
-	if got != "proxy_mcp__nia__manage_resource" {
-		t.Fatalf("nested tool_reference tool_name = %q, want %q", got, "proxy_mcp__nia__manage_resource")
-	}
 }
 
 func TestClaudeExecutor_ExecuteStripsOpenAIEncryptedThinkingBeforeUpstream(t *testing.T) {
@@ -2075,34 +1854,6 @@ func assertStatusErr(t *testing.T, err error, want int) {
 	}
 	if got := status.StatusCode(); got != want {
 		t.Fatalf("StatusCode() = %d, want %d", got, want)
-	}
-}
-
-func TestStripClaudeToolPrefixFromResponse_NestedToolReference(t *testing.T) {
-	input := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"proxy_mcp__nia__manage_resource"}]}]}`)
-	out := stripClaudeToolPrefixFromResponse(input, "proxy_")
-	got := gjson.GetBytes(out, "content.0.content.0.tool_name").String()
-	if got != "mcp__nia__manage_resource" {
-		t.Fatalf("nested tool_reference tool_name = %q, want %q", got, "mcp__nia__manage_resource")
-	}
-}
-
-func TestApplyClaudeToolPrefix_NestedToolReferenceWithStringContent(t *testing.T) {
-	// tool_result.content can be a string - should not be processed
-	input := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"plain string result"}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content").String()
-	if got != "plain string result" {
-		t.Fatalf("string content should remain unchanged = %q", got)
-	}
-}
-
-func TestApplyClaudeToolPrefix_SkipsBuiltinToolReference(t *testing.T) {
-	input := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_reference","tool_name":"web_search"}]}]}]}`)
-	out := applyClaudeToolPrefix(input, "proxy_")
-	got := gjson.GetBytes(out, "messages.0.content.0.content.0.tool_name").String()
-	if got != "web_search" {
-		t.Fatalf("built-in tool_reference should not be prefixed, got %q", got)
 	}
 }
 
@@ -4615,70 +4366,6 @@ func TestReverseRemapOAuthToolNamesFromStreamLine_HonorsPerRequestMap(t *testing
 	// Glob block IS in the reverseMap, must be restored to `glob`.
 	globLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_02","name":"Glob","input":{}}}`)
 	out = reverseRemapOAuthToolNamesFromStreamLine(globLine, reverseMap)
-	if !bytes.Contains(out, []byte(`"name":"glob"`)) {
-		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
-	}
-}
-
-func TestPrepareClaudeOAuthToolNamesForUpstream_MixedCaseWithPrefix(t *testing.T) {
-	body := []byte(`{"tools":[` +
-		`{"name":"Bash","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}},` +
-		`{"name":"glob","input_schema":{"type":"object","properties":{"filePattern":{"type":"string"}}}}` +
-		`],"messages":[{"role":"assistant","content":[` +
-		`{"type":"tool_use","id":"toolu_01","name":"Bash","input":{}},` +
-		`{"type":"tool_use","id":"toolu_02","name":"glob","input":{}}` +
-		`]}]}`)
-
-	out, reverseMap := prepareClaudeOAuthToolNamesForUpstream(body, "proxy_", false)
-
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Bash" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Bash")
-	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Glob" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Glob")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_Bash" {
-		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_Bash")
-	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Glob" {
-		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Glob")
-	}
-	if len(reverseMap) != 1 || reverseMap["Glob"] != "glob" {
-		t.Fatalf("reverseMap = %v, want {Glob:glob}", reverseMap)
-	}
-}
-
-func TestRestoreClaudeOAuthToolNamesFromResponse_MixedCaseWithPrefix(t *testing.T) {
-	reverseMap := map[string]string{"Glob": "glob"}
-	resp := []byte(`{"content":[` +
-		`{"type":"tool_use","id":"toolu_01","name":"proxy_Bash","input":{}},` +
-		`{"type":"tool_use","id":"toolu_02","name":"proxy_Glob","input":{}}` +
-		`]}`)
-
-	out := restoreClaudeOAuthToolNamesFromResponse(resp, "proxy_", false, reverseMap)
-
-	if got := gjson.GetBytes(out, "content.0.name").String(); got != "Bash" {
-		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
-	}
-	if got := gjson.GetBytes(out, "content.1.name").String(); got != "glob" {
-		t.Fatalf("content.1.name = %q, want %q", got, "glob")
-	}
-}
-
-func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testing.T) {
-	reverseMap := map[string]string{"Glob": "glob"}
-
-	bashLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"proxy_Bash","input":{}}}`)
-	out := restoreClaudeOAuthToolNamesFromStreamLine(bashLine, "proxy_", false, reverseMap)
-	if !bytes.Contains(out, []byte(`"name":"Bash"`)) {
-		t.Fatalf("Bash should be preserved, got: %s", string(out))
-	}
-	if bytes.Contains(out, []byte(`"name":"bash"`)) {
-		t.Fatalf("Bash must not be lowercased, got: %s", string(out))
-	}
-
-	globLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_02","name":"proxy_Glob","input":{}}}`)
-	out = restoreClaudeOAuthToolNamesFromStreamLine(globLine, "proxy_", false, reverseMap)
 	if !bytes.Contains(out, []byte(`"name":"glob"`)) {
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
 	}

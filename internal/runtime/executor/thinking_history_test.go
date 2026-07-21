@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -378,4 +379,165 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekConvertsStringContent(t *testing.
 	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "previous answer" {
 		t.Fatalf("messages.0.content.1.text = %q, want %q", got, "previous answer")
 	}
+}
+
+func TestNormalizeOpenAIThinkingHistorySyntheticBudgetBoundary(t *testing.T) {
+	reasoning := strings.Repeat("r", maxSyntheticThinkingHistoryBytes)
+	body := buildOpenAIThinkingBudgetBody(reasoning, 8)
+
+	out, changed, downgraded, report, err := normalizeThinkingHistoryWithReport(body, "openai")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryWithReport() error = %v", err)
+	}
+	if !changed || downgraded {
+		t.Fatalf("normalizeThinkingHistoryWithReport() changed=%v downgraded=%v", changed, downgraded)
+	}
+	if report.InputBytes != len(body) || report.OutputBytes != len(out) {
+		t.Fatalf("report bytes = input:%d output:%d, want input:%d output:%d", report.InputBytes, report.OutputBytes, len(body), len(out))
+	}
+	if report.SyntheticBytes != maxSyntheticThinkingHistoryTotalBytes {
+		t.Fatalf("SyntheticBytes = %d, want %d", report.SyntheticBytes, maxSyntheticThinkingHistoryTotalBytes)
+	}
+	if report.PatchedCount != 8 || report.DowngradeReason != "" {
+		t.Fatalf("report = %+v, want 8 patches without downgrade", report)
+	}
+	if got := gjson.GetBytes(out, "messages.8.reasoning_content").String(); got != reasoning {
+		t.Fatalf("last reasoning length = %d, want %d", len(got), len(reasoning))
+	}
+}
+
+func TestNormalizeThinkingHistorySyntheticBudgetDowngradesMultipleMessages(t *testing.T) {
+	reasoning := strings.Repeat("r", maxSyntheticThinkingHistoryBytes)
+	tests := []struct {
+		name              string
+		provider          string
+		body              []byte
+		thinkingPath      string
+		lastSyntheticPath string
+		placeholder       string
+	}{
+		{
+			name:              "openai",
+			provider:          "openai",
+			body:              buildOpenAIThinkingBudgetBody(reasoning, 9),
+			thinkingPath:      "reasoning_effort",
+			lastSyntheticPath: "messages.9.reasoning_content",
+			placeholder:       openAIReasoningUnavailablePlaceholder,
+		},
+		{
+			name:              "claude",
+			provider:          "claude",
+			body:              buildClaudeThinkingBudgetBody(reasoning, 9),
+			thinkingPath:      "thinking",
+			lastSyntheticPath: "messages.9.content.0.thinking",
+			placeholder:       claudeThinkingUnavailablePlaceholder,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := bytes.Clone(tt.body)
+			out, changed, downgraded, report, err := normalizeThinkingHistoryWithReport(tt.body, tt.provider)
+			if err != nil {
+				t.Fatalf("normalizeThinkingHistoryWithReport() error = %v", err)
+			}
+			if !changed || !downgraded {
+				t.Fatalf("normalizeThinkingHistoryWithReport() changed=%v downgraded=%v", changed, downgraded)
+			}
+			if !bytes.Equal(tt.body, original) {
+				t.Fatal("normalizer mutated its input")
+			}
+			if report.InputBytes != len(tt.body) || report.OutputBytes != len(out) {
+				t.Fatalf("report bytes = input:%d output:%d, want input:%d output:%d", report.InputBytes, report.OutputBytes, len(tt.body), len(out))
+			}
+			if report.SyntheticBytes > maxSyntheticThinkingHistoryTotalBytes {
+				t.Fatalf("SyntheticBytes = %d, exceeds %d", report.SyntheticBytes, maxSyntheticThinkingHistoryTotalBytes)
+			}
+			if report.PatchedCount != 9 || report.DowngradeReason != thinkingHistoryBudgetDowngradeReason {
+				t.Fatalf("report = %+v, want 9 patches and budget downgrade", report)
+			}
+			if gjson.GetBytes(out, tt.thinkingPath).Exists() {
+				t.Fatalf("%s should be stripped after budget downgrade", tt.thinkingPath)
+			}
+			if got := gjson.GetBytes(out, tt.lastSyntheticPath).String(); got != tt.placeholder {
+				t.Fatalf("last synthetic history = %q, want %q", got, tt.placeholder)
+			}
+		})
+	}
+}
+
+func TestNormalizeThinkingHistoryBudgetDowngradeIsIdempotent(t *testing.T) {
+	body := buildOpenAIThinkingBudgetBody(strings.Repeat("r", maxSyntheticThinkingHistoryBytes), 9)
+	original := bytes.Clone(body)
+
+	out, changed, downgraded, firstReport, err := normalizeThinkingHistoryForModelWithReport(body, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("first normalizeThinkingHistoryForModelWithReport() error = %v", err)
+	}
+	if !changed || !downgraded || firstReport.DowngradeReason != thinkingHistoryBudgetDowngradeReason {
+		t.Fatalf("first normalization changed=%v downgraded=%v report=%+v", changed, downgraded, firstReport)
+	}
+	if !bytes.Equal(body, original) {
+		t.Fatal("first normalization mutated its input")
+	}
+
+	second, changed, downgraded, secondReport, err := normalizeThinkingHistoryForModelWithReport(out, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("second normalizeThinkingHistoryForModelWithReport() error = %v", err)
+	}
+	if changed || downgraded || !bytes.Equal(second, out) {
+		t.Fatalf("second normalization changed=%v downgraded=%v", changed, downgraded)
+	}
+	if secondReport.InputBytes != len(out) || secondReport.OutputBytes != len(out) || secondReport.SyntheticBytes != 0 || secondReport.PatchedCount != 0 || secondReport.DowngradeReason != "" {
+		t.Fatalf("second report = %+v, want unchanged report", secondReport)
+	}
+}
+
+func BenchmarkNormalizeOpenAIThinkingHistoryWithReport(b *testing.B) {
+	reasoning := strings.Repeat("r", maxSyntheticThinkingHistoryBytes)
+	for _, missingMessages := range []int{8, 64, 256} {
+		b.Run(fmt.Sprintf("missing_%d", missingMessages), func(b *testing.B) {
+			body := buildOpenAIThinkingBudgetBody(reasoning, missingMessages)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for range b.N {
+				out, _, _, report, err := normalizeThinkingHistoryWithReport(body, "openai")
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkThinkingHistoryOutput = out
+				benchmarkThinkingHistoryReport = report
+			}
+		})
+	}
+}
+
+var benchmarkThinkingHistoryOutput []byte
+var benchmarkThinkingHistoryReport thinkingHistoryTransformReport
+
+func buildOpenAIThinkingBudgetBody(reasoning string, missingMessages int) []byte {
+	var builder strings.Builder
+	builder.Grow(len(reasoning) + missingMessages*160)
+	builder.WriteString(`{"reasoning_effort":"high","messages":[{"role":"assistant","content":"plan","reasoning_content":`)
+	fmt.Fprintf(&builder, "%q", reasoning)
+	builder.WriteByte('}')
+	for idx := 0; idx < missingMessages; idx++ {
+		fmt.Fprintf(&builder, `,{"role":"assistant","tool_calls":[{"id":"call_%d","type":"function","function":{"name":"tool","arguments":"{}"}}]}`, idx)
+	}
+	builder.WriteString(`]}`)
+	return []byte(builder.String())
+}
+
+func buildClaudeThinkingBudgetBody(thinkingText string, missingMessages int) []byte {
+	var builder strings.Builder
+	builder.Grow(len(thinkingText) + missingMessages*140)
+	builder.WriteString(`{"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":`)
+	fmt.Fprintf(&builder, "%q", thinkingText)
+	builder.WriteString(`}]}`)
+	for idx := 0; idx < missingMessages; idx++ {
+		fmt.Fprintf(&builder, `,{"role":"assistant","content":[{"type":"tool_use","id":"tool_%d","name":"tool","input":{}}]}`, idx)
+	}
+	builder.WriteString(`]}`)
+	return []byte(builder.String())
 }

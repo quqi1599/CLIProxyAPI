@@ -648,6 +648,10 @@ func openAIVideoStatus(status string) string {
 func (h *OpenAIAPIHandler) VideosCreate(c *gin.Context) {
 	rawJSON, err := readVideosCreateRequest(c)
 	if err != nil {
+		if handlers.IsRequestBodyTooLarge(err) {
+			handlers.WriteRequestBodyError(c, err)
+			return
+		}
 		writeVideosFailedError(c, http.StatusBadRequest, defaultXAIVideosModel, "invalid_request_error", fmt.Sprintf("Invalid request: %v", err))
 		return
 	}
@@ -684,6 +688,10 @@ func (h *OpenAIAPIHandler) XAIVideosExtensions(c *gin.Context) {
 func (h *OpenAIAPIHandler) handleXAIVideosNativePost(c *gin.Context) {
 	rawJSON, err := readXAIVideosNativeRequest(c)
 	if err != nil {
+		if handlers.IsRequestBodyTooLarge(err) {
+			handlers.WriteRequestBodyError(c, err)
+			return
+		}
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
