@@ -4,10 +4,14 @@ set -Eeuo pipefail
 if ! command -v go >/dev/null 2>&1; then
   docker_bin=$(command -v docker)
   exec "$docker_bin" run --rm \
-    --volume "$PWD:/workspace:ro" \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp/ci-home \
+    --env GOCACHE=/tmp/go-build \
+    --env GOMODCACHE=/tmp/go-mod \
+    --volume "$PWD:/workspace" \
     --workdir /workspace \
     golang:1.26-bookworm \
-    bash -c 'git config --global --add safe.directory /workspace && .ci/ci.sh'
+    bash -c 'mkdir -p "$HOME" && git config --global --add safe.directory /workspace && .ci/ci.sh'
 fi
 
 unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)

@@ -131,6 +131,10 @@ func Parse(raw string) (Setting, error) {
 		setting.Mode = ModeDirect
 		return setting, nil
 	}
+	if strings.Count(trimmed, "://") != 1 {
+		setting.Mode = ModeInvalid
+		return setting, fmt.Errorf("parse proxy URL failed")
+	}
 
 	parsedURL, errParse := url.Parse(trimmed)
 	if errParse != nil {
