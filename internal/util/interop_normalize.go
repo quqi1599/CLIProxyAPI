@@ -1,10 +1,10 @@
 package util
 
 import (
-	"encoding/json"
 	"strings"
 
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/protocol/contentpart"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -58,6 +58,7 @@ func normalizeResponsesInputArray(items []gjson.Result) []byte {
 	for _, item := range items {
 		itemType := item.Get("type").String()
 		itemRole := item.Get("role").String()
+		parsed := contentpart.Parse(item)
 		if itemType == "" && itemRole != "" {
 			itemType = "message"
 		}
@@ -77,16 +78,16 @@ func normalizeResponsesInputArray(items []gjson.Result) []byte {
 			}
 		case "tool_use":
 			call := buildResponsesFunctionCall(
-				strings.TrimSpace(item.Get("id").String()),
-				strings.TrimSpace(item.Get("name").String()),
-				jsonValueToString(item.Get("input").Value(), "{}"),
+				strings.TrimSpace(parsed.ToolCall.ID),
+				strings.TrimSpace(parsed.ToolCall.Name),
+				parsed.ToolCall.Arguments,
 			)
 			normalizedItems = append(normalizedItems, call)
 			changed = true
 		case "tool_result":
 			result := buildResponsesFunctionCallOutput(
-				strings.TrimSpace(item.Get("tool_use_id").String()),
-				toolResultValue(item.Get("content")),
+				strings.TrimSpace(parsed.ToolResult.CallID),
+				parsed.ToolResult.Output,
 			)
 			normalizedItems = append(normalizedItems, result)
 			changed = true
@@ -119,54 +120,55 @@ func normalizeResponsesMessageItem(item gjson.Result) (string, []string) {
 	if content.IsArray() {
 		contentItems = make([]string, 0, len(content.Array()))
 		for _, part := range content.Array() {
-			partType := strings.TrimSpace(part.Get("type").String())
-			switch partType {
-			case "input_text", "output_text", "input_image", "input_audio", "input_file":
-				if partType == "input_image" {
-					if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-						normalizedPart := string(imagePart)
-						contentItems = append(contentItems, normalizedPart)
-						contentChanged = contentChanged || normalizedPart != part.Raw
-					} else {
-						contentChanged = true
-					}
+			parsed := contentpart.Parse(part)
+			switch parsed.Kind {
+			case contentpart.Text:
+				if parsed.SourceType != "text" {
+					contentItems = append(contentItems, part.Raw)
 					break
 				}
-				contentItems = append(contentItems, part.Raw)
-			case "text":
 				normalizedType := "input_text"
 				if role == "assistant" || role == "model" {
 					normalizedType = "output_text"
 				}
 				textPart := []byte(`{}`)
 				textPart, _ = sjson.SetBytes(textPart, "type", normalizedType)
-				textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
+				textPart, _ = sjson.SetBytes(textPart, "text", parsed.Text)
 				contentItems = append(contentItems, string(textPart))
 				contentChanged = true
-			case "image":
-				if dataURL := claudeImageSourceToDataURL(part.Get("source")); dataURL != "" {
-					contentItems = append(contentItems, string(buildResponsesInputImagePart(dataURL, "")))
+			case contentpart.Image:
+				detail := parsed.Image.Detail
+				if parsed.SourceType == "image" {
+					detail = ""
 				}
-				contentChanged = true
-			case "image_url":
-				if imagePart := buildResponsesInputImagePart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-					contentItems = append(contentItems, string(imagePart))
+				if imagePart := buildResponsesInputImagePart(parsed.Image.URL, detail); imagePart != nil {
+					normalizedPart := string(imagePart)
+					contentItems = append(contentItems, normalizedPart)
+					contentChanged = contentChanged || normalizedPart != part.Raw
+				} else {
+					contentChanged = true
 				}
+			case contentpart.ToolCall:
+				if parsed.SourceType != "tool_use" {
+					contentItems = append(contentItems, part.Raw)
+					break
+				}
+				extra = append(extra, buildResponsesFunctionCall(strings.TrimSpace(parsed.ToolCall.ID), strings.TrimSpace(parsed.ToolCall.Name), parsed.ToolCall.Arguments))
 				contentChanged = true
-			case "tool_use":
-				callID := strings.TrimSpace(part.Get("id").String())
-				name := strings.TrimSpace(part.Get("name").String())
-				args := jsonValueToString(part.Get("input").Value(), "{}")
-				extra = append(extra, buildResponsesFunctionCall(callID, name, args))
+			case contentpart.ToolResult:
+				if parsed.SourceType != "tool_result" {
+					contentItems = append(contentItems, part.Raw)
+					break
+				}
+				extra = append(extra, buildResponsesFunctionCallOutput(strings.TrimSpace(parsed.ToolResult.CallID), parsed.ToolResult.Output))
 				contentChanged = true
-			case "tool_result":
-				callID := strings.TrimSpace(part.Get("tool_use_id").String())
-				output := toolResultValue(part.Get("content"))
-				extra = append(extra, buildResponsesFunctionCallOutput(callID, output))
-				contentChanged = true
-			case "thinking":
+			case contentpart.Reasoning:
+				if parsed.SourceType != "thinking" {
+					contentItems = append(contentItems, part.Raw)
+					break
+				}
 				if reasoning == "" {
-					reasoning = strings.TrimSpace(part.Get("thinking").String())
+					reasoning = parsed.Reasoning.Text
 				}
 				contentChanged = true
 			default:
@@ -283,58 +285,64 @@ func normalizeChatMessage(message gjson.Result) ([]string, string, []string) {
 	hasContentParts := false
 
 	for _, part := range content.Array() {
-		partType := strings.TrimSpace(part.Get("type").String())
-		switch partType {
-		case "text", "image_url", "file":
-			if partType == "image_url" {
-				if imagePart := buildChatImageURLPart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-					normalizedContentItems = append(normalizedContentItems, string(imagePart))
-					if string(imagePart) != part.Raw {
-						contentChanged = true
-					}
-					hasContentParts = true
-				}
+		parsed := contentpart.Parse(part)
+		switch parsed.Kind {
+		case contentpart.Text:
+			if parsed.SourceType == "text" {
+				normalizedContentItems = append(normalizedContentItems, part.Raw)
+				hasContentParts = true
 				break
 			}
-			normalizedContentItems = append(normalizedContentItems, part.Raw)
-			hasContentParts = true
-		case "input_text", "output_text":
 			textPart := []byte(`{"type":"text","text":""}`)
-			textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
+			textPart, _ = sjson.SetBytes(textPart, "text", parsed.Text)
 			normalizedContentItems = append(normalizedContentItems, string(textPart))
 			contentChanged = true
 			hasContentParts = true
-		case "input_image":
-			if imagePart := buildChatImageURLPart(OpenAIImageURLFromPart(part), openAIImageDetailFromPart(part)); imagePart != nil {
-				normalizedContentItems = append(normalizedContentItems, string(imagePart))
-				contentChanged = true
+		case contentpart.Image:
+			detail := parsed.Image.Detail
+			if parsed.SourceType == "image" {
+				detail = ""
+			}
+			if imagePart := buildChatImageURLPart(parsed.Image.URL, detail); imagePart != nil {
+				normalizedPart := string(imagePart)
+				normalizedContentItems = append(normalizedContentItems, normalizedPart)
+				contentChanged = contentChanged || normalizedPart != part.Raw
 				hasContentParts = true
 			}
-		case "image":
-			if imagePart := buildChatImageURLPart(claudeImageSourceToDataURL(part.Get("source")), ""); imagePart != nil {
-				normalizedContentItems = append(normalizedContentItems, string(imagePart))
-				contentChanged = true
+		case contentpart.ToolCall:
+			if parsed.SourceType != "tool_use" {
+				normalizedContentItems = append(normalizedContentItems, part.Raw)
 				hasContentParts = true
+				break
 			}
-		case "tool_use":
 			call := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
-			call, _ = sjson.SetBytes(call, "id", part.Get("id").String())
-			call, _ = sjson.SetBytes(call, "function.name", part.Get("name").String())
-			call, _ = sjson.SetBytes(call, "function.arguments", jsonValueToString(part.Get("input").Value(), "{}"))
+			call, _ = sjson.SetBytes(call, "id", parsed.ToolCall.ID)
+			call, _ = sjson.SetBytes(call, "function.name", parsed.ToolCall.Name)
+			call, _ = sjson.SetBytes(call, "function.arguments", parsed.ToolCall.Arguments)
 			if !hasToolCalls {
 				hasToolCalls = true
 			}
 			toolCallItems = append(toolCallItems, string(call))
 			contentChanged = true
-		case "tool_result":
+		case contentpart.ToolResult:
+			if parsed.SourceType != "tool_result" {
+				normalizedContentItems = append(normalizedContentItems, part.Raw)
+				hasContentParts = true
+				break
+			}
 			toolMsg := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
-			toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", part.Get("tool_use_id").String())
-			toolMsg, _ = sjson.SetBytes(toolMsg, "content", toolResultValue(part.Get("content")))
+			toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", parsed.ToolResult.CallID)
+			toolMsg, _ = sjson.SetBytes(toolMsg, "content", parsed.ToolResult.Output)
 			before = append(before, string(toolMsg))
 			contentChanged = true
-		case "thinking":
+		case contentpart.Reasoning:
+			if parsed.SourceType != "thinking" {
+				normalizedContentItems = append(normalizedContentItems, part.Raw)
+				hasContentParts = true
+				break
+			}
 			if role == "assistant" && reasoning == "" {
-				reasoning = strings.TrimSpace(part.Get("thinking").String())
+				reasoning = parsed.Reasoning.Text
 			}
 			contentChanged = true
 		default:
@@ -385,64 +393,10 @@ func buildResponsesFunctionCallOutput(callID, output string) string {
 	return string(item)
 }
 
-func jsonValueToString(value any, fallback string) string {
-	if value == nil {
-		return fallback
-	}
-	switch typed := value.(type) {
-	case string:
-		if strings.TrimSpace(typed) == "" {
-			return fallback
-		}
-		return typed
-	default:
-		raw, err := json.Marshal(value)
-		if err != nil || len(raw) == 0 {
-			return fallback
-		}
-		return string(raw)
-	}
-}
-
-func toolResultValue(content gjson.Result) string {
-	if !content.Exists() {
-		return ""
-	}
-	if content.Type == gjson.String {
-		return content.String()
-	}
-	if content.IsArray() {
-		parts := make([]string, 0, len(content.Array()))
-		for _, item := range content.Array() {
-			switch item.Get("type").String() {
-			case "text":
-				if text := strings.TrimSpace(item.Get("text").String()); text != "" {
-					parts = append(parts, text)
-				}
-			}
-		}
-		if len(parts) > 0 {
-			return strings.Join(parts, "\n")
-		}
-	}
-	return content.Raw
-}
-
 // OpenAIImageURLFromPart extracts the image URL/data URL from common OpenAI
 // Chat, OpenAI Responses, and Claude-style image content parts.
 func OpenAIImageURLFromPart(part gjson.Result) string {
-	for _, path := range []string{"image_url.url", "image_url", "url"} {
-		value := part.Get(path)
-		if value.Exists() && value.Type == gjson.String {
-			if imageURL := strings.TrimSpace(value.String()); imageURL != "" {
-				return imageURL
-			}
-		}
-	}
-	if source := part.Get("source"); source.Exists() {
-		return claudeImageSourceToDataURL(source)
-	}
-	return ""
+	return contentpart.ImageFrom(part).URL
 }
 
 // ParseDataURL splits a data URL into MIME type and data payload.
@@ -515,30 +469,4 @@ func buildChatImageURLPart(imageURL, detail string) []byte {
 		imagePart, _ = sjson.SetBytes(imagePart, "image_url.detail", detail)
 	}
 	return imagePart
-}
-
-func openAIImageDetailFromPart(part gjson.Result) string {
-	if detail := strings.TrimSpace(part.Get("detail").String()); detail != "" {
-		return detail
-	}
-	return strings.TrimSpace(part.Get("image_url.detail").String())
-}
-
-func claudeImageSourceToDataURL(source gjson.Result) string {
-	if !source.Exists() {
-		return ""
-	}
-	switch source.Get("type").String() {
-	case "base64":
-		mediaType := strings.TrimSpace(source.Get("media_type").String())
-		data := strings.TrimSpace(source.Get("data").String())
-		if mediaType == "" || data == "" {
-			return ""
-		}
-		return "data:" + mediaType + ";base64," + data
-	case "url":
-		return strings.TrimSpace(source.Get("url").String())
-	default:
-		return ""
-	}
 }

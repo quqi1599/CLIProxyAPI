@@ -120,33 +120,6 @@ func responsesToolParameters(tool gjson.Result) gjson.Result {
 	return gjson.Result{}
 }
 
-// responsesToolOutputText flattens a tool output value that may be a plain
-// string or an array of content parts ({"type":"input_text","text":...}) into
-// a single text payload for a Chat Completions tool message.
-func responsesToolOutputText(output gjson.Result) string {
-	if output.Type == gjson.String {
-		return output.String()
-	}
-	if output.IsArray() {
-		var b strings.Builder
-		output.ForEach(func(_, part gjson.Result) bool {
-			if part.Type == gjson.String {
-				b.WriteString(part.String())
-				return true
-			}
-			if text := part.Get("text"); text.Exists() {
-				b.WriteString(text.String())
-			}
-			return true
-		})
-		return b.String()
-	}
-	if output.Exists() {
-		return output.Raw
-	}
-	return ""
-}
-
 // responsesCustomToolNames collects the names of freeform ("custom") tools
 // declared in the original Responses request, both in the top-level "tools"
 // field and in Codex Desktop "additional_tools" input items. Namespace child
