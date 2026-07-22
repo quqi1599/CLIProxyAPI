@@ -57,3 +57,8 @@ func clone(input []byte) []byte { return internalpayload.CloneBytes(input) }'
 assert_allowed reasoned_exception 'package fixture
 import "slices"
 func clone(input []string) []string { return slices.Clone(input) } //nolint:payload-clone reason=non_payload_slice'
+
+if ! bash .ci/payload-clone-scan.sh "$fixture_dir/deleted.go" >/dev/null 2>&1; then
+  echo "payload clone scan rejected a deleted source path" >&2
+  exit 1
+fi

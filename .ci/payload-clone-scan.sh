@@ -4,10 +4,13 @@ set -Eeuo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-files=("$@")
-if ((${#files[@]} == 0)); then
+requested_files=("$@")
+files=()
+if ((${#requested_files[@]} == 0)); then
   while IFS= read -r -d '' file; do
-    files+=("$file")
+    if [[ -f $file ]]; then
+      files+=("$file")
+    fi
   done < <(git ls-files -z -co --exclude-standard -- \
     '*.go' \
     ':!**/*_test.go' \
@@ -15,6 +18,12 @@ if ((${#files[@]} == 0)); then
     ':!cmd/payload-soak/**' \
     ':!internal/payload/clone.go' \
     ':!internal/payload/growthlint/testdata/**')
+else
+  for file in "${requested_files[@]}"; do
+    if [[ -f $file ]]; then
+      files+=("$file")
+    fi
+  done
 fi
 
 if ((${#files[@]} == 0)); then
