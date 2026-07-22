@@ -161,6 +161,7 @@ func TestPipelineReportsControlledMetadataWithoutPayload(t *testing.T) {
 		return TransformResult{
 			Payload:        append(append([]byte(nil), input...), '!'),
 			SyntheticBytes: 1,
+			PatchedCount:   2,
 			Downgrades:     []string{"strip.reasoning"},
 		}, nil
 	}
@@ -180,7 +181,7 @@ func TestPipelineReportsControlledMetadataWithoutPayload(t *testing.T) {
 	if bytes.Contains(encoded, []byte(secret)) {
 		t.Fatalf("pipeline report leaked payload: %s", encoded)
 	}
-	if result.Report.SyntheticBytes != 1 || result.Report.Phases[0].Downgrades[0] != "strip.reasoning" {
+	if result.Report.SyntheticBytes != 1 || result.Report.PatchedCount != 2 || result.Report.Phases[0].PatchedCount != 2 || result.Report.Phases[0].Policies[0].PatchedCount != 2 || result.Report.Phases[0].Downgrades[0] != "strip.reasoning" {
 		t.Fatalf("pipeline report = %+v", result.Report)
 	}
 	transformReport, ok := internalpayload.TransformReportFromContext(ctx)
@@ -188,8 +189,49 @@ func TestPipelineReportsControlledMetadataWithoutPayload(t *testing.T) {
 		t.Fatalf("transform report = %+v, ok=%v", transformReport, ok)
 	}
 	stage := transformReport.Stages[0]
-	if stage.Stage != "compat/RepairHistory" || len(stage.AppliedPolicies) != 1 || stage.AppliedPolicies[0] != "reported" || stage.Downgrades[0] != "strip.reasoning" {
+	if stage.Stage != "compat/RepairHistory" || stage.PatchedCount != 2 || len(stage.AppliedPolicies) != 1 || stage.AppliedPolicies[0] != "reported" || stage.Downgrades[0] != "strip.reasoning" {
 		t.Fatalf("transform stage = %+v", stage)
+	}
+}
+
+func TestPipelineRejectsNegativePatchedCount(t *testing.T) {
+	policy := validPolicy("negative-patched-count", RepairHistory, 0, "body.history")
+	policy.Apply = func(_ context.Context, input []byte) (TransformResult, error) {
+		return TransformResult{Payload: input, PatchedCount: -1}, nil
+	}
+	registry, err := NewRegistry(policy)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if _, err = NewPipeline(registry).Apply(context.Background(), MatchContext{}, []byte(`{}`)); err == nil {
+		t.Fatal("Apply() accepted a negative patched count")
+	}
+}
+
+func TestPipelineAggregatesPatchedCount(t *testing.T) {
+	first := validPolicy("first-history-repair", RepairHistory, 0, "body.history.first")
+	first.Apply = func(_ context.Context, input []byte) (TransformResult, error) {
+		return TransformResult{Payload: input, PatchedCount: 2}, nil
+	}
+	second := validPolicy("second-history-repair", ProviderCapabilityScrub, 0, "body.history.second")
+	second.Apply = func(_ context.Context, input []byte) (TransformResult, error) {
+		return TransformResult{Payload: input, PatchedCount: 3}, nil
+	}
+	registry, err := NewRegistry(first, second)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	ctx := internalpayload.WithTransformReport(context.Background(), 2)
+	result, err := NewPipeline(registry).Apply(ctx, MatchContext{}, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if result.Report.PatchedCount != 5 || len(result.Report.Phases) != 2 || result.Report.Phases[0].PatchedCount != 2 || result.Report.Phases[1].PatchedCount != 3 {
+		t.Fatalf("pipeline report = %+v", result.Report)
+	}
+	transformReport, ok := internalpayload.TransformReportFromContext(ctx)
+	if !ok || transformReport.PatchedCount != 5 || len(transformReport.Stages) != 2 {
+		t.Fatalf("transform report = %+v, ok=%v", transformReport, ok)
 	}
 }
 

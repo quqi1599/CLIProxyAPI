@@ -24,6 +24,7 @@ func addTransformReportLogObserver(ctx context.Context) bool {
 			"transform_added_bytes":     report.AddedBytes,
 			"transform_removed_bytes":   report.RemovedBytes,
 			"transform_synthetic_bytes": report.SyntheticBytes,
+			"transform_patched_count":   report.PatchedCount,
 			"transform_duration_ms":     report.Duration.Milliseconds(),
 			"transform_stage_count":     len(report.Stages),
 			"transform_stages":          string(stages),

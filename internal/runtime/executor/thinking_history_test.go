@@ -216,6 +216,46 @@ func TestNormalizeOpenAIThinkingHistoryKeepsPlainAssistantForOtherModels(t *test
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryModelCapabilityBoundaries(t *testing.T) {
+	body := []byte(`{
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"assistant","content":"first answer"},
+			{"role":"assistant","content":"second answer","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}
+		]
+	}`)
+	tests := []struct {
+		name               string
+		model              string
+		wantPatched        int
+		wantFirstReasoning string
+		wantToolReasoning  string
+	}{
+		{name: "deepseek complete history", model: "deepseek-v4-pro", wantPatched: 2, wantFirstReasoning: "first answer", wantToolReasoning: "first answer"},
+		{name: "doubao legacy history", model: "deepseek-r1", wantPatched: 1, wantToolReasoning: "second answer"},
+		{name: "xiaomi legacy history", model: "mimo-v2.5", wantPatched: 1, wantToolReasoning: "second answer"},
+		{name: "kimi legacy history", model: "kimi-k2.6", wantPatched: 1, wantToolReasoning: "second answer"},
+		{name: "unknown legacy history", model: "route-alias", wantPatched: 1, wantToolReasoning: "second answer"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReport(body, "openai", test.model)
+			if err != nil {
+				t.Fatalf("normalizeThinkingHistoryForModelWithReport() error = %v", err)
+			}
+			if !changed || downgraded || report.PatchedCount != test.wantPatched {
+				t.Fatalf("changed=%v downgraded=%v report=%+v", changed, downgraded, report)
+			}
+			if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != test.wantFirstReasoning {
+				t.Fatalf("first reasoning = %q, want %q: %s", got, test.wantFirstReasoning, out)
+			}
+			if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != test.wantToolReasoning {
+				t.Fatalf("tool reasoning = %q, want %q: %s", got, test.wantToolReasoning, out)
+			}
+		})
+	}
+}
+
 func TestNormalizeClaudeThinkingHistoryRepairsFromText(t *testing.T) {
 	body := []byte(`{
 		"thinking":{"type":"enabled","budget_tokens":1024},

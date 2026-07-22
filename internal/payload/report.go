@@ -25,6 +25,7 @@ type TransformStageReport struct {
 	AddedBytes      int64                    `json:"added_bytes"`
 	RemovedBytes    int64                    `json:"removed_bytes"`
 	SyntheticBytes  int64                    `json:"synthetic_bytes"`
+	PatchedCount    int64                    `json:"patched_count"`
 	Duration        time.Duration            `json:"duration"`
 	AppliedPolicies []string                 `json:"applied_policies,omitempty"`
 	Downgrades      []string                 `json:"downgrades,omitempty"`
@@ -44,6 +45,7 @@ type TransformReport struct {
 	AddedBytes         int64                    `json:"added_bytes"`
 	RemovedBytes       int64                    `json:"removed_bytes"`
 	SyntheticBytes     int64                    `json:"synthetic_bytes"`
+	PatchedCount       int64                    `json:"patched_count"`
 	Duration           time.Duration            `json:"duration"`
 	Stages             []TransformStageReport   `json:"stages,omitempty"`
 	FinalAmplification AmplificationObservation `json:"final_amplification"`
@@ -162,6 +164,7 @@ func RecordTransformStage(ctx context.Context, stage TransformStageReport, overr
 	stage.InputBytes = nonNegativeBytes(stage.InputBytes)
 	stage.OutputBytes = nonNegativeBytes(stage.OutputBytes)
 	stage.SyntheticBytes = nonNegativeBytes(stage.SyntheticBytes)
+	stage.PatchedCount = nonNegativeBytes(stage.PatchedCount)
 	if stage.Duration < 0 {
 		stage.Duration = 0
 	}
@@ -181,6 +184,7 @@ func RecordTransformStage(ctx context.Context, stage TransformStageReport, overr
 	accumulator.report.AddedBytes = saturatingAddInt64(accumulator.report.AddedBytes, stage.AddedBytes)
 	accumulator.report.RemovedBytes = saturatingAddInt64(accumulator.report.RemovedBytes, stage.RemovedBytes)
 	accumulator.report.SyntheticBytes = saturatingAddInt64(accumulator.report.SyntheticBytes, stage.SyntheticBytes)
+	accumulator.report.PatchedCount = saturatingAddInt64(accumulator.report.PatchedCount, stage.PatchedCount)
 	accumulator.report.Duration = time.Duration(saturatingAddInt64(int64(accumulator.report.Duration), int64(stage.Duration)))
 	accumulator.report.FinalAmplification = ObserveAmplification(
 		accumulator.report.InputBytes,

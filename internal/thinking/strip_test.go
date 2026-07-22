@@ -31,17 +31,23 @@ func TestStripThinkingConfigNestedProviders(t *testing.T) {
 	tests := []struct {
 		provider string
 		input    string
-		path     string
+		paths    []string
 	}{
-		{provider: "gemini", input: `{"generationConfig":{"thinkingConfig":{"budget":1},"temperature":1}}`, path: "generationConfig.thinkingConfig"},
-		{provider: "antigravity", input: `{"request":{"generationConfig":{"thinkingConfig":{"budget":1},"temperature":1}}}`, path: "request.generationConfig.thinkingConfig"},
-		{provider: "codex", input: `{"reasoning":{"effort":"high","summary":"auto"}}`, path: "reasoning.effort"},
+		{provider: "gemini", input: `{"generationConfig":{"thinkingConfig":{"budget":1},"temperature":1}}`, paths: []string{"generationConfig.thinkingConfig"}},
+		{provider: "antigravity", input: `{"request":{"generationConfig":{"thinkingConfig":{"budget":1},"temperature":1}}}`, paths: []string{"request.generationConfig.thinkingConfig"}},
+		{provider: "openai", input: `{"reasoning_effort":"high","reasoning":{"effort":"medium","summary":"auto"},"thinking":{"reasoning_effort":"low","type":"enabled"}}`, paths: []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"}},
+		{provider: "codex", input: `{"reasoning":{"effort":"high","summary":"auto"}}`, paths: []string{"reasoning.effort"}},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
 			out := StripThinkingConfig([]byte(test.input), test.provider)
-			if gjson.GetBytes(out, test.path).Exists() {
-				t.Fatalf("%s was retained: %s", test.path, out)
+			for _, path := range test.paths {
+				if gjson.GetBytes(out, path).Exists() {
+					t.Fatalf("%s was retained: %s", path, out)
+				}
+			}
+			if test.provider == "openai" && (gjson.GetBytes(out, "reasoning.summary").String() != "auto" || gjson.GetBytes(out, "thinking.type").String() != "enabled") {
+				t.Fatalf("openai sibling fields were removed: %s", out)
 			}
 		})
 	}

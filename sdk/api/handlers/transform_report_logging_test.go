@@ -28,9 +28,10 @@ func TestTransformReportLogObserverEmitsMetadataOnly(t *testing.T) {
 	}
 	release := internalpayload.RetainTransformReport(ctx)
 	internalpayload.RecordTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "executor/upstream-request",
-		InputBytes:  int64(len(secret)),
-		OutputBytes: int64(len(secret) + 4),
+		Stage:        "executor/upstream-request",
+		InputBytes:   int64(len(secret)),
+		OutputBytes:  int64(len(secret) + 4),
+		PatchedCount: 3,
 	}, internalpayload.AmplificationOverride{})
 	release()
 
@@ -46,6 +47,9 @@ func TestTransformReportLogObserverEmitsMetadataOnly(t *testing.T) {
 		}
 		if entry.Data["transform_stage_count"] != 1 || !strings.Contains(fmt.Sprint(entry.Data["transform_stages"]), "executor/upstream-request") {
 			t.Fatalf("missing stage metadata: %#v", entry.Data)
+		}
+		if entry.Data["transform_patched_count"] != int64(3) {
+			t.Fatalf("patched count = %#v", entry.Data["transform_patched_count"])
 		}
 		if strings.Contains(fmt.Sprint(entry.Data), secret) || strings.Contains(entry.Message, secret) {
 			t.Fatalf("transform log leaked request body: %#v", entry.Data)

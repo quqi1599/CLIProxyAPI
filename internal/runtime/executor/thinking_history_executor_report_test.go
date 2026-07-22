@@ -149,8 +149,11 @@ func assertThinkingHistoryProductionStage(t *testing.T, ctx context.Context, wan
 		if stage.Stage != wantStage {
 			continue
 		}
-		if stage.InputBytes <= 0 || stage.OutputBytes <= 0 || stage.SyntheticBytes <= 0 || stage.Duration < 0 {
+		if stage.InputBytes <= 0 || stage.OutputBytes <= 0 || stage.SyntheticBytes <= 0 || stage.PatchedCount != 9 || stage.Duration < 0 {
 			t.Fatalf("thinking history stage bytes = %#v", stage)
+		}
+		if report.PatchedCount != 9 {
+			t.Fatalf("thinking history report patched count = %d", report.PatchedCount)
 		}
 		if len(stage.AppliedPolicies) != 2 || stage.AppliedPolicies[0] != thinkingHistoryPlaceholderPolicy || stage.AppliedPolicies[1] != thinkingHistorySyntheticBudgetPolicy {
 			t.Fatalf("thinking history policies = %v", stage.AppliedPolicies)

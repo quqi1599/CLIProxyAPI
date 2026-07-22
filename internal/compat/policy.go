@@ -16,6 +16,7 @@ type Format string
 type TransformResult struct {
 	Payload        []byte
 	SyntheticBytes int64
+	PatchedCount   int64
 	Downgrades     []string
 }
 

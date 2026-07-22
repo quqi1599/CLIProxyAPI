@@ -20,6 +20,7 @@ type PolicyExecutionReport struct {
 	InputBytes     int64                                    `json:"input_bytes"`
 	OutputBytes    int64                                    `json:"output_bytes"`
 	SyntheticBytes int64                                    `json:"synthetic_bytes"`
+	PatchedCount   int64                                    `json:"patched_count"`
 	Duration       time.Duration                            `json:"duration"`
 	Downgrades     []string                                 `json:"downgrades,omitempty"`
 	ReusedInput    bool                                     `json:"reused_input"`
@@ -32,6 +33,7 @@ type PhaseExecutionReport struct {
 	InputBytes     int64                   `json:"input_bytes"`
 	OutputBytes    int64                   `json:"output_bytes"`
 	SyntheticBytes int64                   `json:"synthetic_bytes"`
+	PatchedCount   int64                   `json:"patched_count"`
 	Duration       time.Duration           `json:"duration"`
 	Downgrades     []string                `json:"downgrades,omitempty"`
 	ReusedInput    bool                    `json:"reused_input"`
@@ -43,6 +45,7 @@ type PipelineReport struct {
 	InputBytes     int64                  `json:"input_bytes"`
 	OutputBytes    int64                  `json:"output_bytes"`
 	SyntheticBytes int64                  `json:"synthetic_bytes"`
+	PatchedCount   int64                  `json:"patched_count"`
 	ReusedInput    bool                   `json:"reused_input"`
 	Phases         []PhaseExecutionReport `json:"phases"`
 }
@@ -119,7 +122,7 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 		transformed, err := policy.Apply(ctx, policyInput)
 		duration := time.Since(started)
 		if err != nil {
-			policyReport := newPolicyExecutionReport(*policy, policyInput, policyInput, 0, duration, nil)
+			policyReport := newPolicyExecutionReport(*policy, policyInput, policyInput, 0, 0, duration, nil)
 			appendPolicyReport(&report, phaseIndex, policyReport)
 			recordPayloadPhase(ctx, report.Phases[phaseIndex])
 			result.Payload = nil
@@ -131,8 +134,8 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 		}
 
 		downgrades, ok := declaredDowngrades(*policy, transformed.Downgrades)
-		if transformed.SyntheticBytes < 0 || !ok {
-			policyReport := newPolicyExecutionReport(*policy, policyInput, policyInput, 0, duration, nil)
+		if transformed.SyntheticBytes < 0 || transformed.PatchedCount < 0 || !ok {
+			policyReport := newPolicyExecutionReport(*policy, policyInput, policyInput, 0, 0, duration, nil)
 			appendPolicyReport(&report, phaseIndex, policyReport)
 			recordPayloadPhase(ctx, report.Phases[phaseIndex])
 			result.Payload = nil
@@ -145,17 +148,25 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 			result.Report = report
 			return result, transformFailure(policy.ID, "compat_synthetic_overflow", "compatibility transform synthetic byte count overflowed")
 		}
+		if transformed.PatchedCount > math.MaxInt64-report.PatchedCount {
+			recordPayloadPhase(ctx, report.Phases[phaseIndex])
+			result.Payload = nil
+			result.Report = report
+			return result, transformFailure(policy.ID, "compat_patched_count_overflow", "compatibility transform patched count overflowed")
+		}
 
 		policyReport := newPolicyExecutionReport(
 			*policy,
 			policyInput,
 			transformed.Payload,
 			transformed.SyntheticBytes,
+			transformed.PatchedCount,
 			duration,
 			downgrades,
 		)
 		appendPolicyReport(&report, phaseIndex, policyReport)
 		report.SyntheticBytes += transformed.SyntheticBytes
+		report.PatchedCount += transformed.PatchedCount
 		current = transformed.Payload
 		report.OutputBytes = int64(len(current))
 		amplificationMode, amplificationModeConfigured := internalpayload.AmplificationModeFromContext(ctx)
@@ -175,7 +186,7 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 	return result, nil
 }
 
-func newPolicyExecutionReport(policy Policy, input, output []byte, syntheticBytes int64, duration time.Duration, downgrades []string) PolicyExecutionReport {
+func newPolicyExecutionReport(policy Policy, input, output []byte, syntheticBytes, patchedCount int64, duration time.Duration, downgrades []string) PolicyExecutionReport {
 	override := internalpayload.AmplificationOverride{
 		PolicyID:          policy.ID,
 		MaxExpansionBytes: policy.Cost.MaxExpansionBytes,
@@ -187,6 +198,7 @@ func newPolicyExecutionReport(policy Policy, input, output []byte, syntheticByte
 		InputBytes:     int64(len(input)),
 		OutputBytes:    int64(len(output)),
 		SyntheticBytes: syntheticBytes,
+		PatchedCount:   patchedCount,
 		Duration:       duration,
 		Downgrades:     downgrades,
 		ReusedInput:    sameBacking(input, output),
@@ -199,6 +211,7 @@ func appendPolicyReport(report *PipelineReport, phaseIndex int, policyReport Pol
 	phase.Policies = append(phase.Policies, policyReport)
 	phase.OutputBytes = policyReport.OutputBytes
 	phase.SyntheticBytes += policyReport.SyntheticBytes
+	phase.PatchedCount += policyReport.PatchedCount
 	phase.Duration += policyReport.Duration
 	phase.ReusedInput = phase.ReusedInput && policyReport.ReusedInput
 	phase.Downgrades = append(phase.Downgrades, policyReport.Downgrades...)
@@ -214,6 +227,7 @@ func recordPayloadPhase(ctx context.Context, phase PhaseExecutionReport) {
 		InputBytes:      phase.InputBytes,
 		OutputBytes:     phase.OutputBytes,
 		SyntheticBytes:  phase.SyntheticBytes,
+		PatchedCount:    phase.PatchedCount,
 		Duration:        phase.Duration,
 		AppliedPolicies: policyIDs,
 		Downgrades:      phase.Downgrades,

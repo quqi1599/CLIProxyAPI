@@ -21,6 +21,7 @@ func TestTransformReportRecordsMetadataOnly(t *testing.T) {
 		InputBytes:      int64(len(body)),
 		OutputBytes:     int64(len(body) + 64),
 		SyntheticBytes:  64,
+		PatchedCount:    2,
 		Duration:        3 * time.Millisecond,
 		AppliedPolicies: policies,
 		Downgrades:      downgrades,
@@ -41,10 +42,10 @@ func TestTransformReportRecordsMetadataOnly(t *testing.T) {
 	if !report.Instrumented || !report.Finalized {
 		t.Fatalf("report completeness = instrumented:%t finalized:%t", report.Instrumented, report.Finalized)
 	}
-	if report.AddedBytes != 64 || report.RemovedBytes != 0 || report.SyntheticBytes != 64 {
-		t.Fatalf("report byte accounting = added %d removed %d synthetic %d", report.AddedBytes, report.RemovedBytes, report.SyntheticBytes)
+	if report.AddedBytes != 64 || report.RemovedBytes != 0 || report.SyntheticBytes != 64 || report.PatchedCount != 2 {
+		t.Fatalf("report accounting = added %d removed %d synthetic %d patched %d", report.AddedBytes, report.RemovedBytes, report.SyntheticBytes, report.PatchedCount)
 	}
-	if len(report.Stages) != 1 || report.Stages[0].Duration != 3*time.Millisecond {
+	if len(report.Stages) != 1 || report.Stages[0].Duration != 3*time.Millisecond || report.Stages[0].PatchedCount != 2 {
 		t.Fatalf("unexpected stages: %#v", report.Stages)
 	}
 
@@ -95,6 +96,16 @@ func TestTransformReportSnapshotIsIndependent(t *testing.T) {
 	}
 	if !second.Stages[0].ReusedInput {
 		t.Fatal("reused-input observation was lost")
+	}
+}
+
+func TestTransformReportAggregatesPatchedCount(t *testing.T) {
+	ctx := WithTransformReport(context.Background(), 10)
+	RecordTransformStage(ctx, TransformStageReport{Stage: "first", InputBytes: 10, OutputBytes: 10, PatchedCount: 2}, AmplificationOverride{})
+	RecordTransformStage(ctx, TransformStageReport{Stage: "second", InputBytes: 10, OutputBytes: 10, PatchedCount: 3}, AmplificationOverride{})
+	report, _ := TransformReportFromContext(ctx)
+	if report.PatchedCount != 5 || len(report.Stages) != 2 || report.Stages[0].PatchedCount != 2 || report.Stages[1].PatchedCount != 3 {
+		t.Fatalf("patched count report = %+v", report)
 	}
 }
 

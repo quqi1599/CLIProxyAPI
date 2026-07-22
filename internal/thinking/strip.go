@@ -45,7 +45,11 @@ func StripThinkingConfig(body []byte, provider string) []byte {
 	case "antigravity":
 		paths = []thinkingStripPath{{segments: []string{"request", "generationConfig", "thinkingConfig"}}}
 	case "openai":
-		paths = []thinkingStripPath{{segments: []string{"reasoning_effort"}}}
+		paths = []thinkingStripPath{
+			{segments: []string{"reasoning_effort"}},
+			{segments: []string{"reasoning", "effort"}, pruneEmpty: true},
+			{segments: []string{"thinking", "reasoning_effort"}, pruneEmpty: true},
+		}
 	case "kimi":
 		paths = []thinkingStripPath{
 			{segments: []string{"reasoning_effort"}},
