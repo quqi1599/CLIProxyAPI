@@ -493,50 +493,22 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	reporter.SetTranslatedReasoningEffort(plan.bodyForUpstream, plan.upstreamFormat.String())
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
-	if err != nil {
-		return resp, err
-	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, plan.apiKey, false, plan.extraBetas, e.cfg); errHeaders != nil {
-		return resp, errHeaders
-	}
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      plan.bodyForUpstream,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
+	exchange := helps.ProviderExchange{Config: e.cfg, Auth: auth, Provider: e.Identifier(), Reporter: reporter}
+	exchangeResponse, err := exchange.Do(ctx, helps.ProviderExchangeRequest{
+		Method: http.MethodPost,
+		URL:    url,
+		Body:   plan.bodyForUpstream,
+		ApplyHeaders: func(httpRequest *http.Request) error {
+			return applyClaudeHeaders(httpRequest, auth, plan.apiKey, false, plan.extraBetas, e.cfg)
+		},
 	})
-
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
-	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+	httpResp := exchangeResponse.HTTPResponse
+	data, err := exchangeResponse.ReadBounded(helps.UpstreamBodyLimits{})
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		if responseLog != nil {
-			responseLog.RecordError(err)
-		}
 		return resp, err
-	}
-	if responseLog != nil {
-		responseLog.AppendChunk(data)
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
@@ -596,55 +568,26 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
 	requestCtx, cancelRequest := context.WithCancel(ctx)
-	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
-	if err != nil {
-		cancelRequest()
-		return nil, err
-	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, plan.apiKey, true, plan.extraBetas, e.cfg); errHeaders != nil {
-		cancelRequest()
-		return nil, errHeaders
-	}
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      plan.bodyForUpstream,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
+	exchange := helps.ProviderExchange{Config: e.cfg, Auth: auth, Provider: e.Identifier(), Reporter: reporter}
+	exchangeResponse, err := exchange.Do(requestCtx, helps.ProviderExchangeRequest{
+		Method: http.MethodPost,
+		URL:    url,
+		Body:   plan.bodyForUpstream,
+		ApplyHeaders: func(httpRequest *http.Request) error {
+			return applyClaudeHeaders(httpRequest, auth, plan.apiKey, true, plan.extraBetas, e.cfg)
+		},
 	})
-
-	httpClient := helps.NewUtlsHTTPClient(requestCtx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		cancelRequest()
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
+	httpResp := exchangeResponse.HTTPResponse
+	responseLog := exchangeResponse.ResponseLog
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, readErr := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		b, readErr := exchangeResponse.ReadBounded(helps.UpstreamBodyLimits{})
 		cancelRequest()
 		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			if responseLog != nil {
-				responseLog.RecordError(readErr)
-			}
 			return nil, readErr
-		}
-		if responseLog != nil {
-			responseLog.AppendChunk(b)
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)

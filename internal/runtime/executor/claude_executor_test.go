@@ -3079,6 +3079,93 @@ func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsTypedProtocolFa
 	})
 }
 
+func TestClaudeExecutor_ProviderExchangePreservesStatusParity(t *testing.T) {
+	const secret = "provider-exchange-error-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.Header().Set("X-Upstream-Request-Id", "upstream-status-1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"` + secret + `"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	request := cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	options := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	type statusView struct {
+		statusCode int
+		errorCode  string
+		retryAfter string
+		requestID  string
+		message    string
+	}
+	views := make([]statusView, 0, 2)
+	invocations := []struct {
+		name   string
+		invoke func() error
+	}{
+		{
+			name: "non-stream",
+			invoke: func() error {
+				_, err := executor.Execute(context.Background(), auth, request, options)
+				return err
+			},
+		},
+		{
+			name: "stream",
+			invoke: func() error {
+				_, err := executor.ExecuteStream(context.Background(), auth, request, options)
+				return err
+			},
+		},
+	}
+	for _, invocation := range invocations {
+		t.Run(invocation.name, func(t *testing.T) {
+			err := invocation.invoke()
+			if err == nil {
+				t.Fatal("expected upstream status error")
+			}
+			status, ok := err.(interface {
+				StatusCode() int
+				ErrorCode() string
+				Headers() http.Header
+			})
+			if !ok {
+				t.Fatalf("error type = %T, want status metadata", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error exposed upstream body: %s", err)
+			}
+			headers := status.Headers()
+			views = append(views, statusView{
+				statusCode: status.StatusCode(),
+				errorCode:  status.ErrorCode(),
+				retryAfter: headers.Get("Retry-After"),
+				requestID:  headers.Get("X-Upstream-Request-Id"),
+				message:    err.Error(),
+			})
+		})
+	}
+	if len(views) != 2 {
+		t.Fatalf("status views = %d, want 2", len(views))
+	}
+	if views[0] != views[1] {
+		t.Fatalf("status parity mismatch: non-stream=%+v stream=%+v", views[0], views[1])
+	}
+	if views[0].statusCode != http.StatusTooManyRequests || views[0].errorCode != "rate_limit_error" || views[0].retryAfter != "7" || views[0].requestID != "upstream-status-1" {
+		t.Fatalf("status metadata changed: %+v", views[0])
+	}
+}
+
 func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyReturnsTypedProtocolFailure(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
