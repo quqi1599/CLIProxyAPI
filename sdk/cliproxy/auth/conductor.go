@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
@@ -1878,7 +1879,9 @@ func cooldownErrorEqual(a, b *Error) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return a.Code == b.Code &&
+	return a.Kind == b.Kind &&
+		a.Scope == b.Scope &&
+		a.Code == b.Code &&
 		a.Message == b.Message &&
 		a.Retryable == b.Retryable &&
 		a.HTTPStatus == b.HTTPStatus
@@ -3071,7 +3074,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				rerr := resultErrorFromCause(chunk.Err)
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: chunk.Err})
 				runtime.recordFinalStatus(statusCodeFromError(chunk.Err))
-				if shouldEvictUnauthorizedResult(rerr) {
+				if shouldEvictUnauthorizedError(chunk.Err) {
 					if errEvict := m.evictUnauthorizedAuth(ctx, auth, meta.provider, meta.upstreamModel); errEvict != nil {
 						runtime.logger.Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
 					}
@@ -3739,9 +3742,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
-		if wait <= 0 {
-			wait = m.retryQueueWait()
-		}
+		wait = m.effectiveRetryWait(errExec, wait)
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			finalErr = errWait
 			return cliproxyexecutor.Response{}, errWait
@@ -3801,9 +3802,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
-		if wait <= 0 {
-			wait = m.retryQueueWait()
-		}
+		wait = m.effectiveRetryWait(errExec, wait)
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			finalErr = errWait
 			return cliproxyexecutor.Response{}, errWait
@@ -3857,9 +3856,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
-		if wait <= 0 {
-			wait = m.retryQueueWait()
-		}
+		wait = m.effectiveRetryWait(errStream, wait)
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			finalErr = errWait
 			return nil, errWait
@@ -4041,7 +4038,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare)}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
 			nextRetryReason = retryReasonFromError(errPrepare)
@@ -4140,7 +4137,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback {
+			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
 				}
@@ -4215,7 +4212,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare)}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
 			nextRetryReason = retryReasonFromError(errPrepare)
@@ -4273,7 +4270,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback {
+			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return nil, errWait
 				}
@@ -5035,6 +5032,25 @@ func (m *Manager) retryQueueWait() time.Duration {
 	return base + time.Duration(time.Now().UnixNano()%jitterLimit)
 }
 
+func (m *Manager) effectiveRetryWait(err error, wait time.Duration) time.Duration {
+	if wait > 0 {
+		return wait
+	}
+	if typedFailureRequestsImmediateRetry(err) {
+		return 0
+	}
+	return m.retryQueueWait()
+}
+
+func typedFailureRequestsImmediateRetry(err error) bool {
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.RetryAfter == nil || *typed.RetryAfter != 0 {
+		return false
+	}
+	_, controlled := controlledFailureScope(string(typed.Scope))
+	return controlled
+}
+
 func (m *Manager) waitForRetryQueue(ctx context.Context) error {
 	return waitForCooldown(ctx, m.retryQueueWait())
 }
@@ -5185,6 +5201,11 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	if typed, ok := failurecontract.As(err); ok {
+		if _, controlled := controlledFailureScope(string(typed.Scope)); controlled {
+			return m.shouldRetryTypedFailure(typed, attempt, providers, model, maxWait)
+		}
+	}
 	status := statusCodeFromError(err)
 	if status == http.StatusOK {
 		return 0, false
@@ -5231,6 +5252,25 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	return *retryAfter, true
+}
+
+func (m *Manager) shouldRetryTypedFailure(failure *failurecontract.Failure, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
+	if failure == nil || !failure.Retryable || maxWait <= 0 || !m.retryAllowed(attempt, providers) {
+		return 0, false
+	}
+	if failure.RetryAfter != nil {
+		if *failure.RetryAfter < 0 || *failure.RetryAfter > maxWait {
+			return 0, false
+		}
+		return *failure.RetryAfter, true
+	}
+	if wait, found := m.closestCooldownWait(providers, model, attempt); found {
+		if wait > maxWait {
+			return 0, false
+		}
+		return wait, true
+	}
+	return transientNetworkRetryDelay(attempt, maxWait)
 }
 
 func (m *Manager) gptSoftRateLimitRetryWait(err error, providers []string, model string, attempt int) (time.Duration, bool) {
@@ -5365,6 +5405,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 		codexAPIKeyHealthOnly := isCodexAPIKeyAuth(auth)
 		codexBypassCooling := isCodexAuth(auth) && !codexAPIKeyHealthOnly
+		failureScope, hasTypedFailureScope := failureScopeFromResult(result)
 		slowPenalty := 0
 		if result.Success && m.slowRequestPenaltyEnabledLocked(auth) {
 			slowPenalty = slowRequestHealthPenalty(result.Duration)
@@ -5435,7 +5476,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				applySlowRequestHealthPenalty(&auth.Health, now, slowPenalty)
 			}
 		} else {
-			if codexBypassCooling {
+			if hasTypedFailureScope && failureScope == failurecontract.ScopeRequest {
+				// Request failures are terminal for this payload and must not alter
+				// credential, model, or provider availability.
+			} else if codexBypassCooling {
 				if result.Model != "" {
 					state := ensureModelState(auth, result.Model)
 					resetModelState(state, now)
@@ -5455,6 +5499,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 			} else if codexAPIKeyHealthOnly {
 				applyCodexAPIKeyFailureState(auth, result, now)
+			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeCredential {
+				disableCooling := m.cooldownDisabledForAuth(auth)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeProvider {
+				// Provider failures feed the provider/channel breaker below. They must
+				// not be attributed to a single credential or model.
 			} else if managedModel != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) &&
 					!isRequestScopedFeatureUnsupportedResultError(result.Error) &&
@@ -5599,7 +5649,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 				}
-			} else {
+			} else if !hasTypedFailureScope || failureScope != failurecontract.ScopeModel {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
@@ -5941,6 +5991,9 @@ func (m *Manager) applyChannelBreakerCooldownLocked(auth *Auth, result Result, b
 func shouldCountChannelBreakerFailure(result Result) bool {
 	if result.Success || result.Error == nil {
 		return false
+	}
+	if scope, ok := failureScopeFromResult(result); ok {
+		return scope == failurecontract.ScopeProvider && result.Error.Retryable
 	}
 	if isRequestScopedNotFoundResultError(result.Error) ||
 		isRequestScopedFeatureUnsupportedResultError(result.Error) ||
@@ -6582,6 +6635,8 @@ func cloneError(err *Error) *Error {
 		return nil
 	}
 	return &Error{
+		Kind:       err.Kind,
+		Scope:      err.Scope,
 		Code:       err.Code,
 		Message:    err.Message,
 		Retryable:  err.Retryable,
@@ -6637,7 +6692,34 @@ func resultErrorFromCause(err error) *Error {
 		Message:    err.Error(),
 		HTTPStatus: statusCodeFromError(err),
 	}
+	if typed, ok := failurecontract.As(err); ok {
+		resultErr.Kind = string(typed.Kind)
+		resultErr.Scope = string(typed.Scope)
+		resultErr.Retryable = typed.Retryable
+	}
 	return resultErr
+}
+
+func failureScopeFromResult(result Result) (failurecontract.Scope, bool) {
+	if typed, ok := failurecontract.As(result.Cause); ok {
+		if scope, valid := controlledFailureScope(string(typed.Scope)); valid {
+			return scope, true
+		}
+	}
+	if result.Error == nil {
+		return "", false
+	}
+	return controlledFailureScope(result.Error.Scope)
+}
+
+func controlledFailureScope(value string) (failurecontract.Scope, bool) {
+	scope := failurecontract.Scope(strings.ToLower(strings.TrimSpace(value)))
+	switch scope {
+	case failurecontract.ScopeRequest, failurecontract.ScopeModel, failurecontract.ScopeCredential, failurecontract.ScopeProvider:
+		return scope, true
+	default:
+		return "", false
+	}
 }
 
 func isUnauthorizedError(err error) bool {
@@ -6652,11 +6734,14 @@ func isUnauthorizedError(err error) bool {
 }
 
 func shouldEvictUnauthorizedError(err error) bool {
+	if typed, ok := failurecontract.As(err); ok {
+		if scope, controlled := controlledFailureScope(string(typed.Scope)); controlled {
+			return scope == failurecontract.ScopeCredential &&
+				typed.Kind == failurecontract.AuthenticationFailed &&
+				statusCodeFromError(err) == http.StatusUnauthorized
+		}
+	}
 	return isUnauthorizedError(err) && !isModelSupportError(err)
-}
-
-func shouldEvictUnauthorizedResult(err *Error) bool {
-	return isUnauthorizedResult(err) && !isModelSupportResultError(err)
 }
 
 func isAccountQuotaExhaustedResultError(err *Error) bool {
@@ -6888,22 +6973,11 @@ func refreshErrorFromError(err error) *Error {
 }
 
 func retryAfterFromError(err error) *time.Duration {
-	if err == nil {
+	retryAfter, ok := failurecontract.RetryAfterOf(err)
+	if !ok {
 		return nil
 	}
-	type retryAfterProvider interface {
-		RetryAfter() *time.Duration
-	}
-	rap, ok := err.(retryAfterProvider)
-	if !ok || rap == nil {
-		return nil
-	}
-	retryAfter := rap.RetryAfter()
-	if retryAfter == nil {
-		return nil
-	}
-	value := *retryAfter
-	return &value
+	return &retryAfter
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -6911,10 +6985,6 @@ func statusCodeFromResult(err *Error) int {
 		return 0
 	}
 	return err.StatusCode()
-}
-
-func isUnauthorizedResult(err *Error) bool {
-	return statusCodeFromResult(err) == http.StatusUnauthorized
 }
 
 func isModelSupportErrorMessage(message string) bool {
@@ -6958,6 +7028,11 @@ func isModelSupportErrorMessage(message string) bool {
 func isModelSupportError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if typed, ok := failurecontract.As(err); ok {
+		if scope, controlled := controlledFailureScope(string(typed.Scope)); controlled {
+			return scope == failurecontract.ScopeModel && typed.Kind == failurecontract.ModelUnavailable
+		}
 	}
 	status := statusCodeFromError(err)
 	switch status {
@@ -7005,6 +7080,9 @@ func isInvalidGrantResultError(err *Error) bool {
 func isModelSupportResultError(err *Error) bool {
 	if err == nil {
 		return false
+	}
+	if scope, ok := controlledFailureScope(err.Scope); ok {
+		return scope == failurecontract.ScopeModel && failurecontract.Kind(err.Kind) == failurecontract.ModelUnavailable
 	}
 	status := statusCodeFromResult(err)
 	switch status {
@@ -7625,6 +7703,11 @@ func isSpecificFallbackModel(model string, target string) bool {
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if typed, ok := failurecontract.As(err); ok {
+		if scope, controlled := controlledFailureScope(string(typed.Scope)); controlled {
+			return scope == failurecontract.ScopeRequest && !typed.Retryable
+		}
 	}
 	if isCloudflareChallengeError(err) {
 		return false
@@ -9058,6 +9141,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromCause(errExec)
+				result.Cause = errExec
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -9812,6 +9896,12 @@ func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Re
 		fields["status_code"] = status
 	}
 	if result.Error != nil {
+		if result.Error.Kind != "" {
+			fields["failure_kind"] = result.Error.Kind
+		}
+		if result.Error.Scope != "" {
+			fields["failure_scope"] = result.Error.Scope
+		}
 		if result.Error.Code != "" {
 			fields["error_code"] = result.Error.Code
 		}

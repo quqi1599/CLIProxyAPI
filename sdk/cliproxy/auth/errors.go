@@ -2,6 +2,10 @@ package auth
 
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
+	// Kind is the stable typed failure family when an executor classified the error.
+	Kind string `json:"kind,omitempty"`
+	// Scope identifies whether the failure belongs to the request, model, credential, or provider.
+	Scope string `json:"scope,omitempty"`
 	// Code is a short machine readable identifier.
 	Code string `json:"code,omitempty"`
 	// Message is a human readable description of the failure.
