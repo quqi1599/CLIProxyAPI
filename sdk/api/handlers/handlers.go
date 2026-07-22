@@ -1475,7 +1475,12 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 		Model:   normalizedModel,
 		Payload: payload,
 	}
-	afterAuthCapture := &requestAfterAuthCapture{}
+	interceptorHost := h.interceptorHost()
+	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	var afterAuthCapture *requestAfterAuthCapture
+	if streamInterceptorsActive {
+		afterAuthCapture = &requestAfterAuthCapture{}
+	}
 	opts := coreexecutor.Options{
 		Stream:                      true,
 		Alt:                         alt,
@@ -1511,8 +1516,6 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 		return afterAuthCapture.apply(req, opts)
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
-	interceptorHost := h.interceptorHost()
-	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)

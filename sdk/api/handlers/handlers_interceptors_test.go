@@ -762,9 +762,22 @@ func TestHandlerStreamSkipsInterceptorsWhenHostReportsNoStreamInterceptors(t *te
 		},
 	}
 	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: false})
+	var afterAuthCalls int
 	var streamCalls int
 	handler.SetPluginHost(&handlerInterceptorNoStreamTestHost{
 		handlerInterceptorTestHost: &handlerInterceptorTestHost{
+			interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				afterAuthCalls++
+				headers := cloneHeader(req.Headers)
+				if headers == nil {
+					headers = make(http.Header)
+				}
+				headers.Set("X-Stage", "after")
+				return pluginapi.RequestInterceptResponse{
+					Headers: headers,
+					Body:    []byte(`{"stage":"after-stream"}`),
+				}
+			},
 			interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
 				streamCalls++
 				return pluginapi.StreamChunkInterceptResponse{Headers: cloneHeader(req.ResponseHeaders), Body: cloneBytes(req.Body)}
@@ -787,6 +800,16 @@ func TestHandlerStreamSkipsInterceptorsWhenHostReportsNoStreamInterceptors(t *te
 	}
 	if upstreamHeaders != nil {
 		t.Fatalf("upstream headers = %#v, want nil without passthrough or stream interceptors", upstreamHeaders)
+	}
+	if afterAuthCalls != 1 {
+		t.Fatalf("after-auth interceptor calls = %d, want 1", afterAuthCalls)
+	}
+	gotReq, gotOpts := executor.captured()
+	if string(gotReq.Payload) != `{"stage":"after-stream"}` {
+		t.Fatalf("executor payload = %q, want after-auth body", gotReq.Payload)
+	}
+	if gotOpts.Headers.Get("X-Stage") != "after" {
+		t.Fatalf("executor headers = %#v, want after-auth header", gotOpts.Headers)
 	}
 	if streamCalls != 0 {
 		t.Fatalf("stream interceptor calls = %d, want 0", streamCalls)

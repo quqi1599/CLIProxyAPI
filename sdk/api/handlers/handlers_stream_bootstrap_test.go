@@ -10,6 +10,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 type failOnceStreamExecutor struct {
@@ -305,6 +306,20 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 			BootstrapRetries: 1,
 		},
 	}, manager)
+	var afterAuthCalls int
+	var streamCalls int
+	handler.SetPluginHost(&handlerInterceptorNoStreamTestHost{
+		handlerInterceptorTestHost: &handlerInterceptorTestHost{
+			interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				afterAuthCalls++
+				return pluginapi.RequestInterceptResponse{Headers: cloneHeader(req.Headers), Body: cloneBytes(req.Body)}
+			},
+			interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+				streamCalls++
+				return pluginapi.StreamChunkInterceptResponse{Headers: cloneHeader(req.ResponseHeaders), Body: cloneBytes(req.Body)}
+			},
+		},
+	})
 	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
 		t.Fatalf("expected non-nil channels")
@@ -326,6 +341,12 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	}
 	if executor.Calls() != 2 {
 		t.Fatalf("expected 2 stream attempts, got %d", executor.Calls())
+	}
+	if afterAuthCalls != 2 {
+		t.Fatalf("after-auth interceptor calls = %d, want 2", afterAuthCalls)
+	}
+	if streamCalls != 0 {
+		t.Fatalf("stream interceptor calls = %d, want 0", streamCalls)
 	}
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
