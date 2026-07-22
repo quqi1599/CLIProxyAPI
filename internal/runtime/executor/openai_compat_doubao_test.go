@@ -544,6 +544,9 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	if !strings.Contains(err.Error(), "DeepSeek 官方当前不支持图片输入") {
 		t.Fatalf("error = %q, want direct Chinese image-input guidance", err.Error())
 	}
+	if !strings.Contains(err.Error(), "deepseek_official_image_input") {
+		t.Fatalf("error = %q, want stable image-input marker", err.Error())
+	}
 
 	failureEntry := waitForFailureMetadataEntry(t, hook, "req-deepseek-image-guard-1")
 	if got := failureEntry.Data["compat_kind"]; got != "deepseek" {

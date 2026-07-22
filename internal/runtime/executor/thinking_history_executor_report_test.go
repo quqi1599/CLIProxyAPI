@@ -35,7 +35,9 @@ func TestPrepareClaudeRequestReportsThinkingHistoryPolicy(t *testing.T) {
 	assertSemanticRequestStages(t, ctx, []semanticStageExpectation{
 		{id: claudeProviderConfigTransformStage, policy: claudeProviderConfigPolicy},
 		{id: claudeProviderCompatibilityTransformStage, policy: claudeProviderCompatibilityPolicy},
-		{id: claudeToolHistoryTransformStage, policy: claudeToolHistoryPolicy, downgrade: claudeToolSearchCompatibilityDowngrade},
+		{id: claudeToolHistoryTransformStage, policy: claudeToolHistoryPolicy},
+		{id: claudeProviderCapabilityTransformStage, policy: claudeLegacyProviderCapabilityPolicy, downgrade: claudeToolSearchCompatibilityDowngrade},
+		{id: claudeCacheControlTransformStage, policy: claudeCacheControlPolicy},
 		{id: claudeFinalSanitizeTransformStage, policy: claudeFinalSanitizePolicy, downgrade: claudeStructuredOutputCompatibilityDowngrade},
 	}, claudeFinalSanitizeTransformStage, len(plan.bodyForUpstream))
 	releaseReport()

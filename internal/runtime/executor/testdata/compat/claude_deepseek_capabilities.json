@@ -1,0 +1,97 @@
+{
+  "policy_id": "claude_compat.deepseek.capability_scrub",
+  "compat_kind": "deepseek",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "cases": [
+    {
+      "name": "image only content is scrubbed without tools",
+      "model": "deepseek-v4-pro",
+      "input": {
+        "model": "deepseek-v4-pro",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {"type": "text", "text": "describe"},
+              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+              {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "model": "deepseek-v4-pro",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {"type": "text", "text": "describe"}
+            ]
+          }
+        ]
+      },
+      "downgrades": ["claude.tool_search_compatibility"]
+    },
+    {
+      "name": "server tools and emptied tool results are normalized",
+      "model": "deepseek-v4-pro",
+      "input": {
+        "model": "deepseek-v4-pro",
+        "tools": [
+          {"type": "web_search_20250305", "name": "web_search"},
+          {"name": "read_file", "defer_loading": true, "input_schema": {"type": "object"}}
+        ],
+        "tool_choice": {"type": "tool", "name": "web_search"},
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {}}
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [
+                  {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "model": "deepseek-v4-pro",
+        "tools": [
+          {
+            "name": "read_file",
+            "input_schema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false,
+              "description": "No extra properties allowed"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [
+                  {"type": "text", "text": "No output."}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "downgrades": ["claude.tool_search_compatibility"]
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "policy_id": "claude_compat.doubao.capability_scrub",
+  "compat_kind": "doubao",
+  "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+  "cases": [
+    {
+      "name": "native image stays while image url is removed",
+      "model": "deepseek-v3.2",
+      "input": {
+        "model": "deepseek-v3.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {"type": "text", "text": "inspect"},
+              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+              {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [
+                  {"type": "image_url", "image_url": {"url": "data:image/png;base64,CCCC"}}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "model": "deepseek-v3.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {"type": "text", "text": "inspect"},
+              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [
+                  {"type": "text", "text": "No output."}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "downgrades": ["claude.tool_search_compatibility"]
+    }
+  ]
+}

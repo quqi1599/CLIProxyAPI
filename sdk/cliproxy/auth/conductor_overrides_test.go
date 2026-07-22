@@ -3567,6 +3567,79 @@ func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
 	}
 }
 
+func TestRequestFeatureUnsupportedCodeDoesNotRequireMessageMarker(t *testing.T) {
+	err := codedStatusError{
+		status: http.StatusBadRequest,
+		code:   "request_feature_unsupported",
+		msg:    "DeepSeek 官方当前不支持图片输入",
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected typed unsupported feature to be request invalid")
+	}
+	if shouldFallbackRequestScopedRouteErrorForRequest("deepseek-v4-pro", cliproxyexecutor.Options{}, err) {
+		t.Fatal("expected typed unsupported feature to stop fallback")
+	}
+	if !isRequestInvalidError(codedStatusError{
+		status: http.StatusUnprocessableEntity,
+		code:   "request_feature_unsupported",
+		msg:    "request_feature_unsupported: deepseek_official_image_input. unsupported request shape",
+	}) {
+		t.Fatal("expected typed unsupported feature with status 422 to retain generic request-invalid semantics")
+	}
+	if isRequestInvalidError(codedStatusError{
+		status: http.StatusInternalServerError,
+		code:   "request_feature_unsupported",
+		msg:    "upstream failed",
+	}) {
+		t.Fatal("expected typed unsupported feature with status 500 to remain retryable")
+	}
+}
+
+func TestRequestScopedMarkersPreserveUnprocessableEntityClassification(t *testing.T) {
+	messages := []string{
+		"large_claude_tool_history cannot be safely routed",
+		"deepseek_official_image_input is unsupported",
+		"request_feature_unsupported by this route",
+	}
+	for _, message := range messages {
+		if !isRequestInvalidError(&Error{HTTPStatus: http.StatusUnprocessableEntity, Message: message}) {
+			t.Fatalf("expected status 422 with marker %q to remain request invalid", message)
+		}
+	}
+}
+
+func TestManagerMarkResult_RequestFeatureUnsupportedUnprocessableEntityDoesNotSuspendModel(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "request-feature-422-auth", Provider: "claude"}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	model := "deepseek-v4-pro"
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnprocessableEntity,
+			Code:       "request_feature_unsupported",
+			Message:    "deepseek_official_image_input is unsupported",
+		},
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped 422 to avoid model suspension, got state=%+v", *state)
+	}
+	if updated.Health.Observed || updated.LastError != nil || updated.Status == StatusError {
+		t.Fatalf("request-scoped 422 polluted auth health: health=%+v last_error=%+v status=%q", updated.Health, updated.LastError, updated.Status)
+	}
+}
+
 func TestManagerRejectsMiMoV25ProImageInputBeforeAuthSelection(t *testing.T) {
 	tests := []struct {
 		name           string

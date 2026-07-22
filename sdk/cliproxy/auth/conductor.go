@@ -7187,7 +7187,11 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 }
 
 func isRequestScopedFeatureUnsupportedResultError(err *Error) bool {
-	if err == nil || statusCodeFromResult(err) != http.StatusBadRequest {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != 0 && status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
 		return false
 	}
 	return isRequestScopedFeatureUnsupportedMessage(err.Code + ": " + err.Message)
@@ -7626,17 +7630,29 @@ func isRequestInvalidError(err error) bool {
 	if isModelSupportError(err) {
 		return false
 	}
+	if strings.EqualFold(strings.TrimSpace(errorCodeFromError(err)), "request_feature_unsupported") {
+		status := statusCodeFromError(err)
+		if status == 0 || status == http.StatusBadRequest {
+			return true
+		}
+	}
 	if isLargeClaudeCompatToolHistoryMessage(err.Error()) {
 		status := statusCodeFromError(err)
-		return status == 0 || status == http.StatusBadRequest
+		if status == 0 || status == http.StatusBadRequest {
+			return true
+		}
 	}
 	if isDeepSeekOfficialImageInputMessage(err.Error()) {
 		status := statusCodeFromError(err)
-		return status == 0 || status == http.StatusBadRequest
+		if status == 0 || status == http.StatusBadRequest {
+			return true
+		}
 	}
 	if isRequestScopedFeatureUnsupportedMessage(err.Error()) {
 		status := statusCodeFromError(err)
-		return status == 0 || status == http.StatusBadRequest
+		if status == 0 || status == http.StatusBadRequest {
+			return true
+		}
 	}
 	if isRequestScopedContentSafetyError(err) {
 		return true

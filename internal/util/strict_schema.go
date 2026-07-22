@@ -8,7 +8,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const strictObjectJSONSchema = `{"type":"object","properties":{},"additionalProperties":false}`
+const (
+	strictObjectJSONSchema         = `{"additionalProperties":false,"description":"No extra properties allowed","properties":{},"type":"object"}`
+	strictRequiredObjectJSONSchema = `{"additionalProperties":false,"description":"No extra properties allowed","properties":{},"required":[],"type":"object"}`
+)
 
 func CleanJSONSchemaForStrictUpstream(jsonStr string) string {
 	return cleanJSONSchemaForStrictUpstream(jsonStr, false)
@@ -19,24 +22,28 @@ func CleanJSONSchemaForOpenAIStructuredOutput(jsonStr string) string {
 }
 
 func cleanJSONSchemaForStrictUpstream(jsonStr string, requireAllObjectProperties bool) string {
+	fallback := strictObjectJSONSchema
+	if requireAllObjectProperties {
+		fallback = strictRequiredObjectJSONSchema
+	}
 	jsonStr = strings.TrimSpace(jsonStr)
 	if jsonStr == "" || jsonStr == "null" || !gjson.Valid(jsonStr) {
-		return strictObjectJSONSchema
+		return fallback
 	}
 
 	jsonStr = CleanJSONSchemaForGemini(jsonStr)
 	if !gjson.Valid(jsonStr) {
-		return strictObjectJSONSchema
+		return fallback
 	}
 
 	var parsed any
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return strictObjectJSONSchema
+		return fallback
 	}
 
 	root, ok := normalizeStrictSchemaNode(parsed).(map[string]any)
 	if !ok {
-		return strictObjectJSONSchema
+		return fallback
 	}
 
 	if schemaType, ok := root["type"].(string); !ok || strings.TrimSpace(schemaType) == "" {
@@ -48,6 +55,7 @@ func cleanJSONSchemaForStrictUpstream(jsonStr string, requireAllObjectProperties
 		}
 		root["additionalProperties"] = false
 	}
+	addStrictObjectDescriptions(root)
 	if requireAllObjectProperties {
 		requireAllPropertiesForObjects(root)
 	} else {
@@ -60,9 +68,25 @@ func cleanJSONSchemaForStrictUpstream(jsonStr string, requireAllObjectProperties
 
 	out, err := json.Marshal(root)
 	if err != nil || !gjson.ValidBytes(out) {
-		return strictObjectJSONSchema
+		return fallback
 	}
 	return string(out)
+}
+
+func addStrictObjectDescriptions(node any) {
+	switch value := node.(type) {
+	case map[string]any:
+		for _, child := range value {
+			addStrictObjectDescriptions(child)
+		}
+		if value["type"] == "object" && value["additionalProperties"] == false {
+			appendDescription(value, "No extra properties allowed")
+		}
+	case []any:
+		for _, child := range value {
+			addStrictObjectDescriptions(child)
+		}
+	}
 }
 
 func normalizeStrictSchemaNode(node any) any {

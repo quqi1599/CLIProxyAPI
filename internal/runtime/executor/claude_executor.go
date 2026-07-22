@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
@@ -43,14 +44,20 @@ const (
 	claudeProviderConfigTransformStage           = "request_plan.claude.provider_config"
 	claudeProviderCompatibilityTransformStage    = "request_plan.claude.provider_compatibility"
 	claudeToolHistoryTransformStage              = "request_plan.claude.tool_history"
+	claudeProviderCapabilityTransformStage       = "compat/ProviderCapabilityScrub"
+	claudeCacheControlTransformStage             = "request_plan.claude.cache_control"
 	claudeFinalSanitizeTransformStage            = "request_plan.claude.final_sanitize"
 	claudeProviderConfigPolicy                   = "claude.provider_config"
 	claudeProviderCompatibilityPolicy            = "claude.provider_compatibility"
 	claudeToolHistoryPolicy                      = "claude.tool_history"
+	claudeLegacyProviderCapabilityPolicy         = "claude_compat.legacy.capability_scrub"
+	claudeCacheControlPolicy                     = "claude.cache_control"
 	claudeFinalSanitizePolicy                    = "claude.final_sanitize"
 	claudeForcedToolChoiceThinkingDowngrade      = "claude.forced_tool_choice_thinking_disabled"
 	claudeToolSearchCompatibilityDowngrade       = "claude.tool_search_compatibility"
 	claudeStructuredOutputCompatibilityDowngrade = "claude.structured_output_compatibility"
+	claudeEmptyToolResultText                    = "No output."
+	claudeUnsupportedContentPlaceholderText      = "Unsupported content removed for upstream compatibility."
 )
 
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
@@ -248,7 +255,8 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 		ctx = req.Context()
 	}
 	httpReq := req.WithContext(ctx)
-	toolNameSanitization, errSanitize := sanitizeClaudeHTTPRequestToolNames(httpReq)
+	identity := claudeProviderIdentity(auth, requestURLString(httpReq))
+	toolNameSanitization, errSanitize := sanitizeClaudeHTTPRequestToolNamesForCompatKind(httpReq, identity.Kind)
 	if errSanitize != nil {
 		return nil, errSanitize
 	}
@@ -405,15 +413,59 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 			return plan, err
 		}
 	}
-	toolHistoryDowngrades := make([]string, 0, 1)
-	if preflight.hasTools || preflight.hasToolSearch {
-		toolSearchInput := body
-		body = downgradeClaudeToolSearchForCompatKind(plan.providerIdentity.Kind, plan.baseURL, body)
-		if !bytes.Equal(toolSearchInput, body) {
-			toolHistoryDowngrades = append(toolHistoryDowngrades, claudeToolSearchCompatibilityDowngrade)
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		claudeToolHistoryTransformStage,
+		toolHistoryInput,
+		body,
+		toolHistoryStarted,
+		[]string{claudeToolHistoryPolicy},
+		nil,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
+		return plan, err
+	}
+
+	providerCapabilityStarted := time.Now()
+	providerCapabilityInput := body
+	policyMatch := compat.MatchContext{
+		Model:        baseModel,
+		Endpoint:     "messages",
+		Mode:         compat.ExecutionMode("non-stream"),
+		SourceFormat: compat.Format(from.String()),
+		TargetFormat: compat.Format(plan.upstreamFormat.String()),
+	}
+	if streamResponse {
+		policyMatch.Mode = "stream"
+	}
+	body, capabilityManaged, err := applyClaudeCompatProviderCapabilities(ctx, body, plan.providerIdentity.Kind, plan.baseURL, policyMatch)
+	if err != nil {
+		return plan, err
+	}
+	if !capabilityManaged {
+		if preflight.hasTools || preflight.hasToolSearch {
+			body = downgradeClaudeToolSearchForCompatKind(plan.providerIdentity.Kind, plan.baseURL, body)
+		}
+		capabilityDowngrades := make([]string, 0, 1)
+		if !bytes.Equal(providerCapabilityInput, body) {
+			capabilityDowngrades = append(capabilityDowngrades, claudeToolSearchCompatibilityDowngrade)
+		}
+		if err = helps.EnforceSemanticTransformStage(
+			ctx,
+			claudeProviderCapabilityTransformStage,
+			providerCapabilityInput,
+			body,
+			providerCapabilityStarted,
+			[]string{claudeLegacyProviderCapabilityPolicy},
+			capabilityDowngrades,
+			internalpayload.AmplificationOverride{},
+		); err != nil {
+			return plan, err
 		}
 	}
 
+	cacheControlStarted := time.Now()
+	cacheControlInput := body
 	if streamResponse {
 		if preflight.hasCache {
 			body = applyCacheControlPipeline(body, 4, true)
@@ -430,12 +482,12 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
-		claudeToolHistoryTransformStage,
-		toolHistoryInput,
+		claudeCacheControlTransformStage,
+		cacheControlInput,
 		body,
-		toolHistoryStarted,
-		[]string{claudeToolHistoryPolicy},
-		toolHistoryDowngrades,
+		cacheControlStarted,
+		[]string{claudeCacheControlPolicy},
+		nil,
 		internalpayload.AmplificationOverride{},
 	); err != nil {
 		return plan, err
@@ -1556,11 +1608,19 @@ func downgradeClaudeToolSearchForCompat(baseURL string, body []byte) []byte {
 }
 
 func downgradeClaudeToolSearchForCompatKind(compatKind, baseURL string, body []byte) []byte {
+	body, _ = downgradeClaudeToolSearchForCompatKindWithStats(compatKind, baseURL, body, false)
+	return body
+}
+
+func downgradeClaudeToolSearchForCompatKindWithStats(compatKind, baseURL string, body []byte, preserveEmptyMessages bool) ([]byte, int) {
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
 	}
-	if isOfficialAnthropicBaseURL(baseURL) || len(body) == 0 || !gjson.ValidBytes(body) {
-		return body
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body, 0
+	}
+	if compatKind == "" && isOfficialAnthropicBaseURL(baseURL) {
+		return body, 0
 	}
 
 	if compatKind == "" {
@@ -1568,11 +1628,12 @@ func downgradeClaudeToolSearchForCompatKind(compatKind, baseURL string, body []b
 	}
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil {
-		return body
+		return body, 0
 	}
 	modelID := strings.TrimSpace(compatStringValue(root["model"]))
 
 	changed := false
+	messagePlaceholders := 0
 	removedToolNames := make(map[string]bool)
 	if tools, ok := root["tools"].([]any); ok {
 		cleanedTools := make([]any, 0, len(tools))
@@ -1634,6 +1695,15 @@ func downgradeClaudeToolSearchForCompatKind(compatKind, baseURL string, body []b
 			if contentChanged {
 				changed = true
 				if len(cleanedContent) == 0 {
+					if preserveEmptyMessages && strings.TrimSpace(compatStringValue(message["role"])) == "user" &&
+						hasUnsupportedClaudeImageForCompat(compatKind, modelID, content) {
+						message["content"] = []any{map[string]any{
+							"type": "text",
+							"text": claudeUnsupportedContentPlaceholderText,
+						}}
+						messagePlaceholders++
+						cleanedMessages = append(cleanedMessages, message)
+					}
 					continue
 				}
 				message["content"] = cleanedContent
@@ -1644,14 +1714,14 @@ func downgradeClaudeToolSearchForCompatKind(compatKind, baseURL string, body []b
 	}
 
 	if !changed {
-		return body
+		return body, 0
 	}
 	out, err := json.Marshal(root)
 	if err != nil || !gjson.ValidBytes(out) {
-		return body
+		return body, 0
 	}
 	log.WithField("compat_kind", compatKind).Debug("downgraded Claude tool search payload for upstream compatibility")
-	return out
+	return out, messagePlaceholders
 }
 
 func sanitizeClaudeToolInputSchemaForCompat(compatKind string, tool map[string]any) bool {
@@ -1757,6 +1827,20 @@ func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, conte
 		cleaned = append(cleaned, part)
 	}
 	return cleaned, changed
+}
+
+func hasUnsupportedClaudeImageForCompat(compatKind, modelID string, content []any) bool {
+	for _, rawPart := range content {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		partType := strings.TrimSpace(compatStringValue(part["type"]))
+		if (partType == "image" || partType == "image_url") && isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType) {
+			return true
+		}
+	}
+	return false
 }
 
 func isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType string) bool {
@@ -2077,7 +2161,7 @@ func normalizeClaudeEmptyToolResults(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	placeholder := []byte(`[{"type":"text","text":"No output."}]`)
+	placeholder := []byte(`[{"type":"text","text":"` + claudeEmptyToolResultText + `"}]`)
 	messageItems := messages.Array()
 	updatedMessages := make([]string, 0, len(messageItems))
 	repairs := 0
@@ -3140,6 +3224,10 @@ func sanitizeClaudeToolNamesForUpstream(body []byte) ([]byte, *claudeToolNameSan
 }
 
 func sanitizeClaudeHTTPRequestToolNames(req *http.Request) (*claudeToolNameSanitization, error) {
+	return sanitizeClaudeHTTPRequestToolNamesForCompatKind(req, "")
+}
+
+func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKind string) (*claudeToolNameSanitization, error) {
 	if req == nil || req.Body == nil || req.Body == http.NoBody {
 		return nil, nil
 	}
@@ -3147,14 +3235,25 @@ func sanitizeClaudeHTTPRequestToolNames(req *http.Request) (*claudeToolNameSanit
 	if errRead != nil {
 		return nil, errRead
 	}
-	compatKind := ""
-	if req.URL != nil {
+	if compatKind == "" && req.URL != nil {
 		compatKind = config.InferCompatKindFromBaseURL(req.URL.String())
 	}
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
 	}
-	body = downgradeClaudeToolSearchForCompatKind(compatKind, requestURLString(req), body)
+	body, capabilityManaged, errCapability := applyClaudeCompatProviderCapabilities(req.Context(), body, compatKind, requestURLString(req), compat.MatchContext{
+		Model:        gjson.GetBytes(body, "model").String(),
+		Endpoint:     "messages",
+		Mode:         compat.ExecutionMode("non-stream"),
+		SourceFormat: "claude",
+		TargetFormat: "claude",
+	})
+	if errCapability != nil {
+		return nil, errCapability
+	}
+	if !capabilityManaged {
+		body = downgradeClaudeToolSearchForCompatKind(compatKind, requestURLString(req), body)
+	}
 	body = scrubDeepSeekThinkingBudgetForCompat(body, gjson.GetBytes(body, "model").String(), requestURLString(req), compatKind)
 	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, gjson.GetBytes(body, "model").String(), compatKind)
 	body = applyMiniMaxStreamingThinkingDefaultForCompat(compatKind, body, gjson.GetBytes(body, "stream").Bool())

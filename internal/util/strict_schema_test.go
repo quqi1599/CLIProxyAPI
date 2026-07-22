@@ -107,6 +107,27 @@ func TestCleanJSONSchemaForStrictUpstream_AddsAdditionalPropertiesFalseRecursive
 	}
 }
 
+func TestCleanJSONSchemaForStrictUpstreamIsIdempotent(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty", input: ""},
+		{name: "null", input: "null"},
+		{name: "invalid", input: "{"},
+		{name: "object", input: `{"type":"object","properties":{"filter":{"type":"object"}}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			first := CleanJSONSchemaForStrictUpstream(test.input)
+			second := CleanJSONSchemaForStrictUpstream(first)
+			if first != second {
+				t.Fatalf("strict schema cleanup is not idempotent:\nfirst:  %s\nsecond: %s", first, second)
+			}
+		})
+	}
+}
+
 func TestCleanJSONSchemaForStrictUpstream_NormalizesScalarPropertySchemas(t *testing.T) {
 	input := `{
 		"type": "object",
@@ -194,10 +215,22 @@ func TestCleanJSONSchemaForOpenAIStructuredOutput_RequiresAllObjectProperties(t 
 }
 
 func TestCleanJSONSchemaForOpenAIStructuredOutputIsIdempotent(t *testing.T) {
-	input := `{"type":"object","properties":{"query":{"type":"string"}},"additionalProperties":false}`
-	first := CleanJSONSchemaForOpenAIStructuredOutput(input)
-	if second := CleanJSONSchemaForOpenAIStructuredOutput(first); second != first {
-		t.Fatalf("second clean changed schema\nfirst:  %s\nsecond: %s", first, second)
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty", input: ""},
+		{name: "null", input: "null"},
+		{name: "invalid", input: "{"},
+		{name: "object", input: `{"type":"object","properties":{"query":{"type":"string"}},"additionalProperties":false}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			first := CleanJSONSchemaForOpenAIStructuredOutput(test.input)
+			if second := CleanJSONSchemaForOpenAIStructuredOutput(first); second != first {
+				t.Fatalf("second clean changed schema\nfirst:  %s\nsecond: %s", first, second)
+			}
+		})
 	}
 }
 
