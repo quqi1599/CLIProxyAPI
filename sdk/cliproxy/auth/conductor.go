@@ -3722,184 +3722,18 @@ func (m *Manager) Load(ctx context.Context) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	ctx = m.translatorContext(ctx)
-	ctx, trace := ensureRequestAttemptTrace(ctx)
-	finalSuccess := false
-	var finalErr error
-	defer func() {
-		coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
-			RequestID:    trace.requestIDValue(),
-			FinalSuccess: finalSuccess,
-			AttemptCount: trace.attemptCount(),
-			CompletedAt:  time.Now(),
-		})
-		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
-	}()
-	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
-		finalErr = errPreflight
-		return cliproxyexecutor.Response{}, errPreflight
-	}
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
-		return cliproxyexecutor.Response{}, finalErr
-	}
-
-	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
-	trace.configureBudget(requestRetry+1, maxRetryCredentials)
-
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
-		if errExec == nil {
-			finalSuccess = true
-			return resp, nil
-		}
-		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
-		if !shouldRetry {
-			break
-		}
-		wait = m.effectiveRetryWait(errExec, wait)
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			finalErr = errWait
-			return cliproxyexecutor.Response{}, errWait
-		}
-	}
-	if lastErr != nil {
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
-				return cliproxyexecutor.Response{}, errCredits
-			} else if ok {
-				return resp, nil
-			}
-		}
-		finalErr = lastErr
-		return cliproxyexecutor.Response{}, lastErr
-	}
-	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
-	return cliproxyexecutor.Response{}, finalErr
+	return m.runExecuteAttempts(ctx, providers, req, opts)
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	ctx = m.translatorContext(ctx)
-	ctx, trace := ensureRequestAttemptTrace(ctx)
-	finalSuccess := false
-	var finalErr error
-	defer func() {
-		coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
-			RequestID:    trace.requestIDValue(),
-			FinalSuccess: finalSuccess,
-			AttemptCount: trace.attemptCount(),
-			CompletedAt:  time.Now(),
-		})
-		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
-	}()
-	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
-		finalErr = errPreflight
-		return cliproxyexecutor.Response{}, errPreflight
-	}
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
-		return cliproxyexecutor.Response{}, finalErr
-	}
-
-	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
-	trace.configureBudget(requestRetry+1, maxRetryCredentials)
-
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
-		if errExec == nil {
-			finalSuccess = true
-			return resp, nil
-		}
-		lastErr = errExec
-		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
-		if !shouldRetry {
-			break
-		}
-		wait = m.effectiveRetryWait(errExec, wait)
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			finalErr = errWait
-			return cliproxyexecutor.Response{}, errWait
-		}
-	}
-	if lastErr != nil {
-		finalErr = lastErr
-		return cliproxyexecutor.Response{}, lastErr
-	}
-	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
-	return cliproxyexecutor.Response{}, finalErr
+	return m.runCountAttempts(ctx, providers, req, opts)
 }
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	ctx = m.translatorContext(ctx)
-	ctx, trace := ensureRequestAttemptTrace(ctx)
-	finalSuccess := false
-	var finalErr error
-	defer func() {
-		coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
-			RequestID:    trace.requestIDValue(),
-			FinalSuccess: finalSuccess,
-			AttemptCount: trace.attemptCount(),
-			CompletedAt:  time.Now(),
-		})
-		logRequestExecutionSummary(ctx, trace, finalSuccess, finalErr)
-	}()
-	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {
-		finalErr = errPreflight
-		return nil, errPreflight
-	}
-	normalized := m.normalizeProviders(providers)
-	if len(normalized) == 0 {
-		finalErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
-		return nil, finalErr
-	}
-
-	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
-	trace.configureBudget(requestRetry+1, maxRetryCredentials)
-
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
-		if errStream == nil {
-			finalSuccess = true
-			return result, nil
-		}
-		lastErr = errStream
-		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, req.Model, maxWait)
-		if !shouldRetry {
-			break
-		}
-		wait = m.effectiveRetryWait(errStream, wait)
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
-			finalErr = errWait
-			return nil, errWait
-		}
-	}
-	if lastErr != nil {
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
-				return nil, errCredits
-			} else if ok {
-				return result, nil
-			}
-		}
-		var bootstrapErr *streamBootstrapError
-		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
-			finalErr = bootstrapErr.cause
-			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
-		}
-		finalErr = lastErr
-		return nil, lastErr
-	}
-	finalErr = &Error{Code: "auth_not_found", Message: "no auth available"}
-	return nil, finalErr
+	return m.runStreamAttempts(ctx, providers, req, opts)
 }
 
 type requestToFormatResolver interface {
