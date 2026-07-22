@@ -35,7 +35,9 @@ go run ./cmd/payload-growth -test=false ./...
 bash .ci/payload-clone-scan-test.sh
 bash .ci/payload-clone-scan.sh
 bash .ci/verify-production-image-test.sh
-go test ./internal/payload
+go test ./internal/payload ./internal/compat
+go test ./internal/runtime/executor \
+  -run '^(TestClaudeCompatPolicyInventory|TestOpenAICompatPolicyRegistryInventory)$'
 go test ./...
 go vet ./...
 
