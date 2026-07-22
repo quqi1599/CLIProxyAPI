@@ -273,6 +273,66 @@ func translateCodexRequestPair(ctx context.Context, from, to sdktranslator.Forma
 	return helps.TranslateRequestPairGuarded(ctx, "legacy.translate.codex", from, to, model, originalPayload, payload, stream, internalpayload.AmplificationOverride{})
 }
 
+type codexResponsesRequestPlan struct {
+	from                  sdktranslator.Format
+	to                    sdktranslator.Format
+	responseFormat        sdktranslator.Format
+	originalPayloadSource []byte
+	body                  []byte
+	replayScope           codexReasoningReplayScope
+}
+
+func (e *CodexExecutor) prepareCodexResponsesRequestPlan(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, stream bool) (codexResponsesRequestPlan, error) {
+	from := opts.SourceFormat
+	to := sdktranslator.FormatCodex
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, baseModel, originalPayloadSource, req.Payload, stream)
+	if err != nil {
+		return codexResponsesRequestPlan{}, err
+	}
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return codexResponsesRequestPlan{}, err
+	}
+
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "stream", true)
+	body = normalizeCodexStatelessPayload(body)
+	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+	body, _ = sjson.DeleteBytes(body, "safety_identifier")
+	body, _ = sjson.DeleteBytes(body, "stream_options")
+	body = normalizeCodexInstructions(body)
+	body, replayScope, err := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
+	if err != nil {
+		return codexResponsesRequestPlan{}, err
+	}
+	body = repairCodexResponsesToolHistory(body)
+	body = normalizeCodexToolSchemas(body)
+	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
+		if err != nil {
+			return codexResponsesRequestPlan{}, err
+		}
+	}
+	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+
+	return codexResponsesRequestPlan{
+		from:                  from,
+		to:                    to,
+		responseFormat:        cliproxyexecutor.ResponseFormatOrSource(opts),
+		originalPayloadSource: originalPayloadSource,
+		body:                  body,
+		replayScope:           replayScope,
+	}, nil
+}
+
 type codexReasoningReplayScope struct {
 	modelName  string
 	sessionKey string
@@ -800,48 +860,17 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
+	plan, err := e.prepareCodexResponsesRequestPlan(ctx, auth, req, opts, baseModel, false)
+	if err != nil {
+		return resp, err
 	}
+	from := plan.from
+	to := plan.to
+	responseFormat := plan.responseFormat
+	originalPayloadSource := plan.originalPayloadSource
 	originalPayload := originalPayloadSource
-	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, baseModel, originalPayload, req.Payload, false)
-	if err != nil {
-		return resp, err
-	}
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body = normalizeCodexStatelessPayload(body)
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = normalizeCodexInstructions(body)
-	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
-	if errReplay != nil {
-		return resp, errReplay
-	}
-	body = repairCodexResponsesToolHistory(body)
-	body = normalizeCodexToolSchemas(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
-		if err != nil {
-			return resp, err
-		}
-	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+	body := plan.body
+	replayScope := plan.replayScope
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1084,47 +1113,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
+	plan, err := e.prepareCodexResponsesRequestPlan(ctx, auth, req, opts, baseModel, true)
+	if err != nil {
+		return nil, err
 	}
+	from := plan.from
+	to := plan.to
+	responseFormat := plan.responseFormat
+	originalPayloadSource := plan.originalPayloadSource
 	originalPayload := originalPayloadSource
-	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, baseModel, originalPayload, req.Payload, true)
-	if err != nil {
-		return nil, err
-	}
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return nil, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = normalizeCodexStatelessPayload(body)
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body = normalizeCodexInstructions(body)
-	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
-	if errReplay != nil {
-		return nil, errReplay
-	}
-	body = repairCodexResponsesToolHistory(body)
-	body = normalizeCodexToolSchemas(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
-		if err != nil {
-			return nil, err
-		}
-	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+	body := plan.body
+	replayScope := plan.replayScope
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
