@@ -468,6 +468,9 @@ func walkObjectChildren(object map[string]any, transform func(any) any) {
 
 func appendDescription(schema map[string]any, hint string) {
 	if existing := valueString(schema["description"]); existing != "" {
+		if existing == hint || strings.Contains(existing, " ("+hint+")") {
+			return
+		}
 		hint = existing + " (" + hint + ")"
 	}
 	schema["description"] = hint

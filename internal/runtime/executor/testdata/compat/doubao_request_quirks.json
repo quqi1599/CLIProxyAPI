@@ -1,0 +1,176 @@
+{
+  "policy_id": "openai_compat.doubao.request_quirks",
+  "compat_kind": "doubao",
+  "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+  "cases": [
+    {
+      "name": "seed20 fields content and tool arguments",
+      "model": "doubao-seed-2.0-pro",
+      "input": {
+        "model": "configured-doubao-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "inspect"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{bad json"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "temperature": 1.8,
+        "max_tokens": 100,
+        "max_completion_tokens": 100000,
+        "max_output_tokens": 20,
+        "user": "customer-1",
+        "store": true,
+        "metadata": {
+          "tenant": "demo"
+        },
+        "parallel_tool_calls": true,
+        "response_format": {
+          "type": "json_object"
+        }
+      },
+      "expected": {
+        "model": "configured-doubao-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "inspect"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "temperature": 1.5,
+        "max_completion_tokens": 98304
+      },
+      "downgrades": [
+        "openai_compat.doubao.unsupported_fields_removed",
+        "openai_compat.doubao.seed20_payload_normalized"
+      ]
+    },
+    {
+      "name": "deepseek bridge keeps Ark reasoning and V4 tool fallback",
+      "model": "deepseek-v4-pro",
+      "input": {
+        "model": "configured-doubao-deepseek-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "xhigh",
+        "reasoning": {
+          "effort": "xhigh",
+          "summary": "auto"
+        },
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 99999
+        },
+        "tools": [
+          {
+            "name": "read:file",
+            "description": "Read file",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "read:file"
+          }
+        }
+      },
+      "expected": {
+        "model": "configured-doubao-deepseek-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning": {
+          "effort": "high"
+        },
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "description": "Read file",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "read_file"
+          }
+        }
+      },
+      "downgrades": [
+        "openai_compat.doubao.unsupported_fields_removed"
+      ]
+    }
+  ]
+}

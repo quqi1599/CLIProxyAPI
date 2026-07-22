@@ -272,7 +272,11 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoEffort, doubaoThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
-	payload = scrubOpenAICompatCapabilityFields(payload, profile)
+	capabilityProfile := profile
+	if compatKind == "doubao" && hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoEffort, doubaoThinkingDisabled) {
+		capabilityProfile.SupportsReasoning = true
+	}
+	payload = scrubOpenAICompatCapabilityFields(payload, capabilityProfile)
 	if compatKind == "doubao" {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoEffort, doubaoThinkingDisabled)
 	}
@@ -290,6 +294,14 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 }
 
 func scrubOpenAICompatPayloadBeforeProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	return scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload, profile, model, baseURL, false)
+}
+
+func scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	return scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload, profile, model, baseURL, true)
+}
+
+func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile openAICompatProfile, model string, baseURL string, registeredPolicies bool) []byte {
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
 		payload = repaired
 	}
@@ -298,13 +310,19 @@ func scrubOpenAICompatPayloadBeforeProviderQuirks(payload []byte, profile openAI
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
-	payload = scrubOpenAICompatPayload(payload, profile)
+	capabilityProfile := profile
+	if compatKind == "doubao" && hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled) {
+		capabilityProfile.SupportsReasoning = true
+	}
+	payload = scrubOpenAICompatPayload(payload, capabilityProfile)
 	if compatKind == "doubao" {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)
 	}
 	payload = repairOpenAICompatToolCallHistory(payload)
 	payload = sanitizeOpenAICompatToolSchemas(payload)
-	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
+	if !registeredPolicies || compatKind != "deepseek" {
+		payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
+	}
 	if profile.NormalizeToolHistory {
 		if normalized, err := normalizeOpenAICompatToolMessageLinks(payload, "openai compat executor"); err == nil {
 			payload = normalized
@@ -314,7 +332,9 @@ func scrubOpenAICompatPayloadBeforeProviderQuirks(payload []byte, profile openAI
 	}
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
-	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	if !registeredPolicies || compatKind != "deepseek" {
+		payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	}
 	return payload
 }
 
@@ -336,17 +356,25 @@ func scrubOpenAICompatLegacyProviderQuirks(payload []byte, profile openAICompatP
 }
 
 func scrubOpenAICompatPayloadAfterProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	return scrubOpenAICompatPayloadAfterProviderQuirksMode(payload, profile, model, baseURL, false)
+}
+
+func scrubOpenAICompatPayloadAfterRegisteredProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	return scrubOpenAICompatPayloadAfterProviderQuirksMode(payload, profile, model, baseURL, true)
+}
+
+func scrubOpenAICompatPayloadAfterProviderQuirksMode(payload []byte, profile openAICompatProfile, model string, baseURL string, registeredPolicies bool) []byte {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
-	if compatKind == "xiaomi" {
+	if compatKind == "xiaomi" && !registeredPolicies {
 		payload = scrubXiaomiPayloadForModel(payload, model)
 	}
 	if compatKind == "zhipu" {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
-	if compatKind == "doubao" {
+	if compatKind == "doubao" && !registeredPolicies {
 		payload = scrubDoubaoPayloadForModel(payload, model)
 	}
-	if requiresDeepSeekToolSchemaCompatibility(model) {
+	if requiresDeepSeekToolSchemaCompatibility(model) && (!registeredPolicies || compatKind != "deepseek") {
 		payload = scrubDeepSeekToolPayload(payload, baseURL)
 	}
 	return payload
@@ -869,6 +897,19 @@ func doubaoDeepSeekReasoningIntent(payload []byte, model string) (string, bool) 
 		}
 	}
 	return "", false
+}
+
+func hasCanonicalDoubaoDeepSeekReasoning(payload []byte, model, effort string, disabled bool) bool {
+	if disabled || effort == "" || !isDoubaoDeepSeekReasoningModel(model) {
+		return false
+	}
+	reasoning := gjson.GetBytes(payload, "reasoning")
+	fields := reasoning.Map()
+	if !reasoning.IsObject() || len(fields) != 1 {
+		return false
+	}
+	value, ok := fields["effort"]
+	return ok && value.Type == gjson.String && strings.EqualFold(strings.TrimSpace(value.String()), effort)
 }
 
 func applyDoubaoDeepSeekReasoningIntent(payload []byte, model, effort string, disabled bool) []byte {

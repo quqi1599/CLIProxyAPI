@@ -29,6 +29,7 @@ type openAICompatPolicyFixture struct {
 type openAICompatPolicyFixtureCase struct {
 	Name       string          `json:"name"`
 	Model      string          `json:"model"`
+	BaseURL    string          `json:"base_url,omitempty"`
 	Input      json.RawMessage `json:"input"`
 	Expected   json.RawMessage `json:"expected"`
 	Downgrades []string        `json:"downgrades"`
@@ -36,9 +37,12 @@ type openAICompatPolicyFixtureCase struct {
 
 func TestOpenAICompatPolicyFixturesMatchLegacyBehavior(t *testing.T) {
 	fixturePaths := []string{
+		"testdata/compat/deepseek_request_quirks.json",
+		"testdata/compat/doubao_request_quirks.json",
 		"testdata/compat/kimi_model_quirks.json",
 		"testdata/compat/minimax_request_quirks.json",
 		"testdata/compat/qwen38_thinking.json",
+		"testdata/compat/xiaomi_request_quirks.json",
 	}
 	for _, fixturePath := range fixturePaths {
 		fixture := readOpenAICompatPolicyFixture(t, fixturePath)
@@ -46,14 +50,18 @@ func TestOpenAICompatPolicyFixturesMatchLegacyBehavior(t *testing.T) {
 			profile := openAICompatProfileForKind(fixture.CompatKind)
 			for _, fixtureCase := range fixture.Cases {
 				t.Run(fixtureCase.Name, func(t *testing.T) {
-					legacy := scrubOpenAICompatPayloadForModel(fixtureCase.Input, profile, fixtureCase.Model, fixture.BaseURL)
+					baseURL := fixture.BaseURL
+					if fixtureCase.BaseURL != "" {
+						baseURL = fixtureCase.BaseURL
+					}
+					legacy := scrubOpenAICompatPayloadForModel(fixtureCase.Input, profile, fixtureCase.Model, baseURL)
 					assertOpenAICompatJSONEqual(t, legacy, fixtureCase.Expected)
 
 					ctx := internalpayload.WithAmplificationMode(
 						internalpayload.WithTransformReport(context.Background(), int64(len(fixtureCase.Input))),
 						internalpayload.AmplificationModeObserve,
 					)
-					actual, err := scrubOpenAICompatPayloadForModelWithPolicies(ctx, fixtureCase.Input, profile, fixtureCase.Model, fixture.BaseURL, compat.MatchContext{})
+					actual, err := scrubOpenAICompatPayloadForModelWithPolicies(ctx, fixtureCase.Input, profile, fixtureCase.Model, baseURL, compat.MatchContext{})
 					if err != nil {
 						t.Fatalf("scrubOpenAICompatPayloadForModelWithPolicies() error = %v", err)
 					}
@@ -201,15 +209,22 @@ func TestOpenAICompatFirstPolicyScrubIsIdempotent(t *testing.T) {
 	}
 
 	for _, fixturePath := range []string{
+		"testdata/compat/deepseek_request_quirks.json",
+		"testdata/compat/doubao_request_quirks.json",
 		"testdata/compat/kimi_model_quirks.json",
 		"testdata/compat/minimax_request_quirks.json",
 		"testdata/compat/qwen38_thinking.json",
+		"testdata/compat/xiaomi_request_quirks.json",
 	} {
 		fixture := readOpenAICompatPolicyFixture(t, fixturePath)
 		profile := openAICompatProfileForKind(fixture.CompatKind)
 		for _, fixtureCase := range fixture.Cases {
 			t.Run(fixture.CompatKind+"/"+fixtureCase.Name, func(t *testing.T) {
-				assertIdempotent(t, fixtureCase.Input, profile, fixtureCase.Model, fixture.BaseURL)
+				baseURL := fixture.BaseURL
+				if fixtureCase.BaseURL != "" {
+					baseURL = fixtureCase.BaseURL
+				}
+				assertIdempotent(t, fixtureCase.Input, profile, fixtureCase.Model, baseURL)
 			})
 		}
 	}
@@ -225,21 +240,6 @@ func TestOpenAICompatFirstPolicyScrubIsIdempotent(t *testing.T) {
 			name:    "generic",
 			payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"inspect","strict":true,"parameters":{"type":"object","properties":{"type":"object"},"additionalProperties":"object","required":null}}}]}`),
 			profile: genericOpenAICompatProfile(), model: "gpt-5", baseURL: "https://api.openai.com/v1",
-		},
-		{
-			name:    "deepseek",
-			payload: []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"thinking_budget":50,"thinking":{"type":"enabled","budget_tokens":99999},"reasoning_effort":"xhigh"}`),
-			profile: genericOpenAICompatProfile(), model: "deepseek-v4-pro", baseURL: "https://api.deepseek.com/v1",
-		},
-		{
-			name:    "doubao",
-			payload: []byte(`{"model":"doubao-seed-2.0-pro","messages":[{"role":"user","content":[{"type":"input_text","text":"inspect"}]}],"temperature":1.8,"max_tokens":100,"max_completion_tokens":100000,"store":true,"metadata":{"tenant":"demo"},"parallel_tool_calls":true}`),
-			profile: openAICompatProfileForKind("doubao"), model: "doubao-seed-2.0-pro", baseURL: "https://ark.cn-beijing.volces.com/api/v3",
-		},
-		{
-			name:    "xiaomi",
-			payload: []byte(`{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","temperature":0.2,"top_p":0.4}`),
-			profile: openAICompatProfileForKind("xiaomi"), model: "mimo-v2.5-pro", baseURL: "https://api.xiaomimimo.com/v1",
 		},
 		{
 			name:    "zhipu",
@@ -260,9 +260,12 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		t.Fatalf("openAICompatPolicyInventory() error = %v", err)
 	}
 	wantIDs := []string{
+		openAICompatDeepSeekPolicyID,
+		openAICompatDoubaoPolicyID,
 		openAICompatKimiPolicyID,
 		openAICompatMiniMaxPolicyID,
 		openAICompatQwen38PolicyID,
+		openAICompatXiaomiPolicyID,
 		openAICompatPostConfigRevalidatePolicyID,
 	}
 	if len(report.Policies) != len(wantIDs) {
@@ -297,6 +300,160 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatMigratedPolicyMatchBoundaries(t *testing.T) {
+	tests := []struct {
+		name         string
+		payload      []byte
+		profile      openAICompatProfile
+		model        string
+		baseURL      string
+		wantPolicies []string
+		assert       func(*testing.T, []byte)
+	}{
+		{
+			name:         "canonical deepseek",
+			payload:      []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"thinking_budget":50}`),
+			profile:      openAICompatProfileForKind("deepseek"),
+			model:        "deepseek-v4-pro",
+			baseURL:      "https://api.deepseek.com/v1",
+			wantPolicies: []string{openAICompatDeepSeekPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "thinking_budget").Int(); got != deepSeekThinkingBudgetMin {
+					t.Fatalf("thinking_budget = %d, want %d: %s", got, deepSeekThinkingBudgetMin, payload)
+				}
+			},
+		},
+		{
+			name:    "unknown kind deepseek fallback",
+			payload: []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"thinking_budget":50}`),
+			profile: genericOpenAICompatProfile(),
+			model:   "deepseek-v4-pro",
+			baseURL: "https://api.deepseek.com/v1",
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "thinking_budget").Int(); got != deepSeekThinkingBudgetMin {
+					t.Fatalf("fallback thinking_budget = %d, want %d: %s", got, deepSeekThinkingBudgetMin, payload)
+				}
+			},
+		},
+		{
+			name:         "explicit kimi excludes deepseek policy",
+			payload:      []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"thinking_budget":50,"reasoning":{"effort":"high"}}`),
+			profile:      openAICompatProfileForKind("kimi"),
+			model:        "deepseek-v4-pro",
+			baseURL:      "https://api.deepseek.com/v1",
+			wantPolicies: []string{openAICompatKimiPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "thinking_budget").Int(); got != 50 {
+					t.Fatalf("Kimi thinking_budget = %d, want unchanged 50: %s", got, payload)
+				}
+				if gjson.GetBytes(payload, "reasoning").Exists() {
+					t.Fatalf("Kimi payload retained DeepSeek reasoning: %s", payload)
+				}
+			},
+		},
+		{
+			name:         "doubao deepseek uses Ark policy only",
+			payload:      []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh","thinking":{"type":"enabled"}}`),
+			profile:      openAICompatProfileForKind("doubao"),
+			model:        "deepseek-v4-pro",
+			baseURL:      "https://ark.cn-beijing.volces.com/api/v3",
+			wantPolicies: []string{openAICompatDoubaoPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "reasoning.effort").String(); got != "high" {
+					t.Fatalf("Doubao reasoning.effort = %q, want high: %s", got, payload)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			legacy := scrubOpenAICompatPayloadForModel(test.payload, test.profile, test.model, test.baseURL)
+			ctx := internalpayload.WithTransformReport(context.Background(), int64(len(test.payload)))
+			actual, err := scrubOpenAICompatPayloadForModelWithPolicies(ctx, test.payload, test.profile, test.model, test.baseURL, compat.MatchContext{})
+			if err != nil {
+				t.Fatalf("scrubOpenAICompatPayloadForModelWithPolicies() error = %v", err)
+			}
+			assertOpenAICompatJSONEqual(t, actual, legacy)
+			if test.assert != nil {
+				test.assert(t, actual)
+			}
+			report, ok := internalpayload.TransformReportFromContext(ctx)
+			if !ok {
+				t.Fatal("transform report missing")
+			}
+			var gotPolicies []string
+			for _, stage := range report.Stages {
+				if stage.Stage == "compat/"+string(compat.ProviderQuirkPatch) {
+					gotPolicies = stage.AppliedPolicies
+				}
+			}
+			if !slices.Equal(gotPolicies, test.wantPolicies) {
+				t.Fatalf("applied policies = %v, want %v; report=%+v", gotPolicies, test.wantPolicies, report)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatPostConfigRevalidatesMigratedProviders(t *testing.T) {
+	tests := []struct {
+		name           string
+		payload        []byte
+		profile        openAICompatProfile
+		model          string
+		baseURL        string
+		wantDowngrades []string
+	}{
+		{
+			name:           "deepseek",
+			payload:        []byte(`{"model":"route-alias","thinking_budget":50,"thinking":{"type":"enabled"},"tool_choice":"auto"}`),
+			profile:        openAICompatProfileForKind("deepseek"),
+			model:          "deepseek-v4-pro",
+			baseURL:        "https://api.deepseek.com/v1",
+			wantDowngrades: []string{openAICompatDeepSeekThinkingDowngrade, openAICompatDeepSeekToolChoiceDowngrade},
+		},
+		{
+			name:           "doubao",
+			payload:        []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"user":"customer","temperature":1.8,"max_completion_tokens":100000}`),
+			profile:        openAICompatProfileForKind("doubao"),
+			model:          "doubao-seed-2.0-pro",
+			baseURL:        "https://ark.cn-beijing.volces.com/api/v3",
+			wantDowngrades: []string{openAICompatDoubaoFieldsDowngrade, openAICompatDoubaoSeed20Downgrade},
+		},
+		{
+			name:           "xiaomi",
+			payload:        []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","temperature":0.2,"top_p":0.4,"max_tokens":384000}`),
+			profile:        openAICompatProfileForKind("xiaomi"),
+			model:          "mimo-v2.5-pro",
+			baseURL:        "https://api.xiaomimimo.com/v1",
+			wantDowngrades: []string{openAICompatReasoningRemovedDowngrade, openAICompatXiaomiReasoningDowngrade, openAICompatXiaomiTokenDowngrade},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := internalpayload.WithTransformReport(context.Background(), int64(len(test.payload)))
+			_, err := revalidateOpenAICompatPayloadAfterConfig(
+				ctx,
+				test.payload,
+				test.profile,
+				test.model,
+				test.baseURL,
+				compat.MatchContext{Endpoint: "chat", Mode: "non-stream", SourceFormat: "openai", TargetFormat: "openai"},
+			)
+			if err != nil {
+				t.Fatalf("revalidateOpenAICompatPayloadAfterConfig() error = %v", err)
+			}
+			report, ok := internalpayload.TransformReportFromContext(ctx)
+			if !ok || len(report.Stages) != 1 {
+				t.Fatalf("post-config report = %+v, ok=%v", report, ok)
+			}
+			if got := report.Stages[0].Downgrades; !slices.Equal(got, test.wantDowngrades) {
+				t.Fatalf("post-config downgrades = %v, want %v", got, test.wantDowngrades)
+			}
+		})
+	}
+}
+
 func TestOpenAICompatPlannerRevalidatesPoliciesAfterPayloadConfig(t *testing.T) {
 	executor := NewOpenAICompatExecutor("kimi-provider", &config.Config{
 		Payload: config.PayloadConfig{
@@ -305,6 +462,7 @@ func TestOpenAICompatPlannerRevalidatesPoliciesAfterPayloadConfig(t *testing.T) 
 				Params: map[string]any{
 					"model":       "configured-kimi-alias",
 					"metadata":    map[string]any{"tenant": "reintroduced"},
+					"reasoning":   map[string]any{"effort": "high"},
 					"temperature": 0.2,
 				},
 			}},
@@ -337,6 +495,9 @@ func TestOpenAICompatPlannerRevalidatesPoliciesAfterPayloadConfig(t *testing.T) 
 	}
 	if gjson.GetBytes(plan.body, "metadata").Exists() {
 		t.Fatalf("post-config metadata was not removed: %s", plan.body)
+	}
+	if gjson.GetBytes(plan.body, "reasoning").Exists() {
+		t.Fatalf("post-config Kimi payload retained DeepSeek reasoning: %s", plan.body)
 	}
 
 	report, ok := internalpayload.TransformReportFromContext(ctx)

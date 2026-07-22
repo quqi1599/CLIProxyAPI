@@ -1,0 +1,152 @@
+{
+  "policy_id": "openai_compat.deepseek.request_quirks",
+  "compat_kind": "deepseek",
+  "base_url": "https://api.deepseek.com/v1",
+  "cases": [
+    {
+      "name": "thinking tool choice and strict schema",
+      "model": "deepseek-v4-pro",
+      "input": {
+        "model": "configured-deepseek-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "thinking_budget": 50,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 99999
+        },
+        "reasoning_effort": "xhigh",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "lookup"
+          }
+        }
+      },
+      "expected": {
+        "model": "configured-deepseek-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "thinking_budget": 100,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 32768
+        },
+        "reasoning_effort": "max",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "downgrades": [
+        "openai_compat.deepseek.thinking_controls_normalized",
+        "openai_compat.deepseek.tool_choice_removed",
+        "openai_compat.deepseek.strict_schema_removed"
+      ]
+    },
+    {
+      "name": "beta strict schema stays strict",
+      "model": "deepseek-v4-pro",
+      "base_url": "https://api.deepseek.com/beta",
+      "input": {
+        "model": "configured-deepseek-beta-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "model": "configured-deepseek-beta-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "description": "No extra properties allowed",
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      },
+      "downgrades": []
+    }
+  ]
+}

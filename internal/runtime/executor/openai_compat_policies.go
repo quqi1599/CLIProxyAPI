@@ -13,9 +13,12 @@ import (
 )
 
 const (
+	openAICompatDeepSeekPolicyID             = "openai_compat.deepseek.request_quirks"
+	openAICompatDoubaoPolicyID               = "openai_compat.doubao.request_quirks"
 	openAICompatKimiPolicyID                 = "openai_compat.kimi.model_quirks"
 	openAICompatMiniMaxPolicyID              = "openai_compat.minimax.request_quirks"
 	openAICompatQwen38PolicyID               = "openai_compat.qwen38.thinking"
+	openAICompatXiaomiPolicyID               = "openai_compat.xiaomi.request_quirks"
 	openAICompatPostConfigRevalidatePolicyID = "openai_compat.post_config_revalidate"
 	openAICompatPostConfigRevalidateStage    = "compat/" + string(compat.PostConfigRevalidate)
 	openAICompatProviderPreQuirkStage        = "request_plan.openai_compat.provider_pre_quirk_scrub"
@@ -23,17 +26,27 @@ const (
 	openAICompatProviderPreQuirkPolicy       = "openai_compat.provider_pre_quirk_scrub"
 	openAICompatProviderPostQuirkPolicy      = "openai_compat.provider_post_quirk_scrub"
 
-	openAICompatKimiToolChoiceDowngrade = "openai_compat.kimi.tool_choice_normalized"
-	openAICompatKimiWebSearchDowngrade  = "openai_compat.kimi.web_search_disables_thinking"
-	openAICompatMiniMaxPenaltyDowngrade = "openai_compat.minimax.penalties_removed"
-	openAICompatQwen38ThinkingDowngrade = "openai_compat.qwen38.disabled_to_low"
+	openAICompatDeepSeekThinkingDowngrade   = "openai_compat.deepseek.thinking_controls_normalized"
+	openAICompatDeepSeekToolChoiceDowngrade = "openai_compat.deepseek.tool_choice_removed"
+	openAICompatDeepSeekStrictDowngrade     = "openai_compat.deepseek.strict_schema_removed"
+	openAICompatDoubaoFieldsDowngrade       = "openai_compat.doubao.unsupported_fields_removed"
+	openAICompatDoubaoSeed20Downgrade       = "openai_compat.doubao.seed20_payload_normalized"
+	openAICompatKimiToolChoiceDowngrade     = "openai_compat.kimi.tool_choice_normalized"
+	openAICompatKimiWebSearchDowngrade      = "openai_compat.kimi.web_search_disables_thinking"
+	openAICompatMiniMaxPenaltyDowngrade     = "openai_compat.minimax.penalties_removed"
+	openAICompatQwen38ThinkingDowngrade     = "openai_compat.qwen38.disabled_to_low"
+	openAICompatXiaomiReasoningDowngrade    = "openai_compat.xiaomi.reasoning_normalized"
+	openAICompatXiaomiTokenDowngrade        = "openai_compat.xiaomi.token_limits_normalized"
 )
 
 var (
 	openAICompatPolicyRegistry, openAICompatPolicyRegistryErr = compat.NewRegistry(
+		openAICompatDeepSeekPolicy(),
+		openAICompatDoubaoPolicy(),
 		openAICompatKimiPolicy(),
 		openAICompatMiniMaxPolicy(),
 		openAICompatQwen38Policy(),
+		openAICompatXiaomiPolicy(),
 	)
 	openAICompatPolicyPipeline                                        = compat.NewPipeline(openAICompatPolicyRegistry)
 	openAICompatPostConfigRegistry, openAICompatPostConfigRegistryErr = compat.NewRegistry(
@@ -42,8 +55,13 @@ var (
 	openAICompatPostConfigPipeline = compat.NewPipeline(openAICompatPostConfigRegistry)
 )
 
-type openAICompatPolicyModelContextKey struct{}
+type openAICompatPolicyContextKey struct{}
 type openAICompatPostConfigContextKey struct{}
+
+type openAICompatPolicyContext struct {
+	model   string
+	baseURL string
+}
 
 type openAICompatPostConfigContext struct {
 	profile openAICompatProfile
@@ -57,7 +75,7 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 	}
 	preQuirkStarted := time.Now()
 	preQuirkInput := payload
-	payload = scrubOpenAICompatPayloadBeforeProviderQuirks(payload, profile, model, baseURL)
+	payload = scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(payload, profile, model, baseURL)
 	if err := helps.EnforceSemanticTransformStage(
 		ctx,
 		openAICompatProviderPreQuirkStage,
@@ -73,13 +91,13 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 	if openAICompatPolicyRegistryErr != nil {
 		return nil, openAICompatPolicyRegistryErr
 	}
-	ctx = context.WithValue(ctx, openAICompatPolicyModelContextKey{}, model)
+	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL})
 	result, err := openAICompatPolicyPipeline.Apply(ctx, openAICompatPolicyMatchContext(profile, payload, model, match), payload)
 	if err != nil {
 		return nil, err
 	}
 	postQuirkStarted := time.Now()
-	output := scrubOpenAICompatPayloadAfterProviderQuirks(result.Payload, profile, model, baseURL)
+	output := scrubOpenAICompatPayloadAfterRegisteredProviderQuirks(result.Payload, profile, model, baseURL)
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
 		openAICompatProviderPostQuirkStage,
@@ -118,7 +136,7 @@ func revalidateOpenAICompatPayloadAfterConfig(ctx context.Context, payload []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx = context.WithValue(ctx, openAICompatPolicyModelContextKey{}, model)
+	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL})
 	ctx = context.WithValue(ctx, openAICompatPostConfigContextKey{}, openAICompatPostConfigContext{
 		profile: profile,
 		model:   model,
@@ -199,10 +217,17 @@ func openAICompatPostConfigRevalidatePolicy() compat.Policy {
 			openAICompatParallelToolsRemovedDowngrade,
 			openAICompatReasoningRemovedDowngrade,
 			openAICompatStreamUsageRemovedDowngrade,
+			openAICompatDeepSeekThinkingDowngrade,
+			openAICompatDeepSeekToolChoiceDowngrade,
+			openAICompatDeepSeekStrictDowngrade,
+			openAICompatDoubaoFieldsDowngrade,
+			openAICompatDoubaoSeed20Downgrade,
 			openAICompatKimiToolChoiceDowngrade,
 			openAICompatKimiWebSearchDowngrade,
 			openAICompatMiniMaxPenaltyDowngrade,
 			openAICompatQwen38ThinkingDowngrade,
+			openAICompatXiaomiReasoningDowngrade,
+			openAICompatXiaomiTokenDowngrade,
 		},
 		Apply: applyOpenAICompatPostConfigRevalidatePolicy,
 	}
@@ -223,12 +248,18 @@ func applyOpenAICompatPostConfigRevalidatePolicy(ctx context.Context, input []by
 func openAICompatPostConfigDowngrades(ctx context.Context, input, output []byte, profile openAICompatProfile) []string {
 	downgrades := appendOpenAICompatDowngrades(nil, openAICompatCompatibilityDowngrades(input, output))
 	switch config.NormalizeOpenAICompatibilityKind(profile.Kind) {
+	case "deepseek":
+		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatDeepSeekPolicyDowngrades(input, output))
+	case "doubao":
+		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatDoubaoPolicyDowngrades(input, output, openAICompatPolicyModel(ctx, input)))
 	case "kimi":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatKimiPolicyDowngrades(input, output))
 	case "minimax":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatMiniMaxPolicyDowngrades(input, output))
 	case "qwen":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatQwen38PolicyDowngrades(ctx, input, output))
+	case "xiaomi":
+		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatXiaomiPolicyDowngrades(input, output))
 	}
 	return downgrades
 }
@@ -249,6 +280,99 @@ func appendOpenAICompatDowngrades(existing []string, groups ...[]string) []strin
 		}
 	}
 	return existing
+}
+
+func openAICompatDeepSeekPolicy() compat.Policy {
+	return compat.Policy{
+		ID:    openAICompatDeepSeekPolicyID,
+		Owner: "runtime/executor",
+		Match: compat.MatchSpec{
+			ProviderFamily: "openai-compatibility",
+			CompatKind:     "deepseek",
+		},
+		Phase:    compat.ProviderQuirkPatch,
+		Priority: 100,
+		Cost: compat.CostContract{
+			Complexity:         "O(bytes)",
+			MaxExpansionBytes:  internalpayload.DefaultMaxExpansionBytes,
+			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
+			MayCopyLargeFields: true,
+		},
+		RemovalCondition: "Remove when official DeepSeek endpoints accept canonical reasoning controls, tool choice, and OpenAI tool schemas.",
+		Lifecycle: compat.LifecycleMetadata{
+			IntroducedVersion: "git:2e769c78",
+			Fixture:           "internal/runtime/executor/testdata/compat/deepseek_request_quirks.json",
+			UpstreamEvidence:  "DeepSeek requires bounded thinking controls and endpoint-specific strict tool schemas.",
+			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
+			ReviewDate:        "2026-10-22",
+		},
+		MutatedFields: []string{
+			"body.messages",
+			"body.reasoning",
+			"body.reasoning_effort",
+			"body.thinking",
+			"body.thinking_budget",
+			"body.tool_choice",
+			"body.tools",
+		},
+		DowngradeIDs: []string{
+			openAICompatDeepSeekThinkingDowngrade,
+			openAICompatDeepSeekToolChoiceDowngrade,
+			openAICompatDeepSeekStrictDowngrade,
+		},
+		Apply: applyOpenAICompatDeepSeekPolicy,
+	}
+}
+
+func openAICompatDoubaoPolicy() compat.Policy {
+	return compat.Policy{
+		ID:    openAICompatDoubaoPolicyID,
+		Owner: "runtime/executor",
+		Match: compat.MatchSpec{
+			ProviderFamily: "openai-compatibility",
+			CompatKind:     "doubao",
+		},
+		Phase:    compat.ProviderQuirkPatch,
+		Priority: 100,
+		Cost: compat.CostContract{
+			Complexity:         "O(bytes)",
+			MaxExpansionBytes:  internalpayload.DefaultMaxExpansionBytes,
+			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
+			MayCopyLargeFields: true,
+		},
+		RemovalCondition: "Remove when Doubao Ark accepts canonical OpenAI request fields and Seed 2.0 payload shapes.",
+		Lifecycle: compat.LifecycleMetadata{
+			IntroducedVersion: "git:d1123231",
+			Fixture:           "internal/runtime/executor/testdata/compat/doubao_request_quirks.json",
+			UpstreamEvidence:  "Doubao Ark rejects unsupported OpenAI fields and constrains Seed 2.0 sampling, token, and content shapes.",
+			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
+			ReviewDate:        "2026-10-22",
+		},
+		MutatedFields: []string{
+			"body.max_completion_tokens",
+			"body.max_output_tokens",
+			"body.max_tokens",
+			"body.messages",
+			"body.metadata",
+			"body.output_config",
+			"body.parallel_tool_calls",
+			"body.reasoning",
+			"body.reasoning_effort",
+			"body.response_format",
+			"body.service_tier",
+			"body.store",
+			"body.stream_options",
+			"body.temperature",
+			"body.thinking",
+			"body.thinking_budget",
+			"body.user",
+		},
+		DowngradeIDs: []string{
+			openAICompatDoubaoFieldsDowngrade,
+			openAICompatDoubaoSeed20Downgrade,
+		},
+		Apply: applyOpenAICompatDoubaoPolicy,
+	}
 }
 
 func openAICompatKimiPolicy() compat.Policy {
@@ -368,6 +492,73 @@ func openAICompatQwen38Policy() compat.Policy {
 	}
 }
 
+func openAICompatXiaomiPolicy() compat.Policy {
+	return compat.Policy{
+		ID:    openAICompatXiaomiPolicyID,
+		Owner: "runtime/executor",
+		Match: compat.MatchSpec{
+			ProviderFamily: "openai-compatibility",
+			CompatKind:     "xiaomi",
+		},
+		Phase:    compat.ProviderQuirkPatch,
+		Priority: 100,
+		Cost: compat.CostContract{
+			Complexity:         "O(bytes)",
+			MaxExpansionBytes:  internalpayload.DefaultMaxExpansionBytes,
+			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
+			MayCopyLargeFields: true,
+		},
+		RemovalCondition: "Remove when Xiaomi MiMo accepts canonical OpenAI reasoning, sampling, token, and tool schema fields.",
+		Lifecycle: compat.LifecycleMetadata{
+			IntroducedVersion: "git:5a961947",
+			Fixture:           "internal/runtime/executor/testdata/compat/xiaomi_request_quirks.json",
+			UpstreamEvidence:  "Xiaomi MiMo requires native thinking controls, fixed thinking sampling, bounded output tokens, and simplified tool schemas.",
+			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
+			ReviewDate:        "2026-10-22",
+		},
+		MutatedFields: []string{
+			"body.max_completion_tokens",
+			"body.max_output_tokens",
+			"body.max_tokens",
+			"body.messages",
+			"body.reasoning",
+			"body.reasoning_effort",
+			"body.temperature",
+			"body.thinking",
+			"body.thinking_budget",
+			"body.tools",
+			"body.top_p",
+		},
+		DowngradeIDs: []string{
+			openAICompatXiaomiReasoningDowngrade,
+			openAICompatXiaomiTokenDowngrade,
+		},
+		Apply: applyOpenAICompatXiaomiPolicy,
+	}
+}
+
+func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
+	state := openAICompatPolicyState(ctx, input)
+	output := scrubDeepSeekThinkingBudgetForCompat(input, state.model, state.baseURL, "deepseek")
+	output = scrubDeepSeekThinkingToolChoice(output, state.model, state.baseURL, "deepseek")
+	if requiresDeepSeekToolSchemaCompatibility(state.model) {
+		output = scrubDeepSeekToolPayload(output, state.baseURL)
+	}
+	return compat.TransformResult{
+		Payload:    output,
+		Downgrades: openAICompatDeepSeekPolicyDowngrades(input, output),
+	}, nil
+}
+
+func applyOpenAICompatDoubaoPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
+	model := openAICompatPolicyModel(ctx, input)
+	output := scrubDoubaoPayloadForModel(input, model)
+	return compat.TransformResult{
+		Payload:    output,
+		Downgrades: openAICompatDoubaoPolicyDowngrades(input, output, model),
+	}, nil
+}
+
 func applyOpenAICompatKimiPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
 	output := scrubKimiPayloadForModel(input, openAICompatPolicyModel(ctx, input))
 	return compat.TransformResult{
@@ -395,13 +586,103 @@ func applyOpenAICompatQwen38Policy(ctx context.Context, input []byte) (compat.Tr
 	}, nil
 }
 
-func openAICompatPolicyModel(ctx context.Context, payload []byte) string {
+func applyOpenAICompatXiaomiPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
+	output := scrubXiaomiPayloadForModel(input, openAICompatPolicyModel(ctx, input))
+	return compat.TransformResult{
+		Payload:    output,
+		Downgrades: openAICompatXiaomiPolicyDowngrades(input, output),
+	}, nil
+}
+
+func openAICompatPolicyState(ctx context.Context, payload []byte) openAICompatPolicyContext {
 	if ctx != nil {
-		if model, ok := ctx.Value(openAICompatPolicyModelContextKey{}).(string); ok && model != "" {
-			return model
+		if state, ok := ctx.Value(openAICompatPolicyContextKey{}).(openAICompatPolicyContext); ok {
+			if state.model == "" {
+				state.model = gjson.GetBytes(payload, "model").String()
+			}
+			return state
 		}
 	}
-	return gjson.GetBytes(payload, "model").String()
+	return openAICompatPolicyContext{model: gjson.GetBytes(payload, "model").String()}
+}
+
+func openAICompatPolicyModel(ctx context.Context, payload []byte) string {
+	return openAICompatPolicyState(ctx, payload).model
+}
+
+func openAICompatDeepSeekPolicyDowngrades(input, output []byte) []string {
+	downgrades := make([]string, 0, 3)
+	for _, path := range []string{
+		"reasoning",
+		"reasoning_effort",
+		"thinking",
+		"thinking_budget",
+	} {
+		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+			downgrades = append(downgrades, openAICompatDeepSeekThinkingDowngrade)
+			break
+		}
+	}
+	if gjson.GetBytes(input, "tool_choice").Exists() && !gjson.GetBytes(output, "tool_choice").Exists() {
+		downgrades = append(downgrades, openAICompatDeepSeekToolChoiceDowngrade)
+	}
+	if deepSeekHasStrictField(input) && !deepSeekHasStrictField(output) {
+		downgrades = append(downgrades, openAICompatDeepSeekStrictDowngrade)
+	}
+	return downgrades
+}
+
+func deepSeekHasStrictField(payload []byte) bool {
+	for _, path := range []string{"tools.#.strict", "tools.#.function.strict"} {
+		if len(gjson.GetBytes(payload, path).Array()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func openAICompatDoubaoPolicyDowngrades(input, output []byte, model string) []string {
+	downgrades := make([]string, 0, 2)
+	for _, path := range []string{
+		"user",
+		"response_format",
+		"service_tier",
+		"reasoning_effort",
+		"thinking",
+		"thinking_budget",
+		"output_config.effort",
+	} {
+		if gjson.GetBytes(input, path).Exists() && !gjson.GetBytes(output, path).Exists() {
+			downgrades = append(downgrades, openAICompatDoubaoFieldsDowngrade)
+			break
+		}
+	}
+	if requiresDoubaoSeed20Compatibility(model) {
+		for _, path := range []string{"temperature", "max_tokens", "max_completion_tokens", "max_output_tokens", "messages"} {
+			if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+				downgrades = append(downgrades, openAICompatDoubaoSeed20Downgrade)
+				break
+			}
+		}
+	}
+	return downgrades
+}
+
+func openAICompatXiaomiPolicyDowngrades(input, output []byte) []string {
+	downgrades := make([]string, 0, 2)
+	for _, path := range []string{"reasoning", "reasoning_effort", "thinking", "thinking_budget"} {
+		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+			downgrades = append(downgrades, openAICompatXiaomiReasoningDowngrade)
+			break
+		}
+	}
+	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+			downgrades = append(downgrades, openAICompatXiaomiTokenDowngrade)
+			break
+		}
+	}
+	return downgrades
 }
 
 func openAICompatKimiPolicyDowngrades(input, output []byte) []string {

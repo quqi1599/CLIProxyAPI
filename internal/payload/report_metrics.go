@@ -21,9 +21,12 @@ const (
 	transformPolicyCodexReplay            = "codex.reasoning_replay"
 	transformPolicyAntigravityReplay      = "antigravity.reasoning_replay"
 	transformPolicyMinimaxImage           = "openai_compat.minimax_m3_image_inline"
+	transformPolicyOpenAICompatDeepSeek   = "openai_compat.deepseek.request_quirks"
+	transformPolicyOpenAICompatDoubao     = "openai_compat.doubao.request_quirks"
 	transformPolicyOpenAICompatKimi       = "openai_compat.kimi.model_quirks"
 	transformPolicyOpenAICompatMiniMax    = "openai_compat.minimax.request_quirks"
 	transformPolicyOpenAICompatQwen38     = "openai_compat.qwen38.thinking"
+	transformPolicyOpenAICompatXiaomi     = "openai_compat.xiaomi.request_quirks"
 	transformPolicyOpenAICompatPostConfig = "openai_compat.post_config_revalidate"
 )
 
@@ -43,9 +46,12 @@ var (
 		transformPolicyCodexReplay,
 		transformPolicyAntigravityReplay,
 		transformPolicyMinimaxImage,
+		transformPolicyOpenAICompatDeepSeek,
+		transformPolicyOpenAICompatDoubao,
 		transformPolicyOpenAICompatKimi,
 		transformPolicyOpenAICompatMiniMax,
 		transformPolicyOpenAICompatQwen38,
+		transformPolicyOpenAICompatXiaomi,
 		transformPolicyOpenAICompatPostConfig,
 		transformMetricOther,
 	}

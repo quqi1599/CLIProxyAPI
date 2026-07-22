@@ -1,0 +1,93 @@
+{
+  "policy_id": "openai_compat.xiaomi.request_quirks",
+  "compat_kind": "xiaomi",
+  "base_url": "https://api.xiaomimimo.com/v1",
+  "cases": [
+    {
+      "name": "native thinking sampling and token limits",
+      "model": "mimo-v2.5-pro",
+      "input": {
+        "model": "configured-xiaomi-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "high",
+        "temperature": 0.2,
+        "top_p": 0.4,
+        "max_tokens": 384000,
+        "max_completion_tokens": "nope",
+        "max_output_tokens": 0
+      },
+      "expected": {
+        "model": "configured-xiaomi-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "temperature": 1,
+        "top_p": 0.95,
+        "max_tokens": 131072,
+        "max_output_tokens": 1,
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "downgrades": [
+        "openai_compat.xiaomi.reasoning_normalized",
+        "openai_compat.xiaomi.token_limits_normalized"
+      ]
+    },
+    {
+      "name": "mimo25 preserves image URL and non-pro token limit",
+      "model": "mimo-v2.5",
+      "input": {
+        "model": "configured-xiaomi-image-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "describe"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,AAAA"
+                }
+              }
+            ]
+          }
+        ],
+        "max_tokens": 999999
+      },
+      "expected": {
+        "model": "configured-xiaomi-image-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "describe"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,AAAA"
+                }
+              }
+            ]
+          }
+        ],
+        "max_tokens": 999999
+      },
+      "downgrades": []
+    }
+  ]
+}

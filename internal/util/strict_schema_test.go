@@ -193,6 +193,14 @@ func TestCleanJSONSchemaForOpenAIStructuredOutput_RequiresAllObjectProperties(t 
 	}
 }
 
+func TestCleanJSONSchemaForOpenAIStructuredOutputIsIdempotent(t *testing.T) {
+	input := `{"type":"object","properties":{"query":{"type":"string"}},"additionalProperties":false}`
+	first := CleanJSONSchemaForOpenAIStructuredOutput(input)
+	if second := CleanJSONSchemaForOpenAIStructuredOutput(first); second != first {
+		t.Fatalf("second clean changed schema\nfirst:  %s\nsecond: %s", first, second)
+	}
+}
+
 func containsGJSONString(values []gjson.Result, want string) bool {
 	for _, value := range values {
 		if value.String() == want {

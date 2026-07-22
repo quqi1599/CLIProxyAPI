@@ -367,9 +367,12 @@ func TestTransformMetricsPublishFixedCatalogDistributions(t *testing.T) {
 
 func TestTransformPolicyCatalogIncludesOpenAICompatPolicies(t *testing.T) {
 	for _, policyID := range []string{
+		transformPolicyOpenAICompatDeepSeek,
+		transformPolicyOpenAICompatDoubao,
 		transformPolicyOpenAICompatKimi,
 		transformPolicyOpenAICompatMiniMax,
 		transformPolicyOpenAICompatQwen38,
+		transformPolicyOpenAICompatXiaomi,
 		transformPolicyOpenAICompatPostConfig,
 	} {
 		if got := transformPolicyCatalogID(policyID); got != policyID {
