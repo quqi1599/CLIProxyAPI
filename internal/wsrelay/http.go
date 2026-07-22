@@ -180,6 +180,9 @@ func (m *Manager) Stream(ctx context.Context, provider string, req *HTTPRequest)
 		defer cancel()
 		defer close(out)
 		send := func(ev StreamEvent) bool {
+			if ctx.Err() != nil {
+				return false
+			}
 			select {
 			case <-ctx.Done():
 				return false
@@ -188,11 +191,17 @@ func (m *Manager) Stream(ctx context.Context, provider string, req *HTTPRequest)
 			}
 		}
 		for {
+			if requestCtx.Err() != nil {
+				return
+			}
 			select {
 			case <-requestCtx.Done():
 				return
 			case msg, ok := <-respCh:
 				if !ok {
+					if requestCtx.Err() != nil {
+						return
+					}
 					_ = send(StreamEvent{Err: errors.New("wsrelay: stream closed")})
 					return
 				}
