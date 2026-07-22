@@ -37,6 +37,7 @@ const (
 	openAICompatQwen38ThinkingDowngrade     = "openai_compat.qwen38.disabled_to_low"
 	openAICompatXiaomiReasoningDowngrade    = "openai_compat.xiaomi.reasoning_normalized"
 	openAICompatXiaomiTokenDowngrade        = "openai_compat.xiaomi.token_limits_normalized"
+	openAICompatXiaomiToolSchemaDowngrade   = "openai_compat.xiaomi.tool_schema_normalized"
 )
 
 var (
@@ -228,6 +229,7 @@ func openAICompatPostConfigRevalidatePolicy() compat.Policy {
 			openAICompatQwen38ThinkingDowngrade,
 			openAICompatXiaomiReasoningDowngrade,
 			openAICompatXiaomiTokenDowngrade,
+			openAICompatXiaomiToolSchemaDowngrade,
 		},
 		Apply: applyOpenAICompatPostConfigRevalidatePolicy,
 	}
@@ -532,6 +534,7 @@ func openAICompatXiaomiPolicy() compat.Policy {
 		DowngradeIDs: []string{
 			openAICompatXiaomiReasoningDowngrade,
 			openAICompatXiaomiTokenDowngrade,
+			openAICompatXiaomiToolSchemaDowngrade,
 		},
 		Apply: applyOpenAICompatXiaomiPolicy,
 	}
@@ -597,9 +600,6 @@ func applyOpenAICompatXiaomiPolicy(ctx context.Context, input []byte) (compat.Tr
 func openAICompatPolicyState(ctx context.Context, payload []byte) openAICompatPolicyContext {
 	if ctx != nil {
 		if state, ok := ctx.Value(openAICompatPolicyContextKey{}).(openAICompatPolicyContext); ok {
-			if state.model == "" {
-				state.model = gjson.GetBytes(payload, "model").String()
-			}
 			return state
 		}
 	}
@@ -651,11 +651,15 @@ func openAICompatDoubaoPolicyDowngrades(input, output []byte, model string) []st
 		"thinking",
 		"thinking_budget",
 		"output_config.effort",
+		"reasoning",
 	} {
-		if gjson.GetBytes(input, path).Exists() && !gjson.GetBytes(output, path).Exists() {
+		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
 			downgrades = append(downgrades, openAICompatDoubaoFieldsDowngrade)
 			break
 		}
+	}
+	if openAICompatHasMessageReasoningContent(input) && !openAICompatHasMessageReasoningContent(output) {
+		downgrades = appendOpenAICompatDowngrades(downgrades, []string{openAICompatDoubaoFieldsDowngrade})
 	}
 	if requiresDoubaoSeed20Compatibility(model) {
 		for _, path := range []string{"temperature", "max_tokens", "max_completion_tokens", "max_output_tokens", "messages"} {
@@ -668,21 +672,42 @@ func openAICompatDoubaoPolicyDowngrades(input, output []byte, model string) []st
 	return downgrades
 }
 
+func openAICompatHasMessageReasoningContent(payload []byte) bool {
+	for _, message := range gjson.GetBytes(payload, "messages").Array() {
+		if message.Get("reasoning_content").Exists() {
+			return true
+		}
+	}
+	return false
+}
+
 func openAICompatXiaomiPolicyDowngrades(input, output []byte) []string {
-	downgrades := make([]string, 0, 2)
-	for _, path := range []string{"reasoning", "reasoning_effort", "thinking", "thinking_budget"} {
-		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+	downgrades := make([]string, 0, 3)
+	for _, path := range []string{"reasoning", "reasoning_effort", "thinking", "thinking_budget", "temperature", "top_p"} {
+		if openAICompatJSONValueChanged(input, output, path) {
 			downgrades = append(downgrades, openAICompatXiaomiReasoningDowngrade)
 			break
 		}
 	}
 	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
+		if openAICompatJSONValueChanged(input, output, path) {
 			downgrades = append(downgrades, openAICompatXiaomiTokenDowngrade)
 			break
 		}
 	}
+	if openAICompatJSONValueChanged(input, output, "tools") {
+		downgrades = append(downgrades, openAICompatXiaomiToolSchemaDowngrade)
+	}
 	return downgrades
+}
+
+func openAICompatJSONValueChanged(input, output []byte, path string) bool {
+	before := gjson.GetBytes(input, path)
+	after := gjson.GetBytes(output, path)
+	if before.Exists() != after.Exists() {
+		return true
+	}
+	return !jsonValuesEqual(before.Value(), after.Value())
 }
 
 func openAICompatKimiPolicyDowngrades(input, output []byte) []string {

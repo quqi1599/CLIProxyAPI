@@ -311,11 +311,11 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 	}
 	doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
 	capabilityProfile := profile
-	if compatKind == "doubao" && hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled) {
+	if compatKind == "doubao" && (registeredPolicies || hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)) {
 		capabilityProfile.SupportsReasoning = true
 	}
 	payload = scrubOpenAICompatPayload(payload, capabilityProfile)
-	if compatKind == "doubao" {
+	if compatKind == "doubao" && !registeredPolicies {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)
 	}
 	payload = repairOpenAICompatToolCallHistory(payload)
@@ -707,7 +707,9 @@ func scrubDoubaoPayloadForModel(payload []byte, model string) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
+	effort, disabled := doubaoDeepSeekReasoningIntent(payload, model)
 	payload = scrubDoubaoUnsupportedOpenAIFields(payload, model)
+	payload = applyDoubaoDeepSeekReasoningIntent(payload, model, effort, disabled)
 	if !requiresDoubaoSeed20Compatibility(model) {
 		return payload
 	}
@@ -848,9 +850,7 @@ func scrubDoubaoUnsupportedOpenAIFields(payload []byte, model string) []byte {
 		"thinking_budget",
 		"thinking",
 		"output_config.effort",
-	}
-	if !isDoubaoDeepSeekReasoningModel(model) {
-		unsupportedPaths = append(unsupportedPaths, "reasoning")
+		"reasoning",
 	}
 	if outputConfig := gjson.GetBytes(payload, "output_config"); outputConfig.Exists() && outputConfig.IsObject() {
 		fields := outputConfig.Map()
@@ -2145,9 +2145,16 @@ func scrubOpenAICompatFunctionToolPayload(payload []byte, profile openAICompatPr
 				}
 			}
 			if profileKind == "xiaomi" {
-				if function, okFunction := cleaned["function"].(map[string]any); okFunction {
-					if parameters, okParameters := function["parameters"]; okParameters {
-						function["parameters"] = normalizeXiaomiToolSchema(parameters)
+				originalTool, okOriginalTool := rawCandidate.(map[string]any)
+				cleanedFunction, okCleanedFunction := cleaned["function"].(map[string]any)
+				if okOriginalTool && okCleanedFunction {
+					if originalFunction, okOriginalFunction := originalTool["function"].(map[string]any); okOriginalFunction {
+						if strict, okStrict := originalFunction["strict"]; okStrict {
+							cleanedFunction["strict"] = strict
+						}
+					}
+					if strict, okStrict := originalTool["strict"]; okStrict {
+						cleaned["strict"] = strict
 					}
 				}
 			}

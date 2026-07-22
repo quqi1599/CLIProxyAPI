@@ -171,6 +171,64 @@
       "downgrades": [
         "openai_compat.doubao.unsupported_fields_removed"
       ]
+    },
+    {
+      "name": "deepseek bridge strips unknown reasoning fields",
+      "model": "deepseek-r1",
+      "input": {
+        "model": "configured-doubao-r1-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning": {
+          "effort": "auto",
+          "summary": "auto"
+        }
+      },
+      "expected": {
+        "model": "configured-doubao-r1-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning": {
+          "effort": "high"
+        }
+      },
+      "downgrades": [
+        "openai_compat.doubao.unsupported_fields_removed"
+      ]
+    },
+    {
+      "name": "message reasoning content removal is reported",
+      "model": "deepseek-r1",
+      "input": {
+        "model": "configured-doubao-r1-alias",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "private reasoning"
+          }
+        ]
+      },
+      "expected": {
+        "model": "configured-doubao-r1-alias",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "answer"
+          }
+        ]
+      },
+      "downgrades": [
+        "openai_compat.doubao.unsupported_fields_removed"
+      ]
     }
   ]
 }

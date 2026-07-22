@@ -88,6 +88,163 @@
         "max_tokens": 999999
       },
       "downgrades": []
+    },
+    {
+      "name": "native thinking sampling only",
+      "model": "mimo-v2.5",
+      "input": {
+        "model": "configured-xiaomi-thinking-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "thinking": {
+          "type": "enabled"
+        },
+        "temperature": 0.1,
+        "top_p": 0.2
+      },
+      "expected": {
+        "model": "configured-xiaomi-thinking-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "thinking": {
+          "type": "enabled"
+        },
+        "temperature": 1,
+        "top_p": 0.95
+      },
+      "downgrades": [
+        "openai_compat.xiaomi.reasoning_normalized"
+      ]
+    },
+    {
+      "name": "tool schema simplification belongs to policy",
+      "model": "mimo-v2.5",
+      "input": {
+        "model": "configured-xiaomi-tool-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "model": "configured-xiaomi-tool-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "downgrades": [
+        "openai_compat.xiaomi.tool_schema_normalized"
+      ]
+    },
+    {
+      "name": "strict-only tool cleanup belongs to policy",
+      "model": "mimo-v2.5",
+      "input": {
+        "model": "configured-xiaomi-strict-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "model": "configured-xiaomi-strict-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "downgrades": [
+        "openai_compat.xiaomi.tool_schema_normalized"
+      ]
     }
   ]
 }

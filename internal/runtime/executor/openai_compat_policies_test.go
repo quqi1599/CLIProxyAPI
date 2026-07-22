@@ -140,6 +140,20 @@ func TestOpenAICompatPostConfigSkipsPreCanonicalization(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatXiaomiArgumentRepairDoesNotReportSchemaDowngrade(t *testing.T) {
+	input := []byte(`{"model":"mimo-v2.5","temperature":1.0,"messages":[{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{bad"}}]}],"tools":[{"function":{"parameters":{"properties":{},"type":"object"},"name":"lookup"},"type":"function"}]}`)
+	output := scrubXiaomiPayloadForModel(input, "mimo-v2.5")
+	if got := gjson.GetBytes(output, "messages.0.tool_calls.0.function.arguments").String(); got != "{}" {
+		t.Fatalf("tool arguments = %q, want repaired JSON object: %s", got, output)
+	}
+	if got := gjson.GetBytes(output, "temperature"); !got.Exists() || got.Float() != 1 {
+		t.Fatalf("temperature = %s, want numeric 1: %s", got.Raw, output)
+	}
+	if downgrades := openAICompatXiaomiPolicyDowngrades(input, output); len(downgrades) != 0 {
+		t.Fatalf("argument-only repair downgrades = %v, want none", downgrades)
+	}
+}
+
 func TestOpenAICompatPostConfigAmplificationModes(t *testing.T) {
 	input := []byte(`{"model":"test"}`)
 	expanded := make([]byte, len(input)+int(internalpayload.DefaultMaxExpansionBytes)+1)
@@ -288,6 +302,9 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		if policy.ID == openAICompatKimiPolicyID && !slices.Contains(policy.MutatedFields, "body.messages") {
 			t.Fatalf("Kimi policy does not declare message mutation: %+v", policy.MutatedFields)
 		}
+		if policy.ID == openAICompatXiaomiPolicyID && !slices.Contains(policy.DowngradeIDs, openAICompatXiaomiToolSchemaDowngrade) {
+			t.Fatalf("Xiaomi policy does not declare tool schema downgrade: %+v", policy.DowngradeIDs)
+		}
 		if policy.ID == openAICompatPostConfigRevalidatePolicyID {
 			if !slices.Contains(policy.MutatedFields, "body.metadata") || !slices.Contains(policy.DowngradeIDs, openAICompatKimiToolChoiceDowngrade) {
 				t.Fatalf("post-config policy inventory is incomplete: %+v", policy)
@@ -325,13 +342,16 @@ func TestOpenAICompatMigratedPolicyMatchBoundaries(t *testing.T) {
 		},
 		{
 			name:    "unknown kind deepseek fallback",
-			payload: []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"thinking_budget":50}`),
+			payload: []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"thinking_budget":50,"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{}}}}]}`),
 			profile: genericOpenAICompatProfile(),
 			model:   "deepseek-v4-pro",
 			baseURL: "https://api.deepseek.com/v1",
 			assert: func(t *testing.T, payload []byte) {
 				if got := gjson.GetBytes(payload, "thinking_budget").Int(); got != deepSeekThinkingBudgetMin {
 					t.Fatalf("fallback thinking_budget = %d, want %d: %s", got, deepSeekThinkingBudgetMin, payload)
+				}
+				if gjson.GetBytes(payload, "tools.0.function.strict").Exists() {
+					t.Fatalf("fallback retained non-beta DeepSeek strict schema: %s", payload)
 				}
 			},
 		},
@@ -361,6 +381,42 @@ func TestOpenAICompatMigratedPolicyMatchBoundaries(t *testing.T) {
 			assert: func(t *testing.T, payload []byte) {
 				if got := gjson.GetBytes(payload, "reasoning.effort").String(); got != "high" {
 					t.Fatalf("Doubao reasoning.effort = %q, want high: %s", got, payload)
+				}
+			},
+		},
+		{
+			name:         "deepseek empty canonical model ignores payload model",
+			payload:      []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{}}}}]}`),
+			profile:      openAICompatProfileForKind("deepseek"),
+			baseURL:      "https://api.deepseek.com/v1",
+			wantPolicies: []string{openAICompatDeepSeekPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if !gjson.GetBytes(payload, "tools.0.function.strict").Bool() {
+					t.Fatalf("empty canonical DeepSeek model used payload model: %s", payload)
+				}
+			},
+		},
+		{
+			name:         "doubao empty canonical model ignores payload model",
+			payload:      []byte(`{"model":"doubao-seed-2.0-pro","messages":[{"role":"user","content":"hi"}],"temperature":1.8,"max_completion_tokens":100000}`),
+			profile:      openAICompatProfileForKind("doubao"),
+			baseURL:      "https://ark.cn-beijing.volces.com/api/v3",
+			wantPolicies: []string{openAICompatDoubaoPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "temperature").Float(); got != 1.8 || gjson.GetBytes(payload, "max_completion_tokens").Int() != 100000 {
+					t.Fatalf("empty canonical Doubao model used payload model: %s", payload)
+				}
+			},
+		},
+		{
+			name:         "xiaomi empty canonical model ignores payload model",
+			payload:      []byte(`{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"hi"}],"max_tokens":384000}`),
+			profile:      openAICompatProfileForKind("xiaomi"),
+			baseURL:      "https://api.xiaomimimo.com/v1",
+			wantPolicies: []string{openAICompatXiaomiPolicyID},
+			assert: func(t *testing.T, payload []byte) {
+				if got := gjson.GetBytes(payload, "max_tokens").Int(); got != 384000 {
+					t.Fatalf("empty canonical Xiaomi model used payload model: %s", payload)
 				}
 			},
 		},
@@ -421,12 +477,43 @@ func TestOpenAICompatPostConfigRevalidatesMigratedProviders(t *testing.T) {
 			wantDowngrades: []string{openAICompatDoubaoFieldsDowngrade, openAICompatDoubaoSeed20Downgrade},
 		},
 		{
+			name:           "doubao message reasoning content",
+			payload:        []byte(`{"model":"route-alias","messages":[{"role":"assistant","content":"answer","reasoning_content":"private reasoning"}]}`),
+			profile:        openAICompatProfileForKind("doubao"),
+			model:          "deepseek-r1",
+			baseURL:        "https://ark.cn-beijing.volces.com/api/v3",
+			wantDowngrades: []string{openAICompatDoubaoFieldsDowngrade},
+		},
+		{
 			name:           "xiaomi",
 			payload:        []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","temperature":0.2,"top_p":0.4,"max_tokens":384000}`),
 			profile:        openAICompatProfileForKind("xiaomi"),
 			model:          "mimo-v2.5-pro",
 			baseURL:        "https://api.xiaomimimo.com/v1",
 			wantDowngrades: []string{openAICompatReasoningRemovedDowngrade, openAICompatXiaomiReasoningDowngrade, openAICompatXiaomiTokenDowngrade},
+		},
+		{
+			name:           "deepseek non-beta strict schema",
+			payload:        []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{}}}}]}`),
+			profile:        openAICompatProfileForKind("deepseek"),
+			model:          "deepseek-v4-pro",
+			baseURL:        "https://api.deepseek.com/v1",
+			wantDowngrades: []string{openAICompatDeepSeekStrictDowngrade},
+		},
+		{
+			name:    "deepseek beta strict schema",
+			payload: []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{}}}}]}`),
+			profile: openAICompatProfileForKind("deepseek"),
+			model:   "deepseek-v4-pro",
+			baseURL: "https://api.deepseek.com/beta",
+		},
+		{
+			name:           "xiaomi tool schema",
+			payload:        []byte(`{"model":"route-alias","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{}}}}]}`),
+			profile:        openAICompatProfileForKind("xiaomi"),
+			model:          "mimo-v2.5",
+			baseURL:        "https://api.xiaomimimo.com/v1",
+			wantDowngrades: []string{openAICompatXiaomiToolSchemaDowngrade},
 		},
 	}
 	for _, test := range tests {
