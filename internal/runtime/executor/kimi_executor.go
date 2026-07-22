@@ -451,7 +451,7 @@ func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 		}
 		authForCount.Attributes["base_url"] = resolveKimiBaseURL(auth)
 	}
-	return e.ClaudeExecutor.countTokens(ctx, authForCount, req, opts, kimiRequestPlanTransformStage, transformInputBytes)
+	return e.ClaudeExecutor.countTokens(ctx, authForCount, req, opts, kimiRequestPlanTransformStage, transformInputBytes, false)
 }
 
 func repairKimiClaudeToolUseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {

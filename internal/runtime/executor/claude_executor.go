@@ -843,10 +843,10 @@ func rewriteClaudeSSEEvent(event []byte, rewrite func([]byte) []byte) []byte {
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return e.countTokens(ctx, auth, req, opts, claudeRequestPlanTransformStage, int64(len(req.Payload)))
+	return e.countTokens(ctx, auth, req, opts, claudeRequestPlanTransformStage, int64(len(req.Payload)), true)
 }
 
-func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, transformStage string, transformInputBytes int64) (cliproxyexecutor.Response, error) {
+func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, transformStage string, transformInputBytes int64, useProviderCapabilityPolicies bool) (cliproxyexecutor.Response, error) {
 	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -854,6 +854,7 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
+	identity := claudeProviderIdentity(auth, baseURL)
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -864,6 +865,8 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	providerConfigStarted := time.Now()
+	providerConfigInput := body
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
 	}
@@ -878,18 +881,69 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if helps.HasClaudeSystemRoleMarker(body) && rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
+	if useProviderCapabilityPolicies {
+		body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, identity.Kind)
+		body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, identity.Kind)
+	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	if helps.HasClaudeToolsMarker(body) || helps.HasClaudeToolSearchMarker(body) {
+	capabilityManaged := false
+	if useProviderCapabilityPolicies {
+		if hasClaudeCompatProviderCapabilityPolicy(identity.Kind) {
+			if err = helps.EnforceSemanticTransformStage(
+				ctx,
+				claudeProviderConfigTransformStage,
+				providerConfigInput,
+				body,
+				providerConfigStarted,
+				[]string{claudeProviderConfigPolicy},
+				nil,
+				internalpayload.AmplificationOverride{},
+			); err != nil {
+				return cliproxyexecutor.Response{}, err
+			}
+		}
+		body, capabilityManaged, err = applyClaudeCompatProviderCapabilities(ctx, body, identity.Kind, baseURL, compat.MatchContext{
+			Model:        baseModel,
+			Endpoint:     "messages/count_tokens",
+			Mode:         "non-stream",
+			SourceFormat: compat.Format(from.String()),
+			TargetFormat: compat.Format(to.String()),
+		})
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		if !capabilityManaged && (helps.HasClaudeToolsMarker(body) || helps.HasClaudeToolSearchMarker(body)) {
+			body = downgradeClaudeToolSearchForCompatKind(identity.Kind, baseURL, body)
+		}
+	} else if helps.HasClaudeToolsMarker(body) || helps.HasClaudeToolSearchMarker(body) {
 		body = downgradeClaudeToolSearchForCompat(baseURL, body)
 	}
 	// count_tokens does NOT inject cache_control; only enforce the limit and
 	// normalize TTL ordering (shares a single payload scan, byte-equivalent to
 	// the legacy enforce → normalize sequence).
+	cacheControlStarted := time.Now()
+	cacheControlInput := body
 	if helps.HasClaudeCacheControlMarker(body) {
 		body = applyCacheControlPipeline(body, 4, false)
 	}
+	if capabilityManaged {
+		if err = helps.EnforceSemanticTransformStage(
+			ctx,
+			claudeCacheControlTransformStage,
+			cacheControlInput,
+			body,
+			cacheControlStarted,
+			[]string{claudeCacheControlPolicy},
+			nil,
+			internalpayload.AmplificationOverride{},
+		); err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+	}
 
+	finalSanitizeStarted := time.Now()
+	finalSanitizeInput := body
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
 	if helps.HasClaudeBetasMarker(body) {
@@ -901,17 +955,38 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		body, _ = sanitizeClaudeToolNamesForUpstream(body)
 	}
-	if errValidate := validateClaudeUpstreamPayload(baseURL, body); errValidate != nil {
+	var errValidate error
+	if useProviderCapabilityPolicies {
+		errValidate = validateClaudeUpstreamPayloadForCompat(identity.Kind, body)
+	} else {
+		errValidate = validateClaudeUpstreamPayload(baseURL, body)
+	}
+	if errValidate != nil {
 		return cliproxyexecutor.Response{}, errValidate
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
-	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       transformStage,
-		InputBytes:  transformInputBytes,
-		OutputBytes: int64(len(body)),
-		Duration:    time.Since(started),
-	}, internalpayload.AmplificationOverride{}); err != nil {
-		return cliproxyexecutor.Response{}, err
+	if capabilityManaged {
+		if err = helps.EnforceSemanticTransformStage(
+			ctx,
+			claudeFinalSanitizeTransformStage,
+			finalSanitizeInput,
+			body,
+			finalSanitizeStarted,
+			[]string{claudeFinalSanitizePolicy},
+			nil,
+			internalpayload.AmplificationOverride{},
+		); err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+	} else {
+		if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+			Stage:       transformStage,
+			InputBytes:  transformInputBytes,
+			OutputBytes: int64(len(body)),
+			Duration:    time.Since(started),
+		}, internalpayload.AmplificationOverride{}); err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
 	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)

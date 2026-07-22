@@ -116,9 +116,7 @@ func applyClaudeCompatCapabilityPolicy(ctx context.Context, input []byte, compat
 
 func applyClaudeCompatProviderCapabilities(ctx context.Context, input []byte, compatKind, baseURL string, match compat.MatchContext) ([]byte, bool, error) {
 	compatKind = config.NormalizeOpenAICompatibilityKind(compatKind)
-	switch compatKind {
-	case "deepseek", "doubao", "xiaomi":
-	default:
+	if !hasClaudeCompatProviderCapabilityPolicy(compatKind) {
 		return input, false, nil
 	}
 	if claudeCompatPolicyRegistryErr != nil {
@@ -138,6 +136,15 @@ func applyClaudeCompatProviderCapabilities(ctx context.Context, input []byte, co
 		return nil, true, err
 	}
 	return result.Payload, true, nil
+}
+
+func hasClaudeCompatProviderCapabilityPolicy(compatKind string) bool {
+	switch config.NormalizeOpenAICompatibilityKind(compatKind) {
+	case "deepseek", "doubao", "xiaomi":
+		return true
+	default:
+		return false
+	}
 }
 
 func claudeCompatPolicyInventory() (compat.Report, error) {

@@ -350,6 +350,146 @@ func TestSanitizeClaudeHTTPRequestToolNamesUsesExplicitCompatKind(t *testing.T) 
 	}
 }
 
+func TestClaudeExecutorCountTokensUsesCanonicalCapabilityPolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		compatKind      string
+		model           string
+		policyID        string
+		payload         string
+		wantImage       bool
+		wantPlaceholder bool
+		assertProvider  func(*testing.T, []byte)
+	}{
+		{
+			name:            "deepseek image-only and thinking budget",
+			compatKind:      "deepseek",
+			model:           "deepseek-v4-pro",
+			policyID:        claudeCompatDeepSeekCapabilityPolicyID,
+			payload:         `{"thinking":{"type":"enabled","budget_tokens":1},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`,
+			wantPlaceholder: true,
+			assertProvider: func(t *testing.T, body []byte) {
+				t.Helper()
+				if got := gjson.GetBytes(body, "thinking.budget_tokens").Int(); got != deepSeekThinkingBudgetMin {
+					t.Fatalf("thinking.budget_tokens = %d, want %d: %s", got, deepSeekThinkingBudgetMin, body)
+				}
+			},
+		},
+		{
+			name:       "doubao keeps native image and normalizes reasoning",
+			compatKind: "doubao",
+			model:      "deepseek-v4-pro",
+			policyID:   claudeCompatDoubaoCapabilityPolicyID,
+			payload:    `{"reasoning_effort":"high","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}}]}]}`,
+			wantImage:  true,
+			assertProvider: func(t *testing.T, body []byte) {
+				t.Helper()
+				if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+					t.Fatalf("thinking.type = %q, want adaptive: %s", got, body)
+				}
+				if got := gjson.GetBytes(body, "output_config.effort").String(); got != "high" {
+					t.Fatalf("output_config.effort = %q, want high: %s", got, body)
+				}
+				if gjson.GetBytes(body, "reasoning_effort").Exists() {
+					t.Fatalf("reasoning_effort was not normalized: %s", body)
+				}
+			},
+		},
+		{
+			name:       "xiaomi mimo v2.5 keeps native image",
+			compatKind: "xiaomi",
+			model:      "mimo-v2.5",
+			policyID:   claudeCompatXiaomiCapabilityPolicyID,
+			payload:    `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}}]}]}`,
+			wantImage:  true,
+		},
+		{
+			name:            "xiaomi unsupported model preserves image-only message",
+			compatKind:      "xiaomi",
+			model:           "mimo-v2.5-pro",
+			policyID:        claudeCompatXiaomiCapabilityPolicyID,
+			payload:         `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`,
+			wantPlaceholder: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var seenBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"input_tokens":42}`))
+			}))
+			defer server.Close()
+
+			executor := NewClaudeExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+				"api_key":     "test-key",
+				"base_url":    server.URL,
+				"compat_kind": test.compatKind,
+			}}
+			payload := []byte(test.payload)
+			ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+			_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
+				Model:   test.model,
+				Payload: payload,
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+			if err != nil {
+				t.Fatalf("CountTokens() error = %v", err)
+			}
+			if len(seenBody) == 0 {
+				t.Fatal("expected count_tokens request body")
+			}
+			content := gjson.GetBytes(seenBody, "messages.0.content").Array()
+			if got := hasClaudePartType(content, "image"); got != test.wantImage {
+				t.Fatalf("image=%v, want %v: %s", got, test.wantImage, seenBody)
+			}
+			if hasClaudePartType(content, "image_url") {
+				t.Fatalf("image_url was not scrubbed: %s", seenBody)
+			}
+			placeholder := gjson.GetBytes(seenBody, "messages.0.content.0.text").String()
+			if got := placeholder == claudeUnsupportedContentPlaceholderText; got != test.wantPlaceholder {
+				t.Fatalf("placeholder=%v, want %v: %s", got, test.wantPlaceholder, seenBody)
+			}
+			if test.assertProvider != nil {
+				test.assertProvider(t, seenBody)
+			}
+
+			report, ok := internalpayload.TransformReportFromContext(ctx)
+			if !ok {
+				t.Fatal("transform report missing")
+			}
+			wantStages := []string{
+				"legacy.translate.claude.count",
+				claudeProviderConfigTransformStage,
+				claudeProviderCapabilityTransformStage,
+				claudeCacheControlTransformStage,
+				claudeFinalSanitizeTransformStage,
+			}
+			if len(report.Stages) != len(wantStages) {
+				t.Fatalf("transform stages = %+v, want %v", report.Stages, wantStages)
+			}
+			for index, wantStage := range wantStages {
+				stage := report.Stages[index]
+				if stage.Stage != wantStage {
+					t.Fatalf("stage %d = %q, want %q; report=%+v", index, stage.Stage, wantStage, report)
+				}
+				if index > 0 && report.Stages[index-1].OutputBytes != stage.InputBytes {
+					t.Fatalf("stages %d/%d are not contiguous: %+v", index-1, index, report.Stages)
+				}
+			}
+			capabilityStage := report.Stages[2]
+			if !slices.Equal(capabilityStage.AppliedPolicies, []string{test.policyID}) {
+				t.Fatalf("capability policies = %v, want %q", capabilityStage.AppliedPolicies, test.policyID)
+			}
+			if got := report.Stages[len(report.Stages)-1].OutputBytes; got != int64(len(seenBody)) {
+				t.Fatalf("final output bytes = %d, want %d", got, len(seenBody))
+			}
+			releaseReport()
+		})
+	}
+}
+
 func BenchmarkClaudeCompatImageCapabilityScrub(b *testing.B) {
 	for _, partCount := range []int{0, 16, 64, 256, 1024} {
 		b.Run("parts_"+strconv.Itoa(partCount), func(b *testing.B) {
