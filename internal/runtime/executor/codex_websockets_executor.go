@@ -1931,6 +1931,13 @@ func (e *CodexAutoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 	return e.httpExec.HttpRequest(ctx, auth, req)
 }
 
+func (e *CodexAutoExecutor) ExecuteRawEndpoint(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.RawEndpointRequest) (cliproxyexecutor.RawEndpointResponse, error) {
+	if e == nil || e.httpExec == nil {
+		return cliproxyexecutor.RawEndpointResponse{}, fmt.Errorf("codex auto executor: http executor is nil")
+	}
+	return e.httpExec.ExecuteRawEndpoint(ctx, auth, req)
+}
+
 func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")

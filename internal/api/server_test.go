@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,8 +30,14 @@ import (
 type codexAlphaSearchTestExecutor struct {
 	body         []byte
 	authIDs      []string
-	responseBody io.Reader
+	responseBody []byte
+	rawError     error
 }
+
+type codexAlphaSearchTestError string
+
+func (e codexAlphaSearchTestError) Error() string { return string(e) }
+func (codexAlphaSearchTestError) StatusCode() int { return http.StatusBadGateway }
 
 type requestTooLargeAccessProvider struct{}
 
@@ -66,20 +72,23 @@ func (e *codexAlphaSearchTestExecutor) PrepareRequest(req *http.Request, candida
 }
 
 func (e *codexAlphaSearchTestExecutor) HttpRequest(_ context.Context, candidate *auth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected raw HTTP request")
+}
+
+func (e *codexAlphaSearchTestExecutor) ExecuteRawEndpoint(_ context.Context, candidate *auth.Auth, req coreexecutor.RawEndpointRequest) (coreexecutor.RawEndpointResponse, error) {
 	e.authIDs = append(e.authIDs, candidate.ID)
-	body, errRead := io.ReadAll(req.Body)
-	if errRead != nil {
-		return nil, errRead
+	e.body = req.Body
+	if e.rawError != nil {
+		return coreexecutor.RawEndpointResponse{}, e.rawError
 	}
-	e.body = body
 	responseBody := e.responseBody
 	if responseBody == nil {
-		responseBody = strings.NewReader(`{"results":[]}`)
+		responseBody = []byte(`{"results":[]}`)
 	}
-	return &http.Response{
+	return coreexecutor.RawEndpointResponse{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(responseBody),
+		Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		Body:       responseBody,
 	}, nil
 }
 
@@ -118,7 +127,7 @@ func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 	return NewServer(cfg, authManager, accessManager, configPath, opts...)
 }
 
-func TestCodexAlphaSearchUsesOAuthAndSanitizesBody(t *testing.T) {
+func TestCodexAlphaSearchUsesOAuthAndDelegatesRawBody(t *testing.T) {
 	server := newTestServer(t)
 	executor := &codexAlphaSearchTestExecutor{}
 	registerCodexAlphaSearchTestExecutor(t, server, executor)
@@ -138,9 +147,9 @@ func TestCodexAlphaSearchUsesOAuthAndSanitizesBody(t *testing.T) {
 			if len(executor.authIDs) != 1 || executor.authIDs[0] != "codex-oauth" {
 				t.Fatalf("selected auth IDs = %v, want [codex-oauth]", executor.authIDs)
 			}
-			upstreamBody := string(executor.body)
-			if strings.Contains(upstreamBody, "prompt_cache") || !strings.Contains(upstreamBody, "commands") {
-				t.Fatalf("unexpected upstream body: %s", upstreamBody)
+			delegatedBody := string(executor.body)
+			if !strings.Contains(delegatedBody, "prompt_cache") || !strings.Contains(delegatedBody, "commands") {
+				t.Fatalf("unexpected delegated body: %s", delegatedBody)
 			}
 		})
 	}
@@ -203,7 +212,7 @@ func TestCodexAlphaSearchUsesPayloadBodyObservePolicy(t *testing.T) {
 func TestCodexAlphaSearchRejectsOversizedUpstreamResponse(t *testing.T) {
 	server := newTestServer(t)
 	executor := &codexAlphaSearchTestExecutor{
-		responseBody: io.LimitReader(zeroReader{}, codexAlphaSearchResponseMaxBytes+1),
+		rawError: codexAlphaSearchTestError("Codex search response exceeds the allowed size"),
 	}
 	registerCodexAlphaSearchTestExecutor(t, server, executor)
 
@@ -231,13 +240,6 @@ func registerCodexAlphaSearchTestExecutor(t *testing.T, server *Server, executor
 			t.Fatalf("register %s: %v", candidate.ID, errRegister)
 		}
 	}
-}
-
-type zeroReader struct{}
-
-func (zeroReader) Read(p []byte) (int, error) {
-	clear(p)
-	return len(p), nil
 }
 
 func TestInjectManagementConfigVersionGuard(t *testing.T) {

@@ -62,6 +62,11 @@ type RequestAuthPreparer interface {
 	PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error)
 }
 
+// RawEndpointExecutor executes provider-owned endpoints without protocol translation.
+type RawEndpointExecutor interface {
+	ExecuteRawEndpoint(ctx context.Context, auth *Auth, req cliproxyexecutor.RawEndpointRequest) (cliproxyexecutor.RawEndpointResponse, error)
+}
+
 // ExecutionSessionCloser allows executors to release per-session runtime resources.
 type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
@@ -9971,4 +9976,27 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
 	return exec.HttpRequest(ctx, auth, req)
+}
+
+// ExecuteRawEndpoint delegates an untranslated endpoint exchange to its provider executor.
+func (m *Manager) ExecuteRawEndpoint(ctx context.Context, auth *Auth, req cliproxyexecutor.RawEndpointRequest) (cliproxyexecutor.RawEndpointResponse, error) {
+	if m == nil {
+		return cliproxyexecutor.RawEndpointResponse{}, &Error{Code: "provider_not_found", Message: "manager is nil"}
+	}
+	if auth == nil {
+		return cliproxyexecutor.RawEndpointResponse{}, &Error{Code: "auth_not_found", Message: "auth is nil"}
+	}
+	providerKey := executorKeyFromAuth(auth)
+	if providerKey == "" {
+		return cliproxyexecutor.RawEndpointResponse{}, &Error{Code: "provider_not_found", Message: "auth provider is empty"}
+	}
+	exec := m.executorFor(providerKey)
+	if exec == nil {
+		return cliproxyexecutor.RawEndpointResponse{}, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
+	}
+	rawExecutor, ok := exec.(RawEndpointExecutor)
+	if !ok || rawExecutor == nil {
+		return cliproxyexecutor.RawEndpointResponse{}, &Error{Code: "not_supported", Message: "executor does not support raw endpoints"}
+	}
+	return rawExecutor.ExecuteRawEndpoint(ctx, auth, req)
 }

@@ -187,6 +187,23 @@ type Response struct {
 	Headers http.Header
 }
 
+// CodexAlphaSearchEndpoint identifies Codex's standalone search exchange.
+const CodexAlphaSearchEndpoint = "codex.alpha_search"
+
+// RawEndpointRequest carries an untranslated provider endpoint request.
+type RawEndpointRequest struct {
+	Endpoint string
+	Body     []byte
+	Headers  http.Header
+}
+
+// RawEndpointResponse carries a bounded untranslated provider response.
+type RawEndpointResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
 // StreamChunk represents a single streaming payload unit emitted by provider executors.
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.

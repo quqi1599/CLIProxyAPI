@@ -17,6 +17,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
@@ -40,6 +41,7 @@ const (
 	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
+	codexAlphaSearchBodyBytes  = 32 << 20
 )
 
 var dataTag = []byte("data:")
@@ -886,6 +888,102 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
+}
+
+func sanitizeCodexAlphaSearchBody(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil || payload == nil {
+		return body
+	}
+	removed := false
+	for _, field := range []string{"prompt_cache_key", "prompt_cache_retention"} {
+		if _, exists := payload[field]; exists {
+			delete(payload, field)
+			removed = true
+		}
+	}
+	if !removed {
+		return body
+	}
+	sanitized, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return body
+	}
+	return sanitized
+}
+
+func (e *CodexExecutor) ExecuteRawEndpoint(ctx context.Context, auth *cliproxyauth.Auth, rawReq cliproxyexecutor.RawEndpointRequest) (cliproxyexecutor.RawEndpointResponse, error) {
+	if rawReq.Endpoint != cliproxyexecutor.CodexAlphaSearchEndpoint {
+		return cliproxyexecutor.RawEndpointResponse{}, statusErr{code: http.StatusBadRequest, msg: "unsupported Codex raw endpoint"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, baseURL := codexCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	targetURL := strings.TrimSuffix(baseURL, "/") + "/alpha/search"
+	body := sanitizeCodexAlphaSearchBody(rawReq.Body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return cliproxyexecutor.RawEndpointResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Originator", "codex_cli_rs")
+	for _, name := range []string{"Version", "User-Agent", "Session_id", "X-Client-Request-Id"} {
+		if value := strings.TrimSpace(rawReq.Headers.Get(name)); value != "" {
+			httpReq.Header.Set(name, value)
+		}
+	}
+	if auth != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			httpReq.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+	}
+	if err = e.PrepareRequest(httpReq, auth); err != nil {
+		return cliproxyexecutor.RawEndpointResponse{}, err
+	}
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL:       targetURL,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      body,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.RawEndpointResponse{}, err
+	}
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	responseBody, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{
+		ErrorBytes:       codexAlphaSearchBodyBytes,
+		SuccessBytes:     codexAlphaSearchBodyBytes,
+		ErrorWireBytes:   codexAlphaSearchBodyBytes,
+		SuccessWireBytes: codexAlphaSearchBodyBytes,
+	})
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		if failure, ok := failurecontract.As(err); ok && strings.Contains(failure.ProviderCode, "too_large") {
+			return cliproxyexecutor.RawEndpointResponse{}, statusErr{code: http.StatusBadGateway, msg: "Codex search response exceeds the allowed size", failure: failure}
+		}
+		return cliproxyexecutor.RawEndpointResponse{}, statusErr{code: http.StatusBadGateway, msg: "Failed to read Codex search response"}
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, responseBody)
+	return cliproxyexecutor.RawEndpointResponse{StatusCode: httpResp.StatusCode, Headers: httpResp.Header.Clone(), Body: responseBody}, nil
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {

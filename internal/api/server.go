@@ -30,14 +30,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -54,9 +52,8 @@ import (
 )
 
 const (
-	oauthCallbackSuccessHTML               = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
-	codexAlphaSearchRequestMaxBytes  int64 = 16 << 20
-	codexAlphaSearchResponseMaxBytes int64 = 32 << 20
+	oauthCallbackSuccessHTML              = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+	codexAlphaSearchRequestMaxBytes int64 = 16 << 20
 )
 
 var corsExposedResponseHeaders = []string{
@@ -608,28 +605,6 @@ func (s *Server) setupRoutes() {
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
-func sanitizeCodexAlphaSearchBody(body []byte) []byte {
-	var payload map[string]json.RawMessage
-	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil || payload == nil {
-		return body
-	}
-	removed := false
-	for _, field := range []string{"prompt_cache_key", "prompt_cache_retention"} {
-		if _, exists := payload[field]; exists {
-			delete(payload, field)
-			removed = true
-		}
-	}
-	if !removed {
-		return body
-	}
-	sanitizedBody, errMarshal := json.Marshal(payload)
-	if errMarshal != nil {
-		return body
-	}
-	return sanitizedBody
-}
-
 // codexAlphaSearch forwards Codex's standalone search payload without protocol translation.
 func (s *Server) codexAlphaSearch(c *gin.Context) {
 	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
@@ -647,8 +622,6 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		Model string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &routing)
-	upstreamRequestBody := sanitizeCodexAlphaSearchBody(body)
-
 	selectionHeaders := c.Request.Header.Clone()
 	if sessionID := strings.TrimSpace(routing.ID); sessionID != "" {
 		selectionHeaders.Set("X-Session-ID", sessionID)
@@ -667,72 +640,24 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		return
 	}
 
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-	headers.Set("Originator", "codex_cli_rs")
-	for _, name := range []string{"Version", "User-Agent", "Session_id", "X-Client-Request-Id"} {
-		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
-			headers.Set(name, value)
-		}
-	}
-	if accountID, ok := selected.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
-		headers.Set("Chatgpt-Account-Id", accountID)
-	}
-
-	const upstreamURL = "https://chatgpt.com/backend-api/codex/alpha/search"
-	req, err := s.handlers.AuthManager.NewHttpRequest(ctx, selected, http.MethodPost, upstreamURL, upstreamRequestBody, headers)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
-	var authID, authLabel, authType, authValue string
-	if selected != nil {
-		authID = selected.ID
-		authLabel = selected.Label
-		authType, authValue = selected.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, s.cfg, helps.UpstreamRequestLog{
-		URL:       upstreamURL,
-		Method:    http.MethodPost,
-		Headers:   req.Header.Clone(),
-		Body:      upstreamRequestBody,
-		Provider:  "codex",
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
+	resp, err := s.handlers.AuthManager.ExecuteRawEndpoint(ctx, selected, coreexecutor.RawEndpointRequest{
+		Endpoint: coreexecutor.CodexAlphaSearchEndpoint,
+		Body:     body,
+		Headers:  c.Request.Header.Clone(),
 	})
-
-	resp, err := s.handlers.AuthManager.HttpRequest(ctx, selected, req)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, s.cfg, err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		status := http.StatusBadGateway
+		if statusError, ok := err.(interface{ StatusCode() int }); ok && statusError.StatusCode() > 0 {
+			status = statusError.StatusCode()
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("codex alpha search: close response body error: %v", errClose)
-		}
-	}()
-	helps.RecordAPIResponseMetadata(ctx, s.cfg, resp.StatusCode, resp.Header.Clone())
-	upstreamBody, err := httpfetch.ReadBytes(resp.Body, codexAlphaSearchResponseMaxBytes)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, s.cfg, err)
-		var tooLarge *httpfetch.ResponseTooLargeError
-		if errors.As(err, &tooLarge) {
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Codex search response exceeds the allowed size"})
-			return
-		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to read Codex search response"})
-		return
-	}
-	helps.AppendAPIResponseChunk(ctx, s.cfg, upstreamBody)
-	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+	if contentType := resp.Headers.Get("Content-Type"); contentType != "" {
 		c.Header("Content-Type", contentType)
 	}
 	c.Status(resp.StatusCode)
-	_, _ = c.Writer.Write(upstreamBody)
+	_, _ = c.Writer.Write(resp.Body)
 }
 
 func unsupportedOpenAIAudioEndpoint(c *gin.Context) {
