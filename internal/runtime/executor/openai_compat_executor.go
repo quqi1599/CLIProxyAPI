@@ -305,23 +305,8 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 	}
 }
 
-func resolvedOpenAICompatKind(profile openAICompatProfile, auth *cliproxyauth.Auth) string {
-	if kind := config.NormalizeOpenAICompatibilityKind(profile.Kind); kind != "" {
-		return kind
-	}
-	if auth != nil && auth.Attributes != nil {
-		if kind := config.NormalizeOpenAICompatibilityKind(auth.Attributes["compat_kind"]); kind != "" {
-			return kind
-		}
-		if kind := inferOpenAICompatKindFromBaseURL(auth.Attributes["base_url"]); kind != "" {
-			return kind
-		}
-	}
-	return ""
-}
-
-func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, auth *cliproxyauth.Auth, model, path string) error {
-	if resolvedOpenAICompatKind(profile, auth) != "deepseek" {
+func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return nil
 	}
 	imageParts := countOpenAICompatImageParts(body)
@@ -708,7 +693,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.failureCtx = cliproxyusage.WithFailureDiagnostic(ctx, diagnostic.failureDiagnostic())
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
-	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, auth, baseModel, plan.requestPath); err != nil {
+	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
 		return plan, err
 	}
 	plan.logBody = body

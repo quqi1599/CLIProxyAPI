@@ -2,6 +2,78 @@ package provideridentity
 
 import "testing"
 
+func TestInputFromAttributes(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   string
+		attributes map[string]string
+		want       Input
+	}{
+		{
+			name:     "nil attributes",
+			provider: "claude",
+			want:     Input{Provider: "claude"},
+		},
+		{
+			name:     "canonical attributes",
+			provider: "openai-compatibility",
+			attributes: map[string]string{
+				"provider_key":      "configured-route",
+				"provider_family":   "openai-compatibility",
+				"compat_name":       "Configured Route",
+				"compat_kind":       "MiniMax",
+				KindSourceAttribute: string(SourceCompatConfig),
+				"base_url":          "https://api.deepseek.com/v1",
+			},
+			want: Input{
+				Provider:        "openai-compatibility",
+				ProviderKey:     "configured-route",
+				ProviderFamily:  "openai-compatibility",
+				CompatName:      "Configured Route",
+				AttributeKind:   "MiniMax",
+				AttributeSource: SourceCompatConfig,
+				BaseURL:         "https://api.deepseek.com/v1",
+			},
+		},
+		{
+			name: "legacy compat kind",
+			attributes: map[string]string{
+				"compat-kind": "MiniMax",
+			},
+			want: Input{AttributeKind: "MiniMax"},
+		},
+		{
+			name: "canonical compat kind wins",
+			attributes: map[string]string{
+				"compat_kind": " Kimi ",
+				"compat-kind": "MiniMax",
+			},
+			want: Input{AttributeKind: "Kimi"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := InputFromAttributes(tt.provider, tt.attributes); got != tt.want {
+				t.Fatalf("InputFromAttributes() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInputFromAttributesReResolvesURLDerivedKind(t *testing.T) {
+	input := InputFromAttributes("openai-compatibility", map[string]string{
+		"provider_key":      "configured-route",
+		"compat_kind":       "minimax",
+		KindSourceAttribute: string(SourceBaseURL),
+		"base_url":          "https://api.deepseek.com/v1",
+	})
+	identity := Resolve(input)
+	if identity.Kind != "deepseek" || identity.Source != SourceBaseURL || identity.ExecutorKey != "configured-route" {
+		t.Fatalf("Resolve(InputFromAttributes()) = %+v", identity)
+	}
+}
+
 func TestResolvePrecedence(t *testing.T) {
 	tests := []struct {
 		name  string

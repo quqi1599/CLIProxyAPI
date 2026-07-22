@@ -481,22 +481,14 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 }
 
 func routePlanProviderIdentity(auth *Auth, provider string) provideridentity.Identity {
-	input := provideridentity.Input{Provider: provider}
-	if auth == nil {
-		return provideridentity.Resolve(input)
+	var attributes map[string]string
+	if auth != nil {
+		if strings.TrimSpace(provider) == "" {
+			provider = auth.Provider
+		}
+		attributes = auth.Attributes
 	}
-	if strings.TrimSpace(input.Provider) == "" {
-		input.Provider = auth.Provider
-	}
-	if auth.Attributes != nil {
-		input.ProviderKey = auth.Attributes["provider_key"]
-		input.ProviderFamily = auth.Attributes["provider_family"]
-		input.CompatName = auth.Attributes["compat_name"]
-		input.AttributeKind = auth.Attributes["compat_kind"]
-		input.AttributeSource = provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute])
-		input.BaseURL = auth.Attributes["base_url"]
-	}
-	return provideridentity.Resolve(input)
+	return provideridentity.Resolve(provideridentity.InputFromAttributes(provider, attributes))
 }
 
 func routePlanCompatKindWithSource(auth *Auth) (string, string) {

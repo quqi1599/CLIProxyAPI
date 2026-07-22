@@ -35,7 +35,7 @@ const kimiTopP = 0.95
 
 type openAICompatProfile struct {
 	Kind                     string
-	KindSource               provideridentity.Source
+	Identity                 provideridentity.Identity
 	SupportsResponses        bool
 	SupportsNativeResponses  bool
 	SupportsStreamUsage      bool
@@ -162,21 +162,22 @@ func openAICompatProfileForKind(kind string) openAICompatProfile {
 
 func (e *OpenAICompatExecutor) resolveProfile(auth *cliproxyauth.Auth) openAICompatProfile {
 	compat := e.resolveCompatConfig(auth)
-	input := provideridentity.Input{}
+	provider := ""
+	var attributes map[string]string
+	if auth != nil {
+		provider = auth.Provider
+		attributes = auth.Attributes
+	}
+	input := provideridentity.InputFromAttributes(provider, attributes)
 	if compat != nil {
 		input.ExplicitKind = compat.Kind
-		input.BaseURL = compat.BaseURL
-	}
-	if auth != nil && auth.Attributes != nil {
-		input.AttributeKind = auth.Attributes["compat_kind"]
-		input.AttributeSource = provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute])
-		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
-			input.BaseURL = baseURL
+		if strings.TrimSpace(input.BaseURL) == "" {
+			input.BaseURL = compat.BaseURL
 		}
 	}
 	identity := provideridentity.Resolve(input)
 	resolved := openAICompatProfileForKind(identity.Kind)
-	resolved.KindSource = identity.Source
+	resolved.Identity = identity
 	if compat != nil && len(compat.Headers) > 0 {
 		resolved.DefaultHeaders = config.NormalizeHeaders(compat.Headers)
 	}
@@ -1204,7 +1205,7 @@ func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompat
 		ModifiedFields:    sortedModifiedFields(beforeFields, afterFields),
 		UpstreamRequestID: firstHeaderValue(responseHeaders, "X-Tt-Logid", "X-Volc-Request-Id", "X-Request-Id", "X-Request-ID", "X-Requestid", "Request-Id"),
 	}
-	diag.CompatKindSource = openAICompatKindSource(profile, auth)
+	diag.CompatKindSource = openAICompatKindSource(profile)
 	diag.CompatMapping = openAICompatMapping(profile, model)
 	if auth != nil {
 		diag.AuthID = strings.TrimSpace(auth.ID)
@@ -1217,23 +1218,14 @@ func newOpenAICompatPayloadDiagnostic(before, after []byte, profile openAICompat
 	return diag
 }
 
-func openAICompatKindSource(profile openAICompatProfile, auth *cliproxyauth.Auth) string {
+func openAICompatKindSource(profile openAICompatProfile) string {
 	kind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if kind == "" {
 		return ""
 	}
-	if profile.KindSource != "" && profile.KindSource != provideridentity.SourceGeneric {
-		return string(profile.KindSource)
-	}
-	if auth != nil && auth.Attributes != nil {
-		identity := provideridentity.Resolve(provideridentity.Input{
-			AttributeKind:   auth.Attributes["compat_kind"],
-			AttributeSource: provideridentity.Source(auth.Attributes[provideridentity.KindSourceAttribute]),
-			BaseURL:         auth.Attributes["base_url"],
-		})
-		if identity.Kind == kind && identity.Source != provideridentity.SourceGeneric {
-			return string(identity.Source)
-		}
+	if config.NormalizeOpenAICompatibilityKind(profile.Identity.Kind) == kind &&
+		profile.Identity.Source != "" && profile.Identity.Source != provideridentity.SourceGeneric {
+		return string(profile.Identity.Source)
 	}
 	return string(provideridentity.SourceCompatConfig)
 }
@@ -3468,7 +3460,7 @@ func logOpenAICompatUpstreamError(profile openAICompatProfile, auth *cliproxyaut
 	entry := log.WithFields(log.Fields{
 		"provider":           profile.KindOrFallback(auth),
 		"compat_kind":        profile.Kind,
-		"compat_kind_source": openAICompatKindSource(profile, auth),
+		"compat_kind_source": openAICompatKindSource(profile),
 		"compat_mapping":     openAICompatMapping(profile, routeModel),
 		"model":              strings.TrimSpace(routeModel),
 		"status":             statusCode,

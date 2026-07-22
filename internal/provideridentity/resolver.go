@@ -33,6 +33,21 @@ type Input struct {
 	BaseURL         string
 }
 
+// InputFromAttributes builds resolver input from the canonical auth attributes.
+func InputFromAttributes(provider string, attributes map[string]string) Input {
+	input := Input{Provider: provider}
+	if attributes == nil {
+		return input
+	}
+	input.ProviderKey = attributes["provider_key"]
+	input.ProviderFamily = attributes["provider_family"]
+	input.CompatName = attributes["compat_name"]
+	input.AttributeKind = firstNonEmpty(attributes["compat_kind"], attributes["compat-kind"])
+	input.AttributeSource = Source(attributes[KindSourceAttribute])
+	input.BaseURL = attributes["base_url"]
+	return input
+}
+
 // Identity keeps the canonical provider separate from compatibility metadata.
 // An empty Kind keeps native/default provider metadata separate from compatibility identity.
 type Identity struct {

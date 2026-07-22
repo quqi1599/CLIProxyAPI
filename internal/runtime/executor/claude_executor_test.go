@@ -20,6 +20,7 @@ import (
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -35,7 +36,7 @@ func resetClaudeDeviceProfileCache() {
 
 func TestPrepareClaudeRequest_StreamAndNonStreamShareCommonFixture(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
 		"api_key":  "test-key",
 		"base_url": "https://api.anthropic.com",
 	}}
@@ -71,6 +72,10 @@ func TestPrepareClaudeRequest_StreamAndNonStreamShareCommonFixture(t *testing.T)
 	}
 	if !bytes.Equal(nonStream.bodyForUpstream, stream.bodyForUpstream) {
 		t.Fatalf("upstream bodies differ:\nnon-stream: %s\nstream: %s", nonStream.bodyForUpstream, stream.bodyForUpstream)
+	}
+	wantIdentity := provideridentity.Identity{CanonicalProvider: "claude", ExecutorKey: "claude", Source: provideridentity.SourceDefault, BaseHost: "api.anthropic.com"}
+	if nonStream.providerIdentity != wantIdentity || stream.providerIdentity != wantIdentity {
+		t.Fatalf("provider identities differ: non-stream=%+v stream=%+v want=%+v", nonStream.providerIdentity, stream.providerIdentity, wantIdentity)
 	}
 	if got := nonStream.extraBetas; len(got) != 1 || got[0] != "prompt-caching-2024-07-31" {
 		t.Fatalf("extraBetas = %v, want prompt-caching beta", got)
@@ -446,16 +451,89 @@ func TestValidateMiniMaxToolResultAdjacencyAcceptsOpenAIToolCycleAfterTranslatio
 	}
 }
 
-func TestClaudeCompatKindPrefersAuthMetadataForMiniMaxAliases(t *testing.T) {
+func TestClaudeProviderIdentityUsesSharedAttributeInput(t *testing.T) {
 	t.Parallel()
 
-	auth := &cliproxyauth.Auth{
-		Attributes: map[string]string{
-			"compat_kind": "MiniMax",
+	tests := []struct {
+		name    string
+		auth    *cliproxyauth.Auth
+		baseURL string
+		want    provideridentity.Identity
+	}{
+		{
+			name: "canonical attribute",
+			auth: &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+				"provider_key":    "configured-route",
+				"provider_family": "openai-compatibility",
+				"compat_name":     "Configured Route",
+				"compat_kind":     "MiniMax",
+			}},
+			baseURL: "https://proxy.example.com/anthropic",
+			want: provideridentity.Identity{
+				CanonicalProvider: "minimax",
+				ExecutorKey:       "configured-route",
+				ProviderFamily:    "openai-compatibility",
+				CompatName:        "Configured Route",
+				Kind:              "minimax",
+				Source:            provideridentity.SourceAttribute,
+				BaseHost:          "proxy.example.com",
+			},
+		},
+		{
+			name: "legacy attribute",
+			auth: &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+				"compat-kind": "MiniMax",
+			}},
+			baseURL: "https://proxy.example.com/anthropic",
+			want:    provideridentity.Identity{CanonicalProvider: "minimax", ExecutorKey: "claude", Kind: "minimax", Source: provideridentity.SourceAttribute, BaseHost: "proxy.example.com"},
+		},
+		{
+			name:    "base URL inference",
+			auth:    &cliproxyauth.Auth{Provider: "claude"},
+			baseURL: "https://api.deepseek.com/anthropic",
+			want:    provideridentity.Identity{CanonicalProvider: "deepseek", ExecutorKey: "claude", Kind: "deepseek", Source: provideridentity.SourceBaseURL, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name:    "known provider root host",
+			auth:    &cliproxyauth.Auth{Provider: "claude"},
+			baseURL: "https://api.deepseek.com",
+			want:    provideridentity.Identity{CanonicalProvider: "deepseek", ExecutorKey: "claude", Kind: "deepseek", Source: provideridentity.SourceBaseURL, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name: "stale URL-derived attribute",
+			auth: &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+				"compat_kind":                        "minimax",
+				provideridentity.KindSourceAttribute: string(provideridentity.SourceBaseURL),
+				"base_url":                           "https://api.deepseek.com/anthropic",
+			}},
+			baseURL: "https://api.deepseek.com/anthropic",
+			want:    provideridentity.Identity{CanonicalProvider: "deepseek", ExecutorKey: "claude", Kind: "deepseek", Source: provideridentity.SourceBaseURL, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name: "explicit attribute source",
+			auth: &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+				"compat_kind":                        "minimax",
+				provideridentity.KindSourceAttribute: string(provideridentity.SourceCompatConfig),
+				"base_url":                           "https://api.deepseek.com/anthropic",
+			}},
+			baseURL: "https://api.deepseek.com/anthropic",
+			want:    provideridentity.Identity{CanonicalProvider: "minimax", ExecutorKey: "claude", Kind: "minimax", Source: provideridentity.SourceCompatConfig, BaseHost: "api.deepseek.com"},
+		},
+		{
+			name:    "native Claude",
+			auth:    &cliproxyauth.Auth{Provider: "claude"},
+			baseURL: "https://api.anthropic.com",
+			want:    provideridentity.Identity{CanonicalProvider: "claude", ExecutorKey: "claude", Source: provideridentity.SourceDefault, BaseHost: "api.anthropic.com"},
 		},
 	}
-	if got := claudeCompatKind(auth, "https://proxy.example.com/anthropic"); got != "minimax" {
-		t.Fatalf("claudeCompatKind() = %q, want minimax", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := claudeProviderIdentity(tt.auth, tt.baseURL); got != tt.want {
+				t.Fatalf("claudeProviderIdentity() = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 

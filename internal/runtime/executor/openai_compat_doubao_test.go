@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -556,16 +557,17 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	}
 }
 
-func TestResolvedOpenAICompatKind_InferDeepSeekFromBaseURL(t *testing.T) {
-	profile := openAICompatProfile{}
-	auth := &auth.Auth{
+func TestOpenAICompatResolveProfileInfersDeepSeekFromBaseURL(t *testing.T) {
+	upstreamAuth := &auth.Auth{
+		Provider: "openai-compatibility",
 		Attributes: map[string]string{
 			"base_url": "https://api.deepseek.com/v1",
 		},
 	}
+	profile := NewOpenAICompatExecutor("openai-compatibility", nil).resolveProfile(upstreamAuth)
 
-	if got := resolvedOpenAICompatKind(profile, auth); got != "deepseek" {
-		t.Fatalf("resolvedOpenAICompatKind() = %q, want deepseek", got)
+	if profile.Kind != "deepseek" || profile.Identity.Kind != "deepseek" || profile.Identity.Source != provideridentity.SourceBaseURL {
+		t.Fatalf("resolveProfile() = %+v", profile)
 	}
 }
 

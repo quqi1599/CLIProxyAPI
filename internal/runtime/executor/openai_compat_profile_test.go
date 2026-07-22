@@ -137,11 +137,11 @@ func TestNewOpenAICompatPayloadDiagnostic_CollectsDeepSeekFailureHints(t *testin
 		"stop":["DONE","END"]
 	}`)
 
-	profile := openAICompatProfile{Kind: "deepseek"}
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
 		"base_url":    "https://api.deepseek.com/v1",
 		"compat_name": "deepseek-official",
 	}}
+	profile := NewOpenAICompatExecutor("openai-compatibility", nil).resolveProfile(auth)
 
 	diag := newOpenAICompatPayloadDiagnostic(nil, payload, profile, auth, "deepseek-v4-pro", "/v1/chat/completions", "/v1/chat/completions", nil, nil)
 

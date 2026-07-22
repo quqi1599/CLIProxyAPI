@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -268,7 +269,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 type claudeRequestPlan struct {
 	apiKey                   string
 	baseURL                  string
-	compatKind               string
+	providerIdentity         provideridentity.Identity
 	upstreamFormat           sdktranslator.Format
 	responseFormat           sdktranslator.Format
 	upstreamStream           bool
@@ -285,7 +286,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if plan.baseURL == "" {
 		plan.baseURL = "https://api.anthropic.com"
 	}
-	plan.compatKind = claudeCompatKind(auth, plan.baseURL)
+	plan.providerIdentity = claudeProviderIdentity(auth, plan.baseURL)
 
 	from := opts.SourceFormat
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -329,13 +330,13 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.compatKind)
+	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, plan.baseURL, plan.compatKind)
-	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, plan.compatKind)
+	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, plan.baseURL, plan.providerIdentity.Kind)
+	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, plan.providerIdentity.Kind)
 	body = ensureModelMaxTokens(body, baseModel)
 	if streamResponse {
-		body = applyMiniMaxStreamingThinkingDefaultForCompat(plan.compatKind, body, true)
+		body = applyMiniMaxStreamingThinkingDefaultForCompat(plan.providerIdentity.Kind, body, true)
 	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
@@ -407,7 +408,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	toolHistoryDowngrades := make([]string, 0, 1)
 	if preflight.hasTools || preflight.hasToolSearch {
 		toolSearchInput := body
-		body = downgradeClaudeToolSearchForCompatKind(plan.compatKind, plan.baseURL, body)
+		body = downgradeClaudeToolSearchForCompatKind(plan.providerIdentity.Kind, plan.baseURL, body)
 		if !bytes.Equal(toolSearchInput, body) {
 			toolHistoryDowngrades = append(toolHistoryDowngrades, claudeToolSearchCompatibilityDowngrade)
 		}
@@ -589,7 +590,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(plan.bodyForUpstream, plan.upstreamFormat.String())
 	progressStartInputTokens := int64(0)
-	if shouldPatchClaudeStartUsageForProgress(plan.compatKind, plan.baseURL) {
+	if shouldPatchClaudeStartUsageForProgress(plan.providerIdentity.Kind, plan.baseURL) {
 		progressStartInputTokens = estimateClaudeProgressInputTokens(baseModel, plan.bodyForUpstream)
 	}
 
@@ -1470,15 +1471,18 @@ func isClaudeOAuthToken(apiKey string) bool {
 	return strings.Contains(apiKey, "sk-ant-oat")
 }
 
-func claudeCompatKind(auth *cliproxyauth.Auth, baseURL string) string {
+func claudeProviderIdentity(auth *cliproxyauth.Auth, baseURL string) provideridentity.Identity {
+	provider := ""
+	var attributes map[string]string
 	if auth != nil {
-		for _, key := range []string{"compat_kind", "compat-kind"} {
-			if value := config.NormalizeOpenAICompatibilityKind(auth.Attributes[key]); value != "" {
-				return value
-			}
-		}
+		provider = auth.Provider
+		attributes = auth.Attributes
 	}
-	return config.InferCompatKindFromBaseURL(baseURL)
+	input := provideridentity.InputFromAttributes(provider, attributes)
+	if strings.TrimSpace(input.BaseURL) == "" {
+		input.BaseURL = baseURL
+	}
+	return provideridentity.Resolve(input)
 }
 
 func shouldPatchClaudeStartUsageForProgress(compatKind, baseURL string) bool {

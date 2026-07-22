@@ -275,6 +275,45 @@ func TestRoutePlanProviderIdentityUsesURLFallbackWithoutReplacingExecutorKey(t *
 	}
 }
 
+func TestRoutePlanProviderIdentityUsesSharedAttributeInput(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes map[string]string
+	}{
+		{
+			name: "legacy compat kind",
+			attributes: map[string]string{
+				"provider_key": "configured-route",
+				"compat-kind":  "MiniMax",
+				"base_url":     "https://api.deepseek.com/v1",
+			},
+		},
+		{
+			name: "stale URL-derived kind",
+			attributes: map[string]string{
+				"provider_key":                       "configured-route",
+				"compat_kind":                        "minimax",
+				provideridentity.KindSourceAttribute: string(provideridentity.SourceBaseURL),
+				"base_url":                           "https://api.deepseek.com/v1",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &Auth{Provider: "configured-route", Attributes: tt.attributes}
+			got := routePlanProviderIdentity(auth, "openai-compatibility")
+			want := provideridentity.Resolve(provideridentity.InputFromAttributes("openai-compatibility", tt.attributes))
+			if got != want {
+				t.Fatalf("routePlanProviderIdentity() = %+v, want %+v", got, want)
+			}
+			if got.ExecutorKey != "configured-route" {
+				t.Fatalf("identity executor_key = %q, want configured-route", got.ExecutorKey)
+			}
+		})
+	}
+}
+
 func TestRoutePlanNormalizedReasoningEffort_OfficialDeepSeekUsesOfficialSemantics(t *testing.T) {
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient("route-plan-deepseek-official", "deepseek", []*registry.ModelInfo{{
