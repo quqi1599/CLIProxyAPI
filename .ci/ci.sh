@@ -32,6 +32,7 @@ if [[ -n $unformatted ]]; then
 fi
 
 go run ./cmd/payload-growth -test=false ./...
+bash .ci/payload-clone-scan-test.sh
 bash .ci/payload-clone-scan.sh
 bash .ci/verify-production-image-test.sh
 go test ./internal/payload

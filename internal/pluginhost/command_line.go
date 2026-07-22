@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -397,7 +398,7 @@ func appendCommandLineSavedPaths(stdout []byte, savedPaths []string) []byte {
 	if len(savedPaths) == 0 {
 		return stdout
 	}
-	out := append([]byte(nil), stdout...)
+	out := internalpayload.CloneBytes(stdout)
 	if len(out) > 0 && out[len(out)-1] != '\n' {
 		out = append(out, '\n')
 	}

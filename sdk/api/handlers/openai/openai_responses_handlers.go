@@ -49,10 +49,12 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending              []byte
-	outputItems          map[int][]byte
-	outputOrder          []int
-	unindexedOutputItems [][]byte
+	pending                     []byte
+	outputItems                 map[int][]byte
+	outputItemReleases          map[int]func()
+	outputOrder                 []int
+	unindexedOutputItems        [][]byte
+	unindexedOutputItemReleases []func()
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -166,19 +168,48 @@ func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
 		return
 	}
 
+	cloned := internalpayload.CloneStringBytes(item.Raw)
 	if outputIndex := gjson.GetBytes(payload, "output_index"); outputIndex.Exists() {
 		index := int(outputIndex.Int())
 		if f.outputItems == nil {
 			f.outputItems = make(map[int][]byte)
 		}
+		if f.outputItemReleases == nil {
+			f.outputItemReleases = make(map[int]func())
+		}
 		if _, exists := f.outputItems[index]; !exists {
 			f.outputOrder = append(f.outputOrder, index)
+		} else if releasePrevious := f.outputItemReleases[index]; releasePrevious != nil {
+			releasePrevious()
 		}
-		f.outputItems[index] = append([]byte(nil), item.Raw...)
+		f.outputItems[index] = cloned
+		f.outputItemReleases[index] = internalpayload.RetainBytesScoped(cloned)
 		return
 	}
 
-	f.unindexedOutputItems = append(f.unindexedOutputItems, append([]byte(nil), item.Raw...))
+	f.unindexedOutputItems = append(f.unindexedOutputItems, cloned)
+	f.unindexedOutputItemReleases = append(f.unindexedOutputItemReleases, internalpayload.RetainBytesScoped(cloned))
+}
+
+func (f *responsesSSEFramer) releaseOutputItems() {
+	if f == nil {
+		return
+	}
+	for _, release := range f.outputItemReleases {
+		if release != nil {
+			release()
+		}
+	}
+	for _, release := range f.unindexedOutputItemReleases {
+		if release != nil {
+			release()
+		}
+	}
+	f.outputItems = nil
+	f.outputItemReleases = nil
+	f.outputOrder = nil
+	f.unindexedOutputItems = nil
+	f.unindexedOutputItemReleases = nil
 }
 
 func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
@@ -533,6 +564,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(summaryCtx context.Co
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
+	defer framer.releaseOutputItems()
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		SummaryContext: summaryCtx,
 		WriteChunk: func(w handlers.StreamBodyWriter, chunk []byte) {

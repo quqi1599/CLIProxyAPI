@@ -8,6 +8,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -213,7 +214,7 @@ func (h *Host) callHostHTTPStreamRead(ctx context.Context, request []byte) ([]by
 		return nil, errRead
 	}
 	resp := rpcHostHTTPStreamReadResponse{
-		Payload: append([]byte(nil), chunk.Payload...),
+		Payload: internalpayload.CloneBytes(chunk.Payload),
 		Done:    done,
 	}
 	if chunk.Err != nil {
@@ -249,14 +250,14 @@ func decodeHostHTTPRequestWithCallbackID(raw []byte) (pluginapi.HTTPRequest, str
 			Method:  req.Request.Method,
 			URL:     req.Request.URL,
 			Headers: map[string][]string(req.Request.Headers),
-			Body:    append([]byte(nil), req.Request.Body...),
+			Body:    internalpayload.CloneBytes(req.Request.Body),
 		}, req.HostCallbackID, nil
 	}
 	return pluginapi.HTTPRequest{
 		Method:  req.Method,
 		URL:     req.URL,
 		Headers: map[string][]string(req.Headers),
-		Body:    append([]byte(nil), req.Body...),
+		Body:    internalpayload.CloneBytes(req.Body),
 	}, req.HostCallbackID, nil
 }
 
@@ -265,7 +266,7 @@ func (h *Host) callHostStreamEmit(ctx context.Context, request []byte) ([]byte, 
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode stream emit request: %w", errUnmarshal)
 	}
-	chunk := pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), req.Payload...)}
+	chunk := pluginapi.ExecutorStreamChunk{Payload: internalpayload.CloneBytes(req.Payload)}
 	if req.Error != "" {
 		chunk.Err = fmt.Errorf("%s", req.Error)
 	}
@@ -305,7 +306,7 @@ func (h *Host) callHostModelExecute(ctx context.Context, request []byte) ([]byte
 	return marshalRPCResult(pluginapi.HostModelExecutionResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    cloneHeader(resp.Headers),
-		Body:       append([]byte(nil), resp.Body...),
+		Body:       internalpayload.CloneBytes(resp.Body),
 	})
 }
 
@@ -315,7 +316,7 @@ func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, sk
 		ExitProtocol:            req.ExitProtocol,
 		Model:                   req.Model,
 		Stream:                  req.Stream,
-		Body:                    append([]byte(nil), req.Body...),
+		Body:                    internalpayload.CloneBytes(req.Body),
 		Headers:                 cloneHeader(req.Headers),
 		Query:                   cloneValues(req.Query),
 		Alt:                     req.Alt,

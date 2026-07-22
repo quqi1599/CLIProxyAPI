@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -194,7 +195,7 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			}
 			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
 			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
-			(*param).(*ConvertAnthropicResponseToGeminiParams).LastStorageOutput = append([]byte(nil), template...)
+			(*param).(*ConvertAnthropicResponseToGeminiParams).LastStorageOutput = internalpayload.CloneBytes(template)
 			// cleanup used state for this index
 			if (*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseArgs != nil {
 				delete((*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseArgs, idx)

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"golang.org/x/sys/windows"
 )
 
@@ -122,7 +123,7 @@ func (c *dynamicLibraryClient) Call(ctx context.Context, method string, request 
 	var out []byte
 	if response.ptr != 0 && response.len > 0 {
 		out = unsafe.Slice((*byte)(unsafe.Pointer(response.ptr)), response.len)
-		out = append([]byte(nil), out...)
+		out = internalpayload.CloneBytes(out)
 	}
 	if response.ptr != 0 {
 		_, _, _ = syscall.SyscallN(c.api.freeBuffer, response.ptr, response.len)
@@ -175,7 +176,7 @@ func windowsHostCall(hostCtx uintptr, methodPtr uintptr, requestPtr uintptr, req
 	var request []byte
 	if requestPtr != 0 && requestLen > 0 {
 		request = unsafe.Slice((*byte)(unsafe.Pointer(requestPtr)), requestLen)
-		request = append([]byte(nil), request...)
+		request = internalpayload.CloneBytes(request)
 	}
 	ctx := withHostCallbackPluginID(context.Background(), entry.pluginID)
 	resp, errCall := entry.host.callFromPlugin(ctx, windowsString(methodPtr), request)

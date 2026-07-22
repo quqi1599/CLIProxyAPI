@@ -623,12 +623,11 @@ func (document *antigravityReplayDocument) bytes() ([]byte, bool) {
 }
 
 type antigravityReasoningReplayAccumulator struct {
-	scope          antigravityReasoningReplayScope
-	requestPayload []byte
-	items          [][]byte
-	seenFC         map[string]bool
-	contentIndex   int
-	nextPartIndex  int
+	scope         antigravityReasoningReplayScope
+	items         [][]byte
+	seenFC        map[string]bool
+	contentIndex  int
+	nextPartIndex int
 }
 
 func newAntigravityReasoningReplayAccumulator(scope antigravityReasoningReplayScope, requestPayload []byte) *antigravityReasoningReplayAccumulator {
@@ -637,11 +636,10 @@ func newAntigravityReasoningReplayAccumulator(scope antigravityReasoningReplaySc
 	}
 	contentIndex, basePartIndex := antigravityReasoningReplayPendingModelContentIndex(requestPayload)
 	return &antigravityReasoningReplayAccumulator{
-		scope:          scope,
-		requestPayload: append([]byte(nil), requestPayload...),
-		seenFC:         make(map[string]bool),
-		contentIndex:   contentIndex,
-		nextPartIndex:  basePartIndex,
+		scope:         scope,
+		seenFC:        make(map[string]bool),
+		contentIndex:  contentIndex,
+		nextPartIndex: basePartIndex,
 	}
 }
 

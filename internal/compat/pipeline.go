@@ -97,7 +97,7 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 			return result, cancelledFailure(err)
 		}
 		if !owned {
-			current = slices.Clone(input)
+			current = internalpayload.CloneBytes(input)
 			owned = true
 			report.ReusedInput = false
 		}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -30,6 +31,26 @@ func newResponsesStreamTestHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *h
 	}
 
 	return h, recorder, c, flusher
+}
+
+func TestResponsesSSEFramerReleasesReplacedLargeOutputItems(t *testing.T) {
+	before := internalpayload.CurrentLargeCloneMetrics()
+	framer := &responsesSSEFramer{}
+	t.Cleanup(framer.releaseOutputItems)
+	payload := []byte(`{"output_index":1,"item":{"type":"message","text":"` + strings.Repeat("x", 1<<20) + `"}}`)
+
+	framer.recordOutputItem(payload)
+	framer.recordOutputItem(payload)
+	retained := internalpayload.CurrentLargeCloneMetrics()
+	if retained.ActiveScopedCount-before.ActiveScopedCount != 1 || retained.ActiveScopedBytes-before.ActiveScopedBytes != uint64(len(gjson.GetBytes(payload, "item").Raw)) {
+		t.Fatalf("retained metrics = count %d bytes %d, want one current item of %d bytes", retained.ActiveScopedCount-before.ActiveScopedCount, retained.ActiveScopedBytes-before.ActiveScopedBytes, len(gjson.GetBytes(payload, "item").Raw))
+	}
+
+	framer.releaseOutputItems()
+	after := internalpayload.CurrentLargeCloneMetrics()
+	if after.ActiveScopedCount != before.ActiveScopedCount || after.ActiveScopedBytes != before.ActiveScopedBytes {
+		t.Fatalf("released metrics = count %d bytes %d, want %d/%d", after.ActiveScopedCount, after.ActiveScopedBytes, before.ActiveScopedCount, before.ActiveScopedBytes)
+	}
 }
 
 func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {

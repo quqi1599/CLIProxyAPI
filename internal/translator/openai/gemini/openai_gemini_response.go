@@ -110,7 +110,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 			_ = int(choice.Get("index").Int()) // choiceIdx not used in streaming
 			delta := choice.Get("delta")
-			baseTemplate := append([]byte(nil), template...)
+			baseTemplate := internalpayload.CloneBytes(template)
 
 			// Handle role (only in first chunk)
 			if role := delta.Get("role"); role.Exists() && (*param).(*ConvertOpenAIResponseToGeminiParams).IsFirstChunk {
@@ -131,7 +131,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					if reasoningText == "" {
 						continue
 					}
-					reasoningTemplate := append([]byte(nil), baseTemplate...)
+					reasoningTemplate := internalpayload.CloneBytes(baseTemplate)
 					reasoningTemplate, _ = sjson.SetBytes(reasoningTemplate, "candidates.0.content.parts.0.thought", true)
 					reasoningTemplate, _ = sjson.SetBytes(reasoningTemplate, "candidates.0.content.parts.0.text", reasoningText)
 					chunkOutputs = append(chunkOutputs, reasoningTemplate)
@@ -144,7 +144,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				(*param).(*ConvertOpenAIResponseToGeminiParams).ContentAccumulator.WriteString(contentText)
 
 				// Create text part for this delta
-				contentTemplate := append([]byte(nil), baseTemplate...)
+				contentTemplate := internalpayload.CloneBytes(baseTemplate)
 				contentTemplate, _ = sjson.SetBytes(contentTemplate, "candidates.0.content.parts.0.text", contentText)
 				chunkOutputs = append(chunkOutputs, contentTemplate)
 			}

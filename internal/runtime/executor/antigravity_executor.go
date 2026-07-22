@@ -805,7 +805,7 @@ attemptLoop:
 			if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 				log.Debugf("antigravity executor: upstream error status: %d, body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), bodyBytes))
 				lastStatus = httpResp.StatusCode
-				lastBody = append([]byte(nil), bodyBytes...)
+				lastBody = bodyBytes
 				lastErr = nil
 				if httpResp.StatusCode == http.StatusNotFound && idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: 404 on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
@@ -1056,7 +1056,7 @@ attemptLoop:
 				}
 
 				lastStatus = httpResp.StatusCode
-				lastBody = append([]byte(nil), bodyBytes...)
+				lastBody = bodyBytes
 				lastErr = nil
 				if httpResp.StatusCode == http.StatusNotFound {
 					log.Warnf("antigravity executor: upstream returned 404, body: %s", helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), bodyBytes))
@@ -1584,7 +1584,7 @@ attemptLoop:
 				}
 
 				lastStatus = httpResp.StatusCode
-				lastBody = append([]byte(nil), bodyBytes...)
+				lastBody = bodyBytes
 				lastErr = nil
 				if httpResp.StatusCode == http.StatusNotFound {
 					log.Warnf("antigravity executor: upstream returned 404, body: %s", helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), bodyBytes))
@@ -1939,7 +1939,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 
 		lastStatus = httpResp.StatusCode
-		lastBody = append([]byte(nil), bodyBytes...)
+		lastBody = bodyBytes
 		lastErr = nil
 		if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
 			log.Debugf("antigravity executor: rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
@@ -2433,10 +2433,6 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		return nil, errGuard
 	}
 	bodyReader := bytes.NewReader(requestBody)
-	var payloadLog []byte
-	if e.cfg != nil && e.cfg.RequestLog {
-		payloadLog = append([]byte(nil), requestBody...)
-	}
 
 	// if useAntigravitySchema {
 	// 	systemInstructionPartsResult := gjson.Get(payloadStr, "request.systemInstruction.parts")
@@ -2478,7 +2474,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		URL:       requestURL.String(),
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
-		Body:      payloadLog,
+		Body:      requestBody,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,

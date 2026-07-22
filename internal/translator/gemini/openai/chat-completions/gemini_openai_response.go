@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	geminicommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -140,7 +141,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	if candidates.IsArray() {
 		candidates.ForEach(func(_, candidate gjson.Result) bool {
 			// Clone the template for the current candidate.
-			template := append([]byte(nil), baseTemplate...)
+			template := internalpayload.CloneBytes(baseTemplate)
 
 			// Set the specific index for this candidate.
 			candidateIndex := int(candidate.Get("index").Int())
@@ -274,7 +275,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	} else {
 		// If there are no candidates (e.g., a pure usageMetadata chunk), return the usage chunk if present.
 		if gjson.GetBytes(rawJSON, "usageMetadata").Exists() && len(responseStrings) == 0 {
-			responseStrings = append(responseStrings, append([]byte(nil), baseTemplate...))
+			responseStrings = append(responseStrings, internalpayload.CloneBytes(baseTemplate))
 		}
 	}
 

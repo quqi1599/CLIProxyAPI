@@ -20,6 +20,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -562,7 +563,7 @@ func buildKVSetArgs(key string, value []byte, opts KVSetOptions) ([]any, error) 
 		return nil, fmt.Errorf("home kv: NX and XX are mutually exclusive")
 	}
 
-	args := []any{key, append([]byte(nil), value...)}
+	args := []any{key, internalpayload.CloneBytes(value)}
 	if opts.EX > 0 {
 		args = append(args, "EX", durationCeil(opts.EX, time.Second))
 	}
@@ -597,7 +598,7 @@ func (c *Client) KVGet(ctx context.Context, key string) ([]byte, bool, error) {
 	if errGet != nil {
 		return nil, false, errGet
 	}
-	return append([]byte(nil), raw...), true, nil
+	return internalpayload.CloneBytes(raw), true, nil
 }
 
 func (c *Client) KVSet(ctx context.Context, key string, value []byte, opts KVSetOptions) (bool, error) {
@@ -698,7 +699,7 @@ func (c *Client) KVMGet(ctx context.Context, keys ...string) ([][]byte, []bool, 
 			values[i] = []byte(typed)
 			found[i] = true
 		case []byte:
-			values[i] = append([]byte(nil), typed...)
+			values[i] = internalpayload.CloneBytes(typed)
 			found[i] = true
 		default:
 			return nil, nil, fmt.Errorf("home kv: unsupported MGET item type %T", item)
@@ -723,7 +724,7 @@ func (c *Client) KVMSet(ctx context.Context, pairs map[string][]byte) error {
 	args := make([]any, 0, 1+len(keys)*2)
 	args = append(args, "MSET")
 	for _, key := range keys {
-		args = append(args, key, append([]byte(nil), pairs[key]...))
+		args = append(args, key, internalpayload.CloneBytes(pairs[key]))
 	}
 	return cmd.Do(ctx, args...).Err()
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
@@ -28,7 +29,7 @@ type usageQueueRecord []byte
 
 func (r usageQueueRecord) MarshalJSON() ([]byte, error) {
 	if json.Valid(r) {
-		return append([]byte(nil), r...), nil
+		return internalpayload.CloneBytes(r), nil
 	}
 	return json.Marshal(string(r))
 }
@@ -128,7 +129,7 @@ func (h *Handler) GetUsageQueue(c *gin.Context) {
 	items := redisqueue.PopOldest(count)
 	records := make([]usageQueueRecord, 0, len(items))
 	for _, item := range items {
-		records = append(records, usageQueueRecord(append([]byte(nil), item...)))
+		records = append(records, usageQueueRecord(internalpayload.CloneBytes(item)))
 	}
 
 	c.JSON(http.StatusOK, records)

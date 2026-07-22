@@ -162,7 +162,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
 			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 
-			params.LastStorageOutput = append([]byte(nil), template...)
+			params.LastStorageOutput = template
 
 			// Use this return to storage message
 			return [][]byte{}
@@ -221,7 +221,7 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 	}
 
 	if len(params.LastStorageOutput) > 0 {
-		stored := append([]byte(nil), params.LastStorageOutput...)
+		stored := params.LastStorageOutput
 		params.LastStorageOutput = nil
 		return [][]byte{stored, template}
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -252,7 +253,7 @@ func (s *reasoningReplayStore) logBestEffortSaveError(err error) {
 func cloneReasoningReplayItems(items [][]byte) [][]byte {
 	cloned := make([][]byte, 0, len(items))
 	for _, item := range items {
-		cloned = append(cloned, append([]byte(nil), item...))
+		cloned = append(cloned, internalpayload.CloneBytes(item))
 	}
 	return cloned
 }

@@ -3,6 +3,7 @@ package payload
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -29,6 +30,31 @@ func TestCloneBytesOwnsStorageAndCountsOnlyLargeCopies(t *testing.T) {
 	if after.Count-before.Count != 1 || after.Bytes-before.Bytes != largeCloneThresholdBytes || after.LargestCloneBytes < largeCloneThresholdBytes || len(after.Hotspots) == 0 {
 		t.Fatalf("large clone metric delta: before=%+v after=%+v", before, after)
 	}
+}
+
+func TestCloneStringBytesOwnsStorageAndAttributesLargeCopiesToCaller(t *testing.T) {
+	before := CurrentLargeCloneMetrics()
+	source := strings.Repeat("x", largeCloneThresholdBytes)
+	cloned := cloneStringBytesHotspotProbe(source)
+	cloned[0] = 'y'
+	if source[0] != 'x' {
+		t.Fatal("string clone changed immutable source")
+	}
+	after := CurrentLargeCloneMetrics()
+	if after.Count != before.Count+1 || after.Bytes != before.Bytes+largeCloneThresholdBytes {
+		t.Fatalf("large string clone metric delta: before=%+v after=%+v", before, after)
+	}
+	for _, hotspot := range after.Hotspots {
+		if strings.HasSuffix(hotspot.Name, "payload.cloneStringBytesHotspotProbe") {
+			return
+		}
+	}
+	t.Fatalf("large string clone caller hotspot missing: %+v", after.Hotspots)
+}
+
+//go:noinline
+func cloneStringBytesHotspotProbe(source string) []byte {
+	return CloneStringBytes(source)
 }
 
 func TestCloneBytesScopedTracksAndReleasesLiveCopies(t *testing.T) {

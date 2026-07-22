@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 )
 
 const (
@@ -133,7 +135,7 @@ func (q *queue) enqueue(payload []byte) {
 	q.pruneLocked(now)
 	q.items = append(q.items, queueItem{
 		enqueuedAt: now,
-		payload:    append([]byte(nil), payload...),
+		payload:    internalpayload.CloneBytes(payload),
 	})
 	q.maybeCompactLocked()
 }
@@ -147,7 +149,7 @@ func (q *queue) publishToSubscribers(payload []byte) bool {
 	}
 
 	for id, subscriber := range q.subscribers {
-		cloned := append([]byte(nil), payload...)
+		cloned := internalpayload.CloneBytes(payload)
 		select {
 		case subscriber <- cloned:
 		default:
@@ -162,7 +164,7 @@ func (q *queue) publishToSubscribers(payload []byte) bool {
 func (q *queue) subscribe(buffer int, initialPayload []byte) (<-chan []byte, func()) {
 	subscriber := make(chan []byte, buffer)
 	if len(initialPayload) > 0 {
-		subscriber <- append([]byte(nil), initialPayload...)
+		subscriber <- internalpayload.CloneBytes(initialPayload)
 	}
 
 	q.mu.Lock()

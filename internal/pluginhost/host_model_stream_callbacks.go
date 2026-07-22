@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -83,7 +84,7 @@ func (h *Host) callHostModelStreamRead(ctx context.Context, request []byte) ([]b
 		return nil, errRead
 	}
 	resp := pluginapi.HostModelStreamReadResponse{
-		Payload: append([]byte(nil), chunk.Payload...),
+		Payload: internalpayload.CloneBytes(chunk.Payload),
 		Done:    done,
 	}
 	if chunk.Err != nil {

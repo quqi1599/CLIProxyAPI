@@ -68,7 +68,7 @@ func defaultRuntimeItemConfig(id string) runtimeItemConfig {
 		ID:         id,
 		Enabled:    false,
 		Priority:   0,
-		ConfigYAML: append([]byte(nil), defaultRuntimeConfigYAML...),
+		ConfigYAML: bytes.Clone(defaultRuntimeConfigYAML), //nolint:payload-clone reason=small_default_config
 	}
 }
 
@@ -76,9 +76,9 @@ func runtimeConfigYAML(item config.PluginInstanceConfig, enabled bool) []byte {
 	rawNode := normalizedConfigNode(item, enabled)
 	rawYAML := bytes.TrimSpace(mustMarshalYAML(rawNode))
 	if len(rawYAML) == 0 {
-		return append([]byte(nil), defaultRuntimeConfigYAML...)
+		return bytes.Clone(defaultRuntimeConfigYAML) //nolint:payload-clone reason=small_default_config
 	}
-	return append(append([]byte(nil), rawYAML...), '\n')
+	return append(rawYAML, '\n')
 }
 
 func normalizedConfigNode(item config.PluginInstanceConfig, enabled bool) *yaml.Node {
@@ -150,7 +150,7 @@ func deepCopyYAMLNode(node *yaml.Node) *yaml.Node {
 func mustMarshalYAML(v any) []byte {
 	raw, errMarshal := yaml.Marshal(v)
 	if errMarshal != nil {
-		return append([]byte(nil), defaultRuntimeConfigYAML...)
+		return bytes.Clone(defaultRuntimeConfigYAML) //nolint:payload-clone reason=small_default_config
 	}
 	return raw
 }

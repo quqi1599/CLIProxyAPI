@@ -264,12 +264,12 @@ func firstSharedField(left, right []string) (string, bool) {
 }
 
 func clonePolicy(policy Policy) Policy {
-	policy.Match.Endpoints = slices.Clone(policy.Match.Endpoints)
-	policy.Match.Modes = slices.Clone(policy.Match.Modes)
-	policy.Match.SourceFormats = slices.Clone(policy.Match.SourceFormats)
-	policy.Match.TargetFormats = slices.Clone(policy.Match.TargetFormats)
-	policy.MutatedFields = slices.Clone(policy.MutatedFields)
-	policy.DowngradeIDs = slices.Clone(policy.DowngradeIDs)
+	policy.Match.Endpoints = slices.Clone(policy.Match.Endpoints)         //nolint:payload-clone reason=small_policy_metadata
+	policy.Match.Modes = slices.Clone(policy.Match.Modes)                 //nolint:payload-clone reason=small_policy_metadata
+	policy.Match.SourceFormats = slices.Clone(policy.Match.SourceFormats) //nolint:payload-clone reason=small_policy_metadata
+	policy.Match.TargetFormats = slices.Clone(policy.Match.TargetFormats) //nolint:payload-clone reason=small_policy_metadata
+	policy.MutatedFields = slices.Clone(policy.MutatedFields)             //nolint:payload-clone reason=small_policy_metadata
+	policy.DowngradeIDs = slices.Clone(policy.DowngradeIDs)               //nolint:payload-clone reason=small_policy_metadata
 	return policy
 }
 

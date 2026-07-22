@@ -1398,7 +1398,7 @@ func NormalizeCommentIndentation(data []byte) []byte {
 		if len(trimmed) == len(line) {
 			continue
 		}
-		lines[i] = append([]byte(nil), trimmed...)
+		lines[i] = trimmed
 		changed = true
 	}
 	if !changed {

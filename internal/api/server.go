@@ -5,6 +5,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
@@ -1864,7 +1865,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		return
 	}
 	s.stateMu.RLock()
-	oldConfigYaml := append([]byte(nil), s.oldConfigYaml...)
+	oldConfigYaml := bytes.Clone(s.oldConfigYaml) //nolint:payload-clone reason=config_snapshot
 	s.stateMu.RUnlock()
 
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
