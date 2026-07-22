@@ -273,63 +273,109 @@ func translateCodexRequestPair(ctx context.Context, from, to sdktranslator.Forma
 	return helps.TranslateRequestPairGuarded(ctx, "legacy.translate.codex", from, to, model, originalPayload, payload, stream, internalpayload.AmplificationOverride{})
 }
 
-type codexResponsesRequestPlan struct {
+type codexRequestPlanMode uint8
+
+const (
+	codexRequestPlanExecute codexRequestPlanMode = iota
+	codexRequestPlanStream
+	codexRequestPlanCompact
+	codexRequestPlanCount
+)
+
+type codexRequestPlan struct {
 	from                  sdktranslator.Format
 	to                    sdktranslator.Format
 	responseFormat        sdktranslator.Format
 	originalPayloadSource []byte
 	body                  []byte
 	replayScope           codexReasoningReplayScope
+	transformStage        string
+	amplificationOverride internalpayload.AmplificationOverride
 }
 
-func (e *CodexExecutor) prepareCodexResponsesRequestPlan(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, stream bool) (codexResponsesRequestPlan, error) {
+func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, mode codexRequestPlanMode) (codexRequestPlan, error) {
 	from := opts.SourceFormat
 	to := sdktranslator.FormatCodex
+	translatorStream := false
+	transformStage := "request_plan.codex"
+	switch mode {
+	case codexRequestPlanExecute:
+	case codexRequestPlanStream:
+		translatorStream = true
+		transformStage = "request_plan.codex.stream"
+	case codexRequestPlanCompact:
+		to = sdktranslator.FormatOpenAIResponse
+		transformStage = "request_plan.codex.compact"
+	case codexRequestPlanCount:
+		transformStage = "request_plan.codex.count"
+	default:
+		return codexRequestPlan{}, fmt.Errorf("codex executor: unsupported request plan mode %d", mode)
+	}
+
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, baseModel, originalPayloadSource, req.Payload, stream)
+	var originalTranslated, body []byte
+	var err error
+	if mode == codexRequestPlanCount {
+		body, err = helps.TranslateRequestGuarded(ctx, "legacy.translate.codex.count", from, to, baseModel, req.Payload, false, internalpayload.AmplificationOverride{})
+	} else {
+		originalTranslated, body, err = translateCodexRequestPair(ctx, from, to, baseModel, originalPayloadSource, req.Payload, translatorStream)
+	}
 	if err != nil {
-		return codexResponsesRequestPlan{}, err
+		return codexRequestPlan{}, err
 	}
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
-		return codexResponsesRequestPlan{}, err
+		return codexRequestPlan{}, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body = normalizeCodexStatelessPayload(body)
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = normalizeCodexInstructions(body)
-	body, replayScope, err := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
-	if err != nil {
-		return codexResponsesRequestPlan{}, err
+	if mode != codexRequestPlanCount {
+		body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	}
-	body = repairCodexResponsesToolHistory(body)
-	body = normalizeCodexToolSchemas(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if mode == codexRequestPlanCompact {
+		body, _ = sjson.DeleteBytes(body, "stream")
+	} else {
+		body = normalizeCodexStatelessPayload(body)
+		body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+		body, _ = sjson.DeleteBytes(body, "safety_identifier")
+		body, _ = sjson.DeleteBytes(body, "stream_options")
+		body, _ = sjson.SetBytes(body, "stream", mode != codexRequestPlanCount)
+	}
+	body = normalizeCodexInstructions(body)
+	var replayScope codexReasoningReplayScope
+	if mode == codexRequestPlanExecute || mode == codexRequestPlanStream {
+		body, replayScope, err = applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 		if err != nil {
-			return codexResponsesRequestPlan{}, err
+			return codexRequestPlan{}, err
 		}
 	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+	body = repairCodexResponsesToolHistory(body)
+	if mode != codexRequestPlanCount {
+		body = normalizeCodexToolSchemas(body)
+		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+			body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
+			if err != nil {
+				return codexRequestPlan{}, err
+			}
+		}
+		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+		body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+	}
 
-	return codexResponsesRequestPlan{
+	return codexRequestPlan{
 		from:                  from,
 		to:                    to,
 		responseFormat:        cliproxyexecutor.ResponseFormatOrSource(opts),
 		originalPayloadSource: originalPayloadSource,
 		body:                  body,
 		replayScope:           replayScope,
+		transformStage:        transformStage,
+		amplificationOverride: codexReplayAmplificationOverride(replayScope),
 	}, nil
 }
 
@@ -860,7 +906,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	plan, err := e.prepareCodexResponsesRequestPlan(ctx, auth, req, opts, baseModel, false)
+	plan, err := e.prepareCodexRequestPlan(ctx, auth, req, opts, baseModel, codexRequestPlanExecute)
 	if err != nil {
 		return resp, err
 	}
@@ -880,11 +926,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "request_plan.codex",
+		Stage:       plan.transformStage,
 		InputBytes:  int64(len(req.Payload)),
 		OutputBytes: int64(len(upstreamBody)),
 		Duration:    time.Since(transformStarted),
-	}, codexReplayAmplificationOverride(replayScope)); err != nil {
+	}, plan.amplificationOverride); err != nil {
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
@@ -997,40 +1043,16 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("openai-response")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
+	plan, err := e.prepareCodexRequestPlan(ctx, auth, req, opts, baseModel, codexRequestPlanCompact)
+	if err != nil {
+		return resp, err
 	}
+	from := plan.from
+	to := plan.to
+	responseFormat := plan.responseFormat
+	originalPayloadSource := plan.originalPayloadSource
 	originalPayload := originalPayloadSource
-	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, baseModel, originalPayload, req.Payload, false)
-	if err != nil {
-		return resp, err
-	}
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "stream")
-	body = normalizeCodexInstructions(body)
-	body = repairCodexResponsesToolHistory(body)
-	body = normalizeCodexToolSchemas(body)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
-		if err != nil {
-			return resp, err
-		}
-	}
-	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body = normalizeCodexParallelToolCallsForToolsAndClient(ctx, body, opts.Metadata)
+	body := plan.body
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -1040,11 +1062,11 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "request_plan.codex.compact",
+		Stage:       plan.transformStage,
 		InputBytes:  int64(len(req.Payload)),
 		OutputBytes: int64(len(upstreamBody)),
 		Duration:    time.Since(transformStarted),
-	}, internalpayload.AmplificationOverride{}); err != nil {
+	}, plan.amplificationOverride); err != nil {
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
@@ -1113,7 +1135,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	plan, err := e.prepareCodexResponsesRequestPlan(ctx, auth, req, opts, baseModel, true)
+	plan, err := e.prepareCodexRequestPlan(ctx, auth, req, opts, baseModel, codexRequestPlanStream)
 	if err != nil {
 		return nil, err
 	}
@@ -1140,11 +1162,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "request_plan.codex.stream",
+		Stage:       plan.transformStage,
 		InputBytes:  int64(len(req.Payload)),
 		OutputBytes: int64(len(upstreamBody)),
 		Duration:    time.Since(transformStarted),
-	}, codexReplayAmplificationOverride(replayScope)); err != nil {
+	}, plan.amplificationOverride); err != nil {
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
@@ -1294,33 +1316,19 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	from := opts.SourceFormat
-	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("codex")
-	body, err := helps.TranslateRequestGuarded(ctx, "legacy.translate.codex.count", from, to, baseModel, req.Payload, false, internalpayload.AmplificationOverride{})
+	plan, err := e.prepareCodexRequestPlan(ctx, auth, req, opts, baseModel, codexRequestPlanCount)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body = normalizeCodexStatelessPayload(body)
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "stream", false)
-	body = normalizeCodexInstructions(body)
-	body = repairCodexResponsesToolHistory(body)
+	to := plan.to
+	responseFormat := plan.responseFormat
+	body := plan.body
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "request_plan.codex.count",
+		Stage:       plan.transformStage,
 		InputBytes:  int64(len(req.Payload)),
 		OutputBytes: int64(len(body)),
 		Duration:    time.Since(transformStarted),
-	}, internalpayload.AmplificationOverride{}); err != nil {
+	}, plan.amplificationOverride); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 
