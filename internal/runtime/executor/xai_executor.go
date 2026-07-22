@@ -303,22 +303,16 @@ func xaiRemoveInputItemsByType(body []byte, itemType string) []byte {
 		return body
 	}
 
-	var buf bytes.Buffer
-	buf.WriteByte('[')
-	kept := 0
-	for _, item := range input.Array() {
+	inputItems := input.Array()
+	kept := make([]string, 0, len(inputItems))
+	for _, item := range inputItems {
 		if item.Get("type").String() == itemType {
 			continue
 		}
-		if kept > 0 {
-			buf.WriteByte(',')
-		}
-		buf.WriteString(item.Raw)
-		kept++
+		kept = append(kept, item.Raw)
 	}
-	buf.WriteByte(']')
 
-	updated, err := sjson.SetRawBytes(body, "input", buf.Bytes())
+	updated, err := sjson.SetRawBytes(body, "input", internalpayload.BuildRaw(kept))
 	if err != nil {
 		return body
 	}
@@ -1459,21 +1453,17 @@ func xaiNormalizeReasoningSummaryIndex(eventData []byte) []byte {
 }
 
 func xaiNormalizeReasoningOutputItems(items []gjson.Result) ([]byte, bool) {
-	var buf bytes.Buffer
-	buf.WriteByte('[')
+	normalizedItems := make([][]byte, len(items))
 	changed := false
 	for i, item := range items {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		updatedItem := xaiNormalizeReasoningOutputItem([]byte(item.Raw))
-		if !bytes.Equal(updatedItem, []byte(item.Raw)) {
+		itemRaw := []byte(item.Raw)
+		updatedItem := xaiNormalizeReasoningOutputItem(itemRaw)
+		if !bytes.Equal(updatedItem, itemRaw) {
 			changed = true
 		}
-		buf.Write(updatedItem)
+		normalizedItems[i] = updatedItem
 	}
-	buf.WriteByte(']')
-	return buf.Bytes(), changed
+	return internalpayload.BuildRaw(normalizedItems), changed
 }
 
 func xaiNormalizeReasoningOutputItem(item []byte) []byte {
@@ -1511,13 +1501,9 @@ func xaiNormalizeReasoningOutputItem(item []byte) []byte {
 }
 
 func xaiNormalizeReasoningSummaryItems(items []gjson.Result) ([]byte, bool) {
-	var buf bytes.Buffer
-	buf.WriteByte('[')
+	normalizedItems := make([][]byte, len(items))
 	changed := false
 	for i, item := range items {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
 		itemRaw := []byte(item.Raw)
 		if item.Get("type").String() == "reasoning_text" {
 			var errSet error
@@ -1526,10 +1512,9 @@ func xaiNormalizeReasoningSummaryItems(items []gjson.Result) ([]byte, bool) {
 				changed = true
 			}
 		}
-		buf.Write(itemRaw)
+		normalizedItems[i] = itemRaw
 	}
-	buf.WriteByte(']')
-	return buf.Bytes(), changed
+	return internalpayload.BuildRaw(normalizedItems), changed
 }
 
 func xaiCollectOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
@@ -1560,29 +1545,12 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 		return indexes[i] < indexes[j]
 	})
 
-	outputArray := []byte("[]")
-	var buf bytes.Buffer
-	buf.WriteByte('[')
-	wrote := false
+	outputItems := make([][]byte, 0, len(indexes)+len(outputItemsFallback))
 	for _, idx := range indexes {
-		if wrote {
-			buf.WriteByte(',')
-		}
-		buf.Write(outputItemsByIndex[idx])
-		wrote = true
+		outputItems = append(outputItems, outputItemsByIndex[idx])
 	}
-	for _, item := range outputItemsFallback {
-		if wrote {
-			buf.WriteByte(',')
-		}
-		buf.Write(item)
-		wrote = true
-	}
-	buf.WriteByte(']')
-	if wrote {
-		outputArray = buf.Bytes()
-	}
+	outputItems = append(outputItems, outputItemsFallback...)
 
-	patched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
+	patched, _ := sjson.SetRawBytes(eventData, "response.output", internalpayload.BuildRaw(outputItems))
 	return patched
 }

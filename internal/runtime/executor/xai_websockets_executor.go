@@ -546,16 +546,11 @@ func xaiJSONRawMessages(result gjson.Result, maxItems int, maxBytes int64) ([]js
 }
 
 func xaiMarshalRawMessages(items []json.RawMessage) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte('[')
+	trimmed := make([]json.RawMessage, len(items))
 	for i, item := range items {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		buf.Write(bytes.TrimSpace(item))
+		trimmed[i] = bytes.TrimSpace(item)
 	}
-	buf.WriteByte(']')
-	return buf.Bytes()
+	return internalpayload.BuildRaw(trimmed)
 }
 
 func preserveXAIInputIDsFromDownstreamTail(payload []byte, downstream []byte) []byte {

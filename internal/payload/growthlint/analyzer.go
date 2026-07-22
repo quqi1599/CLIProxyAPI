@@ -123,6 +123,11 @@ func run(pass *analysis.Pass, baselinePath string) error {
 	inspectResult.Preorder([]ast.Node{(*ast.BinaryExpr)(nil)}, func(node ast.Node) {
 		reportFindings(manualRawJSONArrayFindings(pass, node.(*ast.BinaryExpr), reportedRawJSONArrayCalls))
 	})
+	bufferStates := make(map[types.Object]*manualRawJSONArrayBufferState)
+	inspectResult.Preorder([]ast.Node{(*ast.CallExpr)(nil)}, func(node ast.Node) {
+		inspectManualRawJSONArrayBufferCall(pass, node.(*ast.CallExpr), bufferStates)
+	})
+	reportFindings(manualRawJSONArrayBufferFindings(bufferStates))
 	if root != "" {
 		for _, file := range pass.Files {
 			path := relativeFilename(root, pass.Fset.PositionFor(file.Pos(), false).Filename)
@@ -134,6 +139,125 @@ func run(pass *analysis.Pass, baselinePath string) error {
 		}
 	}
 	return nil
+}
+
+type manualRawJSONArrayBufferState struct {
+	file       *ast.File
+	openings   []*ast.CallExpr
+	separators []token.Pos
+	items      []token.Pos
+	closings   []token.Pos
+	bytesCalls []token.Pos
+}
+
+func inspectManualRawJSONArrayBufferCall(pass *analysis.Pass, call *ast.CallExpr, states map[types.Object]*manualRawJSONArrayBufferState) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	if !ok {
+		return
+	}
+	function := calledFunctionObject(pass, call)
+	if function == nil || function.Pkg() == nil || function.Pkg().Path() != "bytes" {
+		return
+	}
+	object := objectOf(pass, receiver)
+	if object == nil {
+		return
+	}
+	state := states[object]
+	if state == nil {
+		state = &manualRawJSONArrayBufferState{file: fileForPosition(pass.Files, call.Pos())}
+		states[object] = state
+	}
+	switch function.Name() {
+	case "WriteByte":
+		if len(call.Args) != 1 {
+			return
+		}
+		value := pass.TypesInfo.Types[call.Args[0]].Value
+		if value == nil || value.Kind() != constant.Int {
+			return
+		}
+		character, exact := constant.Int64Val(value)
+		if !exact {
+			return
+		}
+		switch character {
+		case '[':
+			state.openings = append(state.openings, call)
+		case ',':
+			state.separators = append(state.separators, call.Pos())
+		case ']':
+			state.closings = append(state.closings, call.Pos())
+		}
+	case "WriteString":
+		if len(call.Args) != 1 {
+			return
+		}
+		value, constantValue := constantString(pass, call.Args[0])
+		if !constantValue {
+			state.items = append(state.items, call.Pos())
+			return
+		}
+		switch value {
+		case "[":
+			state.openings = append(state.openings, call)
+		case ",":
+			state.separators = append(state.separators, call.Pos())
+		case "]":
+			state.closings = append(state.closings, call.Pos())
+		}
+	case "Write":
+		if len(call.Args) == 1 {
+			state.items = append(state.items, call.Pos())
+		}
+	case "Bytes":
+		if len(call.Args) == 0 {
+			state.bytesCalls = append(state.bytesCalls, call.Pos())
+		}
+	}
+}
+
+func manualRawJSONArrayBufferFindings(states map[types.Object]*manualRawJSONArrayBufferState) []finding {
+	var findings []finding
+	for _, state := range states {
+		for _, opening := range state.openings {
+			closing := positionAfter(state.closings, opening.Pos())
+			if !closing.IsValid() || !positionBetween(state.separators, opening.Pos(), closing) || !positionBetween(state.items, opening.Pos(), closing) || !positionAfter(state.bytesCalls, closing).IsValid() {
+				continue
+			}
+			findings = append(findings, finding{
+				rule:            ruleManualRawJSONArray,
+				message:         "manual raw JSON array assembly duplicates internal/payload.BuildRaw",
+				file:            state.file,
+				node:            opening,
+				fingerprintNode: opening,
+			})
+			break
+		}
+	}
+	return findings
+}
+
+func positionAfter(positions []token.Pos, start token.Pos) token.Pos {
+	for _, position := range positions {
+		if position > start {
+			return position
+		}
+	}
+	return token.NoPos
+}
+
+func positionBetween(positions []token.Pos, start, end token.Pos) bool {
+	for _, position := range positions {
+		if start < position && position < end {
+			return true
+		}
+	}
+	return false
 }
 
 func manualRawJSONArrayFindings(pass *analysis.Pass, expression *ast.BinaryExpr, reported map[*ast.CallExpr]bool) []finding {

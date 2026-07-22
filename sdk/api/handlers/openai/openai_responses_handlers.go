@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
@@ -189,32 +190,19 @@ func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
 		return payload
 	}
 
-	var outputJSON bytes.Buffer
-	outputJSON.WriteByte('[')
 	indexes := append([]int(nil), f.outputOrder...)
 	sort.Ints(indexes)
-	written := 0
+	items := make([][]byte, 0, len(indexes)+len(f.unindexedOutputItems))
 	for _, index := range indexes {
 		item, ok := f.outputItems[index]
 		if !ok {
 			continue
 		}
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
+		items = append(items, item)
 	}
-	for _, item := range f.unindexedOutputItems {
-		if written > 0 {
-			outputJSON.WriteByte(',')
-		}
-		outputJSON.Write(item)
-		written++
-	}
-	outputJSON.WriteByte(']')
+	items = append(items, f.unindexedOutputItems...)
 
-	repaired, err := sjson.SetRawBytes(payload, "response.output", outputJSON.Bytes())
+	repaired, err := sjson.SetRawBytes(payload, "response.output", internalpayload.BuildRaw(items))
 	if err != nil {
 		return payload
 	}
