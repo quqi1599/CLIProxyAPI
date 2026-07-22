@@ -3168,6 +3168,101 @@ func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_ExecuteStream_SharedConsumerRestoresToolNames(t *testing.T) {
+	tests := []struct {
+		name            string
+		payload         []byte
+		format          sdktranslator.Format
+		usageField      string
+		totalUsageField string
+	}{
+		{
+			name: "direct",
+			payload: []byte(`{
+				"max_tokens":128,
+				"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+				"tools":[{"name":"skill:pet_animals","input_schema":{"type":"object"}}]
+			}`),
+			format:     sdktranslator.FromString("claude"),
+			usageField: `"input_tokens":2`,
+		},
+		{
+			name: "translated",
+			payload: []byte(`{
+				"max_tokens":128,
+				"messages":[{"role":"user","content":"hi"}],
+				"tools":[{"type":"function","function":{"name":"skill:pet_animals","parameters":{"type":"object"}}}]
+			}`),
+			format:          sdktranslator.FromString("openai"),
+			usageField:      `"prompt_tokens":2`,
+			totalUsageField: `"total_tokens":3`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamToolName := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				toolName := gjson.GetBytes(body, "tools.0.name").String()
+				upstreamToolName <- toolName
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, strings.Join([]string{
+					`event: message_start`,
+					`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022","usage":{"input_tokens":2,"output_tokens":0}}}`,
+					``,
+					`event: content_block_start`,
+					`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":%q,"input":{}}}`,
+					``,
+					`event: content_block_delta`,
+					`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+					``,
+					`event: content_block_stop`,
+					`data: {"type":"content_block_stop","index":0}`,
+					``,
+					`event: message_delta`,
+					`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}`,
+					``,
+				}, "\n")+"\n", toolName)
+			}))
+			defer server.Close()
+
+			executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"api_key":  "key-123",
+				"base_url": server.URL,
+			}}
+			result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-3-5-sonnet-20241022",
+				Payload: tt.payload,
+			}, cliproxyexecutor.Options{SourceFormat: tt.format})
+			if err != nil {
+				t.Fatalf("ExecuteStream error: %v", err)
+			}
+
+			var combined strings.Builder
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					t.Fatalf("chunk error: %v", chunk.Err)
+				}
+				combined.Write(chunk.Payload)
+			}
+			if got := <-upstreamToolName; got != "skill_pet_animals" {
+				t.Fatalf("upstream tool name = %q, want skill_pet_animals", got)
+			}
+			if !strings.Contains(combined.String(), `"name":"skill:pet_animals"`) {
+				t.Fatalf("downstream stream did not restore tool name: %s", combined.String())
+			}
+			if !strings.Contains(combined.String(), tt.usageField) {
+				t.Fatalf("downstream stream missing usage field %s: %s", tt.usageField, combined.String())
+			}
+			if tt.totalUsageField != "" && !strings.Contains(combined.String(), tt.totalUsageField) {
+				t.Fatalf("downstream stream did not merge cross-event usage field %s: %s", tt.totalUsageField, combined.String())
+			}
+		})
+	}
+}
+
 func TestClaudeExecutor_ExecuteStream_PatchesQianfanStartUsageForProgress(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -3372,24 +3467,95 @@ func TestClaudeExecutor_ExecuteStream_GzipSuccessBodyDecoded(t *testing.T) {
 }
 
 func TestClaudeExecutor_ExecuteStream_CancelClosesUpstream(t *testing.T) {
-	requestCancelled := make(chan struct{})
-	releaseServer := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tests := []struct {
+		name    string
+		payload []byte
+		format  sdktranslator.Format
+		want    []byte
+	}{
+		{
+			name:    "direct",
+			payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			format:  sdktranslator.FromString("claude"),
+			want:    []byte(`"type":"message_start"`),
+		},
+		{
+			name:    "translated",
+			payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			format:  sdktranslator.FromString("openai"),
+			want:    []byte(`"object":"chat.completion.chunk"`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requestCancelled := make(chan struct{})
+			releaseServer := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-5-sonnet-20241022\"}}\n\n"))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+					close(requestCancelled)
+				case <-releaseServer:
+				}
+			}))
+			defer func() {
+				close(releaseServer)
+				server.Close()
+			}()
+
+			executor := NewClaudeExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"api_key":  "key-123",
+				"base_url": server.URL,
+			}}
+			result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "claude-3-5-sonnet-20241022",
+				Payload: tt.payload,
+			}, cliproxyexecutor.Options{SourceFormat: tt.format})
+			if err != nil {
+				t.Fatalf("ExecuteStream error: %v", err)
+			}
+
+			select {
+			case chunk := <-result.Chunks:
+				if chunk.Err != nil || !bytes.Contains(chunk.Payload, tt.want) {
+					t.Fatalf("first chunk = %q, error = %v", chunk.Payload, chunk.Err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for first stream chunk")
+			}
+			result.Close()
+			result.Close()
+
+			select {
+			case <-requestCancelled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("upstream request was not cancelled")
+			}
+			select {
+			case _, ok := <-result.Chunks:
+				if ok {
+					t.Fatal("stream channel remained open after cancellation")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("stream channel did not close after cancellation")
+			}
+		})
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_TranslatedReadErrorEmittedOnce(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		select {
-		case <-r.Context().Done():
-			close(requestCancelled)
-		case <-releaseServer:
-		}
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("not-gzip"))
 	}))
-	defer func() {
-		close(releaseServer)
-		server.Close()
-	}()
+	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
@@ -3399,34 +3565,19 @@ func TestClaudeExecutor_ExecuteStream_CancelClosesUpstream(t *testing.T) {
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-3-5-sonnet-20241022",
 		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
 	if err != nil {
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
 
-	select {
-	case chunk := <-result.Chunks:
-		if chunk.Err != nil || !bytes.Contains(chunk.Payload, []byte("message_stop")) {
-			t.Fatalf("first chunk = %q, error = %v", chunk.Payload, chunk.Err)
+	errorChunks := 0
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			errorChunks++
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first stream chunk")
 	}
-	result.Close()
-	result.Close()
-
-	select {
-	case <-requestCancelled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("upstream request was not cancelled")
-	}
-	select {
-	case _, ok := <-result.Chunks:
-		if ok {
-			t.Fatal("stream channel remained open after cancellation")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("stream channel did not close after cancellation")
+	if errorChunks != 1 {
+		t.Fatalf("error chunks = %d, want 1", errorChunks)
 	}
 }
 

@@ -673,44 +673,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return line
 		}
 
-		// If the response target is Claude, directly forward the SSE stream without translation.
-		if plan.responseFormat == plan.upstreamFormat {
-			for {
-				event, errRead := sseStream.ReadEvent()
-				if errRead != nil {
-					if requestCtx.Err() != nil || errors.Is(errRead, io.EOF) {
-						return
-					}
-					if responseLog != nil {
-						responseLog.RecordError(errRead)
-					}
-					reporter.PublishFailure(ctx, errRead)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
-					case <-requestCtx.Done():
-					}
-					return
-				}
-				if responseLog != nil {
-					responseLog.AppendChunk(event)
-				}
-				chunk := rewriteClaudeSSEEvent(event, func(line []byte) []byte {
-					line = prepareLine(line)
-					if progressStartInputTokens > 0 {
-						line = patchClaudeMessageStartUsageForProgress(line, progressStartInputTokens)
-					}
-					return line
-				})
-				payload := terminatedSSEEvent(chunk)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
-				case <-requestCtx.Done():
-					return
-				}
-			}
-		}
-
-		// For other formats, use translation
+		direct := plan.responseFormat == plan.upstreamFormat
 		var param any
 		for {
 			event, errRead := sseStream.ReadEvent()
@@ -731,6 +694,25 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if responseLog != nil {
 				responseLog.AppendChunk(event)
 			}
+
+			// If the response target is Claude, directly forward the SSE event without translation.
+			if direct {
+				chunk := rewriteClaudeSSEEvent(event, func(line []byte) []byte {
+					line = prepareLine(line)
+					if progressStartInputTokens > 0 {
+						line = patchClaudeMessageStartUsageForProgress(line, progressStartInputTokens)
+					}
+					return line
+				})
+				payload := terminatedSSEEvent(chunk)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
+				case <-requestCtx.Done():
+					return
+				}
+				continue
+			}
+
 			completed := forEachClaudeSSELine(event, func(line []byte) bool {
 				line = prepareLine(line)
 				chunks := sdktranslator.TranslateStream(
