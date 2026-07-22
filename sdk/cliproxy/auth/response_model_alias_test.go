@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"strings"
@@ -213,6 +214,24 @@ func TestRewriteResponseSSEModelAliasSplitsGluedEventFrames(t *testing.T) {
 	}
 	if !strings.Contains(got, `"model":"alias"`) {
 		t.Fatalf("rewritten payload = %q, want alias model", got)
+	}
+}
+
+func TestRewriteResponseJSONModelAliasPreservesOrderWhitespaceAndInput(t *testing.T) {
+	payload := []byte(`{"z": 0, "message": {"before":1,"model":"upstream","after":2}, "model":"upstream", "modelVersion":"upstream", "response":{"before":1,"model":"upstream","modelVersion":"upstream","after":2}, "a": 1}`)
+	original := bytes.Clone(payload)
+
+	rewritten, changed := rewriteResponseJSONModelAlias(payload, "alias")
+
+	if !changed {
+		t.Fatal("expected model aliases to be rewritten")
+	}
+	if !bytes.Equal(payload, original) {
+		t.Fatal("rewriteResponseJSONModelAlias mutated caller input")
+	}
+	want := `{"z": 0, "message": {"before":1,"model":"alias","after":2}, "model":"alias", "modelVersion":"alias", "response":{"before":1,"model":"alias","modelVersion":"alias","after":2}, "a": 1}`
+	if string(rewritten) != want {
+		t.Fatalf("rewritten = %s, want %s", rewritten, want)
 	}
 }
 

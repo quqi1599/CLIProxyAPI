@@ -3,8 +3,10 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -25,8 +28,23 @@ import (
 )
 
 type websocketCaptureExecutor struct {
-	streamCalls int
-	payloads    [][]byte
+	streamCalls     int
+	payloads        [][]byte
+	responsePayload []byte
+}
+
+type websocketRetainedStreamPlan struct {
+	payload    []byte
+	beforeSend <-chan struct{}
+	afterSend  <-chan struct{}
+}
+
+type websocketRetainedBudgetExecutor struct {
+	websocketCaptureExecutor
+	mu      sync.Mutex
+	plans   []websocketRetainedStreamPlan
+	calls   int
+	started chan int
 }
 
 type websocketProviderCaptureExecutor struct {
@@ -428,9 +446,56 @@ func (e *websocketCaptureExecutor) Execute(context.Context, *coreauth.Auth, core
 func (e *websocketCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	e.streamCalls++
 	e.payloads = append(e.payloads, bytes.Clone(req.Payload))
+	responsePayload := e.responsePayload
+	if len(responsePayload) == 0 {
+		responsePayload = []byte(`{"type":"response.completed","response":{"id":"resp-upstream","output":[{"type":"message","id":"out-1"}]}}`)
+	}
 	chunks := make(chan coreexecutor.StreamChunk, 1)
-	chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"resp-upstream","output":[{"type":"message","id":"out-1"}]}}`)}
+	chunks <- coreexecutor.StreamChunk{Payload: responsePayload}
 	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *websocketRetainedBudgetExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	call := e.calls
+	e.calls++
+	if call >= len(e.plans) {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("unexpected retained-budget stream call %d", call+1)
+	}
+	plan := e.plans[call]
+	e.mu.Unlock()
+
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	go func() {
+		defer close(chunks)
+		if e.started != nil {
+			select {
+			case e.started <- call + 1:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if plan.beforeSend != nil {
+			select {
+			case <-plan.beforeSend:
+			case <-ctx.Done():
+				return
+			}
+		}
+		select {
+		case chunks <- coreexecutor.StreamChunk{Payload: plan.payload}:
+		case <-ctx.Done():
+			return
+		}
+		if plan.afterSend != nil {
+			select {
+			case <-plan.afterSend:
+			case <-ctx.Done():
+			}
+		}
+	}()
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
 }
 
@@ -510,6 +575,26 @@ func TestNormalizeResponsesWebsocketRequestCreate(t *testing.T) {
 	}
 	if !bytes.Equal(last, normalized) {
 		t.Fatalf("last request snapshot should match normalized request")
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestDefersLargeSnapshotClone(t *testing.T) {
+	raw := make([]byte, 0, 2<<20)
+	raw = append(raw, `{"type":"response.create","model":"test-model","input":[{"role":"user","content":"`...)
+	raw = append(raw, bytes.Repeat([]byte{'x'}, 2<<20)...)
+	raw = append(raw, `"}]}`...)
+
+	before := internalpayload.CurrentLargeCloneMetrics()
+	normalized, last, errMsg := normalizeResponsesWebsocketRequest(raw, nil, nil)
+	if errMsg != nil {
+		t.Fatalf("normalize request: %v", errMsg.Error)
+	}
+	after := internalpayload.CurrentLargeCloneMetrics()
+	if after.Count != before.Count {
+		t.Fatalf("large clone count changed during normalization: before=%d after=%d", before.Count, after.Count)
+	}
+	if len(normalized) == 0 || len(last) == 0 || &normalized[0] != &last[0] {
+		t.Fatal("normalizer created a redundant last-request snapshot")
 	}
 }
 
@@ -774,11 +859,14 @@ func TestAppendWebsocketEvent(t *testing.T) {
 	appendWebsocketEvent(&builder, "response", []byte("{\"type\":\"response.created\"}"))
 
 	got := builder.String()
-	if !strings.Contains(got, "websocket.request\n{\"type\":\"response.create\"}\n") {
+	if !strings.Contains(got, "websocket.request\n[BODY METADATA v1]") {
 		t.Fatalf("request event not found in body: %s", got)
 	}
-	if !strings.Contains(got, "websocket.response\n{\"type\":\"response.created\"}\n") {
+	if !strings.Contains(got, "websocket.response\n[BODY METADATA v1]") {
 		t.Fatalf("response event not found in body: %s", got)
+	}
+	if strings.Contains(got, "response.create") || strings.Contains(got, "response.created") {
+		t.Fatalf("raw websocket payload leaked into event body: %s", got)
 	}
 }
 
@@ -795,8 +883,8 @@ func TestAppendWebsocketTimelineEvent(t *testing.T) {
 	if !strings.Contains(got, "Event: websocket.request") {
 		t.Fatalf("timeline event not found: %s", got)
 	}
-	if !strings.Contains(got, "{\"type\":\"response.create\"}") {
-		t.Fatalf("timeline payload not found: %s", got)
+	if !strings.Contains(got, "[BODY METADATA v1]") || strings.Contains(got, "response.create") {
+		t.Fatalf("timeline payload was not reduced to metadata: %s", got)
 	}
 }
 
@@ -847,8 +935,8 @@ func TestWebsocketTimelineLogFallsBackToMemoryWithoutSource(t *testing.T) {
 	if !strings.Contains(got, "Event: websocket.request") {
 		t.Fatalf("timeline event not found: %s", got)
 	}
-	if !strings.Contains(got, `{"type":"response.create"}`) {
-		t.Fatalf("timeline payload not found: %s", got)
+	if !strings.Contains(got, "[BODY METADATA v1]") || strings.Contains(got, "response.create") {
+		t.Fatalf("timeline payload was not reduced to metadata: %s", got)
 	}
 }
 
@@ -877,6 +965,410 @@ func TestRepairResponsesWebsocketToolCallsInsertsCachedOutput(t *testing.T) {
 	}
 	if input[2].Get("type").String() != "message" || input[2].Get("id").String() != "msg-1" {
 		t.Fatalf("unexpected trailing item: %s", input[2].Raw)
+	}
+}
+
+func TestWebsocketToolOutputCacheEnforcesByteBudgetOnReplaceAndEvict(t *testing.T) {
+	cache := newWebsocketToolOutputCacheWithBudget(time.Minute, 256, 10)
+	const sessionKey = "byte-budget"
+
+	cache.record(sessionKey, "call-a", json.RawMessage("123456"))
+	cache.record(sessionKey, "call-a", json.RawMessage("123"))
+	cache.record(sessionKey, "call-b", json.RawMessage("12345678"))
+
+	if _, ok := cache.get(sessionKey, "call-a"); ok {
+		t.Fatal("oldest item survived byte-budget eviction")
+	}
+	if got, ok := cache.get(sessionKey, "call-b"); !ok || string(got) != "12345678" {
+		t.Fatalf("newest item = %q, %v", got, ok)
+	}
+	cache.mu.Lock()
+	if got := cache.sessions[sessionKey].bytes; got != 8 {
+		cache.mu.Unlock()
+		t.Fatalf("tracked bytes = %d, want 8", got)
+	}
+	cache.mu.Unlock()
+
+	cache.record(sessionKey, "call-b", json.RawMessage("12345678901"))
+	if _, ok := cache.get(sessionKey, "call-b"); ok {
+		t.Fatal("single oversized item remained cached")
+	}
+	cache.mu.Lock()
+	if got := cache.sessions[sessionKey].bytes; got != 0 {
+		cache.mu.Unlock()
+		t.Fatalf("tracked bytes after oversized replacement = %d, want 0", got)
+	}
+	cache.mu.Unlock()
+}
+
+func TestWebsocketToolOutputCacheConcurrentByteEviction(t *testing.T) {
+	limiter := newResponsesWebsocketFrameLimiter(1024)
+	cache := newWebsocketToolOutputCacheWithRetainedBudget(time.Minute, 64, 1024, limiter)
+	const sessionKey = "concurrent-budget"
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 250; i++ {
+				callID := fmt.Sprintf("call-%d", (worker+i)%96)
+				cache.record(sessionKey, callID, json.RawMessage(strings.Repeat("x", 32+(i%17))))
+				_, _ = cache.get(sessionKey, callID)
+			}
+		}(worker)
+	}
+	wg.Wait()
+
+	cache.mu.Lock()
+	session := cache.sessions[sessionKey]
+	if session == nil {
+		cache.mu.Unlock()
+		t.Fatal("session missing after concurrent records")
+	}
+	if session.bytes > cache.maxBytes {
+		cache.mu.Unlock()
+		t.Fatalf("tracked bytes = %d, max = %d", session.bytes, cache.maxBytes)
+	}
+	if len(session.outputs) > cache.maxPerSession {
+		cache.mu.Unlock()
+		t.Fatalf("cached items = %d, max = %d", len(session.outputs), cache.maxPerSession)
+	}
+	wantBytes := session.bytes
+	cache.mu.Unlock()
+
+	limiter.mu.Lock()
+	if limiter.inUse != int64(wantBytes) || limiter.peak > limiter.maxBytes {
+		limiter.mu.Unlock()
+		t.Fatalf("retained cache budget = (in_use=%d peak=%d), want in_use=%d peak<=%d", limiter.inUse, limiter.peak, wantBytes, limiter.maxBytes)
+	}
+	limiter.mu.Unlock()
+	cache.close()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if limiter.inUse != 0 {
+		t.Fatalf("retained cache bytes after close = %d, want 0", limiter.inUse)
+	}
+}
+
+func TestResponsesWebsocketRetainedBudgetAcrossIdleSessions(t *testing.T) {
+	type retainedSession struct {
+		state       *responsesWebsocketFrameLease
+		outputCache *websocketToolOutputCache
+		callCache   *websocketToolOutputCache
+	}
+	limiter := newResponsesWebsocketFrameLimiter(64)
+	idleState := limiter.acquire(0)
+	idleOutputCache := newWebsocketToolOutputCacheWithRetainedBudget(time.Minute, 8, 16, limiter)
+	idleCallCache := newWebsocketToolOutputCacheWithRetainedBudget(time.Minute, 8, 16, limiter)
+	limiter.mu.Lock()
+	idleBytes := limiter.inUse
+	limiter.mu.Unlock()
+	if idleBytes != 0 {
+		t.Fatalf("idle websocket reserved %d retained bytes", idleBytes)
+	}
+	idleState.release()
+	idleOutputCache.close()
+	idleCallCache.close()
+
+	newSession := func(id string) *retainedSession {
+		state := limiter.acquire(0)
+		if state == nil || !state.resize(8) {
+			state.release()
+			return nil
+		}
+		outputCache := newWebsocketToolOutputCacheWithRetainedBudget(time.Minute, 8, 16, limiter)
+		callCache := newWebsocketToolOutputCacheWithRetainedBudget(time.Minute, 8, 16, limiter)
+		outputCache.record(id, "output", json.RawMessage("1234"))
+		callCache.record(id, "call", json.RawMessage("5678"))
+		if _, ok := outputCache.get(id, "output"); !ok {
+			state.release()
+			outputCache.close()
+			callCache.close()
+			return nil
+		}
+		if _, ok := callCache.get(id, "call"); !ok {
+			state.release()
+			outputCache.close()
+			callCache.close()
+			return nil
+		}
+		return &retainedSession{state: state, outputCache: outputCache, callCache: callCache}
+	}
+	closeSession := func(session *retainedSession) {
+		if session == nil {
+			return
+		}
+		session.state.release()
+		session.outputCache.close()
+		session.callCache.close()
+	}
+
+	sessions := make([]*retainedSession, 0, 4)
+	for i := 0; i < 4; i++ {
+		session := newSession(fmt.Sprintf("idle-%d", i))
+		if session == nil {
+			t.Fatalf("idle session %d was rejected before aggregate budget was full", i)
+		}
+		sessions = append(sessions, session)
+	}
+	if session := newSession("overflow"); session != nil {
+		closeSession(session)
+		t.Fatal("idle sessions exceeded the retained aggregate budget")
+	}
+
+	closeSession(sessions[0])
+	sessions[0] = newSession("replacement")
+	if sessions[0] == nil {
+		t.Fatal("released idle-session capacity was not reusable")
+	}
+	for _, session := range sessions {
+		closeSession(session)
+	}
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if limiter.inUse != 0 {
+		t.Fatalf("retained bytes after all sessions closed = %d, want 0", limiter.inUse)
+	}
+	if limiter.peak > limiter.maxBytes {
+		t.Fatalf("retained peak = %d, exceeds budget %d", limiter.peak, limiter.maxBytes)
+	}
+}
+
+func TestResponsesWebsocketRetainedCompletedOutputAggregateCapacityAndRelease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const modelName = "retained-output-capacity-model"
+	blockFirst := make(chan struct{})
+	blockSecond := make(chan struct{})
+	largeContent := strings.Repeat("x", 24<<10)
+	completedPayload := []byte(fmt.Sprintf(
+		`{"type":"response.completed","response":{"id":"resp-large","output":[{"type":"message","id":"out-large","content":%q}]}}`,
+		largeContent,
+	))
+	executor := &websocketRetainedBudgetExecutor{plans: []websocketRetainedStreamPlan{
+		{payload: completedPayload, afterSend: blockFirst},
+		{payload: completedPayload, afterSend: blockSecond},
+	}}
+	h, server := newResponsesRetainedBudgetTestServer(t, modelName, executor, 40<<10)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	connFirst, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial first websocket: %v", errDial)
+	}
+	requestPayload := []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":"one"}]}`, modelName))
+	if errWrite := connFirst.WriteMessage(websocket.TextMessage, requestPayload); errWrite != nil {
+		_ = connFirst.Close()
+		t.Fatalf("write first websocket request: %v", errWrite)
+	}
+	if _, payload, errRead := connFirst.ReadMessage(); errRead != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		_ = connFirst.Close()
+		t.Fatalf("read first completed event: type=%q err=%v", gjson.GetBytes(payload, "type").String(), errRead)
+	}
+	firstRetained := waitResponsesWebsocketRetainedBytes(t, h.responsesWebsocketRetainedLimiter, func(inUse int64) bool {
+		return inUse >= int64(len(largeContent))
+	})
+
+	connSecond, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		_ = connFirst.Close()
+		t.Fatalf("dial second websocket: %v", errDial)
+	}
+	if errWrite := connSecond.WriteMessage(websocket.TextMessage, requestPayload); errWrite != nil {
+		_ = connSecond.Close()
+		_ = connFirst.Close()
+		t.Fatalf("write second websocket request: %v", errWrite)
+	}
+	_, capacityPayload, errRead := connSecond.ReadMessage()
+	if errRead != nil {
+		_ = connSecond.Close()
+		_ = connFirst.Close()
+		t.Fatalf("read retained capacity error: %v", errRead)
+	}
+	if got := gjson.GetBytes(capacityPayload, "type").String(); got != wsEventTypeError {
+		t.Fatalf("capacity payload type = %q, want %q: %s", got, wsEventTypeError, capacityPayload)
+	}
+	if got := int(gjson.GetBytes(capacityPayload, "status").Int()); got != http.StatusServiceUnavailable {
+		t.Fatalf("capacity payload status = %d, want %d: %s", got, http.StatusServiceUnavailable, capacityPayload)
+	}
+	if got := gjson.GetBytes(capacityPayload, "error.code").String(); got != responsesWebsocketRetainedCapacityCode {
+		t.Fatalf("capacity payload code = %q, want %q: %s", got, responsesWebsocketRetainedCapacityCode, capacityPayload)
+	}
+
+	h.responsesWebsocketRetainedLimiter.mu.Lock()
+	peak := h.responsesWebsocketRetainedLimiter.peak
+	maxBytes := h.responsesWebsocketRetainedLimiter.maxBytes
+	inUse := h.responsesWebsocketRetainedLimiter.inUse
+	h.responsesWebsocketRetainedLimiter.mu.Unlock()
+	if peak > maxBytes || inUse < firstRetained {
+		t.Fatalf("aggregate retained budget = (in_use=%d peak=%d max=%d), first=%d", inUse, peak, maxBytes, firstRetained)
+	}
+
+	_ = connSecond.Close()
+	_ = connFirst.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	close(blockFirst)
+	close(blockSecond)
+	_ = connFirst.Close()
+	waitResponsesWebsocketRetainedBytes(t, h.responsesWebsocketRetainedLimiter, func(inUse int64) bool { return inUse == 0 })
+}
+
+func TestResponsesWebsocketRollbackRetainedBudgetTransfersAndReleases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const modelName = "retained-rollback-model"
+	blockFailure := make(chan struct{})
+	largeContent := strings.Repeat("y", 8<<10)
+	completedPayload := []byte(fmt.Sprintf(
+		`{"type":"response.completed","response":{"id":"resp-before-failure","output":[{"type":"message","id":"out-before-failure","content":%q}]}}`,
+		largeContent,
+	))
+	executor := &websocketRetainedBudgetExecutor{
+		plans: []websocketRetainedStreamPlan{
+			{payload: completedPayload},
+			{payload: []byte(`{"type":"error","status":429,"error":{"message":"quota exhausted"}}`), beforeSend: blockFailure},
+		},
+		started: make(chan int, 2),
+	}
+	h, server := newResponsesRetainedBudgetTestServer(t, modelName, executor, 128<<10)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer conn.Close()
+	requestPayload := []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":"one"}]}`, modelName))
+	if errWrite := conn.WriteMessage(websocket.TextMessage, requestPayload); errWrite != nil {
+		t.Fatalf("write first request: %v", errWrite)
+	}
+	if _, payload, errRead := conn.ReadMessage(); errRead != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		t.Fatalf("read first completed event: type=%q err=%v", gjson.GetBytes(payload, "type").String(), errRead)
+	}
+	if call := <-executor.started; call != 1 {
+		t.Fatalf("first stream call = %d, want 1", call)
+	}
+	writeAndReadResponsesWebsocketInvalidRequest(t, conn)
+	baseline := responsesWebsocketRetainedBytes(h.responsesWebsocketRetainedLimiter)
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","input":[{"type":"message","role":"user","content":"two"}]}`)); errWrite != nil {
+		t.Fatalf("write failing request: %v", errWrite)
+	}
+	select {
+	case call := <-executor.started:
+		if call != 2 {
+			t.Fatalf("second stream call = %d, want 2", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocked rollback stream")
+	}
+	duringRollback := responsesWebsocketRetainedBytes(h.responsesWebsocketRetainedLimiter)
+	if duringRollback <= baseline {
+		t.Fatalf("rollback snapshots were not charged: baseline=%d during=%d", baseline, duringRollback)
+	}
+
+	close(blockFailure)
+	_, failurePayload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read quota error: %v", errRead)
+	}
+	if got := int(gjson.GetBytes(failurePayload, "status").Int()); got != http.StatusTooManyRequests {
+		t.Fatalf("quota status = %d, want %d: %s", got, http.StatusTooManyRequests, failurePayload)
+	}
+	writeAndReadResponsesWebsocketInvalidRequest(t, conn)
+	if afterRollback := responsesWebsocketRetainedBytes(h.responsesWebsocketRetainedLimiter); afterRollback != baseline {
+		t.Fatalf("rollback retained bytes = %d, want baseline %d", afterRollback, baseline)
+	}
+
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	_ = conn.Close()
+	waitResponsesWebsocketRetainedBytes(t, h.responsesWebsocketRetainedLimiter, func(inUse int64) bool { return inUse == 0 })
+}
+
+func newResponsesRetainedBudgetTestServer(t *testing.T, modelName string, executor *websocketRetainedBudgetExecutor, maxRetainedBytes int64) (*OpenAIResponsesAPIHandler, *httptest.Server) {
+	t.Helper()
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-" + modelName, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	h.responsesWebsocketRetainedLimiter = newResponsesWebsocketFrameLimiter(maxRetainedBytes)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	return h, httptest.NewServer(router)
+}
+
+func responsesWebsocketRetainedBytes(limiter *responsesWebsocketFrameLimiter) int64 {
+	if limiter == nil {
+		return 0
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	return limiter.inUse
+}
+
+func waitResponsesWebsocketRetainedBytes(t *testing.T, limiter *responsesWebsocketFrameLimiter, ready func(int64) bool) int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		inUse := responsesWebsocketRetainedBytes(limiter)
+		if ready(inUse) {
+			return inUse
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for retained websocket budget: in_use=%d", inUse)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func writeAndReadResponsesWebsocketInvalidRequest(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"unsupported"}`)); errWrite != nil {
+		t.Fatalf("write invalid websocket request: %v", errWrite)
+	}
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read invalid websocket response: %v", errRead)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeError {
+		t.Fatalf("invalid websocket response type = %q, want %q: %s", got, wsEventTypeError, payload)
+	}
+}
+
+func TestResponsesWebsocketConnectionLocalToolCachesIsolateSameSessionKey(t *testing.T) {
+	cacheA := newWebsocketToolOutputCache(time.Minute, 10)
+	cacheB := newWebsocketToolOutputCache(time.Minute, 10)
+	const sessionKey = "same-client-session"
+	cacheA.record(sessionKey, "call-1", json.RawMessage(`{"type":"function_call_output","call_id":"call-1","output":"tenant-a"}`))
+
+	request := []byte(`{"input":[{"type":"function_call","call_id":"call-1","name":"tool"}]}`)
+	if got := gjson.GetBytes(repairResponsesWebsocketToolCallsWithCache(cacheB, sessionKey, request), "input.#").Int(); got != 0 {
+		t.Fatalf("isolated cache repaired with another connection's data: %d items", got)
+	}
+	if got := gjson.GetBytes(repairResponsesWebsocketToolCallsWithCache(cacheA, sessionKey, request), "input.#").Int(); got != 2 {
+		t.Fatalf("own connection cache repaired %d items, want 2", got)
+	}
+
+	cacheA.deleteSession(sessionKey)
+	if _, ok := cacheA.get(sessionKey, "call-1"); ok {
+		t.Fatal("connection-local cache survived cleanup")
+	}
+}
+
+func TestWebsocketDownstreamSessionKeyRejectsOversizedKey(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req.Header.Set("X-Client-Request-Id", strings.Repeat("x", websocketToolSessionKeyMaxBytes+1))
+	if got := websocketDownstreamSessionKey(req); got != "" {
+		t.Fatalf("session key = %q, want empty", got)
 	}
 }
 
@@ -1182,6 +1674,9 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 			errCh,
 			timelineLog,
 			"session-1",
+			nil,
+			"",
+			nil,
 		)
 		if err != nil {
 			serverErrCh <- err
@@ -1274,6 +1769,9 @@ func TestForwardResponsesWebsocketTreatsResponseDoneAsTerminalWithoutRewriting(t
 			errCh,
 			timelineLog,
 			"session-1",
+			nil,
+			"",
+			nil,
 		)
 		if err != nil {
 			serverErrCh <- err
@@ -1358,6 +1856,9 @@ func TestForwardResponsesWebsocketTreatsErrorPayloadAsTerminal(t *testing.T) {
 			errCh,
 			newInMemoryWebsocketTimelineLog(),
 			"session-1",
+			nil,
+			"",
+			nil,
 		)
 		if err != nil {
 			serverErrCh <- err
@@ -1371,8 +1872,8 @@ func TestForwardResponsesWebsocketTreatsErrorPayloadAsTerminal(t *testing.T) {
 			serverErrCh <- fmt.Errorf("websocket error status = %d, want %d", errMsg.StatusCode, http.StatusTooManyRequests)
 			return
 		}
-		if errMsg.Error == nil || !strings.Contains(errMsg.Error.Error(), "upstream failed") {
-			serverErrCh <- fmt.Errorf("websocket error = %v, want upstream failed", errMsg.Error)
+		if errMsg.Error == nil || errMsg.Error.Error() != "upstream websocket error" {
+			serverErrCh <- fmt.Errorf("websocket error = %v, want stable upstream websocket error", errMsg.Error)
 			return
 		}
 		serverErrCh <- nil
@@ -1449,6 +1950,9 @@ func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing
 			errCh,
 			timelineLog,
 			"session-1",
+			nil,
+			"",
+			nil,
 		)
 		if err == nil {
 			serverErrCh <- errors.New("expected websocket write failure")
@@ -1458,8 +1962,8 @@ func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing
 			serverErrCh <- errors.New("websocket timeline did not capture attempted downstream response")
 			return
 		}
-		if !strings.Contains(timelineLog.String(), "\"type\":\"response.completed\"") {
-			serverErrCh <- errors.New("websocket timeline did not retain attempted payload")
+		if !strings.Contains(timelineLog.String(), "[BODY METADATA v1]") || strings.Contains(timelineLog.String(), "response.completed") {
+			serverErrCh <- errors.New("websocket timeline did not reduce attempted payload to metadata")
 			return
 		}
 		serverErrCh <- nil
@@ -1540,6 +2044,336 @@ func TestResponsesWebsocketTimelineRecordsDisconnectEvent(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for websocket timeline")
+	}
+}
+
+func TestResponsesWebsocketRetainedLargeClonesTrackActivePeakAndReleaseOnClose(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const modelName = "retained-clone-metrics-model"
+	largeContent := strings.Repeat("x", (1<<20)+4096)
+	responsePayload := []byte(fmt.Sprintf(
+		`{"type":"response.completed","response":{"id":"resp-large","output":[{"type":"message","id":"out-large","content":%q}]}}`,
+		largeContent,
+	))
+	executor := &websocketCaptureExecutor{responsePayload: responsePayload}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-retained-clone", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	before := internalpayload.CurrentLargeCloneMetrics()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	requestPayload := []byte(fmt.Sprintf(
+		`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":%q}]}`,
+		modelName,
+		largeContent,
+	))
+	if errWrite := conn.WriteMessage(websocket.TextMessage, requestPayload); errWrite != nil {
+		_ = conn.Close()
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+	if _, _, errRead := conn.ReadMessage(); errRead != nil {
+		_ = conn.Close()
+		t.Fatalf("read websocket response: %v", errRead)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var during internalpayload.LargeCloneMetrics
+	for {
+		during = internalpayload.CurrentLargeCloneMetrics()
+		if during.ActiveScopedCount >= before.ActiveScopedCount+2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = conn.Close()
+			t.Fatalf("retained request/output scopes were not active: before=%+v during=%+v", before, during)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if during.ActiveScopedBytes < before.ActiveScopedBytes+2*(1<<20) {
+		_ = conn.Close()
+		t.Fatalf("retained request/output bytes = %d, want at least %d above baseline", during.ActiveScopedBytes, 2*(1<<20))
+	}
+	if during.PeakScopedCount < during.ActiveScopedCount || during.PeakScopedBytes < during.ActiveScopedBytes {
+		_ = conn.Close()
+		t.Fatalf("retained clone peak metrics = %+v", during)
+	}
+
+	closePayload := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done")
+	_ = conn.WriteControl(websocket.CloseMessage, closePayload, time.Now().Add(time.Second))
+	_ = conn.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		after := internalpayload.CurrentLargeCloneMetrics()
+		h.responsesWebsocketRetainedLimiter.mu.Lock()
+		retainedBytes := h.responsesWebsocketRetainedLimiter.inUse
+		h.responsesWebsocketRetainedLimiter.mu.Unlock()
+		if after.ActiveScopedCount == before.ActiveScopedCount && after.ActiveScopedBytes == before.ActiveScopedBytes && retainedBytes == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retained websocket state did not release on close: before=%+v after=%+v budget_bytes=%d", before, after, retainedBytes)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestResponsesWebsocketConnectionLimiterPerIPGlobalAndExactRelease(t *testing.T) {
+	limiter := newResponsesWebsocketConnectionLimiter(2, 1)
+	leaseA, code := limiter.acquire("192.0.2.1")
+	if leaseA == nil || code != "" {
+		t.Fatalf("first acquire = (%v, %q), want lease", leaseA, code)
+	}
+	if lease, gotCode := limiter.acquire("192.0.2.1"); lease != nil || gotCode != responsesWebsocketConnectionLimitPerIPCode {
+		t.Fatalf("same-IP acquire = (%v, %q), want per-IP limit", lease, gotCode)
+	}
+	leaseB, code := limiter.acquire("192.0.2.2")
+	if leaseB == nil || code != "" {
+		t.Fatalf("second IP acquire = (%v, %q), want lease", leaseB, code)
+	}
+	if lease, gotCode := limiter.acquire("192.0.2.3"); lease != nil || gotCode != responsesWebsocketConnectionLimitCode {
+		t.Fatalf("global-limit acquire = (%v, %q), want global limit", lease, gotCode)
+	}
+
+	leaseA.release()
+	leaseA.release()
+	leaseC, code := limiter.acquire("192.0.2.1")
+	if leaseC == nil || code != "" {
+		t.Fatalf("acquire after release = (%v, %q), want lease", leaseC, code)
+	}
+	leaseB.release()
+	leaseC.release()
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if limiter.total != 0 || len(limiter.byIP) != 0 {
+		t.Fatalf("limiter after releases = total %d, byIP %#v", limiter.total, limiter.byIP)
+	}
+}
+
+func TestResponsesWebsocketLimitUsesTCPPeerAndReleasesOnClose(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	h.responsesWebsocketLimiter = newResponsesWebsocketConnectionLimiter(2, 1)
+	returned := make(chan struct{}, 3)
+	router := gin.New()
+	router.GET("/v1/responses/ws", func(c *gin.Context) {
+		h.ResponsesWebsocket(c)
+		returned <- struct{}{}
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	firstHeaders := http.Header{"X-Forwarded-For": []string{"198.51.100.1"}, "Session-Id": []string{"limit-held"}}
+	first, _, err := websocket.DefaultDialer.Dial(wsURL, firstHeaders)
+	if err != nil {
+		t.Fatalf("dial first websocket: %v", err)
+	}
+	defer first.Close()
+
+	secondHeaders := http.Header{"X-Forwarded-For": []string{"203.0.113.2"}, "Session-Id": []string{"limit-rejected"}}
+	second, response, err := websocket.DefaultDialer.Dial(wsURL, secondHeaders)
+	if second != nil {
+		_ = second.Close()
+	}
+	if err == nil || response == nil {
+		t.Fatalf("second dial = conn %v, response %v, err %v; want HTTP 429", second, response, err)
+	}
+	defer response.Body.Close()
+	body, errRead := io.ReadAll(response.Body)
+	if errRead != nil {
+		t.Fatalf("read limit response: %v", errRead)
+	}
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", response.StatusCode, body)
+	}
+	if response.Header.Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q, want 1", response.Header.Get("Retry-After"))
+	}
+	if got := gjson.GetBytes(body, "error.code").String(); got != responsesWebsocketConnectionLimitPerIPCode {
+		t.Fatalf("error code = %q, want %q: %s", got, responsesWebsocketConnectionLimitPerIPCode, body)
+	}
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("limited request did not return")
+	}
+
+	_ = first.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	_ = first.Close()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted websocket did not release after close")
+	}
+
+	third, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial after release: %v", err)
+	}
+	_ = third.Close()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("final websocket did not return")
+	}
+}
+
+func TestResponsesWebsocketReleasesLimiterOnUpgradeFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	h.responsesWebsocketLimiter = newResponsesWebsocketConnectionLimiter(1, 1)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses/ws", nil)
+	c.Request.RemoteAddr = "192.0.2.10:4321"
+	c.Request.Header.Set("X-Forwarded-For", "203.0.113.10")
+	h.ResponsesWebsocket(c)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("upgrade failure status = %d, want 400", recorder.Code)
+	}
+	h.responsesWebsocketLimiter.mu.Lock()
+	defer h.responsesWebsocketLimiter.mu.Unlock()
+	if h.responsesWebsocketLimiter.total != 0 || len(h.responsesWebsocketLimiter.byIP) != 0 {
+		t.Fatalf("limiter leaked after upgrade failure: total %d, byIP %#v", h.responsesWebsocketLimiter.total, h.responsesWebsocketLimiter.byIP)
+	}
+}
+
+func TestResponsesWebsocketFrameLimiterExactRelease(t *testing.T) {
+	limiter := newResponsesWebsocketFrameLimiter(10)
+	lease := limiter.acquire(0)
+	if lease == nil {
+		t.Fatal("first frame lease was rejected")
+	}
+	if !lease.resize(10) {
+		t.Fatal("frame lease did not grow to the byte budget")
+	}
+	if second := limiter.acquire(1); second != nil {
+		t.Fatal("frame limiter exceeded its byte budget")
+	}
+	if !lease.resize(4) {
+		t.Fatal("frame lease did not shrink")
+	}
+	second := limiter.acquire(6)
+	if second == nil {
+		t.Fatal("released frame delta was not reusable")
+	}
+	second.release()
+	lease.release()
+	lease.release()
+	third := limiter.acquire(10)
+	if third == nil {
+		t.Fatal("frame limiter did not release capacity")
+	}
+	third.release()
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if limiter.inUse != 0 {
+		t.Fatalf("frame bytes in use = %d, want 0", limiter.inUse)
+	}
+}
+
+type blockingResponsesWebsocketFrameReader struct {
+	payload []byte
+	blocked chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingResponsesWebsocketFrameReader) Read(p []byte) (int, error) {
+	if len(r.payload) > 0 {
+		n := copy(p, r.payload)
+		r.payload = r.payload[n:]
+		return n, nil
+	}
+	r.once.Do(func() { close(r.blocked) })
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestResponsesWebsocketConcurrentLargeFrameCapacity(t *testing.T) {
+	limiter := newResponsesWebsocketFrameLimiter(10)
+	releaseReaders := make(chan struct{})
+	type readResult struct {
+		payload []byte
+		err     error
+	}
+	startRead := func(payload string) (*responsesWebsocketFrameLease, <-chan struct{}, <-chan readResult) {
+		lease := limiter.acquire(0)
+		blocked := make(chan struct{})
+		results := make(chan readResult, 1)
+		reader := &blockingResponsesWebsocketFrameReader{
+			payload: []byte(payload),
+			blocked: blocked,
+			release: releaseReaders,
+		}
+		go func() {
+			frame, errRead := readResponsesWebsocketFrame(reader, 64, lease)
+			results <- readResult{payload: frame, err: errRead}
+		}()
+		return lease, blocked, results
+	}
+
+	firstLease, firstBlocked, firstResult := startRead("four")
+	secondLease, secondBlocked, secondResult := startRead("tiny")
+	<-firstBlocked
+	<-secondBlocked
+
+	limiter.mu.Lock()
+	inUse := limiter.inUse
+	limiter.mu.Unlock()
+	if inUse != 8 {
+		t.Fatalf("two small frames reserved %d bytes, want their actual 8 bytes", inUse)
+	}
+
+	rejectedLease := limiter.acquire(0)
+	if rejectedLease == nil {
+		t.Fatal("zero-byte frame lease was rejected")
+	}
+	if _, errRead := readResponsesWebsocketFrame(strings.NewReader("big"), 64, rejectedLease); !errors.Is(errRead, errResponsesWebsocketFrameCapacity) {
+		t.Fatalf("aggregate overflow error = %v, want frame capacity", errRead)
+	}
+	rejectedLease.release()
+
+	close(releaseReaders)
+	for i, resultCh := range []<-chan readResult{firstResult, secondResult} {
+		result := <-resultCh
+		if result.err != nil || len(result.payload) != 4 {
+			t.Fatalf("small frame %d result = (%q, %v)", i, result.payload, result.err)
+		}
+	}
+	firstLease.release()
+	secondLease.release()
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if limiter.inUse != 0 {
+		t.Fatalf("frame bytes in use after cancellation = %d, want 0", limiter.inUse)
+	}
+	if limiter.peak > limiter.maxBytes {
+		t.Fatalf("frame peak = %d, exceeds budget %d", limiter.peak, limiter.maxBytes)
 	}
 }
 
@@ -2416,11 +3250,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial websocket: %v", err)
 	}
-	defer func() {
-		if errClose := conn.Close(); errClose != nil {
-			t.Fatalf("close websocket: %v", errClose)
-		}
-	}()
+	defer func() { _ = conn.Close() }()
 
 	requests := []string{
 		`{"type":"response.create","model":"quota-model","input":[{"type":"message","id":"msg-1"}]}`,
@@ -2459,6 +3289,22 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
 	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
+	}
+
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	_ = conn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.responsesWebsocketRetainedLimiter.mu.Lock()
+		retainedBytes := h.responsesWebsocketRetainedLimiter.inUse
+		h.responsesWebsocketRetainedLimiter.mu.Unlock()
+		if retainedBytes == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rollback retained bytes after close = %d, want 0", retainedBytes)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -3087,4 +3933,111 @@ func TestNormalizeSubsequentRequestAssistantInputTriggersTranscriptReplacement(t
 	if input[0].Get("id").String() != "msg-3" {
 		t.Fatalf("input[0].id = %q, want %q", input[0].Get("id").String(), "msg-3")
 	}
+}
+
+func TestNormalizeResponsesWebsocketRequestInputItemLimit(t *testing.T) {
+	atLimit := []byte(`{"type":"response.create","model":"test-model","input":` + websocketInputArray(responsesWebsocketMaxInputItems) + `}`)
+	if _, _, errMsg := normalizeResponsesWebsocketRequest(atLimit, nil, nil); errMsg != nil {
+		t.Fatalf("input at item limit failed: %v", errMsg.Error)
+	}
+
+	overLimit := []byte(`{"type":"response.create","model":"test-model","input":` + websocketInputArray(responsesWebsocketMaxInputItems+1) + `}`)
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(overLimit, nil, nil)
+	if errMsg == nil {
+		t.Fatalf("normalized = %s, want input item limit error", normalized)
+	}
+	if errMsg.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	wantError := fmt.Sprintf("websocket input exceeds %d items", responsesWebsocketMaxInputItems)
+	if errMsg.Error.Error() != wantError {
+		t.Fatalf("error = %q, want %q", errMsg.Error.Error(), wantError)
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestCapsMergedInputItems(t *testing.T) {
+	lastRequest := []byte(`{"model":"test-model","stream":true,"input":` + websocketInputArray(responsesWebsocketMaxInputItems) + `}`)
+	raw := []byte(`{"type":"response.append","input":[{}]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequestWithMode(raw, lastRequest, []byte(`[]`), false, false)
+	if errMsg == nil {
+		t.Fatalf("normalized = %s, want merged input item limit error", normalized)
+	}
+	if errMsg.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestWebsocketTimelineLogWritesOneTruncationMarker(t *testing.T) {
+	timelineLog := newInMemoryWebsocketTimelineLog()
+	timelineLog.maxEvents = 2
+	timelineLog.maxBytes = 2048
+	ts := time.Date(2026, time.July, 21, 8, 0, 0, 0, time.UTC)
+
+	for _, payload := range []string{"first", "second", "third", "fourth"} {
+		timelineLog.Append("request", []byte(payload), ts)
+	}
+
+	got := timelineLog.String()
+	if count := strings.Count(got, "Event: websocket.request"); count != 2 {
+		t.Fatalf("timeline request event count = %d, want 2: %s", count, got)
+	}
+	if strings.Contains(got, "first") || strings.Contains(got, "second") || strings.Contains(got, "third") || strings.Contains(got, "fourth") {
+		t.Fatalf("timeline retained raw event payloads: %s", got)
+	}
+	if !strings.Contains(got, "[BODY METADATA v1]") {
+		t.Fatalf("timeline metadata missing: %s", got)
+	}
+	if count := strings.Count(got, "Event: websocket."+websocketTimelineTruncationEventType); count != 1 {
+		t.Fatalf("truncation marker count = %d, want 1: %s", count, got)
+	}
+	if len(got) > timelineLog.maxBytes {
+		t.Fatalf("timeline bytes = %d, limit = %d", len(got), timelineLog.maxBytes)
+	}
+}
+
+func TestWebsocketTimelineLogByteLimitUsesSingleSourcePart(t *testing.T) {
+	source, errSource := requestlogging.NewFileBodySourceInDir(t.TempDir(), "websocket-budget-test")
+	if errSource != nil {
+		t.Fatalf("create file body source: %v", errSource)
+	}
+	t.Cleanup(func() { _ = source.Cleanup() })
+
+	timelineLog := newWebsocketTimelineLog(true, source)
+	timelineLog.maxEvents = 100
+	timelineLog.maxBytes = 512
+	ts := time.Date(2026, time.July, 21, 8, 0, 0, 0, time.UTC)
+	timelineLog.BeginRequest()
+	timelineLog.Append("request", []byte(strings.Repeat("a", 80)), ts)
+	timelineLog.BeginRequest()
+	timelineLog.Append("response", []byte(strings.Repeat("b", 200)), ts)
+	timelineLog.Append("response", []byte("ignored"), ts)
+
+	if paths := source.Paths(); len(paths) != 1 {
+		t.Fatalf("timeline source parts = %d, want 1", len(paths))
+	}
+	got := timelineLog.String()
+	if strings.Contains(got, strings.Repeat("b", 200)) || strings.Contains(got, "ignored") {
+		t.Fatalf("timeline retained payload after byte budget: %s", got)
+	}
+	if count := strings.Count(got, "Event: websocket."+websocketTimelineTruncationEventType); count != 1 {
+		t.Fatalf("truncation marker count = %d, want 1: %s", count, got)
+	}
+	if len(got) > timelineLog.maxBytes {
+		t.Fatalf("timeline bytes = %d, limit = %d", len(got), timelineLog.maxBytes)
+	}
+}
+
+func websocketInputArray(count int) string {
+	var builder strings.Builder
+	builder.Grow(2 + count*3)
+	builder.WriteByte('[')
+	for index := 0; index < count; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{}`)
+	}
+	builder.WriteByte(']')
+	return builder.String()
 }

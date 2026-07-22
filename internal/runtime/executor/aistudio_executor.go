@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -83,14 +85,12 @@ func (e *AIStudioExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.A
 		return nil, fmt.Errorf("aistudio executor: request URL is empty")
 	}
 
-	var body []byte
-	if httpReq.Body != nil {
-		b, errRead := io.ReadAll(httpReq.Body)
-		if errRead != nil {
-			return nil, errRead
-		}
-		body = b
-		httpReq.Body = io.NopCloser(bytes.NewReader(b))
+	body, errRead := readAndCloseExecutorHTTPRequestBody(httpReq, "aistudio executor")
+	if errRead != nil {
+		return nil, fmt.Errorf("aistudio executor: read request body: %w", errRead)
+	}
+	if httpReq.Body != nil && httpReq.Body != http.NoBody {
+		httpReq.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
 	wsReq := &wsrelay.HTTPRequest{
@@ -131,7 +131,7 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translatedReq, body, err := e.translateRequest(req, opts, false)
+	translatedReq, body, err := e.translateRequest(ctx, req, opts, false)
 	if err != nil {
 		return resp, err
 	}
@@ -181,7 +181,7 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 		helps.AppendAPIResponseChunk(ctx, e.cfg, wsResp.Body)
 	}
 	if wsResp.Status < 200 || wsResp.Status >= 300 {
-		return resp, statusErr{code: wsResp.Status, msg: string(wsResp.Body)}
+		return resp, newUpstreamStatusErr(wsResp.Status, wsResp.Headers, wsResp.Headers.Get("Content-Type"), wsResp.Body)
 	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -200,7 +200,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	translatedReq, body, err := e.translateRequest(req, opts, true)
+	translatedReq, body, err := e.translateRequest(ctx, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
@@ -261,15 +261,12 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 			body.Write(firstEvent.Payload)
 		}
 		if firstEvent.Type == wsrelay.MessageTypeStreamEnd {
-			return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+			return nil, newUpstreamStatusErr(firstEvent.Status, firstEvent.Headers, firstEvent.Headers.Get("Content-Type"), body.Bytes())
 		}
 		for event := range wsStream {
 			if event.Err != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
-				if body.Len() == 0 {
-					body.WriteString(event.Err.Error())
-				}
-				break
+				return nil, fmt.Errorf("wsrelay: %w", event.Err)
 			}
 			if !metadataLogged && event.Status > 0 {
 				helps.RecordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
@@ -285,7 +282,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				break
 			}
 		}
-		return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+		return nil, newUpstreamStatusErr(firstEvent.Status, firstEvent.Headers, firstEvent.Headers.Get("Content-Type"), body.Bytes())
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
@@ -298,7 +295,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.PublishFailure(ctx, event.Err)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}:
+				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %w", event.Err)}:
 				case <-ctx.Done():
 				}
 				return false
@@ -354,7 +351,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
 				reporter.PublishFailure(ctx, event.Err)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}:
+				case out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %w", event.Err)}:
 				case <-ctx.Done():
 				}
 				return false
@@ -376,7 +373,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 // CountTokens counts tokens for the given request using the AI Studio API.
 func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	_, body, err := e.translateRequest(req, opts, false)
+	_, body, err := e.translateRequest(ctx, req, opts, false)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -419,7 +416,7 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 		helps.AppendAPIResponseChunk(ctx, e.cfg, resp.Body)
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
-		return cliproxyexecutor.Response{}, statusErr{code: resp.Status, msg: string(resp.Body)}
+		return cliproxyexecutor.Response{}, newUpstreamStatusErr(resp.Status, resp.Headers, resp.Headers.Get("Content-Type"), resp.Body)
 	}
 	totalTokens := gjson.GetBytes(resp.Body, "totalTokens").Int()
 	if totalTokens <= 0 {
@@ -444,7 +441,8 @@ type translatedPayload struct {
 	toFormat sdktranslator.Format
 }
 
-func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
+func (e *AIStudioExecutor) translateRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
+	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
@@ -454,9 +452,11 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
+	originalTranslated, payload, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.aistudio", from, to, baseModel, originalPayload, req.Payload, stream, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return nil, translatedPayload{}, err
+	}
+	payload, err = thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, translatedPayload{}, err
 	}
@@ -478,6 +478,18 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 		action = "streamGenerateContent"
 	}
 	payload, _ = sjson.DeleteBytes(payload, "session_id")
+	stage := "request_plan.aistudio"
+	if stream {
+		stage = "request_plan.aistudio.stream"
+	}
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       stage,
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(payload)),
+		Duration:    time.Since(started),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return nil, translatedPayload{}, err
+	}
 	return payload, translatedPayload{payload: payload, action: action, toFormat: to}, nil
 }
 

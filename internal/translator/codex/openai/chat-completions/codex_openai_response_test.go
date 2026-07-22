@@ -2,11 +2,51 @@ package chat_completions
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertCodexResponseToOpenAI_NonStreamLargeArraysPreserveOrder(t *testing.T) {
+	const itemCount = 512
+	var raw strings.Builder
+	raw.WriteString(`{"type":"response.completed","response":{"id":"resp-large","created_at":1700000000,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},{"type":"message","content":[{"type":"output_text","text":"answer"}]}`)
+	for i := 0; i < itemCount; i++ {
+		raw.WriteString(`,{"type":"function_call","call_id":"call-`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`","name":"tool_`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`","arguments":"{}"},{"type":"image_generation_call","output_format":"png","result":"aW1hZ2U`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`="}`)
+	}
+	raw.WriteString(`]}}`)
+
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.4", nil, nil, []byte(raw.String()), nil)
+	if got := gjson.GetBytes(out, "choices.0.message.reasoning_content").String(); got != "thinking" {
+		t.Fatalf("reasoning content = %q", got)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "answer" {
+		t.Fatalf("message content = %q", got)
+	}
+	toolCalls := gjson.GetBytes(out, "choices.0.message.tool_calls").Array()
+	if len(toolCalls) != itemCount {
+		t.Fatalf("tool call count = %d, want %d", len(toolCalls), itemCount)
+	}
+	if got := toolCalls[itemCount-1].Get("id").String(); got != "call-511" {
+		t.Fatalf("last call id = %q", got)
+	}
+	images := gjson.GetBytes(out, "choices.0.message.images").Array()
+	if len(images) != itemCount {
+		t.Fatalf("image count = %d, want %d", len(images), itemCount)
+	}
+	if got := images[itemCount-1].Get("index").Int(); got != itemCount-1 {
+		t.Fatalf("last image index = %d, want %d", got, itemCount-1)
+	}
+}
 
 func TestConvertCodexResponseToOpenAI_StreamIncludesCachedTokens(t *testing.T) {
 	ctx := context.Background()

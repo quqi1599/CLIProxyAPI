@@ -5,16 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
+)
+
+const (
+	maxAntigravityOAuthResponseBytes        = 1 << 20
+	maxAntigravityControlPlaneResponseBytes = 4 << 20
 )
 
 // TokenResponse represents OAuth token response from Google
@@ -153,26 +158,17 @@ func (o *AntigravityAuth) ExchangeCodeForTokens(ctx context.Context, code, redir
 	if errDo != nil {
 		return nil, fmt.Errorf("antigravity token exchange: execute request: %w", errDo)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("antigravity token exchange: close body error: %v", errClose)
-		}
-	}()
+	bodyBytes, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityOAuthResponseBytes)
+	if errRead != nil {
+		return nil, fmt.Errorf("antigravity token exchange: read response: %w", errRead)
+	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		bodyBytes, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		if errRead != nil {
-			return nil, fmt.Errorf("antigravity token exchange: read response: %w", errRead)
-		}
-		body := strings.TrimSpace(string(bodyBytes))
-		if body == "" {
-			return nil, fmt.Errorf("antigravity token exchange: request failed: status %d", resp.StatusCode)
-		}
-		return nil, fmt.Errorf("antigravity token exchange: request failed: status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("antigravity token exchange: request failed: status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	var token TokenResponse
-	if errDecode := json.NewDecoder(resp.Body).Decode(&token); errDecode != nil {
+	if errDecode := json.Unmarshal(bodyBytes, &token); errDecode != nil {
 		return nil, fmt.Errorf("antigravity token exchange: decode response: %w", errDecode)
 	}
 	return &token, nil
@@ -195,25 +191,16 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 	if errDo != nil {
 		return "", fmt.Errorf("antigravity userinfo: execute request: %w", errDo)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("antigravity userinfo: close body error: %v", errClose)
-		}
-	}()
+	bodyBytes, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityOAuthResponseBytes)
+	if errRead != nil {
+		return "", fmt.Errorf("antigravity userinfo: read response: %w", errRead)
+	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		bodyBytes, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		if errRead != nil {
-			return "", fmt.Errorf("antigravity userinfo: read response: %w", errRead)
-		}
-		body := strings.TrimSpace(string(bodyBytes))
-		if body == "" {
-			return "", fmt.Errorf("antigravity userinfo: request failed: status %d", resp.StatusCode)
-		}
-		return "", fmt.Errorf("antigravity userinfo: request failed: status %d: %s", resp.StatusCode, body)
+		return "", fmt.Errorf("antigravity userinfo: request failed: status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 	var info userInfo
-	if errDecode := json.NewDecoder(resp.Body).Decode(&info); errDecode != nil {
+	if errDecode := json.Unmarshal(bodyBytes, &info); errDecode != nil {
 		return "", fmt.Errorf("antigravity userinfo: decode response: %w", errDecode)
 	}
 	email := strings.TrimSpace(info.Email)
@@ -247,21 +234,15 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 
 	resp, errDo := o.httpClient.Do(req)
 	if errDo != nil {
-		return "", fmt.Errorf("execute request: %w", errDo)
+		return "", fmt.Errorf("antigravity loadCodeAssist: execute request: %w", errDo)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("antigravity loadCodeAssist: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, errRead := io.ReadAll(resp.Body)
+	bodyBytes, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityControlPlaneResponseBytes)
 	if errRead != nil {
-		return "", fmt.Errorf("read response: %w", errRead)
+		return "", fmt.Errorf("antigravity loadCodeAssist: read response: %w", errRead)
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	var loadResp map[string]any
@@ -328,14 +309,11 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 			return "", fmt.Errorf("execute request: %w", errDo)
 		}
 
-		bodyBytes, errRead := io.ReadAll(resp.Body)
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("close body error: %v", errClose)
-		}
+		bodyBytes, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityControlPlaneResponseBytes)
 		cancel()
 
 		if errRead != nil {
-			return "", fmt.Errorf("read response: %w", errRead)
+			return "", fmt.Errorf("antigravity onboardUser: read response: %w", errRead)
 		}
 
 		if resp.StatusCode == http.StatusOK {
@@ -362,16 +340,7 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 			continue
 		}
 
-		responsePreview := strings.TrimSpace(string(bodyBytes))
-		if len(responsePreview) > 500 {
-			responsePreview = responsePreview[:500]
-		}
-
-		responseErr := responsePreview
-		if len(responseErr) > 200 {
-			responseErr = responseErr[:200]
-		}
-		return "", fmt.Errorf("http %d: %s", resp.StatusCode, responseErr)
+		return "", fmt.Errorf("http %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	return "", fmt.Errorf("onboard user did not complete after %d attempts", maxAttempts)

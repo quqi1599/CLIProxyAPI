@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 
@@ -120,9 +121,14 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 	// Process the main content part of the response.
 	partsResult := gjson.GetBytes(rawJSON, "response.candidates.0.content.parts")
 	if partsResult.IsArray() {
-		partResults := partsResult.Array()
-		for i := 0; i < len(partResults); i++ {
-			partResult := partResults[i]
+		var content string
+		var reasoningContent string
+		contentSet := false
+		reasoningSet := false
+		roleSet := false
+		toolCalls := make([][]byte, 0)
+		images := make([][]byte, 0)
+		for _, partResult := range partsResult.Array() {
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
 			thoughtSignatureResult := partResult.Get("thoughtSignature")
@@ -144,24 +150,21 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 
 			if partTextResult.Exists() {
 				textContent := partTextResult.String()
-
-				// Handle text content, distinguishing between regular content and reasoning/thoughts.
 				if partResult.Get("thought").Bool() {
-					template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", textContent)
+					reasoningContent = textContent
+					reasoningSet = true
 				} else {
-					template, _ = sjson.SetBytes(template, "choices.0.delta.content", textContent)
+					content = textContent
+					contentSet = true
 				}
-				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+				roleSet = true
 			} else if functionCallResult.Exists() {
 				// Handle function call content.
 				(*param).(*convertCliResponseToOpenAIChatParams).SawToolCall = true // Persist across chunks
-				toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
 				functionCallIndex := (*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex
 				(*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex++
-				if toolCallsResult.Exists() && toolCallsResult.IsArray() {
-					functionCallIndex = len(toolCallsResult.Array())
-				} else {
-					template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
+				if len(toolCalls) > 0 {
+					functionCallIndex = len(toolCalls)
 				}
 
 				functionCallTemplate := []byte(`{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`)
@@ -172,8 +175,8 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
 					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", fcArgsResult.Raw)
 				}
-				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-				template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
+				toolCalls = append(toolCalls, functionCallTemplate)
+				roleSet = true
 			} else if inlineDataResult.Exists() {
 				data := inlineDataResult.Get("data").String()
 				if data == "" {
@@ -187,17 +190,28 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 					mimeType = "image/png"
 				}
 				imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-				imagesResult := gjson.GetBytes(template, "choices.0.delta.images")
-				if !imagesResult.Exists() || !imagesResult.IsArray() {
-					template, _ = sjson.SetRawBytes(template, "choices.0.delta.images", []byte(`[]`))
-				}
-				imageIndex := len(gjson.GetBytes(template, "choices.0.delta.images").Array())
+				imageIndex := len(images)
 				imagePayload := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 				imagePayload, _ = sjson.SetBytes(imagePayload, "index", imageIndex)
 				imagePayload, _ = sjson.SetBytes(imagePayload, "image_url.url", imageURL)
-				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-				template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
+				images = append(images, imagePayload)
+				roleSet = true
 			}
+		}
+		if reasoningSet {
+			template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", reasoningContent)
+		}
+		if contentSet {
+			template, _ = sjson.SetBytes(template, "choices.0.delta.content", content)
+		}
+		if len(toolCalls) > 0 {
+			template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", internalpayload.BuildRaw(toolCalls))
+		}
+		if len(images) > 0 {
+			template, _ = sjson.SetRawBytes(template, "choices.0.delta.images", internalpayload.BuildRaw(images))
+		}
+		if roleSet {
+			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		}
 	}
 

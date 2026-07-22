@@ -10,7 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/vertex"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 // ImportVertexCredential handles uploading a Vertex service account JSON and saving it as an auth record.
@@ -24,18 +26,32 @@ func (h *Handler) ImportVertexCredential(c *gin.Context) {
 		return
 	}
 
-	fileHeader, err := c.FormFile("file")
+	form, err := sdkhandlers.ParseMultipartFormWithLimits(c, maxVertexCredentialBodyBytes, 1<<20, maxVertexCredentialBodyBytes)
 	if err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if form == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file required"})
 		return
 	}
+	files := form.File["file"]
+	if len(files) == 0 || files[0] == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file required"})
+		return
+	}
+	fileHeader := files[0]
 
 	file, err := fileHeader.Open()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("failed to read file: %v", err)})
 		return
 	}
-	defer file.Close()
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.Errorf("management: close vertex credential upload: %v", errClose)
+		}
+	}()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
@@ -63,7 +79,10 @@ func (h *Handler) ImportVertexCredential(c *gin.Context) {
 	}
 	email := strings.TrimSpace(valueAsString(serviceAccount["client_email"]))
 
-	location := strings.TrimSpace(c.PostForm("location"))
+	location := ""
+	if values := form.Value["location"]; len(values) > 0 {
+		location = strings.TrimSpace(values[0])
+	}
 	if location == "" {
 		location = strings.TrimSpace(c.Query("location"))
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -506,16 +507,8 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		}
 	}
 
-	contentArrayInitialized := false
-	ensureContentArray := func() {
-		if contentArrayInitialized {
-			return
-		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content", []byte("[]"))
-		contentArrayInitialized = true
-	}
-
 	parts := root.Get("response.candidates.0.content.parts")
+	contentBlocks := make([][]byte, 0)
 	textBuilder := strings.Builder{}
 	thinkingBuilder := strings.Builder{}
 	thinkingSignature := ""
@@ -526,10 +519,9 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		if textBuilder.Len() == 0 {
 			return
 		}
-		ensureContentArray()
 		block := []byte(`{"type":"text","text":""}`)
 		block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", block)
+		contentBlocks = append(contentBlocks, block)
 		textBuilder.Reset()
 	}
 
@@ -537,14 +529,13 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		if thinkingBuilder.Len() == 0 && thinkingSignature == "" {
 			return
 		}
-		ensureContentArray()
 		block := []byte(`{"type":"thinking","thinking":""}`)
 		block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
 		if thinkingSignature != "" {
 			sigValue := formatClaudeSignatureValue(modelName, thinkingSignature)
 			block, _ = sjson.SetBytes(block, "signature", sigValue)
 		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", block)
+		contentBlocks = append(contentBlocks, block)
 		thinkingBuilder.Reset()
 		thinkingSignature = ""
 	}
@@ -587,8 +578,7 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 					toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", []byte(args.Raw))
 				}
 
-				ensureContentArray()
-				responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", toolBlock)
+				contentBlocks = append(contentBlocks, toolBlock)
 				continue
 			}
 		}
@@ -596,6 +586,9 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 	flushThinking()
 	flushText()
+	if len(contentBlocks) > 0 {
+		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content", internalpayload.BuildRaw(contentBlocks))
+	}
 
 	stopReason := "end_turn"
 	if hasToolCall {

@@ -34,7 +34,8 @@ func TestClaudeExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 		"api_key":  "key-123",
 		"base_url": server.URL,
 	}}
-	ctx := logging.WithRequestID(context.Background(), "req-count-claude-1")
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}`)
+	ctx, releaseReport := retainExecutorTransformReport(logging.WithRequestID(context.Background(), "req-count-claude-1"), len(payload))
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("claude"),
 		Metadata: map[string]any{
@@ -48,7 +49,7 @@ func TestClaudeExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 
 	_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
 		Model:   "claude-3-5-sonnet-20241022",
-		Payload: []byte(`{"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}`),
+		Payload: payload,
 	}, opts)
 	if err != nil {
 		t.Fatalf("CountTokens error: %v", err)
@@ -56,6 +57,7 @@ func TestClaudeExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 	if len(seenBody) == 0 {
 		t.Fatal("expected request body")
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, claudeRequestPlanTransformStage, len(seenBody))
 
 	entry := findCountTokensSummaryEntry(t, hook.AllEntries(), "ClaudeExecutor")
 	if got := entry.Data["request_id"]; got != "req-count-claude-1" {
@@ -80,7 +82,8 @@ func TestOpenAICompatExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 	hook.Reset()
 
 	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
-	ctx := logging.WithRequestID(context.Background(), "req-count-openai-1")
+	payload := []byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}`)
+	ctx, releaseReport := retainExecutorTransformReport(logging.WithRequestID(context.Background(), "req-count-openai-1"), len(payload))
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai"),
 		Metadata: map[string]any{
@@ -94,11 +97,12 @@ func TestOpenAICompatExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 
 	_, err := executor.CountTokens(ctx, nil, cliproxyexecutor.Request{
 		Model:   "gpt-4o-mini",
-		Payload: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+		Payload: payload,
 	}, opts)
 	if err != nil {
 		t.Fatalf("CountTokens error: %v", err)
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, openAICompatRequestPlanTransformStage, len(payload))
 
 	entry := findCountTokensSummaryEntry(t, hook.AllEntries(), "OpenAICompatExecutor")
 	if got := entry.Data["request_id"]; got != "req-count-openai-1" {
@@ -116,6 +120,32 @@ func TestOpenAICompatExecutorCountTokensEmitsSummaryLog(t *testing.T) {
 	if tokens, ok := entry.Data["input_tokens"].(int64); !ok || tokens <= 0 {
 		t.Fatalf("input_tokens = %#v, want positive int64", entry.Data["input_tokens"])
 	}
+}
+
+func TestKimiExecutorCountTokensReportsKimiPlan(t *testing.T) {
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":7}`))
+	}))
+	defer server.Close()
+
+	executor := NewKimiExecutor(nil)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+	_, err := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2.5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens error: %v", err)
+	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, kimiRequestPlanTransformStage, len(upstreamBody))
 }
 
 func TestOpenAICompatCountTokensNeedsThinking(t *testing.T) {

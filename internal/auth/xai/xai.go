@@ -5,17 +5,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
+
+const maxXAIOAuthResponseBytes = 1 << 20
 
 // XAIAuth performs xAI OAuth discovery, token exchange, and refresh.
 type XAIAuth struct {
@@ -110,17 +111,12 @@ func (a *XAIAuth) Discover(ctx context.Context) (*Discovery, error) {
 	if err != nil {
 		return nil, fmt.Errorf("xai discovery: request failed: %w", err)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("xai discovery: close response body error: %v", errClose)
-		}
-	}()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpfetch.ReadResponseBytes(resp, maxXAIOAuthResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("xai discovery: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("xai discovery failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("xai discovery failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body))
 	}
 	var payload struct {
 		AuthorizationEndpoint string `json:"authorization_endpoint"`
@@ -232,17 +228,12 @@ func (a *XAIAuth) postTokenForm(ctx context.Context, tokenEndpoint string, form 
 	if err != nil {
 		return nil, fmt.Errorf("xai token request failed: %w", err)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("xai token request: close response body error: %v", errClose)
-		}
-	}()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpfetch.ReadResponseBytes(resp, maxXAIOAuthResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("xai token response: read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("xai token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("xai token request failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body))
 	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`

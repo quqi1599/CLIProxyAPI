@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"errors"
+	"maps"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,14 +16,16 @@ import (
 
 func TestComplexityAdmissionWeightChargesLargeRequestsMore(t *testing.T) {
 	small := complexityAdmissionWeight(complexityVector{
-		BodyBytes:        20 << 10,
+		DecodedBytes:     20 << 10,
 		MessageCount:     1,
 		ContentPartCount: 1,
 	})
 	large := complexityAdmissionWeight(complexityVector{
-		BodyBytes:        20 << 20,
+		DecodedBytes:     20 << 20,
 		MessageCount:     513,
 		ContentPartCount: 1025,
+		ToolOutputBytes:  2 << 20,
+		InlineImageBytes: 8 << 20,
 		toolShapeTelemetry: toolShapeTelemetry{
 			DeclaredToolCount: 65,
 			InteractionCount:  129,
@@ -29,6 +33,9 @@ func TestComplexityAdmissionWeightChargesLargeRequestsMore(t *testing.T) {
 	})
 	if large <= small {
 		t.Fatalf("large request weight = %d, want greater than small request weight %d", large, small)
+	}
+	if small != 3 || large != 18 {
+		t.Fatalf("weights = small:%d large:%d, want 3/18", small, large)
 	}
 }
 
@@ -321,7 +328,67 @@ func TestAdmissionControllerReadinessTracksSustainedSaturation(t *testing.T) {
 	}
 }
 
-func TestAdmissionStreamProducerReleasesWeightOnCancellation(t *testing.T) {
+func TestAdmissionReadinessTracksSustainedFullPoolWithoutQueue(t *testing.T) {
+	const grace = 5 * time.Second
+	now := time.Unix(1_700_000_000, 0)
+	controller := newAdmissionController(2, 64, grace)
+	controller.now = func() time.Time { return now }
+	release, err := controller.acquire(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("acquire full capacity: %v", err)
+	}
+	if !controller.ready() {
+		t.Fatal("short full-capacity burst should remain ready")
+	}
+	now = now.Add(grace - time.Nanosecond)
+	if !controller.ready() {
+		t.Fatal("pool became unready before the saturation grace elapsed")
+	}
+	now = now.Add(time.Nanosecond)
+	if controller.ready() {
+		t.Fatal("sustained full-capacity pool should become unready")
+	}
+	release()
+	if !controller.ready() || !controller.saturatedSince.IsZero() {
+		t.Fatal("readiness did not recover immediately after pressure cleared")
+	}
+}
+
+func TestAdmissionReadinessTracksAnySustainedQueue(t *testing.T) {
+	const grace = 5 * time.Second
+	now := time.Unix(1_700_000_000, 0)
+	controller := newAdmissionController(3, 64, grace)
+	controller.now = func() time.Time { return now }
+	releaseActive, err := controller.acquire(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("active acquire: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan admissionAcquireResult, 1)
+	go func() {
+		release, errAcquire := controller.acquire(ctx, 3)
+		queued <- admissionAcquireResult{release: release, err: errAcquire}
+	}()
+	waitAdmissionQueueDepth(t, controller, 1)
+	if !controller.ready() {
+		t.Fatal("short queue burst should remain ready")
+	}
+	now = now.Add(grace)
+	if controller.ready() {
+		t.Fatal("sustained non-empty queue should become unready")
+	}
+	cancel()
+	result := waitAdmissionAcquire(t, queued)
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("queued acquire error = %v, want context canceled", result.err)
+	}
+	if !controller.ready() || !controller.saturatedSince.IsZero() {
+		t.Fatal("readiness did not recover immediately after queue drained")
+	}
+	releaseActive()
+}
+
+func TestDownstreamWebsocketFrameAdmissionReleasesOnCancellation(t *testing.T) {
 	handler := NewBaseAPIHandlers(admissionTestConfig(4, 2, 1), nil)
 	controller := handler.admission.Load()
 	host := &handlerStuckPluginStreamHost{}
@@ -330,11 +397,15 @@ func TestAdmissionStreamProducerReleasesWeightOnCancellation(t *testing.T) {
 		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: "stuck"}, true
 	}
 	handler.SetModelRouterHost(host)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(coreexecutor.WithDownstreamWebsocket(context.Background()))
 	data, _, errs := handler.ExecuteStreamWithAuthManager(ctx, "openai", "test-model", []byte(`{"messages":[{"role":"user","content":"test"}]}`), "")
 	if data == nil || errs == nil {
 		cancel()
 		t.Fatal("stream channels must be non-nil after startup")
+	}
+	if active, queued := controller.snapshot(); active == 0 || queued != 0 {
+		cancel()
+		t.Fatalf("active websocket frame admission = %d/%d, want positive/0", active, queued)
 	}
 	cancel()
 	waitAdmissionChannelClosed(t, data)
@@ -365,6 +436,92 @@ func TestNestedExecutionReusesAdmissionLease(t *testing.T) {
 	releaseNested()
 	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
 		t.Fatalf("released snapshot = active:%d queued:%d, want 0/0", active, queued)
+	}
+}
+
+func TestConcurrentNestedExecutionsChargeFanoutWeight(t *testing.T) {
+	outerBody := admissionRequestWithMessages(0)
+	nestedBody := admissionRequestWithMessages(257)
+	outerVector, _ := inspectRequestComplexity(outerBody)
+	nestedVector, _ := inspectRequestComplexity(nestedBody)
+	outerWeight := complexityAdmissionWeight(outerVector)
+	nestedWeight := complexityAdmissionWeight(nestedVector)
+	capacity := nestedWeight * 2
+	if outerWeight >= nestedWeight {
+		t.Fatalf("unexpected test weights: outer=%d nested=%d", outerWeight, nestedWeight)
+	}
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	controller := newAdmissionController(capacity, 2, time.Second)
+	handler.admission.Store(controller)
+	ctx, releaseOuter, err := handler.inspectAndAcquireAdmission(context.Background(), outerBody, &modelExecutionOptions{})
+	if err != nil {
+		t.Fatalf("outer acquire error: %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan admissionAcquireResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, release, errNested := handler.inspectAndAcquireAdmission(ctx, nestedBody, &modelExecutionOptions{})
+			results <- admissionAcquireResult{release: release, err: errNested}
+		}()
+	}
+	close(start)
+	releases := make([]func(), 0, 2)
+	for range 2 {
+		result := waitAdmissionAcquire(t, results)
+		if result.err != nil {
+			t.Fatalf("nested acquire error: %v", result.err)
+		}
+		releases = append(releases, result.release)
+	}
+	if active, queued := controller.snapshot(); active != capacity || queued != 0 {
+		t.Fatalf("parallel nested snapshot = %d/%d, want %d/0", active, queued, capacity)
+	}
+
+	releases[0]()
+	if active, queued := controller.snapshot(); active != nestedWeight || queued != 0 {
+		t.Fatalf("snapshot after one sibling release = %d/%d, want %d/0", active, queued, nestedWeight)
+	}
+	releases[1]()
+	releaseOuter()
+	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
+		t.Fatalf("released snapshot = %d/%d, want 0/0", active, queued)
+	}
+}
+
+func TestConcurrentNestedExecutionsRejectFanoutOverCapacity(t *testing.T) {
+	outerBody := admissionRequestWithMessages(0)
+	nestedBody := admissionRequestWithMessages(257)
+	nestedVector, _ := inspectRequestComplexity(nestedBody)
+	nestedWeight := complexityAdmissionWeight(nestedVector)
+	handler := NewBaseAPIHandlers(nil, nil)
+	controller := newAdmissionController(nestedWeight*2-1, 2, time.Second)
+	handler.admission.Store(controller)
+	ctx, releaseOuter, err := handler.inspectAndAcquireAdmission(context.Background(), outerBody, &modelExecutionOptions{})
+	if err != nil {
+		t.Fatalf("outer acquire error: %v", err)
+	}
+	_, releaseFirst, errFirst := handler.inspectAndAcquireAdmission(ctx, nestedBody, &modelExecutionOptions{})
+	if errFirst != nil {
+		t.Fatalf("first nested acquire error: %v", errFirst)
+	}
+	_, releaseSecond, errSecond := handler.inspectAndAcquireAdmission(ctx, nestedBody, &modelExecutionOptions{})
+	if !errors.Is(errSecond, errAdmissionQueueFull) {
+		t.Fatalf("second nested acquire error = %v, want queue full", errSecond)
+	}
+	if releaseSecond != nil {
+		t.Fatal("rejected nested acquire returned a release function")
+	}
+	if active, queued := controller.snapshot(); active != nestedWeight || queued != 0 {
+		t.Fatalf("rejected fanout snapshot = %d/%d, want %d/0", active, queued, nestedWeight)
+	}
+	releaseFirst()
+	releaseOuter()
+	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
+		t.Fatalf("released snapshot = %d/%d, want 0/0", active, queued)
 	}
 }
 
@@ -422,13 +579,95 @@ func TestNestedExecutionUpgradesAdmissionLeaseWithoutBypass(t *testing.T) {
 	}
 	releaseInner()
 	releaseOuter()
-	if active, queued := controller.snapshot(); active != innerWeight || queued != 0 {
-		t.Fatalf("retained snapshot = active:%d queued:%d, want %d/0", active, queued, innerWeight)
+	if active, queued := controller.snapshot(); active != nestedWeight || queued != 0 {
+		t.Fatalf("retained snapshot = active:%d queued:%d, want %d/0", active, queued, nestedWeight)
 	}
 	releaseNested()
 	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
 		t.Fatalf("released snapshot = active:%d queued:%d, want 0/0", active, queued)
 	}
+}
+
+func TestAdmissionLeaseUpgradeMigratesActiveWeightLedger(t *testing.T) {
+	controller := newAdmissionController(10, 2, time.Second)
+	_, admittedWeight, admitted, err := controller.acquireTracked(context.Background(), 2)
+	if err != nil || !admitted {
+		t.Fatalf("initial acquire = admitted:%t weight:%d error:%v", admitted, admittedWeight, err)
+	}
+	lease := newAdmissionLease(controller, admittedWeight)
+
+	child, releaseChild, retained, err := lease.root.retain(context.Background(), controller, 5)
+	if err != nil || !retained {
+		t.Fatalf("first upgrade = retained:%t error:%v", retained, err)
+	}
+	assertAdmissionWeightLedger(t, controller, 5, map[int]int{5: 1})
+
+	_, releaseGrandchild, retained, err := child.retain(context.Background(), controller, 8)
+	if err != nil || !retained {
+		t.Fatalf("second upgrade = retained:%t error:%v", retained, err)
+	}
+	assertAdmissionWeightLedger(t, controller, 8, map[int]int{8: 1})
+	controller.mu.Lock()
+	lightFits := controller.lightFitsAgedHeavyCreditLocked(7, 2)
+	controller.mu.Unlock()
+	if !lightFits {
+		t.Fatal("fairness calculation read a stale pre-upgrade weight")
+	}
+
+	releaseGrandchild()
+	assertAdmissionWeightLedger(t, controller, 5, map[int]int{5: 1})
+	releaseChild()
+	assertAdmissionWeightLedger(t, controller, 2, map[int]int{2: 1})
+	lease.root.releaseReference()
+	lease.root.releaseReference()
+	assertAdmissionWeightLedger(t, controller, 0, map[int]int{})
+}
+
+func TestAdmissionLeaseConcurrentUpgradeAndReleaseKeepsExactLedger(t *testing.T) {
+	const leaseCount = 8
+	controller := newAdmissionController(64, leaseCount, time.Second)
+	leases := make([]*admissionLease, 0, leaseCount)
+	for range leaseCount {
+		_, weight, admitted, err := controller.acquireTracked(context.Background(), 1)
+		if err != nil || !admitted {
+			t.Fatalf("initial acquire = admitted:%t weight:%d error:%v", admitted, weight, err)
+		}
+		leases = append(leases, newAdmissionLease(controller, weight))
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, leaseCount)
+	for index, lease := range leases {
+		target := index + 2
+		go func() {
+			<-start
+			errs <- lease.root.upgrade(context.Background(), target)
+		}()
+	}
+	close(start)
+	wantLedger := make(map[int]int, leaseCount)
+	wantActive := 0
+	for index := range leaseCount {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent upgrade error: %v", err)
+		}
+		target := index + 2
+		wantLedger[target] = 1
+		wantActive += target
+	}
+	assertAdmissionWeightLedger(t, controller, wantActive, wantLedger)
+
+	var released sync.WaitGroup
+	released.Add(leaseCount)
+	for _, lease := range leases {
+		go func() {
+			defer released.Done()
+			lease.root.releaseReference()
+			lease.root.releaseReference()
+		}()
+	}
+	released.Wait()
+	assertAdmissionWeightLedger(t, controller, 0, map[int]int{})
 }
 
 func TestNestedAdmissionUpgradeCancellationKeepsOuterLease(t *testing.T) {
@@ -816,6 +1055,17 @@ func waitAdmissionSnapshot(t *testing.T, controller *admissionController, wantAc
 			t.Fatalf("admission snapshot did not become %d/%d", wantActive, wantQueued)
 		case <-ticker.C:
 		}
+	}
+}
+
+func assertAdmissionWeightLedger(t *testing.T, controller *admissionController, wantActive int, wantWeights map[int]int) {
+	t.Helper()
+	controller.mu.Lock()
+	active := controller.activeWeight
+	weights := maps.Clone(controller.activeWeights)
+	controller.mu.Unlock()
+	if active != wantActive || !maps.Equal(weights, wantWeights) {
+		t.Fatalf("admission ledger = active:%d weights:%v, want active:%d weights:%v", active, weights, wantActive, wantWeights)
 	}
 }
 

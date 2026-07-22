@@ -3,20 +3,20 @@ package cliproxy
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
 	antigravityModelBaseURLDaily = "https://daily-cloudcode-pa.googleapis.com"
 	antigravityModelBaseURLProd  = "https://cloudcode-pa.googleapis.com"
 	antigravityModelsPath        = "/v1internal:fetchAvailableModels"
+	maxAntigravityModelsBytes    = 4 << 20
 )
 
 type antigravityFetchAvailableModelsResponse struct {
@@ -56,10 +56,7 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 		if errDo != nil {
 			continue
 		}
-		body, errRead := io.ReadAll(resp.Body)
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Debugf("antigravity model fetch: close response body: %v", errClose)
-		}
+		body, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityModelsBytes)
 		if errRead != nil {
 			continue
 		}

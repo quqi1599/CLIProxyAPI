@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -37,6 +38,87 @@ func TestConvertGeminiRequestToAntigravity_ReplacesClientSignatureOnFunctionCall
 	expectedSig := "skip_thought_signature_validator"
 	if sig != expectedSig {
 		t.Errorf("Expected thoughtSignature '%s', got '%s'", expectedSig, sig)
+	}
+}
+
+func TestConvertGeminiRequestToAntigravityPreservesUnknownFieldsDuringLinearRewrite(t *testing.T) {
+	input := []byte(`{
+		"model":"gemini-3-pro-preview",
+		"contents":[
+			{"role":"invalid","parts":[{"text":"one"}],"x-content":{"keep":1}},
+			{"parts":[{"text":"two"}],"x-content":{"keep":2}}
+		],
+		"tools":[{
+			"function_declarations":[{
+				"name":"lookup",
+				"parameters":{"type":"object","x-schema":"keep"},
+				"x-function":{"enabled":true}
+			}],
+			"x-tool":{"provider":"vendor"}
+		}]
+	}`)
+
+	output := ConvertGeminiRequestToAntigravity("gemini-3-pro-preview", input, false)
+	if got := gjson.GetBytes(output, "request.contents.0.role").String(); got != "user" {
+		t.Fatalf("first normalized role = %q, want user", got)
+	}
+	if got := gjson.GetBytes(output, "request.contents.1.role").String(); got != "model" {
+		t.Fatalf("second normalized role = %q, want model", got)
+	}
+	if gjson.GetBytes(output, "request.contents.1.x-content.keep").Int() != 2 {
+		t.Fatalf("content extension was not preserved: %s", output)
+	}
+	declaration := gjson.GetBytes(output, "request.tools.0.function_declarations.0")
+	if declaration.Get("parameters").Exists() || declaration.Get("parametersJsonSchema.x-schema").String() != "keep" {
+		t.Fatalf("schema rename failed: %s", declaration.Raw)
+	}
+	if !declaration.Get("x-function.enabled").Bool() || gjson.GetBytes(output, "request.tools.0.x-tool.provider").String() != "vendor" {
+		t.Fatalf("tool extension fields were not preserved: %s", output)
+	}
+}
+
+func TestFixCLIToolResponseLargeHistoryPreservesOrder(t *testing.T) {
+	const groupCount = 1024
+	contents := make([]any, 0, groupCount*2)
+	for index := 0; index < groupCount; index++ {
+		name := fmt.Sprintf("tool_%04d", index)
+		contents = append(contents,
+			map[string]any{
+				"role":  "model",
+				"parts": []any{map[string]any{"functionCall": map[string]any{"name": name, "args": map[string]any{"index": index}}}},
+			},
+			map[string]any{
+				"role": "function",
+				"parts": []any{map[string]any{"functionResponse": map[string]any{
+					"name": "", "response": map[string]any{"result": index}, "x-response": index,
+				}}},
+			},
+		)
+	}
+	input, err := json.Marshal(map[string]any{"request": map[string]any{"contents": contents}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := fixCLIToolResponse(string(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputContents := gjson.Get(output, "request.contents").Array()
+	if len(outputContents) != groupCount*2 {
+		t.Fatalf("contents length = %d, want %d", len(outputContents), groupCount*2)
+	}
+	for _, index := range []int{0, groupCount / 2, groupCount - 1} {
+		modelContent := outputContents[index*2]
+		responseContent := outputContents[index*2+1]
+		wantName := fmt.Sprintf("tool_%04d", index)
+		if got := modelContent.Get("parts.0.functionCall.name").String(); got != wantName {
+			t.Fatalf("model group %d name = %q, want %q", index, got, wantName)
+		}
+		response := responseContent.Get("parts.0.functionResponse")
+		if response.Get("name").String() != wantName || response.Get("x-response").Int() != int64(index) {
+			t.Fatalf("response group %d lost order or extension: %s", index, response.Raw)
+		}
 	}
 }
 

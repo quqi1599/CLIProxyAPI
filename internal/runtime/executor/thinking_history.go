@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -18,21 +20,27 @@ const (
 
 	thinkingHistoryBudgetDowngradeReason  = "synthetic_history_budget_exceeded"
 	thinkingHistoryUnrepairableReason     = "unrepairable_history"
+	thinkingHistorySyntheticBudgetPolicy  = "thinking_history.synthetic_budget"
+	thinkingHistoryPlaceholderPolicy      = "thinking_history.placeholder"
+	openAIThinkingHistoryTransformStage   = "normalize.thinking_history.openai"
+	claudeThinkingHistoryTransformStage   = "normalize.thinking_history.claude"
 	openAIReasoningUnavailablePlaceholder = "[reasoning unavailable]"
 	claudeThinkingUnavailablePlaceholder  = "[thinking unavailable]"
 )
 
 type thinkingHistoryTransformReport struct {
-	InputBytes      int
-	OutputBytes     int
-	SyntheticBytes  int
-	PatchedCount    int
-	DowngradeReason string
+	InputBytes       int
+	OutputBytes      int
+	SyntheticBytes   int
+	PatchedCount     int
+	PlaceholderCount int
+	DowngradeReason  string
 }
 
 type syntheticThinkingHistoryBudget struct {
-	used     int
-	exceeded bool
+	used         int
+	exceeded     bool
+	placeholders int
 }
 
 func (b *syntheticThinkingHistoryBudget) add(value, placeholder string, moreMessages bool) (string, bool) {
@@ -58,7 +66,50 @@ func (b *syntheticThinkingHistoryBudget) add(value, placeholder string, moreMess
 		return "", false
 	}
 	b.used += len(value)
+	if value == placeholder {
+		b.placeholders++
+	}
 	return value, true
+}
+
+func enforceThinkingHistoryTransform(ctx context.Context, provider string, report thinkingHistoryTransformReport, duration time.Duration) error {
+	stage := ""
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai":
+		stage = openAIThinkingHistoryTransformStage
+	case "claude":
+		stage = claudeThinkingHistoryTransformStage
+	default:
+		return nil
+	}
+
+	appliedPolicies := make([]string, 0, 1)
+	if report.PlaceholderCount > 0 {
+		appliedPolicies = append(appliedPolicies, thinkingHistoryPlaceholderPolicy)
+	}
+	downgrades := make([]string, 0, 1)
+	switch report.DowngradeReason {
+	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason:
+		downgrades = append(downgrades, report.DowngradeReason)
+	}
+	override := internalpayload.AmplificationOverride{}
+	if report.PatchedCount > 0 {
+		override = internalpayload.AmplificationOverride{
+			PolicyID:          thinkingHistorySyntheticBudgetPolicy,
+			MaxExpansionBytes: 2 * maxSyntheticThinkingHistoryTotalBytes,
+			MaxExpansionRatio: internalpayload.DefaultMaxExpansionRatio,
+		}
+	}
+	return internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:           stage,
+		InputBytes:      int64(report.InputBytes),
+		OutputBytes:     int64(report.OutputBytes),
+		SyntheticBytes:  int64(report.SyntheticBytes),
+		Duration:        duration,
+		AppliedPolicies: appliedPolicies,
+		Downgrades:      downgrades,
+		ReusedInput:     report.PatchedCount == 0 && report.SyntheticBytes == 0 && report.InputBytes == report.OutputBytes,
+	}, override)
 }
 
 func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool, error) {
@@ -206,6 +257,7 @@ func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireCompleteHistor
 		if err != nil {
 			report.SyntheticBytes = budget.used
 			report.PatchedCount = patched
+			report.PlaceholderCount = budget.placeholders
 			return body, false, false, report, err
 		}
 		normalizedMessages[idx] = string(next)
@@ -221,6 +273,7 @@ func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireCompleteHistor
 		if err != nil {
 			report.SyntheticBytes = budget.used
 			report.PatchedCount = patched
+			report.PlaceholderCount = budget.placeholders
 			return body, false, false, report, err
 		}
 	}
@@ -239,6 +292,7 @@ func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireCompleteHistor
 	report.OutputBytes = len(out)
 	report.SyntheticBytes = budget.used
 	report.PatchedCount = patched
+	report.PlaceholderCount = budget.placeholders
 	if patched > 0 || downgraded {
 		log.WithFields(log.Fields{
 			"patched_reasoning_messages": patched,
@@ -315,6 +369,7 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 			if err != nil {
 				report.SyntheticBytes = budget.used
 				report.PatchedCount = patched
+				report.PlaceholderCount = budget.placeholders
 				return body, false, false, report, err
 			}
 			normalizedMessages[idx] = string(next)
@@ -383,6 +438,7 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 		if err != nil {
 			report.SyntheticBytes = budget.used
 			report.PatchedCount = patched
+			report.PlaceholderCount = budget.placeholders
 			return body, false, false, report, err
 		}
 		normalizedMessages[idx] = string(next)
@@ -398,6 +454,7 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 		if err != nil {
 			report.SyntheticBytes = budget.used
 			report.PatchedCount = patched
+			report.PlaceholderCount = budget.placeholders
 			return body, false, false, report, err
 		}
 	}
@@ -416,6 +473,7 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 	report.OutputBytes = len(out)
 	report.SyntheticBytes = budget.used
 	report.PatchedCount = patched
+	report.PlaceholderCount = budget.placeholders
 	if patched > 0 || downgraded {
 		log.WithFields(log.Fields{
 			"patched_thinking_messages": patched,

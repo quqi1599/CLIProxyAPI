@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -209,7 +210,7 @@ func (h *Host) callParseAuths(ctx context.Context, record capabilityRecord, req 
 			h.fusePlugin(record.id, "AuthProvider.ParseAuth", recovered)
 			auths = nil
 			handled = false
-			err = fmt.Errorf("auth provider panic: %v", recovered)
+			err = fmt.Errorf("auth provider panic")
 		}
 	}()
 	if req.Host.AuthDir == "" {
@@ -219,7 +220,7 @@ func (h *Host) callParseAuths(ctx context.Context, record capabilityRecord, req 
 	if req.Provider == "" {
 		req.Provider = normalizeProviderID(provider.Identifier())
 	}
-	req.RawJSON = bytes.Clone(req.RawJSON)
+	req.RawJSON = internalpayload.CloneBytes(req.RawJSON)
 	resp, errParse := provider.ParseAuth(ctx, req)
 	if errParse != nil {
 		return nil, false, errParse
@@ -273,7 +274,7 @@ func (h *Host) callStartLogin(ctx context.Context, record capabilityRecord, prov
 			h.fusePlugin(record.id, "AuthProvider.StartLogin", recovered)
 			resp = pluginapi.AuthLoginStartResponse{}
 			handled = false
-			err = fmt.Errorf("auth provider start login panic: %v", recovered)
+			err = fmt.Errorf("auth provider start login panic")
 		}
 	}()
 	req := pluginapi.AuthLoginStartRequest{
@@ -311,7 +312,7 @@ func (h *Host) callPollLogin(ctx context.Context, record capabilityRecord, provi
 			h.fusePlugin(record.id, "AuthProvider.PollLogin", recovered)
 			resp = pluginapi.AuthLoginPollResponse{}
 			handled = false
-			err = fmt.Errorf("auth provider poll login panic: %v", recovered)
+			err = fmt.Errorf("auth provider poll login panic")
 		}
 	}()
 	req := pluginapi.AuthLoginPollRequest{
@@ -341,7 +342,7 @@ func (h *Host) RefreshAuth(ctx context.Context, auth *coreauth.Auth) (refreshed 
 			h.fusePlugin(record.id, "AuthProvider.RefreshAuth", recovered)
 			refreshed = nil
 			handled = true
-			err = fmt.Errorf("auth provider refresh panic: %v", recovered)
+			err = fmt.Errorf("auth provider refresh panic")
 		}
 	}()
 
@@ -574,7 +575,7 @@ func pluginAuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string, au
 		ProxyURL:         strings.TrimSpace(data.ProxyURL),
 		Disabled:         data.Disabled,
 		Status:           status,
-		Storage:          &pluginTokenStorage{provider: provider, rawJSON: bytes.Clone(data.StorageJSON), meta: metadata},
+		Storage:          &pluginTokenStorage{provider: provider, rawJSON: internalpayload.CloneBytes(data.StorageJSON), meta: metadata},
 		Metadata:         metadata,
 		Attributes:       attributes,
 		CreatedAt:        now,

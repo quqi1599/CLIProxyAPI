@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -18,13 +19,14 @@ func DedupeClaudeToolResultParts(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	outMessages := []byte(`[]`)
+	messageResults := messages.Array()
+	outMessages := make([][]byte, 0, len(messageResults))
 	changed := false
 	removed := 0
 
-	for _, msg := range messages.Array() {
+	for _, msg := range messageResults {
 		if strings.TrimSpace(msg.Get("role").String()) != "user" || !msg.Get("content").IsArray() {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, []byte(msg.Raw))
 			continue
 		}
 
@@ -54,34 +56,32 @@ func DedupeClaudeToolResultParts(body []byte) ([]byte, int, error) {
 		}
 
 		if !messageChanged {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, []byte(msg.Raw))
 			continue
 		}
 
-		contentOut := []byte(`[]`)
-		keptParts := 0
+		contentOut := make([][]byte, 0, len(parts))
 		for idx, part := range parts {
 			if !keep[idx] {
 				continue
 			}
-			contentOut, _ = sjson.SetRawBytes(contentOut, "-1", []byte(part.Raw))
-			keptParts++
+			contentOut = append(contentOut, []byte(part.Raw))
 		}
-		if keptParts == 0 {
+		if len(contentOut) == 0 {
 			continue
 		}
-		msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", contentOut)
+		msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(contentOut))
 		if err != nil {
 			return body, 0, fmt.Errorf("failed to dedupe Claude tool_result parts: %w", err)
 		}
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+		outMessages = append(outMessages, msgOut)
 	}
 
 	if !changed {
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to update Claude tool_result dedupe: %w", err)
 	}
@@ -98,13 +98,14 @@ func MoveClaudeToolResultsBeforeUserContent(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	outMessages := []byte(`[]`)
+	messageResults := messages.Array()
+	outMessages := make([][]byte, 0, len(messageResults))
 	pendingOrder := []string{}
 	pendingSet := map[string]bool{}
 	changed := false
 	reordered := 0
 
-	for _, msg := range messages.Array() {
+	for _, msg := range messageResults {
 		role := strings.TrimSpace(msg.Get("role").String())
 		switch role {
 		case "assistant":
@@ -113,12 +114,12 @@ func MoveClaudeToolResultsBeforeUserContent(body []byte) ([]byte, int, error) {
 			for _, id := range pendingOrder {
 				pendingSet[id] = true
 			}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, []byte(msg.Raw))
 		case "user":
 			if len(pendingOrder) == 0 || !msg.Get("content").IsArray() {
 				pendingOrder = nil
 				pendingSet = map[string]bool{}
-				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				outMessages = append(outMessages, []byte(msg.Raw))
 				continue
 			}
 
@@ -126,14 +127,14 @@ func MoveClaudeToolResultsBeforeUserContent(body []byte) ([]byte, int, error) {
 			if !moved {
 				pendingOrder = nil
 				pendingSet = map[string]bool{}
-				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				outMessages = append(outMessages, []byte(msg.Raw))
 				continue
 			}
 			msgOut, err := setClaudeMessageContent(msg, orderedParts)
 			if err != nil {
 				return body, 0, err
 			}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+			outMessages = append(outMessages, msgOut)
 			pendingOrder = nil
 			pendingSet = map[string]bool{}
 			changed = true
@@ -141,7 +142,7 @@ func MoveClaudeToolResultsBeforeUserContent(body []byte) ([]byte, int, error) {
 		default:
 			pendingOrder = nil
 			pendingSet = map[string]bool{}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, []byte(msg.Raw))
 		}
 	}
 
@@ -149,7 +150,7 @@ func MoveClaudeToolResultsBeforeUserContent(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to reorder Claude tool_result parts: %w", err)
 	}
@@ -212,11 +213,11 @@ func claudeToolUseIDOrderInMessage(msg gjson.Result) []string {
 }
 
 func setClaudeMessageContent(msg gjson.Result, parts []gjson.Result) ([]byte, error) {
-	content := []byte(`[]`)
+	content := make([][]byte, 0, len(parts))
 	for _, part := range parts {
-		content, _ = sjson.SetRawBytes(content, "-1", []byte(part.Raw))
+		content = append(content, []byte(part.Raw))
 	}
-	out, err := sjson.SetRawBytes([]byte(msg.Raw), "content", content)
+	out, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(content))
 	if err != nil {
 		return nil, fmt.Errorf("failed to update Claude message content: %w", err)
 	}

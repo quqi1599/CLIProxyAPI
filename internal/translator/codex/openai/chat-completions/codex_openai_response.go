@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -446,8 +447,8 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	}
 
 	// Process the output array for content and function calls
-	var toolCalls [][]byte
-	var images [][]byte
+	var toolCalls []json.RawMessage
+	var images []json.RawMessage
 	outputResult := responseResult.Get("output")
 	if outputResult.IsArray() {
 		outputArray := outputResult.Array()
@@ -505,7 +506,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", argsResult.String())
 				}
 
-				toolCalls = append(toolCalls, functionCallTemplate)
+				toolCalls = append(toolCalls, json.RawMessage(functionCallTemplate))
 			case "image_generation_call":
 				b64 := outputItem.Get("result").String()
 				if b64 == "" {
@@ -518,7 +519,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 				imagePayload := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 				imagePayload, _ = sjson.SetBytes(imagePayload, "index", len(images))
 				imagePayload, _ = sjson.SetBytes(imagePayload, "image_url.url", imageURL)
-				images = append(images, imagePayload)
+				images = append(images, json.RawMessage(imagePayload))
 			}
 		}
 
@@ -535,19 +536,15 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 
 		// Add tool calls if any
 		if len(toolCalls) > 0 {
-			template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls", []byte(`[]`))
-			for _, toolCall := range toolCalls {
-				template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls.-1", toolCall)
-			}
+			toolCallsJSON, _ := json.Marshal(toolCalls)
+			template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls", toolCallsJSON)
 			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
 		}
 
 		// Add images if any
 		if len(images) > 0 {
-			template, _ = sjson.SetRawBytes(template, "choices.0.message.images", []byte(`[]`))
-			for _, image := range images {
-				template, _ = sjson.SetRawBytes(template, "choices.0.message.images.-1", image)
-			}
+			imagesJSON, _ := json.Marshal(images)
+			template, _ = sjson.SetRawBytes(template, "choices.0.message.images", imagesJSON)
 			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
 		}
 	}

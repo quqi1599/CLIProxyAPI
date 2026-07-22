@@ -103,6 +103,27 @@ func (e modelExecutionStatusHeaderError) Headers() http.Header {
 	return e.headers
 }
 
+func TestModelExecutionHeadersRemoveTransportHeadersForDecodedBody(t *testing.T) {
+	headers := modelExecutionHeaders(context.Background(), http.Header{
+		"Content-Encoding": {"gzip"},
+		"Content-Length":   {"123"},
+		"Content-Type":     {"application/json"},
+		"X-Request-Id":     {"request-1"},
+	})
+	if got := headers.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", got)
+	}
+	if got := headers.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length = %q, want empty", got)
+	}
+	if got := headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := headers.Get("X-Request-ID"); got != "request-1" {
+		t.Fatalf("X-Request-ID = %q", got)
+	}
+}
+
 func (e *modelExecutionCaptureExecutor) Identifier() string {
 	if e.provider != "" {
 		return e.provider
@@ -293,6 +314,21 @@ func TestExecuteModelIncludesRequestShapeMetadata(t *testing.T) {
 	if got := gotOpts.Metadata[coreexecutor.ToolInteractionCountMetadataKey]; got != 2 {
 		t.Fatalf("tool_interaction_count metadata = %#v, want 2", got)
 	}
+	if got := gotOpts.Metadata[coreexecutor.ToolCallCountMetadataKey]; got != 1 {
+		t.Fatalf("tool_call_count metadata = %#v, want 1", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.ToolOutputBytesMetadataKey]; got != int64(2) {
+		t.Fatalf("tool_output_bytes metadata = %#v, want 2", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestSourceFormatMetadataKey]; got != "openai" {
+		t.Fatalf("request_source_format metadata = %#v, want openai", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestEndpointMetadataKey]; got != "chat" {
+		t.Fatalf("request_endpoint metadata = %#v, want chat", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestStreamMetadataKey]; got != false {
+		t.Fatalf("request_stream metadata = %#v, want false", got)
+	}
 }
 
 func TestExecuteModelSkipsOriginatingPluginInterceptors(t *testing.T) {
@@ -392,6 +428,15 @@ func TestExecuteModelStream(t *testing.T) {
 	}
 	if gotOpts.Headers.Get("X-Callback") != "stream" {
 		t.Fatalf("executor headers = %#v, want callback header", gotOpts.Headers)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestSourceFormatMetadataKey]; got != "openai" {
+		t.Fatalf("request_source_format metadata = %#v, want openai", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestEndpointMetadataKey]; got != "chat" {
+		t.Fatalf("request_endpoint metadata = %#v, want chat", got)
+	}
+	if got := gotOpts.Metadata[coreexecutor.RequestStreamMetadataKey]; got != true {
+		t.Fatalf("request_stream metadata = %#v, want true", got)
 	}
 }
 

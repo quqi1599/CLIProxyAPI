@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -446,6 +449,21 @@ func TestAPICallAcceptsKebabAuthIndexForTokenSubstitution(t *testing.T) {
 	}
 }
 
+func TestAPICallRejectsOversizeRequestBody(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = maxAPICallRequestBodyBytes + 1
+	ctx.Request = req
+
+	(&Handler{}).APICall(ctx)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
+	}
+}
+
 func TestAPICallReturnsJSONResponseWhenStreamDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -492,6 +510,129 @@ func TestAPICallReturnsJSONResponseWhenStreamDisabled(t *testing.T) {
 	}
 	if got := response.Header["X-Upstream"]; len(got) != 1 || got[0] != "ok" {
 		t.Fatalf("header X-Upstream = %v, want [ok]", got)
+	}
+}
+
+func TestAPICallDecodesResponseAndDropsRepresentationHeaders(t *testing.T) {
+	t.Parallel()
+
+	decoded := []byte{0, 1, 'A'}
+	var encoded bytes.Buffer
+	compressor, errCompress := flate.NewWriter(&encoded, flate.BestSpeed)
+	if errCompress != nil {
+		t.Fatalf("create compressor: %v", errCompress)
+	}
+	if _, errWrite := compressor.Write(decoded); errWrite != nil {
+		t.Fatalf("compress body: %v", errWrite)
+	}
+	if errClose := compressor.Close(); errClose != nil {
+		t.Fatalf("close compressor: %v", errClose)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "deflate")
+		w.Header().Set("Content-Length", strconv.Itoa(encoded.Len()))
+		w.Header().Set("Content-MD5", "stale")
+		w.Header().Set("Digest", "stale")
+		w.Header().Set("Content-Digest", "stale")
+		w.Header().Set("Repr-Digest", "stale")
+		w.Header().Set("ETag", `"stale"`)
+		w.Header().Set("Signature", "stale")
+		w.Header().Set("Signature-Input", "stale")
+		w.Header().Set("X-Upstream", "kept")
+		_, _ = w.Write(encoded.Bytes())
+	}))
+	defer upstream.Close()
+
+	recorder := performAPICallRequest(t, &Handler{}, apiCallRequest{Method: http.MethodGet, URL: upstream.URL})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response apiCallResponse
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v", errUnmarshal)
+	}
+	if response.Body != string(decoded) {
+		t.Fatalf("decoded body = %q, want %q", response.Body, decoded)
+	}
+	for _, name := range []string{"Content-Encoding", "Content-Length", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag", "Signature", "Signature-Input"} {
+		if got := http.Header(response.Header).Get(name); got != "" {
+			t.Fatalf("response header %s = %q, want removed", name, got)
+		}
+	}
+	if got := http.Header(response.Header).Get("X-Upstream"); got != "kept" {
+		t.Fatalf("X-Upstream = %q, want kept", got)
+	}
+}
+
+func TestAPICallResponseBudgetsCapJSONEscaping(t *testing.T) {
+	if maxAPICallResponseBodyBytes > 16<<20 || maxAPICallResponseWireBytes > 24<<20 {
+		t.Fatalf("APICall response budgets = decoded %d, wire %d", maxAPICallResponseBodyBytes, maxAPICallResponseWireBytes)
+	}
+}
+
+func TestAPICallRejectsOversizeNonStreamingResponse(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(maxAPICallResponseBodyBytes+1, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer upstream.Close()
+
+	recorder := performAPICallRequest(t, &Handler{}, apiCallRequest{
+		Method: http.MethodGet,
+		URL:    upstream.URL,
+	})
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var response map[string]string
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v", errUnmarshal)
+	}
+	if response["error"] != "upstream response too large" {
+		t.Fatalf("error = %q, want upstream response too large", response["error"])
+	}
+}
+
+func TestReadAPICallResponseBodyRejectsUnknownLengthOverflow(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{
+		Body:          io.NopCloser(strings.NewReader("12345")),
+		ContentLength: -1,
+		StatusCode:    http.StatusOK,
+	}
+	_, errRead := readAPICallResponseBody(resp, 4, 4)
+	typed, ok := failurecontract.As(errRead)
+	if !ok || typed.Kind != failurecontract.UpstreamProtocolError || !strings.HasSuffix(typed.ProviderCode, "body_too_large") {
+		t.Fatalf("error = %#v, want typed upstream body-too-large failure", errRead)
+	}
+}
+
+func TestRefreshAntigravityOAuthAccessTokenRejectsOversizeResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(maxOAuthTokenResponseBytes+1, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer upstream.Close()
+
+	previousTokenURL := antigravityOAuthTokenURL
+	antigravityOAuthTokenURL = upstream.URL
+	t.Cleanup(func() { antigravityOAuthTokenURL = previousTokenURL })
+
+	auth := &coreauth.Auth{
+		Provider: "antigravity",
+		Metadata: map[string]any{"refresh_token": "refresh-token"},
+	}
+	_, errRefresh := (&Handler{}).refreshAntigravityOAuthAccessToken(context.Background(), auth)
+	typed, ok := failurecontract.As(errRefresh)
+	if !ok || typed.Kind != failurecontract.UpstreamProtocolError || !strings.HasSuffix(typed.ProviderCode, "body_too_large") {
+		t.Fatalf("error = %#v, want typed upstream body-too-large failure", errRefresh)
 	}
 }
 

@@ -2,11 +2,42 @@ package responses
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertGeminiResponseToOpenAIResponses_LargeFunctionOutputArray(t *testing.T) {
+	const callCount = 256
+	var input strings.Builder
+	input.WriteString(`{"responseId":"large","candidates":[{"content":{"parts":[`)
+	for index := 0; index < callCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"functionCall":{"name":"tool_%d","args":{"index":%d}}}`, index, index)
+	}
+	input.WriteString(`]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`)
+
+	var param any
+	chunks := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-test", nil, nil, []byte(input.String()), &param)
+	var completed gjson.Result
+	for _, chunk := range chunks {
+		event, data := parseSSEEvent(t, chunk)
+		if event == "response.completed" {
+			completed = data
+		}
+	}
+	outputs := completed.Get("response.output").Array()
+	if len(outputs) != callCount {
+		t.Fatalf("response.output length = %d, want %d", len(outputs), callCount)
+	}
+	if got := outputs[len(outputs)-1].Get("name").String(); got != "tool_255" {
+		t.Fatalf("last function name = %q, want tool_255", got)
+	}
+}
 
 func parseSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
 	t.Helper()

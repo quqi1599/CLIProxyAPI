@@ -57,7 +57,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (http2pool.Client
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	tr := &http2.Transport{DisableCompression: true}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()

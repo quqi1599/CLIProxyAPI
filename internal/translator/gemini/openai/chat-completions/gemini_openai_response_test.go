@@ -2,10 +2,38 @@ package chat_completions
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertGeminiResponseToOpenAINonStream_LargeToolAndImageArrays(t *testing.T) {
+	const itemCount = 512
+	var input strings.Builder
+	input.WriteString(`{"candidates":[{"index":0,"content":{"parts":[`)
+	for index := 0; index < itemCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"functionCall":{"name":"tool_%d","args":{"index":%d}}},{"inlineData":{"mimeType":"image/png","data":"image-%d"}}`, index, index, index)
+	}
+	input.WriteString(`]}}]}`)
+
+	output := ConvertGeminiResponseToOpenAINonStream(context.Background(), "gemini-test", nil, nil, []byte(input.String()), nil)
+	toolCalls := gjson.GetBytes(output, "choices.0.message.tool_calls").Array()
+	images := gjson.GetBytes(output, "choices.0.message.images").Array()
+	if len(toolCalls) != itemCount || len(images) != itemCount {
+		t.Fatalf("tool_calls=%d images=%d, want %d each", len(toolCalls), len(images), itemCount)
+	}
+	if got := toolCalls[len(toolCalls)-1].Get("function.name").String(); got != "tool_511" {
+		t.Fatalf("last tool name = %q, want tool_511", got)
+	}
+	if got := images[len(images)-1].Get("index").Int(); got != itemCount-1 {
+		t.Fatalf("last image index = %d, want %d", got, itemCount-1)
+	}
+}
 
 func TestGeminiFinishReasonOnlyOnFinalChunk(t *testing.T) {
 	ctx := context.Background()

@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -504,10 +505,11 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 
 	// Set the consolidated parts array
 	if len(consolidatedParts) > 0 {
-		partsJSON := []byte(`[]`)
-		for _, partJSON := range consolidatedParts {
-			partsJSON, _ = sjson.SetRawBytes(partsJSON, "-1", partJSON)
+		parts := make([]json.RawMessage, len(consolidatedParts))
+		for i := range consolidatedParts {
+			parts[i] = consolidatedParts[i]
 		}
+		partsJSON, _ := json.Marshal(parts)
 		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts", partsJSON)
 	}
 

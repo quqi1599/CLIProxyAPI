@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -662,15 +663,36 @@ func (s *Service) ensureWebsocketGateway() {
 	if s.wsGateway != nil {
 		return
 	}
+	maxConnections, maxConnectionsPerIP := 0, 0
+	authRequired := false
+	s.cfgMu.RLock()
+	if s.cfg != nil {
+		maxConnections = s.cfg.WebsocketMaxConnections
+		maxConnectionsPerIP = s.cfg.WebsocketMaxConnectionsPerIP
+		authRequired = s.cfg.WebsocketAuth
+	}
+	s.cfgMu.RUnlock()
 	opts := wsrelay.Options{
-		Path:           "/v1/ws",
-		OnConnected:    s.wsOnConnected,
-		OnDisconnected: s.wsOnDisconnected,
-		LogDebugf:      log.Debugf,
-		LogInfof:       log.Infof,
-		LogWarnf:       log.Warnf,
+		Path:                "/v1/ws",
+		MaxConnections:      maxConnections,
+		MaxConnectionsPerIP: maxConnectionsPerIP,
+		AuthRequired:        authRequired,
+		Authenticate:        s.authenticateWebsocketRequest,
+		OnConnected:         s.wsOnConnected,
+		OnDisconnected:      s.wsOnDisconnected,
+		LogDebugf:           log.Debugf,
+		LogInfof:            log.Infof,
+		LogWarnf:            log.Warnf,
 	}
 	s.wsGateway = wsrelay.NewManager(opts)
+}
+
+func (s *Service) authenticateWebsocketRequest(r *http.Request) error {
+	if s == nil || s.accessManager == nil {
+		return nil
+	}
+	_, authErr := s.accessManager.Authenticate(r.Context(), r)
+	return authErr
 }
 
 func (s *Service) wsOnConnected(channelID string) {
@@ -1381,6 +1403,12 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	s.applyRetryConfig(newCfg)
 	s.configureCooldownStateStore(newCfg)
 	s.applyPprofConfig(newCfg)
+	if s.wsGateway != nil {
+		s.wsGateway.SetConnectionLimits(newCfg.WebsocketMaxConnections, newCfg.WebsocketMaxConnectionsPerIP)
+		if s.server == nil {
+			s.wsGateway.SetAuthenticationRequired(newCfg.WebsocketAuth)
+		}
+	}
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)
 	}
@@ -1759,13 +1787,8 @@ func (s *Service) Run(ctx context.Context) error {
 			if oldEnabled == newEnabled {
 				return
 			}
-			if !oldEnabled && newEnabled {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if errStop := s.wsGateway.Stop(ctx); errStop != nil {
-					log.Warnf("failed to reset websocket connections after ws-auth change %t -> %t: %v", oldEnabled, newEnabled, errStop)
-					return
-				}
+			s.wsGateway.SetAuthenticationRequired(newEnabled)
+			if newEnabled {
 				log.Debugf("ws-auth enabled; existing websocket sessions terminated to enforce authentication")
 				return
 			}

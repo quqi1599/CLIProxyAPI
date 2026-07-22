@@ -20,6 +20,7 @@ import (
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -634,6 +635,8 @@ type BaseAPIHandler struct {
 
 	admissionUpdateMu sync.Mutex
 	admission         atomic.Pointer[admissionController]
+	payloadBodyLimit  atomic.Pointer[payloadBodyLimitPolicy]
+	amplification     atomic.Pointer[amplificationGuardPolicy]
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -651,6 +654,8 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 		AuthManager: authManager,
 	}
 	handler.updateAdmissionController(cfg)
+	handler.updatePayloadBodyLimitPolicy(cfg)
+	handler.updateAmplificationGuardPolicy(cfg)
 	return handler
 }
 
@@ -666,6 +671,8 @@ func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) {
 	}
 	h.Cfg = cfg
 	h.updateAdmissionController(cfg)
+	h.updatePayloadBodyLimitPolicy(cfg)
+	h.updateAmplificationGuardPolicy(cfg)
 }
 
 // SetPluginHost configures the optional plugin interceptor host.
@@ -849,7 +856,42 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 }
 
-// StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
+const admissionKeepAliveGateKey = "admission_keepalive_gate"
+
+type admissionKeepAliveGate struct {
+	ready chan struct{}
+	once  sync.Once
+}
+
+func newAdmissionKeepAliveGate() *admissionKeepAliveGate {
+	return &admissionKeepAliveGate{ready: make(chan struct{})}
+}
+
+func (g *admissionKeepAliveGate) allow() {
+	if g == nil {
+		return
+	}
+	g.once.Do(func() { close(g.ready) })
+}
+
+func allowAdmissionKeepAlive(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return
+	}
+	value, exists := ginCtx.Get(admissionKeepAliveGateKey)
+	if !exists {
+		return
+	}
+	gate, _ := value.(*admissionKeepAliveGate)
+	gate.allow()
+}
+
+// StartNonStreamingKeepAlive emits blank lines at the configured interval while waiting for a non-streaming response.
+// The first write is held until local admission succeeds so a queue rejection can still return its HTTP status.
 // It returns a stop function that must be called before writing the final response.
 func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context) func() {
 	if h == nil || c == nil {
@@ -866,6 +908,8 @@ func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	gate := newAdmissionKeepAliveGate()
+	c.Set(admissionKeepAliveGateKey, gate)
 
 	stopChan := make(chan struct{})
 	var stopOnce sync.Once
@@ -882,6 +926,11 @@ func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				select {
+				case <-gate.ready:
+				default:
+					continue
+				}
 				_, _ = c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 			}
@@ -918,7 +967,7 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 		return
 	}
 
-	c.Set("API_RESPONSE", bytes.Clone(data))
+	c.Set("API_RESPONSE", internalpayload.CloneBytes(data))
 }
 
 func currentAPIResponse(c *gin.Context) []byte {
@@ -941,6 +990,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 }
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	execOptions.complexityDimensions = executionComplexityDimensions(entryProtocol, alt, false, allowImageModel, false)
 	var release func()
 	var errAdmission error
 	ctx, release, errAdmission = h.inspectAndAcquireAdmission(ctx, rawJSON, &execOptions)
@@ -959,9 +1009,9 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	providers = filterProvidersByToolCompatibility(providers, execOptions.complexity)
 	if len(providers) == 0 {
-		return nil, nil, toolCompatibilitySelectionError(modelName, rawJSON)
+		return nil, nil, toolCompatibilitySelectionError(modelName, execOptions.complexity)
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
@@ -1019,6 +1069,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	execOptions.complexityDimensions = executionComplexityDimensions(handlerType, alt, false, false, true)
 	var release func()
 	var errAdmission error
 	ctx, release, errAdmission = h.inspectAndAcquireAdmission(ctx, rawJSON, &execOptions)
@@ -1036,9 +1087,9 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	providers = filterProvidersByToolCompatibility(providers, execOptions.complexity)
 	if len(providers) == 0 {
-		return nil, nil, toolCompatibilitySelectionError(modelName, rawJSON)
+		return nil, nil, toolCompatibilitySelectionError(modelName, execOptions.complexity)
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
@@ -1366,6 +1417,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	execOptions.complexityDimensions = executionComplexityDimensions(entryProtocol, alt, true, allowImageModel, false)
 	var release func()
 	var errAdmission error
 	ctx, release, errAdmission = h.inspectAndAcquireAdmission(ctx, rawJSON, &execOptions)
@@ -1401,11 +1453,11 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 		close(errChan)
 		return nil, nil, errChan
 	}
-	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	providers = filterProvidersByToolCompatibility(providers, execOptions.complexity)
 	if len(providers) == 0 {
 		releaseAdmission()
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- toolCompatibilitySelectionError(modelName, rawJSON)
+		errChan <- toolCompatibilitySelectionError(modelName, execOptions.complexity)
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1709,12 +1761,7 @@ func validateSSEDataJSON(chunk []byte) error {
 		if json.Valid(data) {
 			continue
 		}
-		const max = 512
-		preview := data
-		if len(preview) > max {
-			preview = preview[:max]
-		}
-		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
+		return invalidSSEDataJSONError(data)
 	}
 	return nil
 }
@@ -1846,15 +1893,15 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	return providers, resolvedModelName, nil
 }
 
-func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []string {
+func filterProvidersByToolCompatibility(providers []string, compatibility *complexityVector) []string {
 	if len(providers) == 0 {
 		return nil
 	}
-	if len(rawJSON) == 0 {
+	if compatibility == nil {
 		return providers
 	}
 
-	if payloadHasBuiltinImageGenerationTool(rawJSON) {
+	if payloadHasBuiltinImageGenerationTool(compatibility) {
 		filtered := make([]string, 0, len(providers))
 		for _, provider := range providers {
 			if !providerSupportsBuiltinImageGeneration(provider) {
@@ -1865,24 +1912,7 @@ func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []st
 		providers = filtered
 	}
 
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.IsArray() || len(tools.Array()) == 0 {
-		return providers
-	}
-
-	hasSearchTool := false
-	hasNonSearchTool := false
-	for _, tool := range tools.Array() {
-		if tool.Get("google_search").Exists() || tool.Get("type").String() == "web_search" {
-			hasSearchTool = true
-			continue
-		}
-		if tool.Get("type").String() == "function" || tool.Get("code_execution").Exists() || tool.Get("url_context").Exists() {
-			hasNonSearchTool = true
-		}
-	}
-
-	if !(hasSearchTool && hasNonSearchTool) {
+	if !(compatibility.hasSearchTool && compatibility.hasNonSearchTool) {
 		return providers
 	}
 
@@ -1896,25 +1926,16 @@ func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []st
 	return filtered
 }
 
-func payloadHasBuiltinImageGenerationTool(rawJSON []byte) bool {
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
-			return true
-		}
-	}
-	return false
+func payloadHasBuiltinImageGenerationTool(compatibility *complexityVector) bool {
+	return compatibility != nil && compatibility.hasBuiltinImageGeneration
 }
 
 func providerSupportsBuiltinImageGeneration(provider string) bool {
 	return strings.EqualFold(strings.TrimSpace(provider), "codex")
 }
 
-func toolCompatibilitySelectionError(modelName string, rawJSON []byte) *interfaces.ErrorMessage {
-	if payloadHasBuiltinImageGenerationTool(rawJSON) {
+func toolCompatibilitySelectionError(modelName string, compatibility *complexityVector) *interfaces.ErrorMessage {
+	if payloadHasBuiltinImageGenerationTool(compatibility) {
 		return &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("the image_generation builtin tool currently requires a codex-compatible channel for model %s", modelName),
@@ -1977,12 +1998,7 @@ func cloneHeader(src http.Header) http.Header {
 }
 
 func cloneBytes(src []byte) []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make([]byte, len(src))
-	copy(dst, src)
-	return dst
+	return internalpayload.CloneBytes(src)
 }
 
 func cloneByteSlices(src [][]byte) [][]byte {
@@ -2470,16 +2486,8 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
-	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
-		for key, values := range msg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
+	if msg != nil && msg.Addon != nil {
+		WriteErrorAddonHeaders(c.Writer.Header(), msg.Addon, PassthroughHeadersEnabled(h.Cfg))
 	}
 
 	errText := http.StatusText(status)

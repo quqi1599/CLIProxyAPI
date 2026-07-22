@@ -2,9 +2,15 @@
 package thinking
 
 import (
+	"strings"
+
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
+
+type thinkingStripPath struct {
+	segments   []string
+	pruneEmpty bool
+}
 
 // StripThinkingConfig removes thinking configuration fields from request body.
 //
@@ -27,37 +33,91 @@ func StripThinkingConfig(body []byte, provider string) []byte {
 		return body
 	}
 
-	var paths []string
+	var paths []thinkingStripPath
 	switch provider {
 	case "claude":
-		paths = []string{"thinking", "output_config.effort"}
+		paths = []thinkingStripPath{
+			{segments: []string{"thinking"}},
+			{segments: []string{"output_config", "effort"}, pruneEmpty: true},
+		}
 	case "gemini":
-		paths = []string{"generationConfig.thinkingConfig"}
+		paths = []thinkingStripPath{{segments: []string{"generationConfig", "thinkingConfig"}}}
 	case "antigravity":
-		paths = []string{"request.generationConfig.thinkingConfig"}
+		paths = []thinkingStripPath{{segments: []string{"request", "generationConfig", "thinkingConfig"}}}
 	case "openai":
-		paths = []string{"reasoning_effort"}
+		paths = []thinkingStripPath{{segments: []string{"reasoning_effort"}}}
 	case "kimi":
-		paths = []string{
-			"reasoning_effort",
-			"thinking",
+		paths = []thinkingStripPath{
+			{segments: []string{"reasoning_effort"}},
+			{segments: []string{"thinking"}},
 		}
 	case "codex", "xai":
-		paths = []string{"reasoning.effort"}
+		paths = []thinkingStripPath{{segments: []string{"reasoning", "effort"}}}
 	default:
 		return body
 	}
 
-	result := body
-	for _, path := range paths {
-		result, _ = sjson.DeleteBytes(result, path)
+	result, changed, _ := stripThinkingObject(gjson.ParseBytes(body), paths)
+	if !changed {
+		return body
+	}
+	return []byte(result)
+}
+
+func stripThinkingObject(object gjson.Result, paths []thinkingStripPath) (string, bool, int) {
+	if !object.IsObject() {
+		return object.Raw, false, 0
 	}
 
-	// Avoid leaving an empty output_config object for Claude when effort was the only field.
-	if provider == "claude" {
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
+	var builder strings.Builder
+	builder.Grow(len(object.Raw))
+	builder.WriteByte('{')
+	changed := false
+	fields := 0
+	object.ForEach(func(key, value gjson.Result) bool {
+		fieldPaths := make([]thinkingStripPath, 0, len(paths))
+		remove := false
+		pruneEmpty := false
+		for _, path := range paths {
+			if len(path.segments) == 0 || path.segments[0] != key.String() {
+				continue
+			}
+			if len(path.segments) == 1 {
+				remove = true
+				break
+			}
+			fieldPaths = append(fieldPaths, thinkingStripPath{segments: path.segments[1:], pruneEmpty: path.pruneEmpty})
+			pruneEmpty = pruneEmpty || path.pruneEmpty
 		}
+		if remove {
+			changed = true
+			return true
+		}
+
+		fieldRaw := value.Raw
+		if len(fieldPaths) > 0 && value.IsObject() {
+			updated, nestedChanged, nestedFields := stripThinkingObject(value, fieldPaths)
+			if pruneEmpty && nestedFields == 0 {
+				changed = true
+				return true
+			}
+			if nestedChanged {
+				fieldRaw = updated
+				changed = true
+			}
+		}
+		if fields > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(key.Raw)
+		builder.WriteByte(':')
+		builder.WriteString(fieldRaw)
+		fields++
+		return true
+	})
+	builder.WriteByte('}')
+	if !changed {
+		return object.Raw, false, fields
 	}
-	return result
+	return builder.String(), true, fields
 }

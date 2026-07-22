@@ -61,3 +61,35 @@ func TestConvertGeminiRequestToClaude_PreservesCustomToolIDs(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertGeminiRequestToClaude_NormalizesNestedSchemaTypesWithoutDroppingFields(t *testing.T) {
+	raw := []byte(`{
+		"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{
+			"type":"OBJECT",
+			"x-provider-field":{"enabled":true,"limit":9007199254740993},
+			"properties":{
+				"items":{"type":"ARRAY","items":{"type":"STRING"}},
+				"count":{"type":"INTEGER"},
+				"nullable":{"type":["STRING","NULL"]}
+			},
+			"required":["items","count"]
+		}}]}]
+	}`)
+	out := ConvertGeminiRequestToClaude("claude-test", raw, false)
+	schema := gjson.GetBytes(out, "tools.0.input_schema")
+	if schema.Get("type").String() != "object" || schema.Get("properties.items.type").String() != "array" || schema.Get("properties.items.items.type").String() != "string" || schema.Get("properties.count.type").String() != "integer" {
+		t.Fatalf("nested schema types were not normalized: %s", schema.Raw)
+	}
+	if got := schema.Get("properties.nullable.type.0").String() + "," + schema.Get("properties.nullable.type.1").String(); got != "string,null" {
+		t.Fatalf("union schema type = %q", got)
+	}
+	if !schema.Get("x-provider-field.enabled").Bool() {
+		t.Fatalf("unknown schema field was dropped: %s", schema.Raw)
+	}
+	if got := schema.Get("x-provider-field.limit").Raw; got != "9007199254740993" {
+		t.Fatalf("large unknown number = %q", got)
+	}
+	if got := schema.Get("required.0").String() + "," + schema.Get("required.1").String(); got != "items,count" {
+		t.Fatalf("required order = %q", got)
+	}
+}

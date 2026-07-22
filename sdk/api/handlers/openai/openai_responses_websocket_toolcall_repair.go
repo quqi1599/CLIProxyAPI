@@ -13,54 +13,83 @@ import (
 
 const (
 	websocketToolOutputCacheMaxPerSession = 256
+	websocketToolOutputCacheMaxBytes      = 8 << 20
 	websocketToolOutputCacheTTL           = 30 * time.Minute
+	websocketToolSessionKeyMaxBytes       = 256
 )
-
-var defaultWebsocketToolOutputCache = newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
-var defaultWebsocketToolCallCache = newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
-var defaultWebsocketToolSessionRefs = newWebsocketToolSessionRefCounter()
 
 type websocketToolOutputCache struct {
 	mu            sync.Mutex
 	ttl           time.Duration
 	maxPerSession int
+	maxBytes      int
+	bytes         int
 	sessions      map[string]*websocketToolOutputSession
+	retainedLease *responsesWebsocketFrameLease
+	closed        bool
 }
 
 type websocketToolOutputSession struct {
 	lastSeen time.Time
 	outputs  map[string]json.RawMessage
 	order    []string
+	bytes    int
 }
 
 func newWebsocketToolOutputCache(ttl time.Duration, maxPerSession int) *websocketToolOutputCache {
+	return newWebsocketToolOutputCacheWithBudget(ttl, maxPerSession, websocketToolOutputCacheMaxBytes)
+}
+
+func newWebsocketToolOutputCacheWithBudget(ttl time.Duration, maxPerSession, maxBytes int) *websocketToolOutputCache {
+	return newWebsocketToolOutputCacheWithRetainedBudget(ttl, maxPerSession, maxBytes, nil)
+}
+
+func newWebsocketToolOutputCacheWithRetainedBudget(ttl time.Duration, maxPerSession, maxBytes int, limiter *responsesWebsocketFrameLimiter) *websocketToolOutputCache {
 	if ttl < 0 {
 		ttl = websocketToolOutputCacheTTL
 	}
 	if maxPerSession <= 0 {
 		maxPerSession = websocketToolOutputCacheMaxPerSession
 	}
-	return &websocketToolOutputCache{
+	if maxBytes <= 0 {
+		maxBytes = websocketToolOutputCacheMaxBytes
+	}
+	cache := &websocketToolOutputCache{
 		ttl:           ttl,
 		maxPerSession: maxPerSession,
+		maxBytes:      maxBytes,
 		sessions:      make(map[string]*websocketToolOutputSession),
 	}
+	if limiter != nil {
+		cache.retainedLease = limiter.acquire(0)
+	}
+	return cache
 }
 
 func (c *websocketToolOutputCache) record(sessionKey string, callID string, item json.RawMessage) {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	callID = strings.TrimSpace(callID)
-	if sessionKey == "" || callID == "" || c == nil {
+	if c == nil || sessionKey == "" || callID == "" {
 		return
 	}
 
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 
 	c.cleanupLocked(now)
 
 	session, ok := c.sessions[sessionKey]
+	if len(item) > c.maxBytes {
+		if ok && session != nil {
+			c.bytes -= removeWebsocketToolOutput(session, callID)
+			c.resizeRetainedLocked(c.bytes)
+		}
+		return
+	}
 	if !ok || session == nil {
 		session = &websocketToolOutputSession{
 			lastSeen: now,
@@ -70,20 +99,45 @@ func (c *websocketToolOutputCache) record(sessionKey string, callID string, item
 	}
 	session.lastSeen = now
 
-	if _, exists := session.outputs[callID]; !exists {
-		session.order = append(session.order, callID)
+	c.bytes -= removeWebsocketToolOutput(session, callID)
+	for len(session.order) >= c.maxPerSession || session.bytes+len(item) > c.maxBytes {
+		c.bytes -= removeWebsocketToolOutput(session, session.order[0])
 	}
-	session.outputs[callID] = append(json.RawMessage(nil), item...)
+	if !c.resizeRetainedLocked(c.bytes + len(item)) {
+		c.resizeRetainedLocked(c.bytes)
+		if len(session.outputs) == 0 {
+			delete(c.sessions, sessionKey)
+		}
+		return
+	}
+	item = append(json.RawMessage(nil), item...)
+	session.order = append(session.order, callID)
+	session.outputs[callID] = item
+	session.bytes += len(item)
+	c.bytes += len(item)
+}
 
-	for len(session.order) > c.maxPerSession {
-		evict := session.order[0]
-		session.order = session.order[1:]
-		delete(session.outputs, evict)
+func removeWebsocketToolOutput(session *websocketToolOutputSession, callID string) int {
+	if session == nil {
+		return 0
 	}
+	removedBytes := 0
+	if previous, exists := session.outputs[callID]; exists {
+		removedBytes = len(previous)
+		session.bytes -= removedBytes
+		delete(session.outputs, callID)
+	}
+	for i := range session.order {
+		if session.order[i] == callID {
+			session.order = append(session.order[:i], session.order[i+1:]...)
+			return removedBytes
+		}
+	}
+	return removedBytes
 }
 
 func (c *websocketToolOutputCache) get(sessionKey string, callID string) (json.RawMessage, bool) {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	callID = strings.TrimSpace(callID)
 	if sessionKey == "" || callID == "" || c == nil {
 		return nil, false
@@ -92,6 +146,9 @@ func (c *websocketToolOutputCache) get(sessionKey string, callID string) (json.R
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil, false
+	}
 
 	c.cleanupLocked(now)
 
@@ -118,13 +175,15 @@ func (c *websocketToolOutputCache) cleanupLocked(now time.Time) {
 			continue
 		}
 		if now.Sub(session.lastSeen) > c.ttl {
+			c.bytes -= session.bytes
 			delete(c.sessions, key)
 		}
 	}
+	c.resizeRetainedLocked(c.bytes)
 }
 
 func (c *websocketToolOutputCache) deleteSession(sessionKey string) {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	if sessionKey == "" || c == nil {
 		return
 	}
@@ -132,94 +191,68 @@ func (c *websocketToolOutputCache) deleteSession(sessionKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if session := c.sessions[sessionKey]; session != nil {
+		c.bytes -= session.bytes
+	}
 	delete(c.sessions, sessionKey)
+	c.resizeRetainedLocked(c.bytes)
+}
+
+func (c *websocketToolOutputCache) resizeRetainedLocked(bytes int) bool {
+	if bytes < 0 {
+		bytes = 0
+	}
+	if c.retainedLease == nil {
+		return true
+	}
+	return c.retainedLease.resize(int64(bytes))
+}
+
+func (c *websocketToolOutputCache) close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.bytes = 0
+	c.sessions = nil
+	lease := c.retainedLease
+	c.retainedLease = nil
+	c.mu.Unlock()
+	lease.release()
 }
 
 func websocketDownstreamSessionKey(req *http.Request) string {
 	if req == nil {
 		return ""
 	}
-	if requestID := strings.TrimSpace(req.Header.Get("X-Client-Request-Id")); requestID != "" {
+	if requestID := normalizeResponsesWebsocketSessionKey(req.Header.Get("X-Client-Request-Id")); requestID != "" {
 		return requestID
 	}
 	if raw := strings.TrimSpace(req.Header.Get("X-Codex-Turn-Metadata")); raw != "" {
-		if sessionID := strings.TrimSpace(gjson.Get(raw, "session_id").String()); sessionID != "" {
+		if sessionID := normalizeResponsesWebsocketSessionKey(gjson.Get(raw, "session_id").String()); sessionID != "" {
 			return sessionID
 		}
 	}
-	if sessionID := strings.TrimSpace(req.Header.Get("Session-Id")); sessionID != "" {
+	if sessionID := normalizeResponsesWebsocketSessionKey(req.Header.Get("Session-Id")); sessionID != "" {
 		return sessionID
 	}
-	if sessionID := strings.TrimSpace(req.Header.Get("Session_id")); sessionID != "" {
+	if sessionID := normalizeResponsesWebsocketSessionKey(req.Header.Get("Session_id")); sessionID != "" {
 		return sessionID
 	}
 	return ""
 }
 
-type websocketToolSessionRefCounter struct {
-	mu     sync.Mutex
-	counts map[string]int
-}
-
-func newWebsocketToolSessionRefCounter() *websocketToolSessionRefCounter {
-	return &websocketToolSessionRefCounter{counts: make(map[string]int)}
-}
-
-func (c *websocketToolSessionRefCounter) acquire(sessionKey string) {
+func normalizeResponsesWebsocketSessionKey(sessionKey string) string {
 	sessionKey = strings.TrimSpace(sessionKey)
-	if sessionKey == "" || c == nil {
-		return
+	if len(sessionKey) > websocketToolSessionKeyMaxBytes {
+		return ""
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.counts[sessionKey]++
-}
-
-func (c *websocketToolSessionRefCounter) release(sessionKey string) bool {
-	sessionKey = strings.TrimSpace(sessionKey)
-	if sessionKey == "" || c == nil {
-		return false
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	count := c.counts[sessionKey]
-	if count <= 1 {
-		delete(c.counts, sessionKey)
-		return true
-	}
-	c.counts[sessionKey] = count - 1
-	return false
-}
-
-func retainResponsesWebsocketToolCaches(sessionKey string) {
-	if defaultWebsocketToolSessionRefs == nil {
-		return
-	}
-	defaultWebsocketToolSessionRefs.acquire(sessionKey)
-}
-
-func releaseResponsesWebsocketToolCaches(sessionKey string) {
-	if defaultWebsocketToolSessionRefs == nil {
-		return
-	}
-	if !defaultWebsocketToolSessionRefs.release(sessionKey) {
-		return
-	}
-
-	if defaultWebsocketToolOutputCache != nil {
-		defaultWebsocketToolOutputCache.deleteSession(sessionKey)
-	}
-	if defaultWebsocketToolCallCache != nil {
-		defaultWebsocketToolCallCache.deleteSession(sessionKey)
-	}
-}
-
-func repairResponsesWebsocketToolCalls(sessionKey string, payload []byte) []byte {
-	return repairResponsesWebsocketToolCallsWithCaches(defaultWebsocketToolOutputCache, defaultWebsocketToolCallCache, sessionKey, payload)
+	return sessionKey
 }
 
 func repairResponsesWebsocketToolCallsWithCache(cache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
@@ -227,7 +260,7 @@ func repairResponsesWebsocketToolCallsWithCache(cache *websocketToolOutputCache,
 }
 
 func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	if sessionKey == "" || outputCache == nil || len(payload) == 0 {
 		return payload
 	}
@@ -366,12 +399,8 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 	return string(out), nil
 }
 
-func recordResponsesWebsocketToolCallsFromPayload(sessionKey string, payload []byte) {
-	recordResponsesWebsocketToolCallsFromPayloadWithCache(defaultWebsocketToolCallCache, sessionKey, payload)
-}
-
 func recordResponsesWebsocketToolCallsFromPayloadWithCache(cache *websocketToolOutputCache, sessionKey string, payload []byte) {
-	sessionKey = strings.TrimSpace(sessionKey)
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	if sessionKey == "" || cache == nil || len(payload) == 0 {
 		return
 	}

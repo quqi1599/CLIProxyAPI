@@ -1,10 +1,104 @@
 package chat_completions
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertOpenAIRequestToCodex_LargeMixedArraysPreserveOrder(t *testing.T) {
+	const contentParts = 1024
+	const toolCallCount = 512
+	var input strings.Builder
+	input.WriteString(`{"messages":[{"role":"user","content":[`)
+	for i := 0; i < contentParts; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		switch i % 4 {
+		case 0:
+			input.WriteString(`{"type":"text","text":"text-`)
+			input.WriteString(strconv.Itoa(i))
+			input.WriteString(`"}`)
+		case 1:
+			input.WriteString(`{"type":"image_url","image_url":{"url":"https://example.test/`)
+			input.WriteString(strconv.Itoa(i))
+			input.WriteString(`.png","detail":"high"}}`)
+		case 2:
+			input.WriteString(`{"type":"file","file":{"file_data":"data:text/plain;base64,WA==","filename":"file-`)
+			input.WriteString(strconv.Itoa(i))
+			input.WriteString(`.txt"}}`)
+		case 3:
+			input.WriteString(`{"type":"input_audio","input_audio":{"data":"YXVkaW8=","format":"wav"}}`)
+		}
+	}
+	input.WriteString(`]},{"role":"assistant","content":null,"tool_calls":[`)
+	for i := 0; i < toolCallCount; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		input.WriteString(`{"id":"call-`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`","type":"function","function":{"name":"tool_`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`","arguments":"{\"q\":\"x\"}"}}`)
+	}
+	input.WriteString(`]}`)
+	for i := 0; i < toolCallCount; i++ {
+		input.WriteString(`,{"role":"tool","tool_call_id":"call-`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`","content":"result-`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`"}`)
+	}
+	input.WriteString(`],"tools":[`)
+	for i := 0; i < toolCallCount; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		input.WriteString(`{"type":"function","function":{"name":"tool_`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}`)
+	}
+	input.WriteString(`,{"type":"web_search","x_unknown":{"keep":true}}]}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", []byte(input.String()), true)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 1+toolCallCount*2 {
+		t.Fatalf("input item count = %d, want %d", len(items), 1+toolCallCount*2)
+	}
+	content := items[0].Get("content").Array()
+	if len(content) != contentParts {
+		t.Fatalf("content count = %d, want %d", len(content), contentParts)
+	}
+	if got := content[0].Get("text").String(); got != "text-0" {
+		t.Fatalf("first text = %q", got)
+	}
+	if got := content[1].Get("image_url").String(); got != "https://example.test/1.png" {
+		t.Fatalf("first image = %q", got)
+	}
+	if got := content[2].Get("filename").String(); got != "file-2.txt" {
+		t.Fatalf("first file = %q", got)
+	}
+	if got := content[3].Get("format").String(); got != "wav" {
+		t.Fatalf("first audio format = %q", got)
+	}
+	if got := items[toolCallCount].Get("call_id").String(); got != "call-511" {
+		t.Fatalf("last function call id = %q", got)
+	}
+	if got := items[len(items)-1].Get("output").String(); got != "result-511" {
+		t.Fatalf("last function output = %q", got)
+	}
+	tools := gjson.GetBytes(out, "tools").Array()
+	if len(tools) != toolCallCount+1 {
+		t.Fatalf("tool count = %d, want %d", len(tools), toolCallCount+1)
+	}
+	if !tools[len(tools)-1].Get("x_unknown.keep").Bool() {
+		t.Fatalf("unknown built-in tool field was lost: %s", tools[len(tools)-1].Raw)
+	}
+}
 
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
 // Expects developer msg + user msg + function_call + function_call_output.

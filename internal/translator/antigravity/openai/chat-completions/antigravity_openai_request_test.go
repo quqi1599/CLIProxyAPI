@@ -1,6 +1,8 @@
 package chat_completions
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -52,6 +54,63 @@ func TestConvertOpenAIRequestToAntigravitySkipsEmptyTextPartsWithoutNulls(t *tes
 	}
 	if !assistantParts[0].Get("functionCall").Exists() {
 		t.Fatalf("functionCall missing. Output: %s", result)
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravityPreservesLargePartOrder(t *testing.T) {
+	const partCount = 2048
+	parts := make([]map[string]any, 0, partCount)
+	for index := 0; index < partCount; index++ {
+		parts = append(parts, map[string]any{"type": "text", "text": fmt.Sprintf("part-%04d", index)})
+	}
+	input, err := json.Marshal(map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": parts}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", input, false)
+	outputParts := gjson.GetBytes(result, "request.contents.0.parts").Array()
+	if len(outputParts) != partCount {
+		t.Fatalf("parts length = %d, want %d", len(outputParts), partCount)
+	}
+	for _, index := range []int{0, partCount / 2, partCount - 1} {
+		want := fmt.Sprintf("part-%04d", index)
+		if got := outputParts[index].Get("text").String(); got != want {
+			t.Fatalf("parts[%d] = %q, want %q", index, got, want)
+		}
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravityPreservesToolFieldsAndCategoryOrder(t *testing.T) {
+	input := []byte(`{
+		"messages":[{"role":"user","content":"search"}],
+		"tools":[
+			{"type":"function","function":{"name":"lookup","description":"d","parameters":{"type":"object","x-schema":"keep"},"x-vendor":{"enabled":true},"strict":true}},
+			{"type":"web_search"},
+			{"google_search":{"mode":"dynamic"}},
+			{"code_execution":{"runtime":"go"}},
+			{"url_context":{"scope":"page"}}
+		]
+	}`)
+
+	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", input, false)
+	tools := gjson.GetBytes(result, "request.tools").Array()
+	if len(tools) != 5 {
+		t.Fatalf("tools length = %d, want 5: %s", len(tools), result)
+	}
+	declaration := tools[0].Get("functionDeclarations.0")
+	if declaration.Get("strict").Exists() {
+		t.Fatalf("strict should be removed: %s", declaration.Raw)
+	}
+	if !declaration.Get("x-vendor.enabled").Bool() || declaration.Get("parametersJsonSchema.x-schema").String() != "keep" {
+		t.Fatalf("function declaration fields were not preserved: %s", declaration.Raw)
+	}
+	for index, path := range []string{"googleSearch", "googleSearch.mode", "codeExecution.runtime", "urlContext.scope"} {
+		if !tools[index+1].Get(path).Exists() {
+			t.Fatalf("tools[%d] missing %s: %s", index+1, path, tools[index+1].Raw)
+		}
 	}
 }
 

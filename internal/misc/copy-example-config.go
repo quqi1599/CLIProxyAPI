@@ -8,10 +8,14 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
 )
 
-const configTemplateFallbackURL = "https://raw.githubusercontent.com/caidaoli/CLIProxyAPI/refs/heads/main/config.example.yaml"
+const (
+	configTemplateFallbackURL = "https://raw.githubusercontent.com/caidaoli/CLIProxyAPI/refs/heads/main/config.example.yaml"
+	maxConfigTemplateBytes    = 1 << 20
+)
 
 func CopyConfigTemplate(src, dst string) error {
 	in, err := openConfigTemplate(src)
@@ -23,6 +27,10 @@ func CopyConfigTemplate(src, dst string) error {
 			log.WithError(errClose).Warn("failed to close source config file")
 		}
 	}()
+	data, errRead := httpfetch.ReadBytes(in, maxConfigTemplateBytes)
+	if errRead != nil {
+		return fmt.Errorf("read config template: %w", errRead)
+	}
 
 	if err = os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
@@ -38,7 +46,7 @@ func CopyConfigTemplate(src, dst string) error {
 		}
 	}()
 
-	if _, err = io.Copy(out, in); err != nil {
+	if _, err = out.Write(data); err != nil {
 		return err
 	}
 	return out.Sync()

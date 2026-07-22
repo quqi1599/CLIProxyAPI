@@ -1,6 +1,7 @@
 package signature
 
 import (
+	"bytes"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -335,5 +336,49 @@ func TestSanitizeClaudeMessagesForClaudeUpstream_NormalizesValidThinkingAndDrops
 	}
 	if got := messages[1].Get("role").String(); got != "user" {
 		t.Fatalf("remaining second role = %q, want user", got)
+	}
+}
+
+func TestSanitizeClaudeMessagesForClaudeUpstreamLargeToolHistoryIsImmutable(t *testing.T) {
+	const toolParts = 512
+	var builder strings.Builder
+	builder.Grow(toolParts * 180)
+	builder.WriteString(`{"messages":[{"role":"assistant","content":[`)
+	for index := 0; index < toolParts; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"type":"tool_use","before":1,"signature":"bad","extra_content":{"other":1,"google":{"thought_signature":"bad","keep":true}},"extra_content.google.thought_signature":"literal","after":2}`)
+	}
+	builder.WriteString(`]}],"tail":{"keep":true}}`)
+	input := []byte(builder.String())
+	original := bytes.Clone(input)
+
+	out, report := SanitizeClaudeMessagesForClaudeUpstream(input, "claude-sonnet-4-5")
+
+	if !bytes.Equal(input, original) {
+		t.Fatal("sanitizer mutated caller input")
+	}
+	if report.DroppedSignatures != toolParts {
+		t.Fatalf("DroppedSignatures = %d, want %d", report.DroppedSignatures, toolParts)
+	}
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != toolParts {
+		t.Fatalf("parts = %d, want %d", len(parts), toolParts)
+	}
+	for _, index := range []int{0, len(parts) - 1} {
+		part := parts[index]
+		if part.Get("signature").Exists() || part.Get("extra_content.google.thought_signature").Exists() {
+			t.Fatalf("parts.%d retained signature fields: %s", index, part.Raw)
+		}
+		if !strings.Contains(part.Raw, `"extra_content.google.thought_signature":"literal"`) {
+			t.Fatalf("parts.%d lost dotted unknown field: %s", index, part.Raw)
+		}
+		if strings.Index(part.Raw, `"before"`) > strings.Index(part.Raw, `"extra_content"`) || strings.Index(part.Raw, `"extra_content"`) > strings.Index(part.Raw, `"after"`) {
+			t.Fatalf("parts.%d field order changed: %s", index, part.Raw)
+		}
+	}
+	if !gjson.GetBytes(out, "tail.keep").Bool() {
+		t.Fatal("unknown top-level field was not preserved")
 	}
 }

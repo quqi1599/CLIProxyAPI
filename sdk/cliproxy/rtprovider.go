@@ -44,6 +44,7 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	if transport == nil {
 		return nil
 	}
+	transport.DisableCompression = true
 	p.mu.Lock()
 	p.cache[proxyStr] = transport
 	p.mu.Unlock()

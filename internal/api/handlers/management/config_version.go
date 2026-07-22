@@ -75,6 +75,20 @@ func (h *Handler) readConfigSnapshot() (configSnapshot, error) {
 	return newConfigSnapshot(data, info), nil
 }
 
+// ConfigSnapshotVersion returns the SHA-256 version of the persisted config.
+func (h *Handler) ConfigSnapshotVersion() (string, error) {
+	if h == nil {
+		return "", os.ErrInvalid
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	snap, err := h.readConfigSnapshot()
+	if err != nil {
+		return "", err
+	}
+	return configVersionFromSnapshot(snap), nil
+}
+
 func setConfigSnapshotHeaders(c *gin.Context, snap configSnapshot) {
 	if c == nil || strings.TrimSpace(snap.version) == "" {
 		return

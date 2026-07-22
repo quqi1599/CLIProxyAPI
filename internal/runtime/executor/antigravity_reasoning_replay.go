@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
@@ -22,6 +23,17 @@ type antigravityReasoningReplayScope struct {
 
 func (s antigravityReasoningReplayScope) valid() bool {
 	return strings.TrimSpace(s.modelName) != "" && strings.TrimSpace(s.sessionKey) != ""
+}
+
+func antigravityReplayAmplificationOverride(scope antigravityReasoningReplayScope) internalpayload.AmplificationOverride {
+	if !scope.valid() {
+		return internalpayload.AmplificationOverride{}
+	}
+	return internalpayload.AmplificationOverride{
+		PolicyID:          "antigravity.reasoning_replay",
+		MaxExpansionBytes: (1 << 20) + internalpayload.DefaultMaxExpansionBytes,
+		MaxExpansionRatio: internalpayload.DefaultMaxExpansionRatio,
+	}
 }
 
 func antigravityReasoningReplayScopeFromPayload(modelName string, payload []byte) antigravityReasoningReplayScope {
@@ -321,45 +333,6 @@ func antigravityFunctionCallPartLocation(payload []byte, callID string) (content
 	return -1, -1, false
 }
 
-func insertAntigravityModelFunctionCallBeforeContent(payload []byte, beforeIndex int, name, callID, thoughtSig string, args gjson.Result) ([]byte, bool) {
-	contents := gjson.GetBytes(payload, "request.contents")
-	if !contents.IsArray() {
-		return payload, false
-	}
-	arr := contents.Array()
-	if beforeIndex < 0 || beforeIndex > len(arr) {
-		return payload, false
-	}
-	fc := map[string]any{"name": name}
-	if callID != "" {
-		fc["id"] = callID
-	}
-	if args.Exists() {
-		fc["args"] = args.Value()
-	}
-	part := map[string]any{"functionCall": fc}
-	if thoughtSig != "" {
-		part["thoughtSignature"] = thoughtSig
-	}
-	newContent := map[string]any{
-		"role":  "model",
-		"parts": []any{part},
-	}
-	newArr := make([]any, 0, len(arr)+1)
-	for i := 0; i < beforeIndex; i++ {
-		newArr = append(newArr, arr[i].Value())
-	}
-	newArr = append(newArr, newContent)
-	for i := beforeIndex; i < len(arr); i++ {
-		newArr = append(newArr, arr[i].Value())
-	}
-	updated, err := sjson.SetBytes(payload, "request.contents", newArr)
-	if err != nil {
-		return payload, false
-	}
-	return updated, true
-}
-
 func antigravityRequestHasThoughtSignatureAt(payload []byte, itemResult gjson.Result) bool {
 	ci := int(itemResult.Get("contentIndex").Int())
 	pi := int(itemResult.Get("partIndex").Int())
@@ -387,165 +360,266 @@ func antigravityExistingReplayPartPath(payload []byte, contentIndex int, partInd
 	return fmt.Sprintf("%s.%d", partsPath, partIndex), true
 }
 
-func antigravityReplayPartWritePath(payload []byte, contentIndex int, partIndex int) string {
-	if path, ok := antigravityExistingReplayPartPath(payload, contentIndex, partIndex); ok {
-		return path
-	}
-	partsPath := fmt.Sprintf("request.contents.%d.parts", contentIndex)
-	if gjson.GetBytes(payload, partsPath).IsArray() {
-		return partsPath + ".-1"
-	}
-	return partsPath + ".0"
-}
-
 func insertAntigravityReasoningReplayItems(payload []byte, items [][]byte) ([]byte, bool) {
-	out := payload
-	changed := false
+	document, ok := newAntigravityReplayDocument(payload)
+	if !ok {
+		return payload, false
+	}
 	for _, item := range items {
 		itemResult := gjson.ParseBytes(item)
 		switch strings.TrimSpace(itemResult.Get("type").String()) {
 		case "thought_signature":
-			ci := antigravityReasoningReplayResolveContentIndex(out, int(itemResult.Get("contentIndex").Int()))
-			pi := int(itemResult.Get("partIndex").Int())
 			sig := strings.TrimSpace(itemResult.Get("thoughtSignature").String())
-			if sig == "" {
-				continue
-			}
-			partPath, exists := antigravityExistingReplayPartPath(out, ci, pi)
-			if exists {
-				path := partPath + ".thoughtSignature"
-				if strings.TrimSpace(gjson.GetBytes(out, path).String()) != "" {
-					continue
-				}
-				updated, err := sjson.SetBytes(out, path, sig)
-				if err != nil {
-					continue
-				}
-				out = updated
-				changed = true
-				continue
-			}
-			updated, err := appendAntigravityReplayPart(out, ci, map[string]string{"thoughtSignature": sig})
-			if err != nil {
-				continue
-			}
-			out = updated
-			changed = true
+			document.setThoughtSignature(int(itemResult.Get("contentIndex").Int()), int(itemResult.Get("partIndex").Int()), sig)
 		case "function_call_part":
-			updated, ok := mergeAntigravityFunctionCallPartReplay(out, itemResult)
-			if ok {
-				out = updated
-				changed = true
-			}
+			document.mergeFunctionCallPart(itemResult)
 		}
 	}
-	return out, changed
+	return document.bytes()
 }
 
-func appendAntigravityReplayPart(payload []byte, contentIndex int, part any) ([]byte, error) {
+type antigravityReplayContent struct {
+	raw          []byte
+	parts        [][]byte
+	partsChanged bool
+}
+
+type antigravityReplayDocument struct {
+	payload  []byte
+	contents []*antigravityReplayContent
+	changed  bool
+}
+
+func newAntigravityReplayDocument(payload []byte) (*antigravityReplayDocument, bool) {
+	contents := gjson.GetBytes(payload, "request.contents")
+	if !contents.IsArray() {
+		return nil, false
+	}
+	document := &antigravityReplayDocument{
+		payload:  payload,
+		contents: make([]*antigravityReplayContent, 0, len(contents.Array())),
+	}
+	for _, content := range contents.Array() {
+		parsed := &antigravityReplayContent{raw: []byte(content.Raw)}
+		if parts := content.Get("parts"); parts.IsArray() {
+			parsed.parts = make([][]byte, 0, len(parts.Array()))
+			for _, part := range parts.Array() {
+				parsed.parts = append(parsed.parts, []byte(part.Raw))
+			}
+		}
+		document.contents = append(document.contents, parsed)
+	}
+	return document, true
+}
+
+func (document *antigravityReplayDocument) resolveContentIndex(cached int) int {
+	if cached >= 0 && cached < len(document.contents) {
+		return cached
+	}
+	for i := len(document.contents) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(document.contents[i].raw, "role").String()), "model") {
+			return i
+		}
+	}
+	if len(document.contents) == 0 {
+		return 0
+	}
+	return len(document.contents) - 1
+}
+
+func (document *antigravityReplayDocument) existingPart(contentIndex, partIndex int) ([]byte, bool) {
+	if contentIndex < 0 || contentIndex >= len(document.contents) || partIndex < 0 {
+		return nil, false
+	}
+	parts := document.contents[contentIndex].parts
+	if partIndex >= len(parts) || gjson.ParseBytes(parts[partIndex]).Type == gjson.Null {
+		return nil, false
+	}
+	return parts[partIndex], true
+}
+
+func (document *antigravityReplayDocument) updatePart(contentIndex, partIndex int, part []byte) bool {
+	if _, ok := document.existingPart(contentIndex, partIndex); !ok {
+		return false
+	}
+	document.contents[contentIndex].parts[partIndex] = part
+	document.contents[contentIndex].partsChanged = true
+	document.changed = true
+	return true
+}
+
+func (document *antigravityReplayDocument) appendPart(contentIndex int, part []byte) {
 	if contentIndex < 0 {
 		contentIndex = 0
 	}
-	partRaw, errMarshal := json.Marshal(part)
-	if errMarshal != nil {
-		return payload, errMarshal
+	for len(document.contents) <= contentIndex {
+		document.contents = append(document.contents, &antigravityReplayContent{raw: []byte(`{}`)})
 	}
-	partsPath := fmt.Sprintf("request.contents.%d.parts", contentIndex)
-	var parts []json.RawMessage
-	if existing := gjson.GetBytes(payload, partsPath); existing.IsArray() {
-		if errUnmarshal := json.Unmarshal([]byte(existing.Raw), &parts); errUnmarshal != nil {
-			return payload, errUnmarshal
-		}
+	content := document.contents[contentIndex]
+	if !gjson.ParseBytes(content.raw).IsObject() {
+		content.raw = []byte(`{}`)
 	}
-	parts = append(parts, json.RawMessage(partRaw))
-	partsRaw, errMarshalParts := json.Marshal(parts)
-	if errMarshalParts != nil {
-		return payload, errMarshalParts
-	}
-	return sjson.SetRawBytes(payload, partsPath, partsRaw)
+	content.parts = append(content.parts, part)
+	content.partsChanged = true
+	document.changed = true
 }
 
-func mergeAntigravityFunctionCallPartReplay(payload []byte, itemResult gjson.Result) ([]byte, bool) {
+func (document *antigravityReplayDocument) setThoughtSignature(contentIndex, partIndex int, signature string) {
+	if signature == "" {
+		return
+	}
+	contentIndex = document.resolveContentIndex(contentIndex)
+	if part, ok := document.existingPart(contentIndex, partIndex); ok {
+		if strings.TrimSpace(gjson.GetBytes(part, "thoughtSignature").String()) != "" {
+			return
+		}
+		updated, errSet := sjson.SetBytes(part, "thoughtSignature", signature)
+		if errSet == nil {
+			document.updatePart(contentIndex, partIndex, updated)
+		}
+		return
+	}
+	part, errMarshal := json.Marshal(map[string]string{"thoughtSignature": signature})
+	if errMarshal == nil {
+		document.appendPart(contentIndex, part)
+	}
+}
+
+func (document *antigravityReplayDocument) functionCallPartLocation(callID string) (int, int, bool) {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return -1, -1, false
+	}
+	for contentIndex, content := range document.contents {
+		for partIndex, part := range content.parts {
+			functionCall := gjson.GetBytes(part, "functionCall")
+			if functionCall.Exists() && strings.TrimSpace(functionCall.Get("id").String()) == callID {
+				return contentIndex, partIndex, true
+			}
+		}
+	}
+	return -1, -1, false
+}
+
+func (document *antigravityReplayDocument) functionResponseContentIndex(callID string) (int, bool) {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return -1, false
+	}
+	for contentIndex, content := range document.contents {
+		for _, part := range content.parts {
+			functionResponse := gjson.GetBytes(part, "functionResponse")
+			if functionResponse.Exists() && strings.TrimSpace(functionResponse.Get("id").String()) == callID {
+				return contentIndex, true
+			}
+		}
+	}
+	return -1, false
+}
+
+func (document *antigravityReplayDocument) insertContent(index int, raw []byte) bool {
+	if index < 0 || index > len(document.contents) {
+		return false
+	}
+	document.contents = append(document.contents, nil)
+	copy(document.contents[index+1:], document.contents[index:])
+	document.contents[index] = &antigravityReplayContent{raw: raw}
+	document.changed = true
+	return true
+}
+
+func (document *antigravityReplayDocument) mergeFunctionCallPart(itemResult gjson.Result) bool {
 	name := strings.TrimSpace(itemResult.Get("name").String())
 	args := itemResult.Get("args")
 	callID := strings.TrimSpace(itemResult.Get("call_id").String())
 	sig := strings.TrimSpace(itemResult.Get("thoughtSignature").String())
 	if name == "" || !args.Exists() {
-		return payload, false
+		return false
 	}
 	if callID != "" {
-		if ci, pi, exists := antigravityFunctionCallPartLocation(payload, callID); exists {
+		if contentIndex, partIndex, exists := document.functionCallPartLocation(callID); exists {
 			if sig != "" {
-				pathSig := fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", ci, pi)
-				if strings.TrimSpace(gjson.GetBytes(payload, pathSig).String()) == "" {
-					if updated, err := sjson.SetBytes(payload, pathSig, sig); err == nil {
-						return updated, true
-					}
+				part, _ := document.existingPart(contentIndex, partIndex)
+				if strings.TrimSpace(gjson.GetBytes(part, "thoughtSignature").String()) == "" {
+					updated, errSet := sjson.SetBytes(part, "thoughtSignature", sig)
+					return errSet == nil && document.updatePart(contentIndex, partIndex, updated)
 				}
 			}
-			return payload, false
+			return false
 		}
-		if frIndex, ok := antigravityFunctionResponseContentIndex(payload, callID); ok {
-			return insertAntigravityModelFunctionCallBeforeContent(payload, frIndex, name, callID, sig, args)
+		if responseIndex, exists := document.functionResponseContentIndex(callID); exists {
+			functionCall := map[string]any{"name": name, "id": callID, "args": args.Value()}
+			part := map[string]any{"functionCall": functionCall}
+			if sig != "" {
+				part["thoughtSignature"] = sig
+			}
+			content, errMarshal := json.Marshal(map[string]any{"role": "model", "parts": []any{part}})
+			return errMarshal == nil && document.insertContent(responseIndex, content)
 		}
 	}
 
-	ci := antigravityReasoningReplayResolveContentIndex(payload, int(itemResult.Get("contentIndex").Int()))
-	pi := int(itemResult.Get("partIndex").Int())
-	out := payload
-	changed := false
-
-	partPath, exists := antigravityExistingReplayPartPath(out, ci, pi)
+	contentIndex := document.resolveContentIndex(int(itemResult.Get("contentIndex").Int()))
+	partIndex := int(itemResult.Get("partIndex").Int())
+	part, exists := document.existingPart(contentIndex, partIndex)
+	functionCall := map[string]any{"name": name}
+	if callID != "" {
+		functionCall["id"] = callID
+	}
+	functionCall["args"] = args.Value()
 	if !exists {
-		fc := map[string]any{"name": name}
-		if callID != "" {
-			fc["id"] = callID
-		}
-		if args.Type == gjson.String {
-			fc["args"] = args.String()
-		} else {
-			var parsed any
-			if json.Unmarshal([]byte(args.Raw), &parsed) == nil {
-				fc["args"] = parsed
-			}
-		}
-		part := map[string]any{"functionCall": fc}
+		newPart := map[string]any{"functionCall": functionCall}
 		if sig != "" {
-			part["thoughtSignature"] = sig
+			newPart["thoughtSignature"] = sig
 		}
-		if updated, err := sjson.SetBytes(out, antigravityReplayPartWritePath(out, ci, pi), part); err == nil {
-			return updated, true
+		partRaw, errMarshal := json.Marshal(newPart)
+		if errMarshal != nil {
+			return false
 		}
-		return payload, false
+		document.appendPart(contentIndex, partRaw)
+		return true
 	}
 
-	pathSig := partPath + ".thoughtSignature"
-	if sig != "" && strings.TrimSpace(gjson.GetBytes(out, pathSig).String()) == "" {
-		if updated, err := sjson.SetBytes(out, pathSig, sig); err == nil {
-			out = updated
+	updatedPart := part
+	changed := false
+	if sig != "" && strings.TrimSpace(gjson.GetBytes(updatedPart, "thoughtSignature").String()) == "" {
+		if updated, errSet := sjson.SetBytes(updatedPart, "thoughtSignature", sig); errSet == nil {
+			updatedPart = updated
 			changed = true
 		}
 	}
-	pathFC := partPath + ".functionCall"
-	if !gjson.GetBytes(out, pathFC).Exists() {
-		fc := map[string]any{"name": name}
-		if callID != "" {
-			fc["id"] = callID
+	if !gjson.GetBytes(updatedPart, "functionCall").Exists() {
+		if updated, errSet := sjson.SetBytes(updatedPart, "functionCall", functionCall); errSet == nil {
+			updatedPart = updated
+			changed = true
 		}
-		if args.Type == gjson.String {
-			fc["args"] = args.String()
-		} else {
-			var parsed any
-			if json.Unmarshal([]byte(args.Raw), &parsed) == nil {
-				fc["args"] = parsed
+	}
+	return changed && document.updatePart(contentIndex, partIndex, updatedPart)
+}
+
+func (document *antigravityReplayDocument) bytes() ([]byte, bool) {
+	if document == nil {
+		return nil, false
+	}
+	if !document.changed {
+		return document.payload, false
+	}
+	contents := make([][]byte, len(document.contents))
+	for i, content := range document.contents {
+		contentRaw := content.raw
+		if content.partsChanged {
+			var errSet error
+			contentRaw, errSet = sjson.SetRawBytes(contentRaw, "parts", internalpayload.BuildRaw(content.parts))
+			if errSet != nil {
+				return document.payload, false
 			}
 		}
-		if updated, err := sjson.SetBytes(out, pathFC, fc); err == nil {
-			out = updated
-			changed = true
-		}
+		contents[i] = contentRaw
 	}
-	return out, changed
+	out, errSet := sjson.SetRawBytes(document.payload, "request.contents", internalpayload.BuildRaw(contents))
+	if errSet != nil {
+		return document.payload, false
+	}
+	return out, true
 }
 
 type antigravityReasoningReplayAccumulator struct {

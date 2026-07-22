@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -222,16 +223,18 @@ func TestNormalizeCodexStatelessPayloadDropsPersistedItemIDs(t *testing.T) {
 	}
 }
 
-func TestNewCodexStatusErrPreservesUnclassifiedErrors(t *testing.T) {
-	body := []byte(`{"error":{"message":"documentation mentions too many tokens, but this is a billing configuration failure","type":"server_error","code":"billing_config_error"}}`)
+func TestNewCodexStatusErrSummarizesUnclassifiedErrors(t *testing.T) {
+	const secret = "codex-unclassified-error-sentinel"
+	body := []byte(`{"error":{"message":"documentation mentions too many tokens, but this is a billing configuration failure ` + secret + `","type":"server_error","code":"billing_config_error"}}`)
 
 	err := newCodexStatusErr(http.StatusBadGateway, body)
 
 	if got := err.StatusCode(); got != http.StatusBadGateway {
 		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
 	}
-	if got := err.Error(); got != string(body) {
-		t.Fatalf("error body = %s, want original %s", got, string(body))
+	got := err.Error()
+	if strings.Contains(got, secret) || strings.Contains(got, "billing_config_error") || !strings.Contains(got, "[BODY METADATA v1]") || !strings.Contains(got, "sha256") {
+		t.Fatalf("error body = %s, want metadata without upstream body", got)
 	}
 }
 

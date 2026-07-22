@@ -12,7 +12,9 @@ type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
 type RequestGuardsConfig = internalconfig.RequestGuardsConfig
+type AmplificationGuardConfig = internalconfig.AmplificationGuardConfig
 type GlobalAdmissionConfig = internalconfig.GlobalAdmissionConfig
+type PayloadBodyLimitConfig = internalconfig.PayloadBodyLimitConfig
 type MiniMaxHighspeedNarrativeGuardConfig = internalconfig.MiniMaxHighspeedNarrativeGuardConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement

@@ -3,7 +3,6 @@ package management
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,17 +11,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	latestReleaseURL       = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
 	latestReleaseUserAgent = "CLIProxyAPI"
+	maxLatestReleaseBytes  = 64 << 10
 )
 
 func (h *Handler) GetConfig(c *gin.Context) {
@@ -84,20 +84,19 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request_failed", "message": err.Error()})
 		return
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close latest version response body")
-		}
-	}()
+	body, errRead := httpfetch.ReadResponseBytes(resp, maxLatestReleaseBytes)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "unexpected_status", "message": fmt.Sprintf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "unexpected_status", "message": fmt.Sprintf("status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body))})
+		return
+	}
+	if errRead != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "decode_failed", "message": errRead.Error()})
 		return
 	}
 
 	var info releaseInfo
-	if errDecode := json.NewDecoder(resp.Body).Decode(&info); errDecode != nil {
+	if errDecode := json.Unmarshal(body, &info); errDecode != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "decode_failed", "message": errDecode.Error()})
 		return
 	}
@@ -132,9 +131,9 @@ func WriteConfig(path string, data []byte) error {
 }
 
 func (h *Handler) PutConfigYAML(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": "cannot read request body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var cfg config.Config
@@ -242,7 +241,11 @@ func (h *Handler) PutLogsMaxTotalSizeMB(c *gin.Context) {
 	var body struct {
 		Value *int `json:"value"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
@@ -262,7 +265,11 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 	var body struct {
 		Value *int `json:"value"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
@@ -282,7 +289,11 @@ func (h *Handler) PutUsageRetentionDays(c *gin.Context) {
 	var body struct {
 		Value *int `json:"value"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
@@ -371,7 +382,11 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	var body struct {
 		Value *string `json:"value"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}

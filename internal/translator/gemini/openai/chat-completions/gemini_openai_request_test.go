@@ -1,10 +1,43 @@
 package chat_completions
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertOpenAIRequestToGemini_LargeContentArrayStaysOrdered(t *testing.T) {
+	const partCount = 2048
+	var input strings.Builder
+	input.WriteString(`{"messages":[{"role":"user","content":[`)
+	for index := 0; index < partCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"type":"text","text":"part-%d"}`, index)
+	}
+	input.WriteString(`]}]}`)
+
+	output := ConvertOpenAIRequestToGemini("gemini-test", []byte(input.String()), false)
+	parts := gjson.GetBytes(output, "contents.0.parts").Array()
+	if len(parts) != partCount {
+		t.Fatalf("parts length = %d, want %d", len(parts), partCount)
+	}
+	if got := parts[len(parts)-1].Get("text").String(); got != "part-2047" {
+		t.Fatalf("last part = %q, want part-2047", got)
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_PreservesUnknownToolFieldsAndOrder(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"search","description":"find","x-vendor":{"keep":true},"parameters":{"type":"object"}}}]}`)
+	output := ConvertOpenAIRequestToGemini("gemini-test", input, false)
+	tool := gjson.GetBytes(output, "tools.0.functionDeclarations.0").Raw
+	if !strings.HasPrefix(tool, `{"name":"search","description":"find","x-vendor":{"keep":true},"parametersJsonSchema":`) {
+		t.Fatalf("tool field order or unknown field changed: %s", tool)
+	}
+}
 
 func TestConvertOpenAIRequestToGemini_StripsTrailingAssistantPrefill(t *testing.T) {
 	inputJSON := `{

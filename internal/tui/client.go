@@ -9,7 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 )
+
+const maxManagementResponseBytes = 16 << 20
 
 // Client wraps HTTP calls to the management API.
 type Client struct {
@@ -50,8 +54,7 @@ func (c *Client) doRequest(method, path string, body io.Reader) ([]byte, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := httpfetch.ReadResponseBytes(resp, maxManagementResponseBytes)
 	if err != nil {
 		return nil, resp.StatusCode, err
 	}

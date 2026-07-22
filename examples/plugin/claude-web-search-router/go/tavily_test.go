@@ -192,6 +192,22 @@ func TestRunTavilyClaudeJSONWithMock(t *testing.T) {
 	}
 }
 
+func TestTavilySearchErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "tavily-error-body-sentinel"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"` + secret + `"}`))
+	}))
+	defer server.Close()
+
+	client := newTavilyClientWithOptions([]string{"key"}, server.Client(), server.URL)
+	_, _, err := client.search(context.Background(), "query", 1)
+	if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":`) || !strings.Contains(err.Error(), `"content_type":"application/json"`) {
+		t.Fatalf("unsafe Tavily error: %v", err)
+	}
+}
+
 func TestExecuteStreamRPCWithMockTavily(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"answer":"rpc-ok","results":[]}`))

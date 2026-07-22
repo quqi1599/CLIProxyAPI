@@ -11,6 +11,7 @@ import (
 	"context"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -361,9 +362,10 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 
 	hasToolCall := false
 	webSearchSeen := make(map[string]struct{})
+	contentBlocks := make([][]byte, 0)
 
 	if output := responseData.Get("output"); output.Exists() && output.IsArray() {
-		output.ForEach(func(_, item gjson.Result) bool {
+		for _, item := range output.Array() {
 			switch item.Get("type").String() {
 			case "reasoning":
 				thinkingBuilder := strings.Builder{}
@@ -404,33 +406,32 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					if signature != "" {
 						block, _ = sjson.SetBytes(block, "signature", signature)
 					}
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+					contentBlocks = append(contentBlocks, block)
 				}
 			case "message":
 				if content := item.Get("content"); content.Exists() {
 					if content.IsArray() {
-						content.ForEach(func(_, part gjson.Result) bool {
+						for _, part := range content.Array() {
 							if part.Get("type").String() == "output_text" {
 								text := part.Get("text").String()
 								if text != "" {
 									block := []byte(`{"type":"text","text":""}`)
 									block, _ = sjson.SetBytes(block, "text", text)
-									out, _ = sjson.SetRawBytes(out, "content.-1", block)
+									contentBlocks = append(contentBlocks, block)
 								}
 							}
-							return true
-						})
+						}
 					} else {
 						text := content.String()
 						if text != "" {
 							block := []byte(`{"type":"text","text":""}`)
 							block, _ = sjson.SetBytes(block, "text", text)
-							out, _ = sjson.SetRawBytes(out, "content.-1", block)
+							contentBlocks = append(contentBlocks, block)
 						}
 					}
 				}
 			case "web_search_call":
-				out = appendCodexWebSearchNonStreamContent(out, item, webSearchSeen)
+				contentBlocks = append(contentBlocks, codexWebSearchNonStreamBlocks(item, webSearchSeen)...)
 			case "function_call":
 				hasToolCall = true
 				name := item.Get("name").String()
@@ -449,10 +450,12 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					}
 				}
 				toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", []byte(inputRaw))
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolBlock)
+				contentBlocks = append(contentBlocks, toolBlock)
 			}
-			return true
-		})
+		}
+	}
+	if len(contentBlocks) > 0 {
+		out, _ = sjson.SetRawBytes(out, "content", internalpayload.BuildRaw(contentBlocks))
 	}
 
 	out, _ = sjson.SetBytes(out, "stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), hasToolCall))

@@ -1,10 +1,34 @@
 package claude
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertClaudeRequestToGemini_LargeToolResultImagesStayOrdered(t *testing.T) {
+	const imageCount = 1024
+	var input strings.Builder
+	input.WriteString(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"render-call-1","name":"render","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"render-call-1","content":[{"type":"text","text":"done"}`)
+	for index := 0; index < imageCount; index++ {
+		fmt.Fprintf(&input, `,{"type":"image","source":{"type":"base64","media_type":"image/png","data":"image-%d"}}`, index)
+	}
+	input.WriteString(`]}]}]}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-test", []byte(input.String()), false)
+	parts := gjson.GetBytes(output, "contents.1.parts").Array()
+	if len(parts) != imageCount+1 {
+		t.Fatalf("parts length = %d, want %d", len(parts), imageCount+1)
+	}
+	if got := parts[0].Get("functionResponse.response.result.text").String(); got != "done" {
+		t.Fatalf("function response = %q, want done", got)
+	}
+	if got := parts[len(parts)-1].Get("inline_data.data").String(); got != "image-1023" {
+		t.Fatalf("last image = %q, want image-1023", got)
+	}
+}
 
 func TestConvertClaudeRequestToGemini_ToolChoice_SpecificTool(t *testing.T) {
 	inputJSON := []byte(`{

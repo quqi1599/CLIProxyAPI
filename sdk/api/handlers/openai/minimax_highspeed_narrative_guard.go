@@ -5,15 +5,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -317,22 +317,39 @@ func capMiniMaxHighspeedNarrativeOutput(rawJSON []byte, maxOutputTokens int) ([]
 	if maxOutputTokens <= 0 {
 		maxOutputTokens = defaultMiniMaxHighspeedNarrativeMaxOutputTokens
 	}
-	updated := rawJSON
-	capped := false
+	replacement := strconv.Itoa(maxOutputTokens)
+	type edit struct {
+		start int
+		end   int
+	}
+	edits := make([]edit, 0, 3)
 	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-		tokenValue := gjson.GetBytes(updated, path)
+		tokenValue := gjson.GetBytes(rawJSON, path)
 		if !tokenValue.Exists() || tokenValue.Type != gjson.Number || tokenValue.Int() <= int64(maxOutputTokens) {
 			continue
 		}
-		next, err := sjson.SetBytes(updated, path, maxOutputTokens)
-		if err != nil {
-			log.WithError(err).WithField("path", path).Warn("minimax highspeed narrative guard failed to cap output tokens")
+		if tokenValue.Index < 0 || tokenValue.Index+len(tokenValue.Raw) > len(rawJSON) {
 			continue
 		}
-		updated = next
-		capped = true
+		edits = append(edits, edit{start: tokenValue.Index, end: tokenValue.Index + len(tokenValue.Raw)})
 	}
-	return updated, capped
+	if len(edits) == 0 {
+		return rawJSON, false
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	size := len(rawJSON)
+	for _, item := range edits {
+		size += len(replacement) - (item.end - item.start)
+	}
+	updated := make([]byte, 0, size)
+	cursor := 0
+	for _, item := range edits {
+		updated = append(updated, rawJSON[cursor:item.start]...)
+		updated = append(updated, replacement...)
+		cursor = item.end
+	}
+	updated = append(updated, rawJSON[cursor:]...)
+	return updated, true
 }
 
 func writeMiniMaxHighspeedNarrativeGuardQueueFull(c *gin.Context, decision miniMaxHighspeedNarrativeGuardDecision) {

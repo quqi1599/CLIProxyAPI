@@ -4,15 +4,17 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -20,7 +22,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -31,9 +32,6 @@ const (
 
 	// glAPIVersion is the API version used for Gemini requests.
 	glAPIVersion = "v1beta"
-
-	// streamScannerBuffer is the buffer size for SSE stream scanning.
-	streamScannerBuffer = 52_428_800
 )
 
 // GeminiExecutor is a stateless executor for the official Gemini API using API keys.
@@ -104,6 +102,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey := geminiAPIKey(auth)
@@ -120,8 +119,10 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.gemini", from, to, baseModel, originalPayload, req.Payload, false, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return resp, err
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -149,6 +150,14 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.gemini",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return resp, err
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -184,29 +193,22 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("gemini executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return resp, err
-	}
-	data, err := io.ReadAll(httpResp.Body)
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+		return resp, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}
 	return resp, nil
 }
 
@@ -215,6 +217,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey := geminiAPIKey(auth)
@@ -230,8 +233,10 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.gemini.stream", from, to, baseModel, originalPayload, req.Payload, true, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return nil, err
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -255,9 +260,19 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.gemini.stream",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return nil, err
+	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		cancelRequest()
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -283,77 +298,96 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(requestCtx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cancelRequest()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		if errRead != nil {
+			cancelRequest()
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, errRead
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("gemini executor: close response body error: %v", errClose)
-		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		cancelRequest()
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
 		return nil, err
 	}
+	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
+	if errStream != nil {
+		cancelRequest()
+		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+		return nil, errStream
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "gemini executor")
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("gemini executor: close response body error: %v", errClose)
-			}
-		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, streamScannerBuffer)
+		defer closeResponse()
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			filtered := helps.FilterSSEUsageMetadata(line)
-			payload := helps.JSONPayload(filtered)
-			if len(payload) == 0 {
-				continue
+		cleanEOF := false
+		for {
+			event, errRead := sseStream.ReadEvent()
+			if errRead != nil {
+				if requestCtx.Err() != nil {
+					return
+				}
+				if errors.Is(errRead, io.EOF) {
+					cleanEOF = true
+					break
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+				reporter.PublishFailure(ctx, errRead)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case <-requestCtx.Done():
+				}
+				return
 			}
-			if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
-				reporter.Publish(ctx, detail)
+			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				filtered := helps.FilterSSEUsageMetadata(line)
+				payload := helps.JSONPayload(filtered)
+				if len(payload) == 0 {
+					continue
+				}
+				if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
+					reporter.Publish(ctx, detail)
+				}
+				lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, internalpayload.CloneBytes(payload), &param)
+				for i := range lines {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+					case <-requestCtx.Done():
+						return
+					}
+				}
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param)
+		}
+		if cleanEOF {
+			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 			for i := range lines {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-				case <-ctx.Done():
+				case <-requestCtx.Done():
 					return
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
-		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
 }
 
 // CountTokens counts tokens for the given request using the Gemini API.
 func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey := geminiAPIKey(auth)
@@ -361,9 +395,12 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("gemini")
-	translatedReq := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translatedReq, err := helps.TranslateRequestGuarded(ctx, "legacy.translate.gemini.count", from, to, baseModel, req.Payload, false, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
-	translatedReq, err := thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -374,6 +411,14 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.gemini.count",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(translatedReq)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "countTokens")
@@ -413,14 +458,9 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			helps.LogWithRequestID(ctx).Errorf("response body close error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
@@ -428,12 +468,12 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", resp.StatusCode, helps.SummarizeErrorBody(resp.Header.Get("Content-Type"), data))
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(data)}
+		return cliproxyexecutor.Response{}, newUpstreamStatusErr(resp.StatusCode, resp.Header, resp.Header.Get("Content-Type"), data)
 	}
 
 	count := gjson.GetBytes(data, "totalTokens").Int()
 	translated := sdktranslator.TranslateTokenCount(respCtx, to, responseFormat, count, data)
-	return cliproxyexecutor.Response{Payload: translated, Headers: resp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: translated, Headers: decodedResponseHeaders(resp.Header)}, nil
 }
 
 // Refresh refreshes the authentication credentials (no-op for Gemini API key).
@@ -520,16 +560,17 @@ func fixGeminiImageAspectRatio(modelName string, rawJSON []byte) []byte {
 					emptyImageBase64ed, _ := util.CreateWhiteImageBase64(aspectRatioResult.String())
 					emptyImagePart := []byte(`{"inlineData":{"mime_type":"image/png","data":""}}`)
 					emptyImagePart, _ = sjson.SetBytes(emptyImagePart, "inlineData.data", emptyImageBase64ed)
-					newPartsJson := []byte(`[]`)
-					newPartsJson, _ = sjson.SetRawBytes(newPartsJson, "-1", []byte(`{"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear."}`))
-					newPartsJson, _ = sjson.SetRawBytes(newPartsJson, "-1", emptyImagePart)
-
 					parts := contentArray[0].Get("parts").Array()
-					for j := 0; j < len(parts); j++ {
-						newPartsJson, _ = sjson.SetRawBytes(newPartsJson, "-1", []byte(parts[j].Raw))
+					newParts := make([][]byte, 0, len(parts)+2)
+					newParts = append(newParts,
+						[]byte(`{"text": "Based on the following requirements, create an image within the uploaded picture. The new content *MUST* completely cover the entire area of the original picture, maintaining its exact proportions, and *NO* blank areas should appear."}`),
+						emptyImagePart,
+					)
+					for j := range parts {
+						newParts = append(newParts, []byte(parts[j].Raw))
 					}
 
-					rawJSON, _ = sjson.SetRawBytes(rawJSON, "contents.0.parts", newPartsJson)
+					rawJSON, _ = sjson.SetRawBytes(rawJSON, "contents.0.parts", internalpayload.BuildRaw(newParts))
 					rawJSON, _ = sjson.SetRawBytes(rawJSON, "generationConfig.responseModalities", []byte(`["IMAGE", "TEXT"]`))
 				}
 			}

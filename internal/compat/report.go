@@ -17,6 +17,7 @@ type ReportPolicy struct {
 	RemovalCondition string            `json:"removal_condition"`
 	Lifecycle        LifecycleMetadata `json:"lifecycle"`
 	MutatedFields    []string          `json:"mutated_fields,omitempty"`
+	DowngradeIDs     []string          `json:"downgrade_ids,omitempty"`
 }
 
 // Report returns an owned, payload-free policy inventory.
@@ -34,6 +35,7 @@ func (registry *Registry) Report() Report {
 			RemovalCondition: policies[i].RemovalCondition,
 			Lifecycle:        policies[i].Lifecycle,
 			MutatedFields:    policies[i].MutatedFields,
+			DowngradeIDs:     policies[i].DowngradeIDs,
 		}
 	}
 	return report

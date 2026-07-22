@@ -14,13 +14,26 @@ if ! command -v go >/dev/null 2>&1; then
     bash -c 'mkdir -p "$HOME" && git config --global --add safe.directory /workspace && .ci/ci.sh'
 fi
 
-unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+go_files=()
+while IFS= read -r -d '' file; do
+  if [[ -f $file ]]; then
+    go_files+=("$file")
+  fi
+done < <(git ls-files -z -co --exclude-standard -- '*.go')
+
+unformatted=
+if ((${#go_files[@]} > 0)); then
+  unformatted=$(gofmt -l "${go_files[@]}")
+fi
 if [[ -n $unformatted ]]; then
   echo "gofmt required for:" >&2
   echo "$unformatted" >&2
   exit 1
 fi
 
+go run ./cmd/payload-growth -test=false ./...
+bash .ci/payload-clone-scan.sh
+bash .ci/verify-production-image-test.sh
 go test ./internal/payload
 go test ./...
 go vet ./...

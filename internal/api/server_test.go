@@ -15,6 +15,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -30,6 +31,14 @@ type codexAlphaSearchTestExecutor struct {
 	body         []byte
 	authIDs      []string
 	responseBody io.Reader
+}
+
+type requestTooLargeAccessProvider struct{}
+
+func (requestTooLargeAccessProvider) Identifier() string { return "request-too-large" }
+
+func (requestTooLargeAccessProvider) Authenticate(context.Context, *http.Request) (*sdkaccess.Result, *sdkaccess.AuthError) {
+	return nil, sdkaccess.NewRequestTooLargeAuthError(nil)
 }
 
 func (e *codexAlphaSearchTestExecutor) Identifier() string { return "codex" }
@@ -158,6 +167,36 @@ func TestCodexAlphaSearchRejectsOversizedRequest(t *testing.T) {
 	}
 	if response.Error.Code != "request_too_large" {
 		t.Fatalf("error code = %q, want request_too_large", response.Error.Code)
+	}
+}
+
+func TestCodexAlphaSearchUsesPayloadBodyObservePolicy(t *testing.T) {
+	server := newTestServer(t)
+	server.handlers.UpdateClients(&sdkconfig.SDKConfig{RequestGuards: sdkconfig.RequestGuardsConfig{
+		PayloadBodyLimit: sdkconfig.PayloadBodyLimitConfig{
+			Mode:      "observe",
+			JSONBytes: 8,
+		},
+	}})
+	executor := &codexAlphaSearchTestExecutor{}
+	registerCodexAlphaSearchTestExecutor(t, server, executor)
+
+	for _, path := range []string{"/v1/alpha/search", "/backend-api/codex/alpha/search"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"commands":{}}`))
+		req.Header.Set("Authorization", "Bearer test-key")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body=%s", path, rr.Code, rr.Body.String())
+		}
+	}
+
+	snapshot := server.handlers.PayloadBodyLimitSnapshot()
+	for _, endpoint := range []string{"json /v1/alpha/search", "json /backend-api/codex/alpha/search"} {
+		metric, exists := snapshot.Endpoints[endpoint]
+		if !exists || metric.Requests == 0 || metric.WouldReject == 0 || metric.Rejected != 0 {
+			t.Fatalf("%s metrics = %+v, exists=%v; snapshot=%+v", endpoint, metric, exists, snapshot.Endpoints)
+		}
 	}
 }
 
@@ -488,7 +527,22 @@ func TestHealthEndpointsTrackReadiness(t *testing.T) {
 	assertHealthStatus("/livez", http.StatusOK, "ok")
 }
 
-func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
+func TestReadinessFailsWhenHomeHeartbeatIsUnavailable(t *testing.T) {
+	home.ClearCurrent()
+	t.Cleanup(home.ClearCurrent)
+
+	server := newTestServer(t)
+	server.cfg.Home.Enabled = true
+	server.ready.Store(true)
+
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+}
+
+func TestManagementResponseHidesBuildHeadersUntilAuthenticated(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
 	server := newTestServer(t)
@@ -500,8 +554,14 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
 	}
-	if got := rr.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
-		t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+	if got := rr.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != "" {
+		t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want hidden before authentication", got)
+	}
+	if got := rr.Header().Get("X-CPA-VERSION"); got != "" {
+		t.Fatalf("X-CPA-VERSION = %q, want hidden before authentication", got)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
 
 	exposedHeaders := make(map[string]struct{})
@@ -515,6 +575,50 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 		if _, ok := exposedHeaders[strings.ToLower(headerName)]; !ok {
 			t.Fatalf("Access-Control-Expose-Headers missing %s: %q", headerName, rr.Header().Get("Access-Control-Expose-Headers"))
 		}
+	}
+
+	authorizedReq := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	authorizedReq.Header.Set("Origin", "http://127.0.0.1:5173")
+	authorizedReq.Header.Set("X-Management-Key", "test-management-key")
+	authorized := httptest.NewRecorder()
+	server.engine.ServeHTTP(authorized, authorizedReq)
+	if authorized.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d body=%s", authorized.Code, http.StatusOK, authorized.Body.String())
+	}
+	if got := authorized.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
+		t.Fatalf("authenticated X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+	}
+	if got := authorized.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("authenticated Cache-Control = %q, want no-store", got)
+	}
+}
+
+func TestAuthMiddlewareReturnsTypedRequestTooLargeError(t *testing.T) {
+	manager := sdkaccess.NewManager()
+	manager.SetProviders([]sdkaccess.Provider{requestTooLargeAccessProvider{}})
+
+	engine := gin.New()
+	engine.Use(AuthMiddleware(manager))
+	engine.POST("/v1/test", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/test", strings.NewReader("{}")))
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatalf("decode response: %v", errUnmarshal)
+	}
+	if response.Error.Type != "invalid_request_error" || response.Error.Code != string(sdkaccess.AuthErrorCodeRequestTooLarge) {
+		t.Fatalf("error = %+v, want typed request_too_large", response.Error)
 	}
 }
 

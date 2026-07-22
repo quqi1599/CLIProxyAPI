@@ -22,6 +22,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -3903,13 +3904,13 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		RequestedModel: requestedModel,
 		Stream:         opts.Stream,
 		Headers:        cloneHTTPHeader(opts.Headers),
-		Body:           bytes.Clone(req.Payload),
+		Body:           internalpayload.CloneBytes(req.Payload),
 		Metadata:       opts.Metadata,
 	})
 	opts.Headers = mergeRequestHeaders(opts.Headers, resp.Headers, resp.ClearHeaders)
 	if len(resp.Body) > 0 {
-		req.Payload = bytes.Clone(resp.Body)
-		opts.OriginalRequest = bytes.Clone(resp.Body)
+		req.Payload = internalpayload.CloneBytes(resp.Body)
+		opts.OriginalRequest = internalpayload.CloneBytes(resp.Body)
 	}
 	return req, opts
 }

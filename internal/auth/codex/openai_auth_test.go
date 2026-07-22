@@ -52,6 +52,22 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 }
 
+func TestCodexTokenHTTPErrorRedactsBodyAndKeepsKnownClassification(t *testing.T) {
+	const secret = "codex-oauth-secret-marker"
+	err := newCodexTokenHTTPError(
+		"token refresh",
+		http.StatusBadRequest,
+		"application/json",
+		[]byte(`{"error":"`+secret+`","code":"refresh_token_reused"}`),
+	)
+	if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("unsafe token error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refresh_token_reused") || !isNonRetryableRefreshErr(err) {
+		t.Fatalf("known retry classification was lost: %v", err)
+	}
+}
+
 func TestRefreshTokens_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T) {
 	resetCodexRefreshGroupForTest()
 	t.Cleanup(resetCodexRefreshGroupForTest)

@@ -24,6 +24,15 @@ func mustDefaultTransport(t *testing.T) *http.Transport {
 	return transport
 }
 
+func TestNewDefaultTransportPreservesStandardResponseDecompression(t *testing.T) {
+	t.Parallel()
+
+	transport := NewDefaultTransport()
+	if transport == nil || transport.DisableCompression {
+		t.Fatalf("DisableCompression = %v, want false", transport != nil && transport.DisableCompression)
+	}
+}
+
 func TestParse(t *testing.T) {
 	t.Parallel()
 

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -32,6 +33,24 @@ func TestMiniMaxHighspeedNarrativeGuardMatchesAndCaps(t *testing.T) {
 	}
 	if decision.narrativeHits < miniMaxHighspeedNarrativeMinNarrativeHits {
 		t.Fatalf("narrative hits = %d, want >= %d", decision.narrativeHits, miniMaxHighspeedNarrativeMinNarrativeHits)
+	}
+}
+
+func TestCapMiniMaxHighspeedNarrativeOutputPreservesOrderAndInput(t *testing.T) {
+	payload := []byte(`{"before":1,"max_tokens":12000,"middle":2,"max_completion_tokens":13000,"max_output_tokens":14000,"after":3}`)
+	original := bytes.Clone(payload)
+
+	updated, capped := capMiniMaxHighspeedNarrativeOutput(payload, 4096)
+
+	if !capped {
+		t.Fatal("expected output token fields to be capped")
+	}
+	if !bytes.Equal(payload, original) {
+		t.Fatal("capMiniMaxHighspeedNarrativeOutput mutated caller input")
+	}
+	want := `{"before":1,"max_tokens":4096,"middle":2,"max_completion_tokens":4096,"max_output_tokens":4096,"after":3}`
+	if string(updated) != want {
+		t.Fatalf("updated = %s, want %s", updated, want)
 	}
 }
 

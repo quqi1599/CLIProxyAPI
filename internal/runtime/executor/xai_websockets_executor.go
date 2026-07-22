@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -26,6 +28,15 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const (
+	xaiWebsocketTranscriptMaxItems       = 1024
+	xaiWebsocketTranscriptMaxBytes       = 32 << 20
+	xaiWebsocketTranscriptAggregateBytes = 128 << 20
+	xaiWebsocketIDMapMaxEntries          = 2048
+)
+
+var errXAIWebsocketIDStateClosed = errors.New("xai websocket session state is closed")
 
 // XAIWebsocketsExecutor executes xAI Responses requests using a WebSocket transport.
 type XAIWebsocketsExecutor struct {
@@ -41,18 +52,30 @@ var globalXAIWebsocketSessionStore = &codexWebsocketSessionStore{
 
 var globalXAIWebsocketIDStates = &xaiWebsocketIDStateStore{
 	sessions: make(map[string]*xaiWebsocketIDState),
+	budget:   newXAIWebsocketTranscriptBudget(xaiWebsocketTranscriptAggregateBytes),
 }
 
 type xaiWebsocketIDStateStore struct {
 	mu       sync.Mutex
 	sessions map[string]*xaiWebsocketIDState
+	budget   *xaiWebsocketTranscriptBudget
 }
 
 type xaiWebsocketIDState struct {
 	mu                   sync.Mutex
+	closed               bool
+	budget               *xaiWebsocketTranscriptBudget
 	downstreamToUpstream map[string]string
 	sequence             int
 	transcriptInput      []json.RawMessage
+	transcriptReleases   []func()
+	transcriptBytes      int64
+}
+
+type xaiWebsocketTranscriptBudget struct {
+	mu    sync.Mutex
+	limit int64
+	inUse int64
 }
 
 type xaiWebsocketRequestIDMapper struct {
@@ -81,24 +104,80 @@ func getXAIWebsocketIDState(store *xaiWebsocketIDStateStore, sessionID string) *
 	if store.sessions == nil {
 		store.sessions = make(map[string]*xaiWebsocketIDState)
 	}
+	if store.budget == nil {
+		store.budget = newXAIWebsocketTranscriptBudget(xaiWebsocketTranscriptAggregateBytes)
+	}
 	if state := store.sessions[sessionID]; state != nil {
 		return state
 	}
 	state := &xaiWebsocketIDState{
 		downstreamToUpstream: make(map[string]string),
+		budget:               store.budget,
 	}
 	store.sessions[sessionID] = state
 	return state
 }
 
 func deleteXAIWebsocketIDState(store *xaiWebsocketIDStateStore, sessionID string) {
+	deleteXAIWebsocketIDStateIfMatch(store, sessionID, nil)
+}
+
+func deleteXAIWebsocketIDStateIfMatch(store *xaiWebsocketIDStateStore, sessionID string, expected *xaiWebsocketIDState) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" || store == nil {
 		return
 	}
 	store.mu.Lock()
-	delete(store.sessions, sessionID)
+	state := store.sessions[sessionID]
+	if expected != nil {
+		state = expected
+		if store.sessions[sessionID] == expected {
+			delete(store.sessions, sessionID)
+		}
+	} else {
+		delete(store.sessions, sessionID)
+	}
+	if state != nil {
+		state.mu.Lock()
+		state.closeLocked()
+		state.mu.Unlock()
+	}
 	store.mu.Unlock()
+}
+
+func newXAIWebsocketTranscriptBudget(limit int64) *xaiWebsocketTranscriptBudget {
+	if limit < 0 {
+		limit = 0
+	}
+	return &xaiWebsocketTranscriptBudget{limit: limit}
+}
+
+func (b *xaiWebsocketTranscriptBudget) resize(currentBytes, nextBytes int64) bool {
+	if b == nil {
+		return true
+	}
+	currentBytes = max(currentBytes, 0)
+	nextBytes = max(nextBytes, 0)
+	delta := nextBytes - currentBytes
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if delta > 0 && (delta > b.limit || b.inUse > b.limit-delta) {
+		return false
+	}
+	b.inUse += delta
+	if b.inUse < 0 {
+		b.inUse = 0
+	}
+	return true
+}
+
+func (b *xaiWebsocketTranscriptBudget) InUse() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inUse
 }
 
 func newXAIWebsocketRequestIDMapper(store *xaiWebsocketIDStateStore, sessionID string, downstreamRequest []byte) *xaiWebsocketRequestIDMapper {
@@ -125,23 +204,132 @@ func (s *xaiWebsocketIDState) upstreamIDForDownstream(downstreamID string) strin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return downstreamID
+	}
 	if upstreamID, ok := s.downstreamToUpstream[downstreamID]; ok {
 		return strings.TrimSpace(upstreamID)
 	}
 	return downstreamID
 }
 
-func (s *xaiWebsocketIDState) mapDownstreamToUpstream(downstreamID string, upstreamID string) {
-	downstreamID = strings.TrimSpace(downstreamID)
-	if s == nil || downstreamID == "" {
+func xaiWebsocketSessionStateTooLargeError() error {
+	return statusErr{
+		code:      http.StatusRequestEntityTooLarge,
+		msg:       `{"error":{"message":"websocket session state exceeds the safe limit; start a new session","type":"invalid_request_error","code":"session_state_too_large"}}`,
+		errorCode: "session_state_too_large",
+	}
+}
+
+func xaiWebsocketSessionStateCapacityError() error {
+	retryAfter := time.Second
+	return statusErr{
+		code:       http.StatusServiceUnavailable,
+		msg:        `{"error":{"message":"websocket session state capacity is temporarily exhausted; retry later","type":"server_error","code":"session_state_capacity"}}`,
+		errorCode:  "session_state_capacity",
+		retryAfter: &retryAfter,
+		headers:    http.Header{"Retry-After": {"1"}},
+	}
+}
+
+func isXAIWebsocketSessionStateCapacityError(err error) bool {
+	var coded interface{ ErrorCode() string }
+	return errors.As(err, &coded) && coded.ErrorCode() == "session_state_capacity"
+}
+
+func shouldDiscardXAIWebsocketIDState(err error) bool {
+	if errors.Is(err, errXAIWebsocketIDStateClosed) {
+		return true
+	}
+	var status interface{ StatusCode() int }
+	return errors.As(err, &status) && status.StatusCode() == http.StatusRequestEntityTooLarge
+}
+
+func discardXAIWebsocketIDStateOnError(store *xaiWebsocketIDStateStore, sessionID string, expected *xaiWebsocketIDState, err error) {
+	if !shouldDiscardXAIWebsocketIDState(err) {
 		return
 	}
+	deleteXAIWebsocketIDStateIfMatch(store, sessionID, expected)
+}
+
+func xaiWebsocketSessionStateErrorReason(err error) string {
+	if isXAIWebsocketSessionStateCapacityError(err) {
+		return "session_state_capacity"
+	}
+	if errors.Is(err, errXAIWebsocketIDStateClosed) {
+		return "session_state_closed"
+	}
+	return "session_state_too_large"
+}
+
+func (s *xaiWebsocketIDState) clearLocked() {
+	if s == nil {
+		return
+	}
+	s.downstreamToUpstream = make(map[string]string)
+	s.sequence = 0
+	s.clearTranscriptLocked()
+}
+
+func (s *xaiWebsocketIDState) closeLocked() {
+	if s == nil || s.closed {
+		return
+	}
+	s.closed = true
+	s.clearLocked()
+}
+
+func (s *xaiWebsocketIDState) clearTranscriptLocked() {
+	if s == nil {
+		return
+	}
+	if s.budget != nil {
+		_ = s.budget.resize(s.transcriptBytes, 0)
+	}
+	releaseXAIWebsocketTranscriptItems(s.transcriptReleases)
+	s.transcriptInput = nil
+	s.transcriptReleases = nil
+	s.transcriptBytes = 0
+}
+
+func retainXAIWebsocketTranscriptItems(items []json.RawMessage) []func() {
+	if len(items) == 0 {
+		return nil
+	}
+	releases := make([]func(), 0, len(items))
+	for _, item := range items {
+		releases = append(releases, internalpayload.RetainBytesScoped(item))
+	}
+	return releases
+}
+
+func releaseXAIWebsocketTranscriptItems(releases []func()) {
+	for _, release := range releases {
+		if release != nil {
+			release()
+		}
+	}
+}
+
+func (s *xaiWebsocketIDState) mapDownstreamToUpstream(downstreamID string, upstreamID string) error {
+	downstreamID = strings.TrimSpace(downstreamID)
+	if s == nil || downstreamID == "" {
+		return nil
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errXAIWebsocketIDStateClosed
+	}
 	if s.downstreamToUpstream == nil {
 		s.downstreamToUpstream = make(map[string]string)
 	}
+	if _, exists := s.downstreamToUpstream[downstreamID]; !exists && len(s.downstreamToUpstream) >= xaiWebsocketIDMapMaxEntries {
+		s.clearLocked()
+		return xaiWebsocketSessionStateTooLargeError()
+	}
 	s.downstreamToUpstream[downstreamID] = strings.TrimSpace(upstreamID)
-	s.mu.Unlock()
+	return nil
 }
 
 func (s *xaiWebsocketIDState) snapshotTranscriptInput() []byte {
@@ -150,84 +338,211 @@ func (s *xaiWebsocketIDState) snapshotTranscriptInput() []byte {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
 	if len(s.transcriptInput) == 0 {
 		return nil
 	}
 	return xaiMarshalRawMessages(s.transcriptInput)
 }
 
-func (s *xaiWebsocketIDState) prependTranscriptInput(payload []byte) []byte {
+func (s *xaiWebsocketIDState) prependTranscriptInput(payload []byte) ([]byte, error) {
 	if s == nil || len(payload) == 0 {
-		return payload
+		return payload, nil
 	}
 	s.mu.Lock()
-	prefix := make([]json.RawMessage, 0, len(s.transcriptInput))
-	for _, item := range s.transcriptInput {
-		prefix = append(prefix, bytes.Clone(item))
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errXAIWebsocketIDStateClosed
 	}
+	prefix := xaiMarshalRawMessages(s.transcriptInput)
 	s.mu.Unlock()
-	if len(prefix) == 0 {
-		return payload
+	if len(prefix) <= 2 {
+		return payload, nil
 	}
-	current := xaiJSONRawMessages(gjson.GetBytes(payload, "input"))
-	merged := append(prefix, current...)
-	out, errSet := sjson.SetRawBytes(payload, "input", xaiMarshalRawMessages(merged))
+	current := bytes.TrimSpace([]byte(gjson.GetBytes(payload, "input").Raw))
+	if len(current) < 2 || current[0] != '[' || current[len(current)-1] != ']' {
+		current = []byte("[]")
+	}
+	mergedBytes := len(prefix) + len(current) - 2
+	if len(prefix) > 2 && len(current) > 2 {
+		mergedBytes++
+	}
+	if mergedBytes > xaiWebsocketTranscriptMaxBytes {
+		s.mu.Lock()
+		s.clearLocked()
+		s.mu.Unlock()
+		return nil, xaiWebsocketSessionStateTooLargeError()
+	}
+	merged := make([]byte, 0, mergedBytes)
+	merged = append(merged, '[')
+	merged = append(merged, prefix[1:len(prefix)-1]...)
+	if len(prefix) > 2 && len(current) > 2 {
+		merged = append(merged, ',')
+	}
+	merged = append(merged, current[1:len(current)-1]...)
+	merged = append(merged, ']')
+	out, errSet := sjson.SetRawBytes(payload, "input", merged)
 	if errSet != nil {
-		return payload
+		return nil, errSet
 	}
-	return out
+	return out, nil
 }
 
-func (s *xaiWebsocketIDState) recordTranscriptTurn(requestPayload []byte, completedPayload []byte) {
+func (s *xaiWebsocketIDState) recordTranscriptTurn(requestPayload []byte, completedPayload []byte) error {
 	if s == nil || len(requestPayload) == 0 || len(completedPayload) == 0 {
-		return
+		return nil
 	}
-	inputItems := xaiJSONRawMessages(gjson.GetBytes(requestPayload, "input"))
-	outputItems := xaiJSONRawMessages(gjson.GetBytes(completedPayload, "response.output"))
+	resetTranscript := strings.TrimSpace(gjson.GetBytes(requestPayload, "previous_response_id").String()) == ""
+	existingItems := 0
+	var existingBytes int64
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errXAIWebsocketIDStateClosed
+	}
+	if !resetTranscript {
+		existingItems = len(s.transcriptInput)
+		existingBytes = s.transcriptBytes
+	}
+	s.mu.Unlock()
+	inputItems, inputBytes, overflow := xaiJSONRawMessages(
+		gjson.GetBytes(requestPayload, "input"),
+		xaiWebsocketTranscriptMaxItems-existingItems,
+		xaiWebsocketTranscriptMaxBytes-existingBytes,
+	)
+	if overflow {
+		s.mu.Lock()
+		s.clearLocked()
+		s.mu.Unlock()
+		return xaiWebsocketSessionStateTooLargeError()
+	}
+	outputItems, outputBytes, overflow := xaiJSONRawMessages(
+		gjson.GetBytes(completedPayload, "response.output"),
+		xaiWebsocketTranscriptMaxItems-existingItems-len(inputItems),
+		xaiWebsocketTranscriptMaxBytes-existingBytes-inputBytes,
+	)
+	if overflow {
+		s.mu.Lock()
+		s.clearLocked()
+		s.mu.Unlock()
+		return xaiWebsocketSessionStateTooLargeError()
+	}
 	if len(inputItems) == 0 && len(outputItems) == 0 {
-		return
+		if !resetTranscript {
+			return nil
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed {
+			return errXAIWebsocketIDStateClosed
+		}
+		s.clearTranscriptLocked()
+		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if strings.TrimSpace(gjson.GetBytes(requestPayload, "previous_response_id").String()) == "" {
+	if s.closed {
+		return errXAIWebsocketIDStateClosed
+	}
+	addedItems := len(inputItems) + len(outputItems)
+	addedBytes := inputBytes + outputBytes
+	currentItems := len(s.transcriptInput)
+	currentBytes := s.transcriptBytes
+	if resetTranscript {
+		currentItems = 0
+		currentBytes = 0
+	}
+	if currentItems+addedItems > xaiWebsocketTranscriptMaxItems || currentBytes+addedBytes > xaiWebsocketTranscriptMaxBytes {
+		s.clearLocked()
+		return xaiWebsocketSessionStateTooLargeError()
+	}
+	nextBytes := s.transcriptBytes + addedBytes
+	if resetTranscript {
+		nextBytes = addedBytes
+	}
+	if s.budget != nil && !s.budget.resize(s.transcriptBytes, nextBytes) {
+		return xaiWebsocketSessionStateCapacityError()
+	}
+	if resetTranscript {
+		releaseXAIWebsocketTranscriptItems(s.transcriptReleases)
 		s.transcriptInput = nil
+		s.transcriptReleases = nil
+		s.transcriptBytes = 0
 	}
 	s.transcriptInput = append(s.transcriptInput, inputItems...)
 	s.transcriptInput = append(s.transcriptInput, outputItems...)
+	s.transcriptReleases = append(s.transcriptReleases, retainXAIWebsocketTranscriptItems(inputItems)...)
+	s.transcriptReleases = append(s.transcriptReleases, retainXAIWebsocketTranscriptItems(outputItems)...)
+	s.transcriptBytes += addedBytes
+	return nil
 }
 
-func (s *xaiWebsocketIDState) replaceTranscriptWithItems(items ...[]byte) {
+func (s *xaiWebsocketIDState) replaceTranscriptWithItems(items ...[]byte) error {
 	if s == nil {
-		return
+		return nil
 	}
 	next := make([]json.RawMessage, 0, len(items))
+	var nextBytes int64
 	for _, item := range items {
 		item = bytes.TrimSpace(item)
 		if len(item) == 0 || !json.Valid(item) {
 			continue
 		}
-		next = append(next, bytes.Clone(item))
+		if len(next) == xaiWebsocketTranscriptMaxItems || nextBytes+int64(len(item)) > xaiWebsocketTranscriptMaxBytes {
+			s.mu.Lock()
+			s.clearLocked()
+			s.mu.Unlock()
+			return xaiWebsocketSessionStateTooLargeError()
+		}
+		next = append(next, internalpayload.CloneBytes(item))
+		nextBytes += int64(len(item))
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errXAIWebsocketIDStateClosed
+	}
+	if s.budget != nil && !s.budget.resize(s.transcriptBytes, nextBytes) {
+		return xaiWebsocketSessionStateCapacityError()
+	}
+	releaseXAIWebsocketTranscriptItems(s.transcriptReleases)
 	s.transcriptInput = next
-	s.mu.Unlock()
+	s.transcriptReleases = retainXAIWebsocketTranscriptItems(next)
+	s.transcriptBytes = nextBytes
+	return nil
 }
 
-func xaiJSONRawMessages(result gjson.Result) []json.RawMessage {
+func xaiJSONRawMessages(result gjson.Result, maxItems int, maxBytes int64) ([]json.RawMessage, int64, bool) {
 	if !result.Exists() || !result.IsArray() {
-		return nil
+		return nil, 0, false
 	}
-	items := result.Array()
-	out := make([]json.RawMessage, 0, len(items))
-	for _, item := range items {
+	if maxItems < 0 || maxBytes < 0 {
+		return nil, 0, true
+	}
+	capacity := min(maxItems, 64)
+	out := make([]json.RawMessage, 0, capacity)
+	var totalBytes int64
+	overflow := false
+	result.ForEach(func(_, item gjson.Result) bool {
 		raw := bytes.TrimSpace([]byte(item.Raw))
 		if len(raw) == 0 || !json.Valid(raw) {
-			continue
+			return true
 		}
-		out = append(out, bytes.Clone(raw))
+		if len(out) >= maxItems || int64(len(raw)) > maxBytes-totalBytes {
+			overflow = true
+			return false
+		}
+		out = append(out, internalpayload.CloneBytes(raw))
+		totalBytes += int64(len(raw))
+		return true
+	})
+	if overflow {
+		return nil, 0, true
 	}
-	return out
+	return out, totalBytes, false
 }
 
 func xaiMarshalRawMessages(items []json.RawMessage) []byte {
@@ -257,73 +572,91 @@ func preserveXAIInputIDsFromDownstreamTail(payload []byte, downstream []byte) []
 	if len(srcItems) == 0 || len(dstItems) < len(srcItems) {
 		return payload
 	}
-	out := payload
 	offset := len(dstItems) - len(srcItems)
+	updatedItems := make([][]byte, len(dstItems))
+	for i := range dstItems {
+		updatedItems[i] = []byte(dstItems[i].Raw)
+	}
+	changed := false
 	for i, srcItem := range srcItems {
 		id := strings.TrimSpace(srcItem.Get("id").String())
 		if id == "" {
 			continue
 		}
-		path := fmt.Sprintf("input.%d.id", offset+i)
-		if strings.TrimSpace(gjson.GetBytes(out, path).String()) != "" {
+		dstIndex := offset + i
+		if strings.TrimSpace(dstItems[dstIndex].Get("id").String()) != "" {
 			continue
 		}
-		next, errSet := sjson.SetBytes(out, path, id)
+		next, errSet := sjson.SetBytes(updatedItems[dstIndex], "id", id)
 		if errSet != nil {
 			continue
 		}
-		out = next
+		updatedItems[dstIndex] = next
+		changed = true
 	}
-	return out
-}
-
-func (m *xaiWebsocketRequestIDMapper) upstreamRequestPayload(payload []byte) []byte {
-	if m == nil || len(payload) == 0 || m.downstreamPreviousID == m.upstreamPreviousID {
+	if !changed {
 		return payload
 	}
-	if m.upstreamPreviousID == "" {
-		out, errDelete := sjson.DeleteBytes(payload, "previous_response_id")
-		if errDelete == nil {
-			if m.downstreamPreviousID != "" && m.state != nil {
-				out = m.state.prependTranscriptInput(out)
-			}
-			return out
-		}
-		return payload
-	}
-	out, errSet := sjson.SetBytes(payload, "previous_response_id", m.upstreamPreviousID)
+	out, errSet := sjson.SetRawBytes(payload, "input", internalpayload.BuildRaw(updatedItems))
 	if errSet != nil {
 		return payload
 	}
 	return out
 }
 
-func (m *xaiWebsocketRequestIDMapper) downstreamResponsePayload(payload []byte) []byte {
-	if m == nil || len(payload) == 0 {
-		return payload
+func (m *xaiWebsocketRequestIDMapper) upstreamRequestPayload(payload []byte) ([]byte, error) {
+	if m == nil || len(payload) == 0 || m.downstreamPreviousID == m.upstreamPreviousID {
+		return payload, nil
 	}
-	upstreamResponseID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
-	downstreamResponseID := m.downstreamIDForUpstreamResponse(upstreamResponseID)
-	if downstreamResponseID == "" {
-		return payload
+	if m.upstreamPreviousID == "" {
+		out, errDelete := sjson.DeleteBytes(payload, "previous_response_id")
+		if errDelete == nil {
+			if m.downstreamPreviousID != "" && m.state != nil {
+				return m.state.prependTranscriptInput(out)
+			}
+			return out, nil
+		}
+		return nil, errDelete
 	}
-	return rewriteXAIWebsocketDownstreamIDs(payload, m.upstreamResponseID, downstreamResponseID, m.upstreamPreviousID, m.downstreamPreviousID)
+	out, errSet := sjson.SetBytes(payload, "previous_response_id", m.upstreamPreviousID)
+	if errSet != nil {
+		return nil, errSet
+	}
+	return out, nil
 }
 
-func (m *xaiWebsocketRequestIDMapper) downstreamIDForUpstreamResponse(upstreamResponseID string) string {
+func (m *xaiWebsocketRequestIDMapper) downstreamResponsePayload(payload []byte) ([]byte, error) {
+	if m == nil || len(payload) == 0 {
+		return payload, nil
+	}
+	upstreamResponseID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+	downstreamResponseID, err := m.downstreamIDForUpstreamResponse(upstreamResponseID)
+	if err != nil {
+		return nil, err
+	}
+	if downstreamResponseID == "" {
+		return payload, nil
+	}
+	return rewriteXAIWebsocketDownstreamIDs(payload, m.upstreamResponseID, downstreamResponseID, m.upstreamPreviousID, m.downstreamPreviousID), nil
+}
+
+func (m *xaiWebsocketRequestIDMapper) downstreamIDForUpstreamResponse(upstreamResponseID string) (string, error) {
 	upstreamResponseID = strings.TrimSpace(upstreamResponseID)
 	if m == nil || m.state == nil {
-		return upstreamResponseID
+		return upstreamResponseID, nil
 	}
 	if m.upstreamResponseID != "" {
-		return m.downstreamResponseID
+		return m.downstreamResponseID, nil
 	}
 	if upstreamResponseID == "" {
-		return ""
+		return "", nil
 	}
 
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
+	if m.state.closed {
+		return "", errXAIWebsocketIDStateClosed
+	}
 	m.upstreamResponseID = upstreamResponseID
 	m.downstreamResponseID = upstreamResponseID
 	if m.downstreamPreviousID != "" && m.upstreamPreviousID != "" && upstreamResponseID == m.upstreamPreviousID {
@@ -333,9 +666,22 @@ func (m *xaiWebsocketRequestIDMapper) downstreamIDForUpstreamResponse(upstreamRe
 	if m.state.downstreamToUpstream == nil {
 		m.state.downstreamToUpstream = make(map[string]string)
 	}
+	newEntries := 0
+	if _, exists := m.state.downstreamToUpstream[upstreamResponseID]; !exists {
+		newEntries++
+	}
+	if m.downstreamResponseID != upstreamResponseID {
+		if _, exists := m.state.downstreamToUpstream[m.downstreamResponseID]; !exists {
+			newEntries++
+		}
+	}
+	if len(m.state.downstreamToUpstream)+newEntries > xaiWebsocketIDMapMaxEntries {
+		m.state.clearLocked()
+		return "", xaiWebsocketSessionStateTooLargeError()
+	}
 	m.state.downstreamToUpstream[upstreamResponseID] = upstreamResponseID
 	m.state.downstreamToUpstream[m.downstreamResponseID] = upstreamResponseID
-	return m.downstreamResponseID
+	return m.downstreamResponseID, nil
 }
 
 func rewriteXAIWebsocketDownstreamIDs(payload []byte, upstreamResponseID string, downstreamResponseID string, upstreamPreviousID string, downstreamPreviousID string) []byte {
@@ -434,6 +780,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if xaiInputHasItemType(req.Payload, "compaction_trigger") {
 		return e.executeCompactionTriggerFromWebsocketContext(ctx, auth, req, opts, idMapper)
 	}
+	transformStarted := time.Now()
 
 	token, baseURL := xaiCreds(auth)
 	if baseURL == "" {
@@ -445,7 +792,11 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		return nil, err
 	}
 	if idMapper != nil {
-		prepared.body = idMapper.upstreamRequestPayload(prepared.body)
+		prepared.body, err = idMapper.upstreamRequestPayload(prepared.body)
+		if err != nil {
+			discardXAIWebsocketIDStateOnError(e.idStore, stateSessionID, idMapper.state, err)
+			return nil, err
+		}
 	}
 	prepared.body = preserveXAIInputIDsFromDownstreamTail(prepared.body, req.Payload)
 
@@ -460,6 +811,14 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	}
 	wsHeaders := applyXAIWebsocketHeaders(http.Header{}, auth, token, prepared.sessionID)
 	wsReqBody := buildXAIWebsocketRequestBody(prepared.body)
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.xai.websocket_stream",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(wsReqBody)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return nil, err
+	}
 	warmupRequest := xaiWebsocketGenerateFalse(wsReqBody)
 
 	var authID, authLabel, authType, authValue string
@@ -497,15 +856,22 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		upstreamHeaders = respHS.Header.Clone()
 	}
 	if errDial != nil {
-		bodyErr := websocketHandshakeBody(respHS)
+		bodyErr, errBody := websocketHandshakeBody(respHS)
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
+		}
+		if errBody != nil {
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "handshake_body", errBody)
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
+			return nil, errBody
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			if sess != nil {
 				sess.reqMu.Unlock()
 			}
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return nil, newUpstreamStatusErr(respHS.StatusCode, respHS.Header, respHS.Header.Get("Content-Type"), bodyErr)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
@@ -522,7 +888,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 
 	var readCh chan codexWebsocketRead
 	if sess != nil {
-		readCh = make(chan codexWebsocketRead, 4096)
+		readCh = make(chan codexWebsocketRead, providerWebsocketReadQueueSize)
 		sess.setActive(readCh)
 	}
 
@@ -538,7 +904,13 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
+			retryTransformStarted := time.Now()
 			wsReqBodyRetry := buildXAIWebsocketRequestBody(prepared.body)
+			internalpayload.RecordTransformStageSince(ctx, internalpayload.TransformStageReport{
+				Stage:       "request_plan.xai.websocket_stream_retry",
+				InputBytes:  int64(len(req.Payload)),
+				OutputBytes: int64(len(wsReqBodyRetry)),
+			}, retryTransformStarted, internalpayload.AmplificationOverride{})
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -606,14 +978,18 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		recordedTranscript := false
+		var activeFrame codexWebsocketRead
+		defer activeFrame.release()
 		for {
+			activeFrame.release()
+			activeFrame = codexWebsocketRead{}
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
 				terminateErr = ctx.Err()
 				_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 				return
 			}
-			msgType, payload, errRead := readXAIWebsocketMessage(ctx, sess, conn, readCh)
+			frame, errRead := readXAIWebsocketMessage(ctx, sess, conn, readCh)
 			if errRead != nil {
 				if sess != nil && ctx != nil && ctx.Err() != nil {
 					terminateReason = "context_done"
@@ -621,6 +997,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 					return
 				}
+				errRead = mapCodexWebsocketReadError(errRead)
 				terminateReason = "read_error"
 				terminateErr = errRead
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
@@ -628,6 +1005,9 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
 				return
 			}
+			activeFrame = frame
+			msgType := frame.msgType
+			payload := frame.payload
 			if msgType != websocket.TextMessage {
 				if msgType == websocket.BinaryMessage {
 					errBinary := fmt.Errorf("xai websockets executor: unexpected binary message")
@@ -683,7 +1063,18 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					payload = xaiPatchCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 					payload = xaiNormalizeReasoningSummaryData(payload)
 					if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
-						idMapper.state.recordTranscriptTurn(req.Payload, payload)
+						if errState := idMapper.state.recordTranscriptTurn(req.Payload, payload); errState != nil {
+							reason := xaiWebsocketSessionStateErrorReason(errState)
+							discardXAIWebsocketIDStateOnError(e.idStore, stateSessionID, idMapper.state, errState)
+							if sess != nil && !isXAIWebsocketSessionStateCapacityError(errState) {
+								e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, errState)
+							}
+							terminateReason = reason
+							terminateErr = errState
+							reporter.PublishFailure(ctx, errState)
+							_ = send(cliproxyexecutor.StreamChunk{Err: errState})
+							return
+						}
 						recordedTranscript = true
 					}
 				case "response.done":
@@ -692,7 +1083,18 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						reporter.Publish(ctx, detail)
 					}
 					if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
-						idMapper.state.recordTranscriptTurn(req.Payload, payload)
+						if errState := idMapper.state.recordTranscriptTurn(req.Payload, payload); errState != nil {
+							reason := xaiWebsocketSessionStateErrorReason(errState)
+							discardXAIWebsocketIDStateOnError(e.idStore, stateSessionID, idMapper.state, errState)
+							if sess != nil && !isXAIWebsocketSessionStateCapacityError(errState) {
+								e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, errState)
+							}
+							terminateReason = reason
+							terminateErr = errState
+							reporter.PublishFailure(ctx, errState)
+							_ = send(cliproxyexecutor.StreamChunk{Err: errState})
+							return
+						}
 						recordedTranscript = true
 					}
 				}
@@ -701,9 +1103,34 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					downstreamPayload := payload
 					downstreamWarmupCompletedPayload := warmupCompletedPayload
 					if idMapper != nil {
-						downstreamPayload = idMapper.downstreamResponsePayload(payload)
+						var errState error
+						downstreamPayload, errState = idMapper.downstreamResponsePayload(payload)
+						if errState != nil {
+							reason := xaiWebsocketSessionStateErrorReason(errState)
+							discardXAIWebsocketIDStateOnError(e.idStore, stateSessionID, idMapper.state, errState)
+							if sess != nil && !isXAIWebsocketSessionStateCapacityError(errState) {
+								e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, errState)
+							}
+							terminateReason = reason
+							terminateErr = errState
+							reporter.PublishFailure(ctx, errState)
+							_ = send(cliproxyexecutor.StreamChunk{Err: errState})
+							return
+						}
 						if len(warmupCompletedPayload) > 0 {
-							downstreamWarmupCompletedPayload = idMapper.downstreamResponsePayload(warmupCompletedPayload)
+							downstreamWarmupCompletedPayload, errState = idMapper.downstreamResponsePayload(warmupCompletedPayload)
+							if errState != nil {
+								reason := xaiWebsocketSessionStateErrorReason(errState)
+								discardXAIWebsocketIDStateOnError(e.idStore, stateSessionID, idMapper.state, errState)
+								if sess != nil && !isXAIWebsocketSessionStateCapacityError(errState) {
+									e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, reason, errState)
+								}
+								terminateReason = reason
+								terminateErr = errState
+								reporter.PublishFailure(ctx, errState)
+								_ = send(cliproxyexecutor.StreamChunk{Err: errState})
+								return
+							}
 						}
 					}
 					if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
@@ -787,8 +1214,14 @@ func (e *XAIWebsocketsExecutor) executeCompactionTriggerFromWebsocketContext(ctx
 	}
 
 	responseID := xaiCompactionResponseID(data)
-	idMapper.state.replaceTranscriptWithItems(xaiCompactionOutputItem(data, responseID))
-	idMapper.state.mapDownstreamToUpstream(responseID, "")
+	if errState := idMapper.state.replaceTranscriptWithItems(xaiCompactionOutputItem(data, responseID)); errState != nil {
+		discardXAIWebsocketIDStateOnError(e.idStore, xaiExecutionSessionID(req, opts), idMapper.state, errState)
+		return nil, errState
+	}
+	if errState := idMapper.state.mapDownstreamToUpstream(responseID, ""); errState != nil {
+		discardXAIWebsocketIDStateOnError(e.idStore, xaiExecutionSessionID(req, opts), idMapper.state, errState)
+		return nil, errState
+	}
 
 	headers = headers.Clone()
 	if headers == nil {
@@ -812,7 +1245,7 @@ func buildXAIWebsocketCompactionPayload(payload []byte, transcriptInput []byte) 
 	if len(transcriptInput) == 0 {
 		transcriptInput = []byte("[]")
 	}
-	out := bytes.Clone(payload)
+	out := internalpayload.CloneBytes(payload)
 	var err error
 	out, err = sjson.SetRawBytes(out, "input", transcriptInput)
 	if err != nil {
@@ -866,7 +1299,7 @@ func parseXAIWebsocketError(payload []byte) (error, bool) {
 	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
 		out, _ = sjson.SetRawBytes(out, "error", []byte(errNode.Raw))
 	}
-	return statusErr{code: status, msg: string(out)}, true
+	return newUpstreamStatusErr(status, nil, "application/json", out), true
 }
 
 func xaiBareWebsocketErrorStatus(payload []byte) int {
@@ -901,13 +1334,13 @@ func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequest(ctx context.Con
 func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
 	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
-	dialer.EnableCompression = true
+	dialer.EnableCompression = false
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if conn != nil {
-		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
+		conn.SetReadLimit(providerWebsocketReadLimit)
 		conn.EnableWriteCompression(false)
 	}
 	return conn, resp, err
@@ -953,18 +1386,29 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 
 	sess.connMu.Lock()
 	conn := sess.conn
-	readerConn := sess.readerConn
-	sess.connMu.Unlock()
 	if conn != nil {
-		if readerConn != conn {
-			sess.connMu.Lock()
+		if sess.readerConn != conn {
+			readerCtx, readerCancel := context.WithCancel(context.Background())
+			readerDone := make(chan struct{})
+			previousCancel := sess.readerCancel
 			sess.readerConn = conn
+			sess.readerCancel = readerCancel
+			sess.readerDone = readerDone
 			sess.connMu.Unlock()
+			if previousCancel != nil {
+				previousCancel()
+			}
 			configureXAIWebsocketConn(sess, conn)
-			go e.readUpstreamLoop(sess, conn)
+			go func() {
+				defer close(readerDone)
+				e.readUpstreamLoop(readerCtx, sess, conn)
+			}()
+			return conn, nil, nil
 		}
+		sess.connMu.Unlock()
 		return conn, nil, nil
 	}
+	sess.connMu.Unlock()
 
 	conn, resp, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
@@ -984,10 +1428,17 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.readerConn = conn
+	readerCtx, readerCancel := context.WithCancel(context.Background())
+	readerDone := make(chan struct{})
+	sess.readerCancel = readerCancel
+	sess.readerDone = readerDone
 	sess.connMu.Unlock()
 
 	configureXAIWebsocketConn(sess, conn)
-	go e.readUpstreamLoop(sess, conn)
+	go func() {
+		defer close(readerDone)
+		e.readUpstreamLoop(readerCtx, sess, conn)
+	}()
 	logXAIWebsocketConnected(sess.sessionID, authID, wsURL)
 	return conn, resp, nil
 }
@@ -996,6 +1447,7 @@ func configureXAIWebsocketConn(sess *codexWebsocketSession, conn *websocket.Conn
 	if sess == nil || conn == nil {
 		return
 	}
+	conn.SetReadLimit(providerWebsocketReadLimit)
 	conn.SetPingHandler(func(appData string) error {
 		sess.writeMu.Lock()
 		defer sess.writeMu.Unlock()
@@ -1003,99 +1455,71 @@ func configureXAIWebsocketConn(sess *codexWebsocketSession, conn *websocket.Conn
 	})
 }
 
-func readXAIWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
+func readXAIWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (codexWebsocketRead, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if sess == nil {
 		if conn == nil {
-			return 0, nil, fmt.Errorf("xai websockets executor: websocket conn is nil")
+			return codexWebsocketRead{}, fmt.Errorf("xai websockets executor: websocket conn is nil")
 		}
-		msgType, payload, errRead := conn.ReadMessage()
-		return msgType, payload, errRead
+		return readProviderWebsocketFrame(ctx, conn, providerWebsocketReadBudget(nil))
 	}
 	if conn == nil {
-		return 0, nil, fmt.Errorf("xai websockets executor: websocket conn is nil")
+		return codexWebsocketRead{}, fmt.Errorf("xai websockets executor: websocket conn is nil")
 	}
 	if readCh == nil {
-		return 0, nil, fmt.Errorf("xai websockets executor: session read channel is nil")
+		return codexWebsocketRead{}, fmt.Errorf("xai websockets executor: session read channel is nil")
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			return 0, nil, ctx.Err()
+			return codexWebsocketRead{}, ctx.Err()
 		case ev, ok := <-readCh:
 			if !ok {
-				return 0, nil, fmt.Errorf("xai websockets executor: session read channel closed")
+				return codexWebsocketRead{}, fmt.Errorf("xai websockets executor: session read channel closed")
 			}
 			if ev.conn != conn {
+				ev.release()
 				continue
 			}
 			if ev.err != nil {
-				return 0, nil, ev.err
+				ev.release()
+				return codexWebsocketRead{}, ev.err
 			}
-			return ev.msgType, ev.payload, nil
+			return ev, nil
 		}
 	}
 }
 
-func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn) {
+func (e *XAIWebsocketsExecutor) readUpstreamLoop(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn) {
 	if e == nil || sess == nil || conn == nil {
 		return
 	}
 	for {
-		msgType, payload, errRead := conn.ReadMessage()
+		frame, errRead := readProviderWebsocketFrame(ctx, conn, providerWebsocketReadBudget(sess))
 		if errRead != nil {
-			sess.activeMu.Lock()
-			ch := sess.activeCh
-			done := sess.activeDone
-			sess.activeMu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
-				case <-done:
-				default:
-				}
-				sess.clearActive(ch)
-				close(ch)
+			if ctx != nil && ctx.Err() != nil {
+				return
 			}
+			sess.finishActive(codexWebsocketRead{conn: conn, err: errRead})
 			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			return
 		}
 
-		if msgType != websocket.TextMessage {
-			if msgType == websocket.BinaryMessage {
+		if frame.msgType != websocket.TextMessage {
+			if frame.msgType == websocket.BinaryMessage {
+				frame.release()
 				errBinary := fmt.Errorf("xai websockets executor: unexpected binary message")
-				sess.activeMu.Lock()
-				ch := sess.activeCh
-				done := sess.activeDone
-				sess.activeMu.Unlock()
-				if ch != nil {
-					select {
-					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
-					case <-done:
-					default:
-					}
-					sess.clearActive(ch)
-					close(ch)
-				}
+				sess.finishActive(codexWebsocketRead{conn: conn, err: errBinary})
 				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				return
 			}
+			frame.release()
 			continue
 		}
 
-		sess.activeMu.Lock()
-		ch := sess.activeCh
-		done := sess.activeDone
-		sess.activeMu.Unlock()
-		if ch == nil {
-			continue
-		}
-		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
-		case <-done:
-		}
+		sess.enqueueActiveRead(frame)
 	}
 }
 
@@ -1122,11 +1546,18 @@ func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebs
 		return
 	}
 	sess.conn = nil
+	var readerCancel context.CancelFunc
 	if sess.readerConn == conn {
+		readerCancel = sess.readerCancel
 		sess.readerConn = nil
+		sess.readerCancel = nil
+		sess.readerDone = nil
 	}
 	sess.connMu.Unlock()
 
+	if readerCancel != nil {
+		readerCancel()
+	}
 	logXAIWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	if notify {
 		sess.notifyUpstreamDisconnect(err)
@@ -1145,6 +1576,8 @@ func (e *XAIWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 
+	deleteXAIWebsocketIDState(e.idStore, sessionID)
+
 	store := e.store
 	if store == nil {
 		store = globalXAIWebsocketSessionStore
@@ -1153,8 +1586,6 @@ func (e *XAIWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 	sess := store.sessions[sessionID]
 	delete(store.sessions, sessionID)
 	store.mu.Unlock()
-	deleteXAIWebsocketIDState(e.idStore, sessionID)
-
 	e.closeExecutionSession(sess, "session_closed")
 }
 
@@ -1176,18 +1607,34 @@ func closeXAIWebsocketSession(sess *codexWebsocketSession, reason string) {
 	authID := sess.authID
 	wsURL := sess.wsURL
 	sess.conn = nil
+	var readerCancel context.CancelFunc
+	var readerDone <-chan struct{}
 	if sess.readerConn == conn {
+		readerCancel = sess.readerCancel
+		readerDone = sess.readerDone
 		sess.readerConn = nil
+		sess.readerCancel = nil
+		sess.readerDone = nil
 	}
 	sessionID := sess.sessionID
 	sess.connMu.Unlock()
 
+	if readerCancel != nil {
+		readerCancel()
+	}
+	sess.cancelActive()
 	if conn == nil {
+		if readerDone != nil {
+			<-readerDone
+		}
 		return
 	}
 	logXAIWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("xai websockets executor: close websocket error: %v", errClose)
+	}
+	if readerDone != nil {
+		<-readerDone
 	}
 }
 
@@ -1195,7 +1642,7 @@ func buildXAIWebsocketRequestBody(body []byte) []byte {
 	if len(body) == 0 {
 		return nil
 	}
-	wsReqBody := bytes.Clone(body)
+	wsReqBody := internalpayload.CloneBytes(body)
 	wsReqBody, _ = sjson.SetBytes(wsReqBody, "type", "response.create")
 	wsReqBody, _ = sjson.DeleteBytes(wsReqBody, "stream")
 	wsReqBody, _ = sjson.DeleteBytes(wsReqBody, "stream_options")

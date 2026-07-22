@@ -1,15 +1,74 @@
 package pluginhost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/iotest"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestServeManagementHTTPRejectsOversizedBody(t *testing.T) {
+	called := false
+	host := newHostWithRecords(capabilityRecord{
+		id: "bounded",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			ManagementAPI: &managementPluginDouble{routes: []pluginapi.ManagementRoute{{
+				Method: http.MethodPost,
+				Path:   "/plugins/bounded/run",
+				Handler: managementHandlerFunc(func(context.Context, pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+					called = true
+					return pluginapi.ManagementResponse{}, nil
+				}),
+			}}},
+		}},
+	})
+	host.RegisterManagementRoutes(context.Background(), nil)
+
+	requests := []*http.Request{
+		func() *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "/v0/management/plugins/bounded/run", nil)
+			req.Body = io.NopCloser(iotest.ErrReader(errors.New("body must not be read")))
+			req.ContentLength = maxPluginManagementBody + 1
+			return req
+		}(),
+		func() *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "/v0/management/plugins/bounded/run", bytes.NewReader(make([]byte, maxPluginManagementBody+1)))
+			req.ContentLength = -1
+			return req
+		}(),
+	}
+
+	for index, req := range requests {
+		recorder := httptest.NewRecorder()
+		if !host.ServeManagementHTTP(recorder, req) {
+			t.Fatalf("request %d was not handled", index)
+		}
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("request %d status = %d, want %d: %s", index, recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
+		}
+		var response struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+			t.Fatalf("request %d response decode error = %v", index, errDecode)
+		}
+		if response.Error != "request_too_large" || response.Message != "request body exceeds the allowed size" {
+			t.Fatalf("request %d response = %#v", index, response)
+		}
+	}
+	if called {
+		t.Fatal("plugin handler was called for oversized body")
+	}
+}
 
 func TestRegisterManagementRoutesSkipsReservedAndUsesPriority(t *testing.T) {
 	high := &managementPluginDouble{

@@ -19,6 +19,34 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
+func TestAIStudioExecutorHTTPRequestRejectsUnknownLengthAtLimitPlusOne(t *testing.T) {
+	relay := wsrelay.NewManager(wsrelay.Options{})
+	t.Cleanup(func() {
+		if errStop := relay.Stop(context.Background()); errStop != nil {
+			t.Errorf("relay stop error = %v", errStop)
+		}
+	})
+	source := &trackedExecutorRequestBody{remaining: executorHTTPRequestBodyBytes + 2}
+	req, errNew := http.NewRequest(http.MethodPost, "https://example.test/v1", source)
+	if errNew != nil {
+		t.Fatalf("new request: %v", errNew)
+	}
+	req.ContentLength = -1
+
+	_, errRequest := NewAIStudioExecutor(&config.Config{}, "aistudio", relay).HttpRequest(
+		context.Background(),
+		&cliproxyauth.Auth{ID: "aistudio-body-limit", Provider: "aistudio"},
+		req,
+	)
+	assertExecutorRequestTooLarge(t, errRequest)
+	if !strings.Contains(errRequest.Error(), "aistudio executor: read request body") {
+		t.Fatalf("error = %v, want executor context", errRequest)
+	}
+	if source.readBytes != executorHTTPRequestBodyBytes+1 || source.closes != 1 {
+		t.Fatalf("source reads=%d closes=%d, want limit+1 reads and one close", source.readBytes, source.closes)
+	}
+}
+
 func TestAIStudioExecutorExecuteStartsTTFTBeforeRelayWait(t *testing.T) {
 	const authID = "aistudio-ttft-auth"
 	delay := 40 * time.Millisecond

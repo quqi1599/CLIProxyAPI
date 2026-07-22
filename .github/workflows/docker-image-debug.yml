@@ -50,7 +50,7 @@ jobs:
 
           VERSION="${RELEASE_TAG#fork/}"
           DOCKER_TAG="${RELEASE_TAG//\//-}-debug"
-          COMMIT="$(git rev-parse --short HEAD)"
+          COMMIT="$(git rev-parse HEAD)"
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           REPOSITORY_URL="https://github.com/${{ github.repository }}"
 

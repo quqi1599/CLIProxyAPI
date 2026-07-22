@@ -57,12 +57,14 @@ The script prints:
 The current production host is `x86_64`, so the release workflow only builds `linux/amd64`.
 If you later add ARM servers, you can reintroduce `linux/arm64` to the Docker workflow.
 
-Use the `sha-<12>` image produced by `ci-builder`. `CLIPROXY_IMAGE` is required,
-so Compose fails before deployment when no immutable image is supplied:
+Use the `sha-<12>` image produced by `ci-builder`. `CLIPROXY_COMMIT12` is
+required and must contain exactly 12 lowercase hexadecimal characters, so
+Compose fails before deployment when no candidate revision is supplied:
 
 ```bash
 cd /opt/cliproxy
-export CLIPROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:sha-7822c9e37aed
+export CLIPROXY_COMMIT12=7822c9e37aed
+./scripts/verify-production-image.sh
 docker compose -f docker-compose.prod.yml config --quiet
 docker compose -f docker-compose.prod.yml config --images
 docker compose -f docker-compose.prod.yml pull
@@ -71,6 +73,12 @@ docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs --tail 20 cli-proxy-api
 curl -fsS http://127.0.0.1:8317/livez
 ```
+
+The preflight rejects mutable tags, pulls the exact candidate, requires a full
+40-character `org.opencontainers.image.revision` label, and verifies that a
+`sha-<12>` tag matches that revision. Before opening traffic, run the 12-hour
+release gate with the same full revision; it continuously verifies
+`/healthz/details.build.commit` and fails on a restart or revision change.
 
 The production defaults are an 8 GiB memory hard limit, a 6 GiB
 `GOMEMLIMIT`, 4 CPUs with `GOMAXPROCS=4`, 1024 PIDs, no container swap, and a
@@ -87,7 +95,8 @@ The corresponding overrides are `CLIPROXY_MEMORY_LIMIT`,
 Rollback is the same process with an older image tag:
 
 ```bash
-export CLIPROXY_IMAGE=ghcr.io/quqi1599/cliproxyapi:sha-<previous-12-char-sha>
+export CLIPROXY_COMMIT12=0123456789ab # replace with the previous revision
+./scripts/verify-production-image.sh
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d --no-build
 ```
@@ -101,7 +110,9 @@ symbolized CPU or heap profiles, trigger the manual workflow:
 - Input tag: `fork/v7.10.43`
 - Published tag: `ghcr.io/quqi1599/cliproxyapi:fork-v7.10.43-debug`
 
-Enable `pprof` in `config.yaml` and keep it bound to localhost:
+`pprof` accepts only `localhost` or a loopback IP. Each enable or re-apply starts
+a fixed 30-minute diagnostic window; the listener then shuts down automatically.
+Enable it in `config.yaml`:
 
 ```yaml
 pprof:
@@ -109,12 +120,37 @@ pprof:
   addr: 127.0.0.1:8316
 ```
 
-Typical collection commands:
+After the configuration reloads, verify that only the loopback listener and
+the expected endpoint are available:
 
 ```bash
-curl -fsS http://127.0.0.1:8316/debug/pprof/heap >/dev/null
-go tool pprof http://127.0.0.1:8316/debug/pprof/profile?seconds=30
-go tool pprof http://127.0.0.1:8316/debug/pprof/heap
+ss -ltnp | grep '127.0.0.1:8316'
+curl -fsS http://127.0.0.1:8316/debug/pprof/ >/dev/null
+```
+
+Collect the bounded profiles you need before the 30-minute TTL expires:
+
+```bash
+go tool pprof -o /tmp/cliproxy-heap.pb.gz http://127.0.0.1:8316/debug/pprof/heap
+go tool pprof -o /tmp/cliproxy-allocs.pb.gz http://127.0.0.1:8316/debug/pprof/allocs
+go tool pprof -o /tmp/cliproxy-cpu.pb.gz 'http://127.0.0.1:8316/debug/pprof/profile?seconds=30'
+curl -fsS 'http://127.0.0.1:8316/debug/pprof/goroutine?debug=1' \
+  -o /tmp/cliproxy-goroutine.txt
+```
+
+Disable `pprof` immediately after collection rather than waiting for the TTL:
+
+```yaml
+pprof:
+  enable: false
+  addr: 127.0.0.1:8316
+```
+
+After the reload, both checks must show that the listener is gone:
+
+```bash
+! ss -ltn | grep -q '127.0.0.1:8316'
+! curl -fsS --max-time 2 http://127.0.0.1:8316/debug/pprof/
 ```
 
 ## Local Developer Builds

@@ -127,6 +127,17 @@ func TestRegistryRejectsMissingRequiredMetadata(t *testing.T) {
 }
 
 func TestRegistryRejectsMissingTransformUnsupportedCostAndInvalidMatch(t *testing.T) {
+	t.Run("controlled policy ID", func(t *testing.T) {
+		policy := validPolicy("unsafe id", ProviderQuirkPatch, 0, "body.model")
+		assertRegistryErrorContains(t, []Policy{policy}, "controlled identifier")
+	})
+
+	t.Run("controlled downgrade ID", func(t *testing.T) {
+		policy := validPolicy("unsafe-downgrade", ProviderQuirkPatch, 0, "body.model")
+		policy.DowngradeIDs = []string{"request derived value"}
+		assertRegistryErrorContains(t, []Policy{policy}, "downgrade ID")
+	})
+
 	t.Run("transform", func(t *testing.T) {
 		policy := validPolicy("missing-transform", ProviderQuirkPatch, 0, "body.model")
 		policy.Apply = nil
@@ -216,9 +227,10 @@ func TestReportIsDeterministicOwnedAndPayloadFree(t *testing.T) {
 	applyCalled := false
 	policy := validPolicy("report-policy", ProviderCapabilityScrub, 0, "body.metadata")
 	policy.Match.Endpoints = []EndpointKind{"responses", "chat"}
-	policy.Apply = func(context.Context, []byte) ([]byte, error) {
+	policy.DowngradeIDs = []string{"strip.metadata"}
+	policy.Apply = func(context.Context, []byte) (TransformResult, error) {
 		applyCalled = true
-		return secretPayload, nil
+		return TransformResult{Payload: secretPayload}, nil
 	}
 
 	registry, err := NewRegistry(policy)
@@ -242,12 +254,16 @@ func TestReportIsDeterministicOwnedAndPayloadFree(t *testing.T) {
 
 	report.Policies[0].MutatedFields[0] = "body.changed"
 	report.Policies[0].Match.Endpoints[0] = "changed"
+	report.Policies[0].DowngradeIDs[0] = "changed"
 	fresh := registry.Report()
 	if fresh.Policies[0].MutatedFields[0] != "body.metadata" {
 		t.Fatalf("registry mutated through report field: %v", fresh.Policies[0].MutatedFields)
 	}
 	if fresh.Policies[0].Match.Endpoints[0] == "changed" {
 		t.Fatalf("registry match mutated through report: %v", fresh.Policies[0].Match.Endpoints)
+	}
+	if fresh.Policies[0].DowngradeIDs[0] != "strip.metadata" {
+		t.Fatalf("registry downgrade IDs mutated through report: %v", fresh.Policies[0].DowngradeIDs)
 	}
 }
 
@@ -285,8 +301,8 @@ func validPolicy(id string, phase Phase, priority int, field string) Policy {
 			ReviewDate:        "2026-10-01",
 		},
 		MutatedFields: []string{field},
-		Apply: func(_ context.Context, payload []byte) ([]byte, error) {
-			return payload, nil
+		Apply: func(_ context.Context, payload []byte) (TransformResult, error) {
+			return TransformResult{Payload: payload}, nil
 		},
 	}
 }

@@ -3,11 +3,11 @@ package auth
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strings"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var responseModelAliasPaths = []string{
@@ -98,24 +98,42 @@ func rewriteResponseJSONModelAlias(payload []byte, alias string) ([]byte, bool) 
 	if !json.Valid(payload) {
 		return nil, false
 	}
-	rewritten := payload
-	changed := false
+	replacement, _ := json.Marshal(alias)
+	type edit struct {
+		start int
+		end   int
+	}
+	edits := make([]edit, 0, len(responseModelAliasPaths))
 	for _, path := range responseModelAliasPaths {
-		value := gjson.GetBytes(rewritten, path)
+		value := gjson.GetBytes(payload, path)
 		if !value.Exists() || value.Type != gjson.String {
 			continue
 		}
 		if strings.TrimSpace(value.String()) == "" || strings.EqualFold(strings.TrimSpace(value.String()), alias) {
 			continue
 		}
-		updated, err := sjson.SetBytes(rewritten, path, alias)
-		if err != nil {
+		if value.Index < 0 || value.Index+len(value.Raw) > len(payload) {
 			continue
 		}
-		rewritten = updated
-		changed = true
+		edits = append(edits, edit{start: value.Index, end: value.Index + len(value.Raw)})
 	}
-	return rewritten, changed
+	if len(edits) == 0 {
+		return payload, false
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	size := len(payload)
+	for _, item := range edits {
+		size += len(replacement) - (item.end - item.start)
+	}
+	rewritten := make([]byte, 0, size)
+	cursor := 0
+	for _, item := range edits {
+		rewritten = append(rewritten, payload[cursor:item.start]...)
+		rewritten = append(rewritten, replacement...)
+		cursor = item.end
+	}
+	rewritten = append(rewritten, payload[cursor:]...)
+	return rewritten, true
 }
 
 func rewriteResponseSSEModelAlias(payload []byte, alias string) ([]byte, bool) {

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -30,6 +30,7 @@ const (
 	codexDeviceTokenExchangeRedirectURI   = "https://auth.openai.com/deviceauth/callback"
 	codexDeviceTimeout                    = 15 * time.Minute
 	codexDeviceDefaultPollIntervalSeconds = 5
+	codexDeviceMaxResponseBytes           = 1 << 20
 )
 
 type codexDeviceUserCodeRequest struct {
@@ -142,22 +143,17 @@ func requestCodexDeviceUserCode(ctx context.Context, client *http.Client) (*code
 	if err != nil {
 		return nil, fmt.Errorf("failed to request codex device code: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := httpfetch.ReadResponseBytes(resp, codexDeviceMaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read codex device code response: %w", err)
 	}
 
 	if !codexDeviceIsSuccessStatus(resp.StatusCode) {
-		trimmed := strings.TrimSpace(string(respBody))
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("codex device endpoint is unavailable (status %d)", resp.StatusCode)
 		}
-		if trimmed == "" {
-			trimmed = "empty response body"
-		}
-		return nil, fmt.Errorf("codex device code request failed with status %d: %s", resp.StatusCode, trimmed)
+		return nil, fmt.Errorf("codex device code request failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), respBody))
 	}
 
 	var parsed codexDeviceUserCodeResponse
@@ -196,8 +192,7 @@ func pollCodexDeviceToken(ctx context.Context, client *http.Client, deviceAuthID
 			return nil, fmt.Errorf("failed to poll codex device token: %w", err)
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		respBody, readErr := httpfetch.ReadResponseBytes(resp, codexDeviceMaxResponseBytes)
 		if readErr != nil {
 			return nil, fmt.Errorf("failed to read codex device poll response: %w", readErr)
 		}
@@ -217,11 +212,7 @@ func pollCodexDeviceToken(ctx context.Context, client *http.Client, deviceAuthID
 				continue
 			}
 		default:
-			trimmed := strings.TrimSpace(string(respBody))
-			if trimmed == "" {
-				trimmed = "empty response body"
-			}
-			return nil, fmt.Errorf("codex device token polling failed with status %d: %s", resp.StatusCode, trimmed)
+			return nil, fmt.Errorf("codex device token polling failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), respBody))
 		}
 	}
 }

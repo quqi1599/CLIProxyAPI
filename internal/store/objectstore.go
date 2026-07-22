@@ -17,14 +17,17 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	objectStoreConfigKey  = "config/config.yaml"
-	objectStoreAuthPrefix = "auths"
+	objectStoreConfigKey      = "config/config.yaml"
+	objectStoreAuthPrefix     = "auths"
+	objectStoreMaxConfigBytes = 8 << 20
+	objectStoreMaxAuthBytes   = 8 << 20
 )
 
 // ObjectStoreConfig captures configuration for the object storage-backed token store.
@@ -204,7 +207,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		if errMarshal != nil {
 			return "", fmt.Errorf("object store: marshal metadata: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
+		if existing, errRead := readFileBytes(path, objectStoreMaxAuthBytes); errRead == nil {
 			if jsonEqual(existing, raw) {
 				return path, nil
 			}
@@ -323,7 +326,7 @@ func (s *ObjectTokenStore) PersistConfig(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.configPath)
+	data, err := readFileBytes(s.configPath, objectStoreMaxConfigBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteObject(ctx, objectStoreConfigKey)
@@ -352,17 +355,16 @@ func (s *ObjectTokenStore) ensureBucket(ctx context.Context) error {
 
 func (s *ObjectTokenStore) syncConfigFromBucket(ctx context.Context, example string) error {
 	key := s.prefixedKey(objectStoreConfigKey)
-	_, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	info, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
 	switch {
 	case err == nil:
 		object, errGet := s.client.GetObject(ctx, s.cfg.Bucket, key, minio.GetObjectOptions{})
 		if errGet != nil {
 			return fmt.Errorf("object store: fetch config: %w", errGet)
 		}
-		defer object.Close()
-		data, errRead := io.ReadAll(object)
+		data, errRead := readBoundedBytes(object, info.Size, objectStoreMaxConfigBytes)
 		if errRead != nil {
-			return fmt.Errorf("object store: read config: %w", errRead)
+			return fmt.Errorf("object store: read config %s: %w", key, errRead)
 		}
 		if errWrite := os.WriteFile(s.configPath, normalizeLineEndingsBytes(data), 0o600); errWrite != nil {
 			return fmt.Errorf("object store: write config: %w", errWrite)
@@ -382,7 +384,7 @@ func (s *ObjectTokenStore) syncConfigFromBucket(ctx context.Context, example str
 				}
 			}
 		}
-		data, errRead := os.ReadFile(s.configPath)
+		data, errRead := readFileBytes(s.configPath, objectStoreMaxConfigBytes)
 		if errRead != nil {
 			return fmt.Errorf("object store: read local config: %w", errRead)
 		}
@@ -437,8 +439,7 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 		if errGet != nil {
 			return fmt.Errorf("object store: download auth %s: %w", object.Key, errGet)
 		}
-		data, errRead := io.ReadAll(reader)
-		_ = reader.Close()
+		data, errRead := readBoundedBytes(reader, object.Size, objectStoreMaxAuthBytes)
 		if errRead != nil {
 			return fmt.Errorf("object store: read auth %s: %w", object.Key, errRead)
 		}
@@ -449,6 +450,34 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 	return nil
 }
 
+func readBoundedBytes(reader io.ReadCloser, declaredSize, maxSize int64) (data []byte, err error) {
+	if reader == nil {
+		return nil, fmt.Errorf("reader is nil")
+	}
+	defer func() {
+		if errClose := reader.Close(); errClose != nil && err == nil {
+			err = fmt.Errorf("close object reader: %w", errClose)
+		}
+	}()
+
+	if maxSize > 0 && declaredSize > maxSize {
+		return nil, fmt.Errorf("declared size %d: %w", declaredSize, &httpfetch.ResponseTooLargeError{Limit: maxSize})
+	}
+	return httpfetch.ReadBytes(reader, maxSize)
+}
+
+func readFileBytes(path string, maxSize int64) ([]byte, error) {
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		return nil, errStat
+	}
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	return readBoundedBytes(file, info.Size(), maxSize)
+}
+
 func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 	if path == "" {
 		return nil
@@ -457,7 +486,7 @@ func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("object store: resolve auth relative path: %w", err)
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFileBytes(path, objectStoreMaxAuthBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteAuthObject(ctx, path)
@@ -566,7 +595,7 @@ func (s *ObjectTokenStore) resolveDeletePath(id string) (string, error) {
 }
 
 func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileBytes(path, objectStoreMaxAuthBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
 	}

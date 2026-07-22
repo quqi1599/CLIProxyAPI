@@ -124,6 +124,12 @@ type Config struct {
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
+	// WebsocketMaxConnections bounds concurrent /v1/ws relay connections globally.
+	// Values <= 0 use the safe runtime default.
+	WebsocketMaxConnections int `yaml:"ws-max-connections" json:"ws-max-connections"`
+	// WebsocketMaxConnectionsPerIP bounds concurrent /v1/ws relay connections per TCP peer IP.
+	// Values <= 0 use the safe runtime default.
+	WebsocketMaxConnectionsPerIP int `yaml:"ws-max-connections-per-ip" json:"ws-max-connections-per-ip"`
 
 	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
 	// When true (default), cached signatures are preferred and validated.
@@ -749,7 +755,8 @@ func LoadConfig(configFile string) (*Config, error) {
 
 // LoadConfigOptional reads YAML from configFile.
 // If optional is true and the file is missing, it returns an empty Config.
-// If optional is true and the file is empty or invalid, it returns an empty Config.
+// If optional is true and the file is empty, it returns an empty Config.
+// Invalid YAML always returns an error so callers can keep their last-known-good config.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
@@ -758,6 +765,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
 				cfg := &Config{}
+				cfg.RequestGuards.GlobalAdmission.Enabled = true
+				cfg.RequestGuards.Amplification.Mode = "observe"
+				cfg.RequestGuards.PayloadBodyLimit.Mode = "observe"
 				cfg.NormalizePluginsConfig()
 				return cfg, nil
 			}
@@ -768,6 +778,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
 		cfg := &Config{}
+		cfg.RequestGuards.GlobalAdmission.Enabled = true
+		cfg.RequestGuards.Amplification.Mode = "observe"
+		cfg.RequestGuards.PayloadBodyLimit.Mode = "observe"
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
@@ -790,13 +803,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.RequestGuards.GlobalAdmission.Enabled = true
+	cfg.RequestGuards.Amplification.Mode = "observe"
+	cfg.RequestGuards.PayloadBodyLimit.Mode = "observe"
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
-		if optional {
-			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			cfgOptional := &Config{}
-			cfgOptional.NormalizePluginsConfig()
-			return cfgOptional, nil
-		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 

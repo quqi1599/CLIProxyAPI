@@ -20,13 +20,18 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 	if executor == nil {
 		return nil, fmt.Errorf("host model executor is unavailable")
 	}
-	skipPluginID := h.callbackCallerPluginID(ctx, req.HostCallbackID)
-	callbackCtx := h.resolveCallbackContext(req.HostCallbackID, ctx)
-	if callbackCtx == nil {
-		callbackCtx = context.Background()
+	if req.HostCallbackID == "" || h == nil || h.callbackContexts == nil {
+		return nil, fmt.Errorf("host.model.execute_stream requires a registered host callback id")
 	}
+	h.callbackContexts.mu.RLock()
+	callbackEntry, callbackExists := h.callbackContexts.contexts[req.HostCallbackID]
+	h.callbackContexts.mu.RUnlock()
+	if !callbackExists || callbackEntry.ctx == nil {
+		return nil, fmt.Errorf("host.model.execute_stream requires a registered host callback id")
+	}
+	skipPluginID := h.callbackCallerPluginID(ctx, req.HostCallbackID)
 	// Detach request cancellation while preserving callback values; callback cleanup owns the model stream lifetime.
-	streamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackCtx))
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackEntry.ctx))
 	defer func() {
 		if cancel != nil {
 			cancel()
@@ -37,11 +42,15 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 		return nil, modelExecutionError(errMsg)
 	}
 	streamID := ""
+	var errOpen error
 	if h.modelStreams != nil {
-		streamID = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
+		streamID, errOpen = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
+	}
+	if errOpen != nil {
+		return nil, errOpen
 	}
 	if streamID == "" {
-		return nil, fmt.Errorf("host model stream bridge is unavailable")
+		return nil, errModelStreamBridgeUnavailable
 	}
 	result, errMarshal := marshalRPCResult(pluginapi.HostModelStreamResponse{
 		StatusCode: stream.StatusCode,
@@ -52,10 +61,10 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 		h.modelStreams.close(streamID)
 		return nil, errMarshal
 	}
-	if req.HostCallbackID != "" {
-		h.addCallbackCleanup(req.HostCallbackID, func() {
-			h.modelStreams.close(streamID)
-		})
+	if !h.addCallbackCleanup(req.HostCallbackID, func() {
+		h.modelStreams.close(streamID)
+	}) {
+		return nil, fmt.Errorf("host model stream callback is no longer registered")
 	}
 	cancel = nil
 	return result, nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -39,8 +40,8 @@ func StripInvalidClaudeThinkingBlocks(payload []byte, opts ...ClaudeSignatureVal
 		}
 		if stripped {
 			modified = true
-			updated, _ := sjson.SetRaw(msg.Raw, "content", "["+strings.Join(keptParts, ",")+"]")
-			keptMessages = append(keptMessages, updated)
+			updated, _ := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(keptParts))
+			keptMessages = append(keptMessages, string(updated))
 			continue
 		}
 		keptMessages = append(keptMessages, msg.Raw)
@@ -48,7 +49,7 @@ func StripInvalidClaudeThinkingBlocks(payload []byte, opts ...ClaudeSignatureVal
 	if !modified {
 		return payload
 	}
-	output, _ := sjson.SetRawBytes(payload, "messages", []byte("["+strings.Join(keptMessages, ",")+"]"))
+	output, _ := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(keptMessages))
 	return output
 }
 
@@ -71,7 +72,7 @@ func StripInvalidClaudeThinkingBlocksAndEmptyMessages(payload []byte, opts ...Cl
 		}
 		kept = append(kept, message.Raw)
 	}
-	stripped, _ = sjson.SetRawBytes(stripped, "messages", []byte("["+strings.Join(kept, ",")+"]"))
+	stripped, _ = sjson.SetRawBytes(stripped, "messages", internalpayload.BuildRaw(kept))
 	return stripped
 }
 

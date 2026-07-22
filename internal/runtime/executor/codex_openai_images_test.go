@@ -11,7 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/andybalholm/brotli"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -35,6 +38,89 @@ func codexOpenAIImageTestOptions(path string, stream bool) cliproxyexecutor.Opti
 		Metadata: map[string]any{
 			cliproxyexecutor.RequestPathMetadataKey: path,
 		},
+	}
+}
+
+func TestCodexOpenAIImageEmptyOutputErrDoesNotExposeUpstreamBody(t *testing.T) {
+	secret := "sentinel-codex-image-secret"
+	payload := []byte(`{"response":{"status":"failed","error":{"message":"` + secret + `"}}}`)
+
+	err := codexOpenAIImageEmptyOutputErr(payload)
+	if err.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", err.StatusCode(), http.StatusBadGateway)
+	}
+	if err.ErrorCode() != "codex_image_empty_output" {
+		t.Fatalf("error code = %q, want codex_image_empty_output", err.ErrorCode())
+	}
+	got := err.Error()
+	if strings.Contains(got, secret) || strings.Contains(got, `"message"`) {
+		t.Fatalf("unsafe upstream body exposure: %s", got)
+	}
+	if !strings.Contains(got, `"bytes":`) || !strings.Contains(got, `"sha256":`) || !strings.Contains(got, `"content_type":"application/json"`) {
+		t.Fatalf("missing upstream body metadata: %s", got)
+	}
+}
+
+func TestCodexBuildImagesResponsesRequestBuildsLinearContent(t *testing.T) {
+	images := []string{"data:image/png;base64,AA==", "", "https://example.com/b.png"}
+	tool := []byte(`{"type":"image_generation","action":"edit","model":"gpt-image-2","unknown":{"keep":true}}`)
+
+	out := codexBuildImagesResponsesRequest("edit", images, tool)
+	content := gjson.GetBytes(out, "input.0.content").Array()
+	if len(content) != 3 {
+		t.Fatalf("content length = %d, want 3; body=%s", len(content), out)
+	}
+	if got := content[0].Get("text").String(); got != "edit" {
+		t.Fatalf("input text = %q", got)
+	}
+	if got := content[1].Get("image_url").String(); got != images[0] {
+		t.Fatalf("first image = %q", got)
+	}
+	if !gjson.GetBytes(out, "tools.0.unknown.keep").Bool() {
+		t.Fatalf("tool unknown field missing: %s", out)
+	}
+	if empty := codexBuildImagesResponsesRequest("", nil, nil); !bytes.Contains(empty, []byte(`"text":""`)) {
+		t.Fatalf("empty input text field was omitted: %s", empty)
+	}
+}
+
+func TestCodexBuildImagesAPIResponsePreservesItemOrderAndMetadata(t *testing.T) {
+	results := []codexImageCallResult{
+		{Result: "first", RevisedPrompt: "one", OutputFormat: "png"},
+		{Result: "second", RevisedPrompt: "two", OutputFormat: "jpeg"},
+	}
+	out, err := codexBuildImagesAPIResponse(results, 123, []byte(`{"total_tokens":9}`), codexImageCallResult{
+		Background: "transparent", OutputFormat: "png", Quality: "high", Size: "1024x1024",
+	}, "b64_json")
+	if err != nil {
+		t.Fatalf("codexBuildImagesAPIResponse() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "data.0.b64_json").String(); got != "first" {
+		t.Fatalf("first result = %q", got)
+	}
+	if got := gjson.GetBytes(out, "data.1.revised_prompt").String(); got != "two" {
+		t.Fatalf("second revised prompt = %q", got)
+	}
+	if got := gjson.GetBytes(out, "usage.total_tokens").Int(); got != 9 {
+		t.Fatalf("usage.total_tokens = %d", got)
+	}
+	empty, err := codexBuildImagesAPIResponse([]codexImageCallResult{{}}, 123, nil, codexImageCallResult{}, "b64_json")
+	if err != nil || !bytes.Contains(empty, []byte(`"b64_json":""`)) {
+		t.Fatalf("empty b64_json field was omitted: body=%s err=%v", empty, err)
+	}
+}
+
+func BenchmarkPayloadGrowthCodexImagesResponse(b *testing.B) {
+	results := make([]codexImageCallResult, 256)
+	for idx := range results {
+		results[idx] = codexImageCallResult{Result: strings.Repeat("A", 4096), RevisedPrompt: "refined", OutputFormat: "png"}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for idx := 0; idx < b.N; idx++ {
+		if out, err := codexBuildImagesAPIResponse(results, 123, nil, codexImageCallResult{}, "b64_json"); err != nil || len(out) == 0 {
+			b.Fatalf("build response: len=%d err=%v", len(out), err)
+		}
 	}
 }
 
@@ -97,6 +183,13 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	var gotPath string
 	var gotAccept string
 	var gotBody []byte
+	var encoded bytes.Buffer
+	encoder := brotli.NewWriter(&encoded)
+	_, _ = encoder.Write([]byte("event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA==\",\"partial_image_index\":0}\n\n"))
+	_, _ = encoder.Write([]byte("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"BB==\",\"usage\":{\"total_tokens\":10,\"input_tokens\":4,\"output_tokens\":6}}\n\n"))
+	if errClose := encoder.Close(); errClose != nil {
+		t.Fatalf("close brotli encoder: %v", errClose)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAccept = r.Header.Get("Accept")
@@ -106,8 +199,8 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 			t.Fatalf("read body: %v", errRead)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AA==\",\"partial_image_index\":0}\n\n"))
-		_, _ = w.Write([]byte("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"BB==\",\"usage\":{\"total_tokens\":10,\"input_tokens\":4,\"output_tokens\":6}}\n\n"))
+		w.Header().Set("Content-Encoding", "br")
+		_, _ = w.Write(encoded.Bytes())
 	}))
 	defer server.Close()
 
@@ -134,6 +227,9 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	if gotAccept != "text/event-stream" {
 		t.Fatalf("Accept = %q, want text/event-stream", gotAccept)
 	}
+	if stream.Headers.Get("Content-Encoding") != "" || stream.Headers.Get("Content-Length") != "" {
+		t.Fatalf("decoded stream headers retained stale framing: %v", stream.Headers)
+	}
 	if !gjson.GetBytes(gotBody, "stream").Bool() {
 		t.Fatalf("stream flag missing from upstream body: %s", string(gotBody))
 	}
@@ -143,6 +239,24 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	out := combined.String()
 	if !strings.Contains(out, "event: image_generation.partial_image") || !strings.Contains(out, "event: image_generation.completed") {
 		t.Fatalf("stream output missing image events: %q", out)
+	}
+}
+
+func TestCodexExecutorDirectOpenAIImageRejectsOversizedUpstreamError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), int(helps.DefaultUpstreamErrorBodyBytes)+1))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	_, errExecute := executor.Execute(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"test"}`),
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
+	failure, ok := failurecontract.As(errExecute)
+	if !ok || failure.Kind != failurecontract.UpstreamProtocolError || failure.ProviderCode != "upstream_error_body_too_large" {
+		t.Fatalf("Execute() error = %#v, want typed bounded-upstream failure", errExecute)
 	}
 }
 

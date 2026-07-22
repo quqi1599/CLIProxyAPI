@@ -11,6 +11,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -209,9 +210,66 @@ func TestFilterProvidersByToolCompatibility(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := filterProvidersByToolCompatibility(tt.providers, tt.payload)
+			complexity, ok := inspectRequestComplexity(tt.payload)
+			if !ok {
+				t.Fatal("inspectRequestComplexity() rejected valid fixture")
+			}
+			got := filterProvidersByToolCompatibility(tt.providers, &complexity)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("filterProvidersByToolCompatibility() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponsesChatToolCompatibilityMatchesConvertedPayload(t *testing.T) {
+	providers := []string{"antigravity", "codex", "xai"}
+	tests := []struct {
+		name              string
+		body              []byte
+		wantNonSearchTool bool
+	}{
+		{
+			name:              "additional namespace custom",
+			body:              []byte(`{"model":"test","input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"terminal","tools":[{"type":"custom","name":"exec"}]}]}]}`),
+			wantNonSearchTool: true,
+		},
+		{
+			name:              "namespace function and dropped search",
+			body:              []byte(`{"model":"test","input":"hi","tools":[{"type":"web_search"},{"type":"namespace","name":"ops","tools":[{"type":"function","name":"lookup"}]}]}`),
+			wantNonSearchTool: true,
+		},
+		{
+			name: "dropped image generation",
+			body: []byte(`{"model":"test","input":"draw","tools":[{"type":"image_generation"}]}`),
+		},
+		{
+			name: "unsupported nested namespace",
+			body: []byte(`{"model":"test","input":"hi","tools":[{"type":"namespace","name":"outer","tools":[{"type":"namespace","name":"inner","tools":[{"type":"custom","name":"exec"}]}]}]}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original, ok := inspectRequestComplexity(tt.body)
+			if !ok {
+				t.Fatal("inspectRequestComplexity() rejected original fixture")
+			}
+			if original.responsesChatCompatibility.hasNonSearchTool != tt.wantNonSearchTool {
+				t.Fatalf("precomputed Responses-to-Chat non-search = %t, want %t", original.responsesChatCompatibility.hasNonSearchTool, tt.wantNonSearchTool)
+			}
+			original.useResponsesChatToolCompatibility()
+
+			convertedBody := responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions("test", tt.body, false)
+			converted, ok := inspectRequestComplexity(convertedBody)
+			if !ok {
+				t.Fatal("inspectRequestComplexity() rejected converted fixture")
+			}
+
+			got := filterProvidersByToolCompatibility(providers, &original)
+			want := filterProvidersByToolCompatibility(providers, &converted)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("provider filter after cached profile = %v, converted body = %v; converted=%s", got, want, convertedBody)
 			}
 		})
 	}

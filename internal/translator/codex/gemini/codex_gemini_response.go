@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -190,22 +191,22 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		if !contentResult.Exists() || !contentResult.IsArray() {
 			return [][]byte{}
 		}
-		wroteText := false
-		contentResult.ForEach(func(_, partResult gjson.Result) bool {
+		contentItems := contentResult.Array()
+		contentParts := make([][]byte, 0, len(contentItems))
+		for _, partResult := range contentItems {
 			if partResult.Get("type").String() != "output_text" {
-				return true
+				continue
 			}
 			text := partResult.Get("text").String()
 			if text == "" {
-				return true
+				continue
 			}
 			part := []byte(`{"text":""}`)
 			part, _ = sjson.SetBytes(part, "text", text)
-			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
-			wroteText = true
-			return true
-		})
-		if wroteText {
+			contentParts = append(contentParts, part)
+		}
+		if len(contentParts) > 0 {
+			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts", internalpayload.BuildRaw(contentParts))
 			params.HasOutputTextDelta = true
 			return [][]byte{template}
 		}
@@ -280,17 +281,15 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 		// Process output content to build parts array
 		hasToolCall := false
+		parts := make([][]byte, 0)
 		var pendingFunctionCalls [][]byte
 
 		flushPendingFunctionCalls := func() {
 			if len(pendingFunctionCalls) == 0 {
 				return
 			}
-			// Add all pending function calls as individual parts
-			// This maintains the original Gemini API format while ensuring consecutive calls are grouped together
-			for _, fc := range pendingFunctionCalls {
-				template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", fc)
-			}
+			// Add all pending function calls as individual parts.
+			parts = append(parts, pendingFunctionCalls...)
 			pendingFunctionCalls = nil
 		}
 
@@ -307,7 +306,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 					if content := value.Get("content"); content.Exists() {
 						part := []byte(`{"text":"","thought":true}`)
 						part, _ = sjson.SetBytes(part, "text", content.String())
-						template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+						parts = append(parts, part)
 					}
 
 				case "message":
@@ -321,7 +320,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 								if text := contentItem.Get("text"); text.Exists() {
 									part := []byte(`{"text":""}`)
 									part, _ = sjson.SetBytes(part, "text", text.String())
-									template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+									parts = append(parts, part)
 								}
 							}
 							return true
@@ -340,7 +339,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 					part := []byte(`{"inlineData":{"data":"","mimeType":""}}`)
 					part, _ = sjson.SetBytes(part, "inlineData.data", b64)
 					part, _ = sjson.SetBytes(part, "inlineData.mimeType", mimeType)
-					template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", part)
+					parts = append(parts, part)
 
 				case "function_call":
 					// Collect function call for potential merging with consecutive ones
@@ -371,6 +370,9 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 			// Handle any remaining pending function calls at the end
 			flushPendingFunctionCalls()
+			if len(parts) > 0 {
+				template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts", internalpayload.BuildRaw(parts))
+			}
 		}
 
 		// Set finish reason based on whether there were tool calls

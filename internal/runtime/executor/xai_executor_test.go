@@ -9,8 +9,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -38,7 +42,10 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 			t.Fatalf("read body: %v", errRead)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		w.Header().Set("Content-Encoding", "br")
+		encoded := brotli.NewWriter(w)
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		_ = encoded.Close()
 	}))
 	defer server.Close()
 
@@ -56,10 +63,13 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 		},
 	}
 
-	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	request := cliproxyexecutor.Request{
 		Model:   "grok-4.3",
 		Payload: []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}]}`),
-	}, cliproxyexecutor.Options{
+	}
+	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(request.Payload)))
+	releaseReport := internalpayload.RetainTransformReport(ctx)
+	resp, err := exec.Execute(ctx, auth, request, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:       false,
 		Metadata: map[string]any{
@@ -69,6 +79,10 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
+	if got := resp.Headers.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want decoded response headers", got)
+	}
+	assertTransformStageContract(t, ctx, releaseReport, "request_plan.xai", int64(len(gotBody)))
 
 	if gotPath != "/responses" {
 		t.Fatalf("path = %q, want /responses", gotPath)
@@ -157,6 +171,33 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 		if include.String() == "reasoning.encrypted_content" {
 			t.Fatalf("xai request must not ask for encrypted reasoning content: %s", string(gotBody))
 		}
+	}
+}
+
+func TestXAIExecutorExecuteRejectsOversizedErrorResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, strings.Repeat("x", int(helps.DefaultUpstreamErrorBodyBytes)+1))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: []byte(`{"model":"grok-4.3","input":"hello"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want bounded upstream failure")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.UpstreamProtocolError || typed.Scope != failurecontract.ScopeProvider {
+		t.Fatalf("Execute() error = %#v, want provider-scoped upstream protocol failure", err)
 	}
 }
 
@@ -566,18 +607,21 @@ func TestXAIExecutorExecuteStreamFiltersToolSearchTool(t *testing.T) {
 func TestXAIExecutorExecuteStreamNormalizesReasoningTextEvents(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: response.output_item.added\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}}\n\n"))
-		_, _ = w.Write([]byte("event: response.content_part.added\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}\n\n"))
-		_, _ = w.Write([]byte("event: response.reasoning_text.delta\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":3,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n"))
-		_, _ = w.Write([]byte("event: response.reasoning_text.done\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_text.done\",\"sequence_number\":4,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"text\":\"thinking\"}\n\n"))
-		_, _ = w.Write([]byte("event: response.output_item.done\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":5,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"thinking\"}]}}\n\n"))
-		_, _ = w.Write([]byte("event: response.completed\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"sequence_number\":6,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		w.Header().Set("Content-Encoding", "br")
+		encoded := brotli.NewWriter(w)
+		_, _ = encoded.Write([]byte("event: response.output_item.added\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}}\n\n"))
+		_, _ = encoded.Write([]byte("event: response.content_part.added\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}\n\n"))
+		_, _ = encoded.Write([]byte("event: response.reasoning_text.delta\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":3,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n"))
+		_, _ = encoded.Write([]byte("event: response.reasoning_text.done\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.reasoning_text.done\",\"sequence_number\":4,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"text\":\"thinking\"}\n\n"))
+		_, _ = encoded.Write([]byte("event: response.output_item.done\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":5,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"thinking\"}]}}\n\n"))
+		_, _ = encoded.Write([]byte("event: response.completed\n"))
+		_, _ = encoded.Write([]byte("data: {\"type\":\"response.completed\",\"sequence_number\":6,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		_ = encoded.Close()
 	}))
 	defer server.Close()
 
@@ -598,6 +642,12 @@ func TestXAIExecutorExecuteStreamNormalizesReasoningTextEvents(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if result.Cancel == nil {
+		t.Fatal("expected stream cancel callback")
+	}
+	if got := result.Headers.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want decoded response headers", got)
 	}
 
 	var streamed bytes.Buffer
@@ -633,6 +683,8 @@ func TestXAIExecutorExecuteStreamNormalizesReasoningTextEvents(t *testing.T) {
 	if textDoneIndex < 0 || partDoneIndex < 0 || textDoneIndex > partDoneIndex {
 		t.Fatalf("reasoning done events are out of order: %s", output)
 	}
+	result.Cancel()
+	result.Cancel()
 }
 
 func TestXAIExecutorExecuteNormalizesReasoningOutputForNonStreamTranslation(t *testing.T) {

@@ -4,10 +4,10 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +16,7 @@ import (
 
 	vertexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/vertex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -304,6 +305,7 @@ func (e *GeminiVertexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.A
 // executeWithServiceAccount handles authentication using service account credentials.
 // This method contains the original service account authentication logic.
 func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (resp cliproxyexecutor.Response, err error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -328,8 +330,21 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 			originalPayloadSource = opts.OriginalRequest
 		}
 		originalPayload := originalPayloadSource
-		originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-		body = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+		originalTranslated, translatedBody, errTranslate := helps.TranslateRequestPairGuarded(
+			ctx,
+			"legacy.translate.vertex",
+			from,
+			to,
+			baseModel,
+			originalPayload,
+			req.Payload,
+			false,
+			internalpayload.AmplificationOverride{},
+		)
+		if errTranslate != nil {
+			return resp, errTranslate
+		}
+		body = translatedBody
 
 		body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 		if err != nil {
@@ -357,6 +372,14 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	}
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, "gemini")
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return resp, errGuard
+	}
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -401,25 +424,18 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return resp, err
-	}
-	data, errRead := io.ReadAll(httpResp.Body)
+	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return resp, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+		return resp, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 
 	// For Imagen models, convert response to Gemini format before translation
@@ -433,12 +449,13 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	to := sdktranslator.FromString("gemini")
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}
 	return resp, nil
 }
 
 // executeWithAPIKey handles authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (resp cliproxyexecutor.Response, err error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -453,8 +470,20 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, body, errTranslate := helps.TranslateRequestPairGuarded(
+		ctx,
+		"legacy.translate.vertex",
+		from,
+		to,
+		baseModel,
+		originalPayload,
+		req.Payload,
+		false,
+		internalpayload.AmplificationOverride{},
+	)
+	if errTranslate != nil {
+		return resp, errTranslate
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -485,6 +514,14 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	}
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return resp, errGuard
+	}
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -526,34 +563,28 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return resp, err
-	}
-	data, errRead := io.ReadAll(httpResp.Body)
+	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return resp, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+		return resp, err
+	}
 	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}
 	return resp, nil
 }
 
 // executeStreamWithServiceAccount handles streaming authentication using service account credentials.
 func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (_ *cliproxyexecutor.StreamResult, err error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -568,8 +599,20 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, body, errTranslate := helps.TranslateRequestPairGuarded(
+		ctx,
+		"legacy.translate.vertex.stream",
+		from,
+		to,
+		baseModel,
+		originalPayload,
+		req.Payload,
+		true,
+		internalpayload.AmplificationOverride{},
+	)
+	if errTranslate != nil {
+		return nil, errTranslate
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -596,15 +639,26 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	}
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex.stream",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return nil, errGuard
+	}
 
-	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	httpReq, errNewReq := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
+		cancelRequest()
 		return nil, errNewReq
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if token, errTok := vertexAccessToken(ctx, e.cfg, auth, saJSON); errTok == nil && token != "" {
+	if token, errTok := vertexAccessToken(requestCtx, e.cfg, auth, saJSON); errTok == nil && token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	} else if errTok != nil {
+		cancelRequest()
 		log.Errorf("vertex executor: access token error: %v", errTok)
 		return nil, statusErr{code: 500, msg: "internal server error"}
 	}
@@ -633,72 +687,91 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(requestCtx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
+		cancelRequest()
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		if errRead != nil {
+			cancelRequest()
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, errRead
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		cancelRequest()
+		return nil, newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
+	}
+	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
+	if errStream != nil {
+		cancelRequest()
+		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+		return nil, errStream
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
+	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "vertex executor")
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("vertex executor: close response body error: %v", errClose)
-			}
-		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, streamScannerBuffer)
+		defer closeResponse()
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+		cleanEOF := false
+		for {
+			event, errRead := sseStream.ReadEvent()
+			if errRead != nil {
+				if requestCtx.Err() != nil {
+					return
+				}
+				if errors.Is(errRead, io.EOF) {
+					cleanEOF = true
+					break
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+				reporter.PublishFailure(ctx, errRead)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case <-requestCtx.Done():
+				}
+				return
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
+			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
+					reporter.Publish(ctx, detail)
+				}
+				lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, internalpayload.CloneBytes(line), &param)
+				for i := range lines {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+					case <-requestCtx.Done():
+						return
+					}
+				}
+			}
+		}
+		if cleanEOF {
+			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 			for i := range lines {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-				case <-ctx.Done():
+				case <-requestCtx.Done():
 					return
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
-		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
 }
 
 // executeStreamWithAPIKey handles streaming authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (_ *cliproxyexecutor.StreamResult, err error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -713,8 +786,20 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, body, errTranslate := helps.TranslateRequestPairGuarded(
+		ctx,
+		"legacy.translate.vertex.stream",
+		from,
+		to,
+		baseModel,
+		originalPayload,
+		req.Payload,
+		true,
+		internalpayload.AmplificationOverride{},
+	)
+	if errTranslate != nil {
+		return nil, errTranslate
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -744,9 +829,19 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	}
 	body, _ = sjson.DeleteBytes(body, "session_id")
 	reporter.SetTranslatedReasoningEffort(body, to.String())
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex.stream",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return nil, errGuard
+	}
 
-	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	httpReq, errNewReq := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
+		cancelRequest()
 		return nil, errNewReq
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -778,81 +873,112 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewProxyAwareHTTPClient(requestCtx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
+		cancelRequest()
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		if errRead != nil {
+			cancelRequest()
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, errRead
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		cancelRequest()
+		return nil, newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
+	}
+	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
+	if errStream != nil {
+		cancelRequest()
+		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+		return nil, errStream
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
+	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "vertex executor")
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("vertex executor: close response body error: %v", errClose)
-			}
-		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, streamScannerBuffer)
+		defer closeResponse()
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+		cleanEOF := false
+		for {
+			event, errRead := sseStream.ReadEvent()
+			if errRead != nil {
+				if requestCtx.Err() != nil {
+					return
+				}
+				if errors.Is(errRead, io.EOF) {
+					cleanEOF = true
+					break
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+				reporter.PublishFailure(ctx, errRead)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case <-requestCtx.Done():
+				}
+				return
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
+			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
+					reporter.Publish(ctx, detail)
+				}
+				lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, internalpayload.CloneBytes(line), &param)
+				for i := range lines {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
+					case <-requestCtx.Done():
+						return
+					}
+				}
+			}
+		}
+		if cleanEOF {
+			lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 			for i := range lines {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-				case <-ctx.Done():
+				case <-requestCtx.Done():
 					return
 				}
 			}
 		}
-		lines := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range lines {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
-		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
 }
 
 // countTokensWithServiceAccount counts tokens using service account credentials.
 func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (cliproxyexecutor.Response, error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("gemini")
 
-	translatedReq := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translatedReq, err := helps.TranslateRequestGuarded(
+		ctx,
+		"legacy.translate.vertex.count",
+		from,
+		to,
+		baseModel,
+		req.Payload,
+		false,
+		internalpayload.AmplificationOverride{},
+	)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
-	translatedReq, err := thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -864,6 +990,14 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex.count",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(translatedReq)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return cliproxyexecutor.Response{}, errGuard
+	}
 
 	baseURL := vertexBaseURL(location)
 	url := fmt.Sprintf("%s/%s/projects/%s/locations/%s/publishers/google/models/%s:%s", baseURL, vertexAPIVersion, projectID, location, baseModel, "countTokens")
@@ -910,40 +1044,46 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return cliproxyexecutor.Response{}, errDo
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
-	}
-	data, errRead := io.ReadAll(httpResp.Body)
+	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return cliproxyexecutor.Response{}, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		return cliproxyexecutor.Response{}, newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+	}
 	count := gjson.GetBytes(data, "totalTokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
-	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}, nil
 }
 
 // countTokensWithAPIKey handles token counting using API key credentials.
 func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (cliproxyexecutor.Response, error) {
+	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("gemini")
 
-	translatedReq := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	translatedReq, err := helps.TranslateRequestGuarded(
+		ctx,
+		"legacy.translate.vertex.count",
+		from,
+		to,
+		baseModel,
+		req.Payload,
+		false,
+		internalpayload.AmplificationOverride{},
+	)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
-	translatedReq, err := thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
+	translatedReq, err = thinking.ApplyThinking(translatedReq, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -955,6 +1095,14 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "tools")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "generationConfig")
 	translatedReq, _ = sjson.DeleteBytes(translatedReq, "safetySettings")
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.vertex.count",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(translatedReq)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return cliproxyexecutor.Response{}, errGuard
+	}
 
 	// For API key auth, use simpler URL format without project/location
 	if baseURL == "" {
@@ -1001,27 +1149,20 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return cliproxyexecutor.Response{}, errDo
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("vertex executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
-	}
-	data, errRead := io.ReadAll(httpResp.Body)
+	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		return cliproxyexecutor.Response{}, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		return cliproxyexecutor.Response{}, newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+	}
 	count := gjson.GetBytes(data, "totalTokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
-	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}, nil
 }
 
 // vertexCreds extracts project, location and raw service account JSON from auth metadata.

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -44,18 +45,16 @@ func ConvertAntigravityResponseToGemini(ctx context.Context, _ string, originalR
 				chunk = restoreUsageMetadata(chunk)
 			}
 		} else {
-			chunkTemplate := []byte("[]")
 			responseResult := gjson.ParseBytes(chunk)
+			responses := make([][]byte, 0, len(responseResult.Array()))
 			if responseResult.IsArray() {
-				responseResultItems := responseResult.Array()
-				for i := 0; i < len(responseResultItems); i++ {
-					responseResultItem := responseResultItems[i]
+				for _, responseResultItem := range responseResult.Array() {
 					if responseResultItem.Get("response").Exists() {
-						chunkTemplate, _ = sjson.SetRawBytes(chunkTemplate, "-1", []byte(responseResultItem.Get("response").Raw))
+						responses = append(responses, []byte(responseResultItem.Get("response").Raw))
 					}
 				}
 			}
-			chunk = chunkTemplate
+			chunk = internalpayload.BuildRaw(responses)
 		}
 		return [][]byte{chunk}
 	}

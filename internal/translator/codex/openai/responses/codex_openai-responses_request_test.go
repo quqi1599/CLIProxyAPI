@@ -1,13 +1,11 @@
 package responses
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 var benchmarkConvertSystemRoleOutput []byte
@@ -439,7 +437,7 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 	}
 }
 
-func BenchmarkConvertSystemRoleToDeveloperLargeInput(b *testing.B) {
+func BenchmarkPayloadGrowthCodexResponsesSystemRole(b *testing.B) {
 	cases := []struct {
 		name      string
 		inputJSON []byte
@@ -457,42 +455,26 @@ func BenchmarkConvertSystemRoleToDeveloperLargeInput(b *testing.B) {
 			inputJSON: makeLargeResponsesInputForBenchmark(2000, 100),
 		},
 	}
-	benchmarks := []struct {
-		name string
-		fn   func([]byte) []byte
-	}{
-		{
-			name: "previous_root_path_rewrite",
-			fn:   convertSystemRoleToDeveloperPreviousRootPathRewriteForBenchmark,
-		},
-		{
-			name: "current_rebuilt_input_json_marshal",
-			fn:   convertSystemRoleToDeveloper,
-		},
-	}
-
 	for _, testCase := range cases {
-		for _, benchmark := range benchmarks {
-			b.Run(testCase.name+"/"+benchmark.name, func(b *testing.B) {
-				output := benchmark.fn(testCase.inputJSON)
-				if got := gjson.GetBytes(output, "input.0.role").String(); got != "developer" {
-					b.Fatalf("input.0.role = %q, want %q", got, "developer")
-				}
-				if got := gjson.GetBytes(output, "input.1.role").String(); got != "user" {
-					b.Fatalf("input.1.role = %q, want %q", got, "user")
-				}
+		b.Run(testCase.name, func(b *testing.B) {
+			output := convertSystemRoleToDeveloper(testCase.inputJSON)
+			if got := gjson.GetBytes(output, "input.0.role").String(); got != "developer" {
+				b.Fatalf("input.0.role = %q, want %q", got, "developer")
+			}
+			if got := gjson.GetBytes(output, "input.1.role").String(); got != "user" {
+				b.Fatalf("input.1.role = %q, want %q", got, "user")
+			}
 
-				b.ReportAllocs()
-				b.SetBytes(int64(len(testCase.inputJSON)))
-				b.ResetTimer()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(testCase.inputJSON)))
+			b.ResetTimer()
 
-				var benchmarkOutput []byte
-				for i := 0; i < b.N; i++ {
-					benchmarkOutput = benchmark.fn(testCase.inputJSON)
-				}
-				benchmarkConvertSystemRoleOutput = benchmarkOutput
-			})
-		}
+			var benchmarkOutput []byte
+			for b.Loop() {
+				benchmarkOutput = convertSystemRoleToDeveloper(testCase.inputJSON)
+			}
+			benchmarkConvertSystemRoleOutput = benchmarkOutput
+		})
 	}
 }
 
@@ -516,23 +498,4 @@ func makeLargeResponsesInputForBenchmark(inputCount int, systemEvery int) []byte
 	}
 	builder.WriteString(`]}`)
 	return []byte(builder.String())
-}
-
-func convertSystemRoleToDeveloperPreviousRootPathRewriteForBenchmark(rawJSON []byte) []byte {
-	inputResult := gjson.GetBytes(rawJSON, "input")
-	if !inputResult.IsArray() {
-		return rawJSON
-	}
-
-	inputArray := inputResult.Array()
-	result := rawJSON
-
-	for i := 0; i < len(inputArray); i++ {
-		rolePath := fmt.Sprintf("input.%d.role", i)
-		if gjson.GetBytes(result, rolePath).String() == "system" {
-			result, _ = sjson.SetBytes(result, rolePath, "developer")
-		}
-	}
-
-	return result
 }

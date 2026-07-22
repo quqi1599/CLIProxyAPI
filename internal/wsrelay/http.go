@@ -9,6 +9,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+)
+
+const (
+	maxHTTPResponseBodyBytes = 128 << 20
+	maxStreamChunkBytes      = 16 << 20
+	maxStreamResponseBytes   = 128 << 20
+
+	wsrelayResponseBodyTooLargeCode   = "wsrelay_response_body_too_large"
+	wsrelayStreamChunkTooLargeCode    = "wsrelay_stream_chunk_too_large"
+	wsrelayStreamResponseTooLargeCode = "wsrelay_stream_response_too_large"
+)
+
+var (
+	errHTTPResponseBodyTooLarge = errors.New("wsrelay: HTTP response body exceeds limit")
+	errStreamChunkTooLarge      = errors.New("wsrelay: stream chunk exceeds limit")
+	errStreamResponseTooLarge   = errors.New("wsrelay: stream response exceeds limit")
 )
 
 // HTTPRequest represents a proxied HTTP request delivered to websocket clients.
@@ -40,8 +57,13 @@ func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPReque
 	if req == nil {
 		return nil, fmt.Errorf("wsrelay: request is nil")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	msg := Message{ID: uuid.NewString(), Type: MessageTypeHTTPReq, Payload: encodeRequest(req)}
-	respCh, err := m.Send(ctx, provider, msg)
+	respCh, err := m.Send(requestCtx, provider, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -49,11 +71,12 @@ func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPReque
 		streamMode bool
 		streamResp *HTTPResponse
 		streamBody bytes.Buffer
+		budget     = responseByteBudget{limit: maxStreamResponseBytes}
 	)
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-requestCtx.Done():
+			return nil, requestCtx.Err()
 		case msg, ok := <-respCh:
 			if !ok {
 				if streamMode {
@@ -62,50 +85,76 @@ func (m *Manager) NonStream(ctx context.Context, provider string, req *HTTPReque
 					} else if streamResp.Headers == nil {
 						streamResp.Headers = make(http.Header)
 					}
-					streamResp.Body = append(streamResp.Body[:0], streamBody.Bytes()...)
+					streamResp.Body = streamBody.Bytes()
 					return streamResp, nil
 				}
 				return nil, errors.New("wsrelay: connection closed during response")
 			}
-			switch msg.Type {
-			case MessageTypeHTTPResp:
-				resp := decodeResponse(msg.Payload)
-				if streamMode && streamBody.Len() > 0 && len(resp.Body) == 0 {
-					resp.Body = append(resp.Body[:0], streamBody.Bytes()...)
-				}
-				return resp, nil
-			case MessageTypeError:
-				return nil, decodeError(msg.Payload)
-			case MessageTypeStreamStart, MessageTypeStreamChunk:
-				if msg.Type == MessageTypeStreamStart {
+			resp, errProcess, done := func() (*HTTPResponse, error, bool) {
+				defer msg.Release()
+				switch msg.Type {
+				case MessageTypeHTTPResp:
+					resp, errDecode := decodeResponse(msg.Payload)
+					if errDecode != nil {
+						return nil, errDecode, true
+					}
+					if errBudget := budget.add(len(resp.Body)); errBudget != nil {
+						return nil, errBudget, true
+					}
+					if streamMode && streamBody.Len() > 0 && len(resp.Body) == 0 {
+						resp.Body = streamBody.Bytes()
+					}
+					return resp, nil, true
+				case MessageTypeError:
+					return nil, decodeError(msg.Payload), true
+				case MessageTypeStreamStart:
+					decodedResp, errDecode := decodeResponse(msg.Payload)
+					if errDecode != nil {
+						return nil, errDecode, true
+					}
 					streamMode = true
-					streamResp = decodeResponse(msg.Payload)
+					streamResp = decodedResp
+					if errBudget := budget.add(len(streamResp.Body)); errBudget != nil {
+						return nil, errBudget, true
+					}
 					if streamResp.Headers == nil {
 						streamResp.Headers = make(http.Header)
 					}
 					streamBody.Reset()
-					continue
+					return nil, nil, false
+				case MessageTypeStreamChunk:
+					if !streamMode {
+						streamMode = true
+						streamResp = &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
+					}
+					chunk, errDecode := decodeChunk(msg.Payload)
+					if errDecode != nil {
+						return nil, errDecode, true
+					}
+					if errBudget := budget.add(len(chunk)); errBudget != nil {
+						return nil, errBudget, true
+					}
+					if len(chunk) > 0 {
+						_, _ = streamBody.Write(chunk)
+					}
+					return nil, nil, false
+				case MessageTypeStreamEnd:
+					if !streamMode {
+						return &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}, nil, true
+					}
+					if streamResp == nil {
+						streamResp = &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
+					} else if streamResp.Headers == nil {
+						streamResp.Headers = make(http.Header)
+					}
+					streamResp.Body = streamBody.Bytes()
+					return streamResp, nil, true
+				default:
+					return nil, nil, false
 				}
-				if !streamMode {
-					streamMode = true
-					streamResp = &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
-				}
-				chunk := decodeChunk(msg.Payload)
-				if len(chunk) > 0 {
-					streamBody.Write(chunk)
-				}
-			case MessageTypeStreamEnd:
-				if !streamMode {
-					return &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}, nil
-				}
-				if streamResp == nil {
-					streamResp = &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
-				} else if streamResp.Headers == nil {
-					streamResp.Headers = make(http.Header)
-				}
-				streamResp.Body = append(streamResp.Body[:0], streamBody.Bytes()...)
-				return streamResp, nil
-			default:
+			}()
+			if done {
+				return resp, errProcess
 			}
 		}
 	}
@@ -116,19 +165,21 @@ func (m *Manager) Stream(ctx context.Context, provider string, req *HTTPRequest)
 	if req == nil {
 		return nil, fmt.Errorf("wsrelay: request is nil")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
 	msg := Message{ID: uuid.NewString(), Type: MessageTypeHTTPReq, Payload: encodeRequest(req)}
-	respCh, err := m.Send(ctx, provider, msg)
+	respCh, err := m.Send(requestCtx, provider, msg)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	out := make(chan StreamEvent)
 	go func() {
+		defer cancel()
 		defer close(out)
 		send := func(ev StreamEvent) bool {
-			if ctx == nil {
-				out <- ev
-				return true
-			}
 			select {
 			case <-ctx.Done():
 				return false
@@ -138,35 +189,53 @@ func (m *Manager) Stream(ctx context.Context, provider string, req *HTTPRequest)
 		}
 		for {
 			select {
-			case <-ctx.Done():
+			case <-requestCtx.Done():
 				return
 			case msg, ok := <-respCh:
 				if !ok {
 					_ = send(StreamEvent{Err: errors.New("wsrelay: stream closed")})
 					return
 				}
-				switch msg.Type {
-				case MessageTypeStreamStart:
-					resp := decodeResponse(msg.Payload)
-					if okSend := send(StreamEvent{Type: MessageTypeStreamStart, Status: resp.Status, Headers: resp.Headers}); !okSend {
-						return
+				keepGoing := func() bool {
+					defer msg.Release()
+					switch msg.Type {
+					case MessageTypeStreamStart:
+						resp, errDecode := decodeResponse(msg.Payload)
+						if errDecode != nil {
+							cancel()
+							_ = send(StreamEvent{Type: MessageTypeError, Err: errDecode})
+							return false
+						}
+						return send(StreamEvent{Type: MessageTypeStreamStart, Status: resp.Status, Headers: resp.Headers})
+					case MessageTypeStreamChunk:
+						chunk, errDecode := decodeChunk(msg.Payload)
+						if errDecode != nil {
+							cancel()
+							_ = send(StreamEvent{Type: MessageTypeError, Err: errDecode})
+							return false
+						}
+						return send(StreamEvent{Type: MessageTypeStreamChunk, Payload: chunk})
+					case MessageTypeStreamEnd:
+						_ = send(StreamEvent{Type: MessageTypeStreamEnd})
+						return false
+					case MessageTypeError:
+						_ = send(StreamEvent{Type: MessageTypeError, Err: decodeError(msg.Payload)})
+						return false
+					case MessageTypeHTTPResp:
+						resp, errDecode := decodeResponse(msg.Payload)
+						if errDecode != nil {
+							cancel()
+							_ = send(StreamEvent{Type: MessageTypeError, Err: errDecode})
+							return false
+						}
+						_ = send(StreamEvent{Type: MessageTypeHTTPResp, Status: resp.Status, Headers: resp.Headers, Payload: resp.Body})
+						return false
+					default:
+						return true
 					}
-				case MessageTypeStreamChunk:
-					chunk := decodeChunk(msg.Payload)
-					if okSend := send(StreamEvent{Type: MessageTypeStreamChunk, Payload: chunk}); !okSend {
-						return
-					}
-				case MessageTypeStreamEnd:
-					_ = send(StreamEvent{Type: MessageTypeStreamEnd})
+				}()
+				if !keepGoing {
 					return
-				case MessageTypeError:
-					_ = send(StreamEvent{Type: MessageTypeError, Err: decodeError(msg.Payload)})
-					return
-				case MessageTypeHTTPResp:
-					resp := decodeResponse(msg.Payload)
-					_ = send(StreamEvent{Type: MessageTypeHTTPResp, Status: resp.Status, Headers: resp.Headers, Payload: resp.Body})
-					return
-				default:
 				}
 			}
 		}
@@ -190,9 +259,13 @@ func encodeRequest(req *HTTPRequest) map[string]any {
 	}
 }
 
-func decodeResponse(payload map[string]any) *HTTPResponse {
+func decodeResponse(payload map[string]any) (*HTTPResponse, error) {
+	return decodeResponseWithLimit(payload, maxHTTPResponseBodyBytes)
+}
+
+func decodeResponseWithLimit(payload map[string]any, bodyLimit int) (*HTTPResponse, error) {
 	if payload == nil {
-		return &HTTPResponse{Status: http.StatusBadGateway, Headers: make(http.Header)}
+		return &HTTPResponse{Status: http.StatusBadGateway, Headers: make(http.Header)}, nil
 	}
 	resp := &HTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
 	if status, ok := payload["status"].(float64); ok {
@@ -217,19 +290,73 @@ func decodeResponse(payload map[string]any) *HTTPResponse {
 		}
 	}
 	if body, ok := payload["body"].(string); ok {
-		resp.Body = []byte(body)
+		var err error
+		resp.Body, err = decodePayloadString(body, bodyLimit, errHTTPResponseBodyTooLarge)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return resp
+	return resp, nil
 }
 
-func decodeChunk(payload map[string]any) []byte {
+func decodeChunk(payload map[string]any) ([]byte, error) {
+	return decodeChunkWithLimit(payload, maxStreamChunkBytes)
+}
+
+func decodeChunkWithLimit(payload map[string]any, chunkLimit int) ([]byte, error) {
 	if payload == nil {
-		return nil
+		return nil, nil
 	}
 	if data, ok := payload["data"].(string); ok {
-		return []byte(data)
+		return decodePayloadString(data, chunkLimit, errStreamChunkTooLarge)
 	}
+	return nil, nil
+}
+
+func decodePayloadString(payload string, limit int, limitErr error) ([]byte, error) {
+	if len(payload) > limit {
+		return nil, wsrelayLimitFailure(limitErr)
+	}
+	return []byte(payload), nil
+}
+
+type responseByteBudget struct {
+	total int
+	limit int
+}
+
+func (b *responseByteBudget) add(size int) error {
+	if size < 0 || b.total > b.limit-size {
+		return wsrelayLimitFailure(errStreamResponseTooLarge)
+	}
+	b.total += size
 	return nil
+}
+
+func wsrelayLimitFailure(cause error) error {
+	code := ""
+	message := ""
+	switch cause {
+	case errHTTPResponseBodyTooLarge:
+		code = wsrelayResponseBodyTooLargeCode
+		message = "upstream websocket response body exceeded the configured limit"
+	case errStreamChunkTooLarge:
+		code = wsrelayStreamChunkTooLargeCode
+		message = "upstream websocket stream chunk exceeded the configured limit"
+	case errStreamResponseTooLarge:
+		code = wsrelayStreamResponseTooLargeCode
+		message = "upstream websocket stream response exceeded the configured limit"
+	default:
+		return cause
+	}
+	return &failurecontract.Failure{
+		Kind:          failurecontract.UpstreamProtocolError,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusBadGateway,
+		ProviderCode:  code,
+		Cause:         cause,
+		PublicMessage: message,
+	}
 }
 
 func decodeError(payload map[string]any) error {

@@ -2,10 +2,13 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 )
 
@@ -462,6 +465,30 @@ func TestNormalizeThinkingHistorySyntheticBudgetDowngradesMultipleMessages(t *te
 			if got := gjson.GetBytes(out, tt.lastSyntheticPath).String(); got != tt.placeholder {
 				t.Fatalf("last synthetic history = %q, want %q", got, tt.placeholder)
 			}
+
+			ctx := internalpayload.WithTransformReport(context.Background(), int64(len(tt.body)))
+			const stageDuration = 2 * time.Millisecond
+			if errRecord := enforceThinkingHistoryTransform(ctx, tt.provider, report, stageDuration); errRecord != nil {
+				t.Fatalf("enforceThinkingHistoryTransform() error = %v", errRecord)
+			}
+			transformReport, ok := internalpayload.TransformReportFromContext(ctx)
+			if !ok || len(transformReport.Stages) != 1 {
+				t.Fatalf("transform report = %#v", transformReport)
+			}
+			stage := transformReport.Stages[0]
+			wantStage := openAIThinkingHistoryTransformStage
+			if tt.provider == "claude" {
+				wantStage = claudeThinkingHistoryTransformStage
+			}
+			if stage.Stage != wantStage || stage.InputBytes != int64(report.InputBytes) || stage.OutputBytes != int64(report.OutputBytes) || stage.SyntheticBytes != int64(report.SyntheticBytes) || stage.Duration != stageDuration {
+				t.Fatalf("thinking history stage = %#v", stage)
+			}
+			if len(stage.AppliedPolicies) != 2 || stage.AppliedPolicies[0] != thinkingHistoryPlaceholderPolicy || stage.AppliedPolicies[1] != thinkingHistorySyntheticBudgetPolicy {
+				t.Fatalf("applied policies = %v", stage.AppliedPolicies)
+			}
+			if len(stage.Downgrades) != 1 || stage.Downgrades[0] != thinkingHistoryBudgetDowngradeReason {
+				t.Fatalf("downgrades = %v", stage.Downgrades)
+			}
 		})
 	}
 }
@@ -488,7 +515,7 @@ func TestNormalizeThinkingHistoryBudgetDowngradeIsIdempotent(t *testing.T) {
 	if changed || downgraded || !bytes.Equal(second, out) {
 		t.Fatalf("second normalization changed=%v downgraded=%v", changed, downgraded)
 	}
-	if secondReport.InputBytes != len(out) || secondReport.OutputBytes != len(out) || secondReport.SyntheticBytes != 0 || secondReport.PatchedCount != 0 || secondReport.DowngradeReason != "" {
+	if secondReport.InputBytes != len(out) || secondReport.OutputBytes != len(out) || secondReport.SyntheticBytes != 0 || secondReport.PatchedCount != 0 || secondReport.PlaceholderCount != 0 || secondReport.DowngradeReason != "" {
 		t.Fatalf("second report = %+v, want unchanged report", secondReport)
 	}
 }

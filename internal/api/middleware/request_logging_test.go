@@ -7,11 +7,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 )
 
@@ -76,79 +81,6 @@ func TestShouldSkipMethodForRequestLogging(t *testing.T) {
 		got := shouldSkipMethodForRequestLogging(tests[i].req)
 		if got != tests[i].skip {
 			t.Fatalf("%s: got skip=%t, want %t", tests[i].name, got, tests[i].skip)
-		}
-	}
-}
-
-func TestShouldCaptureRequestBody(t *testing.T) {
-	tests := []struct {
-		name          string
-		loggerEnabled bool
-		req           *http.Request
-		want          bool
-	}{
-		{
-			name:          "logger enabled always captures",
-			loggerEnabled: true,
-			req: &http.Request{
-				Body:          io.NopCloser(strings.NewReader("{}")),
-				ContentLength: -1,
-				Header:        http.Header{"Content-Type": []string{"application/json"}},
-			},
-			want: true,
-		},
-		{
-			name:          "nil request",
-			loggerEnabled: false,
-			req:           nil,
-			want:          false,
-		},
-		{
-			name:          "small known size json in error-only mode",
-			loggerEnabled: false,
-			req: &http.Request{
-				Body:          io.NopCloser(strings.NewReader("{}")),
-				ContentLength: 2,
-				Header:        http.Header{"Content-Type": []string{"application/json"}},
-			},
-			want: true,
-		},
-		{
-			name:          "large known size skipped in error-only mode",
-			loggerEnabled: false,
-			req: &http.Request{
-				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: maxCapturedRequestBodyBytes + 1,
-				Header:        http.Header{"Content-Type": []string{"application/json"}},
-			},
-			want: false,
-		},
-		{
-			name:          "unknown size skipped in error-only mode",
-			loggerEnabled: false,
-			req: &http.Request{
-				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: -1,
-				Header:        http.Header{"Content-Type": []string{"application/json"}},
-			},
-			want: false,
-		},
-		{
-			name:          "multipart skipped in error-only mode",
-			loggerEnabled: false,
-			req: &http.Request{
-				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: 1,
-				Header:        http.Header{"Content-Type": []string{"multipart/form-data; boundary=abc"}},
-			},
-			want: false,
-		},
-	}
-
-	for i := range tests {
-		got := shouldCaptureRequestBody(tests[i].loggerEnabled, tests[i].req)
-		if got != tests[i].want {
-			t.Fatalf("%s: got %t, want %t", tests[i].name, got, tests[i].want)
 		}
 	}
 }
@@ -233,12 +165,12 @@ func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
 	req.Header.Set("Content-Encoding", "zstd")
 	c.Request = req
 
-	info, errCapture := captureRequestInfo(c, true)
+	info, errCapture := captureRequestInfo(c)
 	if errCapture != nil {
 		t.Fatalf("captureRequestInfo: %v", errCapture)
 	}
-	if !bytes.Equal(info.Body, payload) {
-		t.Fatalf("logged request body = %q, want %q", string(info.Body), string(payload))
+	if len(info.Body) != 0 || info.bodyCapture == nil {
+		t.Fatal("request body should be represented only by streaming metadata")
 	}
 
 	restoredBody, errRead := io.ReadAll(c.Request.Body)
@@ -253,17 +185,17 @@ func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
 func TestCaptureRequestInfoDoesNotBufferLargeRequestBody(t *testing.T) {
 	t.Parallel()
 
-	payload := bytes.Repeat([]byte("x"), int(maxCapturedRequestBodyBytes)+2)
+	payload := bytes.Repeat([]byte("x"), (1<<20)+2)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
 
-	info, err := captureRequestInfo(c, true)
+	info, err := captureRequestInfo(c)
 	if err != nil {
 		t.Fatalf("captureRequestInfo: %v", err)
 	}
 	if len(info.Body) != 0 {
-		t.Fatalf("captured body bytes = %d, want 0 for oversized body", len(info.Body))
+		t.Fatalf("captured body bytes = %d, want metadata-only", len(info.Body))
 	}
 	restored, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -272,4 +204,117 @@ func TestCaptureRequestInfoDoesNotBufferLargeRequestBody(t *testing.T) {
 	if !bytes.Equal(restored, payload) {
 		t.Fatal("request body was not fully replayed after bounded capture")
 	}
+}
+
+func TestRequestLoggingMiddleware_PanicClosesStreamAndCleansSources(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	streamWriter := &lifecycleStreamingLogWriter{closed: make(chan struct{})}
+	logger := &lifecycleRequestLogger{logsDir: t.TempDir(), streamWriter: streamWriter}
+	pathsCh := make(chan []string, 1)
+
+	router := gin.New()
+	router.Use(gin.Recovery(), RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		var paths []string
+		for _, key := range []string{logging.APIRequestSourceContextKey, logging.APIResponseSourceContextKey} {
+			value, exists := c.Get(key)
+			if !exists {
+				t.Fatalf("source %s was not attached", key)
+			}
+			source, ok := value.(*logging.FileBodySource)
+			if !ok || source == nil {
+				t.Fatalf("source %s has type %T", key, value)
+			}
+			if errAppend := source.AppendBytes([]byte("panic-path-secret")); errAppend != nil {
+				t.Fatalf("AppendBytes(%s): %v", key, errAppend)
+			}
+			paths = append(paths, source.Paths()...)
+		}
+		pathsCh <- paths
+		c.Header("Content-Type", "text/event-stream")
+		c.Status(http.StatusOK)
+		_, _ = c.Writer.Write([]byte("data: client still receives this\n\n"))
+		panic("panic after stream start")
+	})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"safe"}`))
+	router.ServeHTTP(recorder, req)
+	paths := <-pathsCh
+
+	select {
+	case <-streamWriter.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream writer was not closed during panic unwinding")
+	}
+	if got := streamWriter.closeCalls.Load(); got != 1 {
+		t.Fatalf("stream close calls = %d, want 1", got)
+	}
+	if got := streamWriter.chunkCalls.Load(); got == 0 {
+		t.Fatal("streaming queue did not drain before close")
+	}
+	if !strings.Contains(recorder.Body.String(), "client still receives this") {
+		t.Fatalf("client stream was changed: %q", recorder.Body.String())
+	}
+	for _, path := range paths {
+		if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+			t.Fatalf("panic cleanup left source part %s: %v", path, errStat)
+		}
+		if _, errStat := os.Stat(filepath.Dir(path)); !os.IsNotExist(errStat) {
+			t.Fatalf("panic cleanup left source dir %s: %v", filepath.Dir(path), errStat)
+		}
+	}
+}
+
+type lifecycleRequestLogger struct {
+	logsDir      string
+	streamWriter *lifecycleStreamingLogWriter
+	mu           sync.Mutex
+	sources      []*logging.FileBodySource
+}
+
+func (l *lifecycleRequestLogger) IsEnabled() bool { return true }
+
+func (l *lifecycleRequestLogger) LogRequest(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, string, time.Time, time.Time) error {
+	return nil
+}
+
+func (l *lifecycleRequestLogger) LogStreamingRequest(string, string, map[string][]string, []byte, string) (logging.StreamingLogWriter, error) {
+	return l.streamWriter, nil
+}
+
+func (l *lifecycleRequestLogger) NewFileBodySource(prefix string) (*logging.FileBodySource, error) {
+	source, errSource := logging.NewFileBodySourceInDir(l.logsDir, prefix)
+	if errSource != nil {
+		return nil, errSource
+	}
+	l.mu.Lock()
+	l.sources = append(l.sources, source)
+	l.mu.Unlock()
+	return source, nil
+}
+
+type lifecycleStreamingLogWriter struct {
+	closeOnce  sync.Once
+	closed     chan struct{}
+	closeCalls atomic.Int32
+	chunkCalls atomic.Int32
+}
+
+func (w *lifecycleStreamingLogWriter) WriteChunkAsync([]byte) { w.chunkCalls.Add(1) }
+func (w *lifecycleStreamingLogWriter) WriteStatus(int, map[string][]string) error {
+	return nil
+}
+func (w *lifecycleStreamingLogWriter) WriteAPIRequest([]byte) error  { return nil }
+func (w *lifecycleStreamingLogWriter) WriteAPIResponse([]byte) error { return nil }
+func (w *lifecycleStreamingLogWriter) WriteAPIWebsocketTimeline([]byte) error {
+	return nil
+}
+func (w *lifecycleStreamingLogWriter) SetFirstChunkTimestamp(time.Time) {}
+func (w *lifecycleStreamingLogWriter) Close() error {
+	w.closeOnce.Do(func() {
+		w.closeCalls.Add(1)
+		close(w.closed)
+	})
+	return nil
 }

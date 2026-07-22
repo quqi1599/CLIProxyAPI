@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -265,13 +266,14 @@ func webSearchQueryFromGrounding(groundingMetadata gjson.Result) string {
 }
 
 func webSearchResultsFromGrounding(groundingMetadata gjson.Result) []byte {
-	results := []byte(`[]`)
 	groundingChunks := groundingMetadata.Get("groundingChunks")
 	if !groundingChunks.IsArray() {
-		return results
+		return []byte(`[]`)
 	}
+	chunks := groundingChunks.Array()
+	results := make([][]byte, 0, len(chunks))
 	seenURLs := make(map[string]struct{})
-	for _, chunk := range groundingChunks.Array() {
+	for _, chunk := range chunks {
 		web := chunk.Get("web")
 		if !web.Exists() {
 			continue
@@ -290,9 +292,9 @@ func webSearchResultsFromGrounding(groundingMetadata gjson.Result) []byte {
 			result, _ = sjson.SetBytes(result, "title", title.String())
 		}
 		result, _ = sjson.SetBytes(result, "url", uri)
-		results, _ = sjson.SetRawBytes(results, "-1", result)
+		results = append(results, result)
 	}
-	return results
+	return internalpayload.BuildRaw(results)
 }
 
 func parseWebSearchGroundingSupports(groundingMetadata gjson.Result) []webSearchGroundingSupport {
@@ -403,21 +405,22 @@ func buildWebSearchCitedTextBlocks(textContent string, supports []webSearchGroun
 }
 
 func buildClaudeWebSearchContent(toolUseID string, textContent string, groundingMetadata gjson.Result) []byte {
-	content := []byte(`[]`)
+	blocks := buildWebSearchCitedTextBlocks(textContent, parseWebSearchGroundingSupports(groundingMetadata))
+	content := make([][]byte, 0, len(blocks)+2)
 
 	serverToolUse := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
 	serverToolUse, _ = sjson.SetBytes(serverToolUse, "id", toolUseID)
 	if query := webSearchQueryFromGrounding(groundingMetadata); query != "" {
 		serverToolUse, _ = sjson.SetBytes(serverToolUse, "input.query", query)
 	}
-	content, _ = sjson.SetRawBytes(content, "-1", serverToolUse)
+	content = append(content, serverToolUse)
 
 	webSearchToolResult := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
 	webSearchToolResult, _ = sjson.SetBytes(webSearchToolResult, "tool_use_id", toolUseID)
 	webSearchToolResult, _ = sjson.SetRawBytes(webSearchToolResult, "content", webSearchResultsFromGrounding(groundingMetadata))
-	content, _ = sjson.SetRawBytes(content, "-1", webSearchToolResult)
+	content = append(content, webSearchToolResult)
 
-	for _, block := range buildWebSearchCitedTextBlocks(textContent, parseWebSearchGroundingSupports(groundingMetadata)) {
+	for _, block := range blocks {
 		if block.Text == "" {
 			continue
 		}
@@ -427,10 +430,10 @@ func buildClaudeWebSearchContent(toolUseID string, textContent string, grounding
 			citationsJSON, _ := json.Marshal(block.Citations)
 			textBlock, _ = sjson.SetRawBytes(textBlock, "citations", citationsJSON)
 		}
-		content, _ = sjson.SetRawBytes(content, "-1", textBlock)
+		content = append(content, textBlock)
 	}
 
-	return content
+	return internalpayload.BuildRaw(content)
 }
 
 func appendClaudeWebSearchStreamBlocks(appendEvent func(string, string), startIndex int, toolUseID string, textContent string, groundingMetadata gjson.Result) int {

@@ -40,7 +40,7 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 	}
 }
 
-func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
+func TestMiddlewareDisablesCachingAndHidesBuildHeadersUntilAuthenticated(t *testing.T) {
 
 	h := &Handler{
 		cfg:            &config.Config{},
@@ -61,8 +61,11 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
-		if got := rec.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
-			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", got)
+		}
+		if got := rec.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != "" {
+			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want hidden before authentication", got)
 		}
 	})
 
@@ -83,6 +86,9 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 		}
 		if got := rec.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
 			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", got)
 		}
 	})
 }

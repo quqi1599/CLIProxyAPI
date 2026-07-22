@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"sort"
 	"strings"
 
@@ -427,6 +428,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", root.Get("id").String())
 	out, _ = sjson.SetBytes(out, "model", root.Get("model").String())
+	contentBlocks := make([]json.RawMessage, 0)
 
 	// Process message content and tool calls
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
@@ -440,14 +442,14 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
 			block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle text content
 		if content := choice.Get("message.content"); content.Exists() && content.String() != "" {
 			block := []byte(`{"type":"text","text":""}`)
 			block, _ = sjson.SetBytes(block, "text", content.String())
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle tool calls
@@ -469,7 +471,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 					toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 				}
 
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+				contentBlocks = append(contentBlocks, toolUseBlock)
 				return true
 			})
 		}
@@ -478,6 +480,10 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
 			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAIFinishReasonToAnthropic(finishReason.String()))
 		}
+	}
+	if len(contentBlocks) > 0 {
+		contentJSON, _ := json.Marshal(contentBlocks)
+		out, _ = sjson.SetRawBytes(out, "content", contentJSON)
 	}
 
 	// Set usage information
@@ -631,6 +637,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", root.Get("id").String())
 	out, _ = sjson.SetBytes(out, "model", root.Get("model").String())
+	contentBlocks := make([]json.RawMessage, 0)
 
 	hasToolCall := false
 	stopReasonSet := false
@@ -652,7 +659,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					block := []byte(`{"type":"thinking","thinking":""}`)
 					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
 					block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+					contentBlocks = append(contentBlocks, block)
 				}
 			}
 
@@ -667,7 +674,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						contentBlocks = append(contentBlocks, block)
 						textBuilder.Reset()
 					}
 
@@ -678,7 +685,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						block := []byte(`{"type":"thinking","thinking":""}`)
 						block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
 						block, _ = sjson.SetBytes(block, "signature", syntheticGPTReasoningSignature)
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						contentBlocks = append(contentBlocks, block)
 						thinkingBuilder.Reset()
 					}
 
@@ -710,7 +717,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 										toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(`{}`))
 									}
 
-									out, _ = sjson.SetRawBytes(out, "content.-1", toolUse)
+									contentBlocks = append(contentBlocks, toolUse)
 									return true
 								})
 							}
@@ -732,7 +739,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					if textContent != "" {
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textContent)
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						contentBlocks = append(contentBlocks, block)
 					}
 				}
 			}
@@ -756,11 +763,15 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 					}
 
-					out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+					contentBlocks = append(contentBlocks, toolUseBlock)
 					return true
 				})
 			}
 		}
+	}
+	if len(contentBlocks) > 0 {
+		contentJSON, _ := json.Marshal(contentBlocks)
+		out, _ = sjson.SetRawBytes(out, "content", contentJSON)
 	}
 
 	if respUsage := root.Get("usage"); respUsage.Exists() {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -36,13 +37,13 @@ func (c *hostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (plu
 	if errDo != nil {
 		return pluginapi.HTTPResponse{}, errDo
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Warnf("pluginhost: response body close error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, cfg, resp.StatusCode, resp.Header.Clone())
-	body, errReadAll := io.ReadAll(resp.Body)
+	body, errReadAll := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{
+		ErrorBytes:       helps.DefaultUpstreamErrorBodyBytes,
+		SuccessBytes:     helps.DefaultUpstreamSuccessBodyBytes,
+		ErrorWireBytes:   helps.DefaultUpstreamErrorWireBytes,
+		SuccessWireBytes: helps.DefaultUpstreamSuccessWireBytes,
+	})
 	if len(body) > 0 {
 		helps.AppendAPIResponseChunk(ctx, cfg, body)
 		helps.MaterializeAPIResponseFromContext(ctx)
@@ -79,7 +80,7 @@ func (c *hostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest
 		for {
 			n, errRead := resp.Body.Read(buf)
 			if n > 0 {
-				payload := bytes.Clone(buf[:n])
+				payload := internalpayload.CloneBytes(buf[:n])
 				helps.AppendAPIResponseChunk(ctx, cfg, payload)
 				select {
 				case <-ctx.Done():
@@ -118,7 +119,7 @@ func (c *hostHTTPClient) doHTTP(ctx context.Context, req pluginapi.HTTPRequest) 
 	if method == "" {
 		method = http.MethodGet
 	}
-	httpReq, errNewRequest := http.NewRequestWithContext(ctx, method, req.URL, bytes.NewReader(bytes.Clone(req.Body)))
+	httpReq, errNewRequest := http.NewRequestWithContext(ctx, method, req.URL, bytes.NewReader(internalpayload.CloneBytes(req.Body)))
 	if errNewRequest != nil {
 		return nil, cfg, fmt.Errorf("create host http request: %w", errNewRequest)
 	}
@@ -154,7 +155,7 @@ func (c *hostHTTPClient) recordHTTPRequest(ctx context.Context, cfg *config.Conf
 		URL:       req.URL.String(),
 		Method:    req.Method,
 		Headers:   req.Header.Clone(),
-		Body:      bytes.Clone(body),
+		Body:      internalpayload.CloneBytes(body),
 		Provider:  provider,
 		AuthID:    authID,
 		AuthLabel: authLabel,

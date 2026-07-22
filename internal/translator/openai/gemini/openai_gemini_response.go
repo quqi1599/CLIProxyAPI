@@ -8,10 +8,12 @@ package gemini
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -212,14 +214,20 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 				// If we have accumulated tool calls, output them now
 				if len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator) > 0 {
-					partIndex := 0
-					for _, accumulator := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
-						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
-						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
-						template, _ = sjson.SetBytes(template, namePath, accumulator.Name)
-						template, _ = sjson.SetRawBytes(template, argsPath, []byte(parseArgsToObjectRaw(accumulator.Arguments.String())))
-						partIndex++
+					indices := make([]int, 0, len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator))
+					for index := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
+						indices = append(indices, index)
 					}
+					sort.Ints(indices)
+					parts := make([][]byte, 0, len(indices))
+					for _, index := range indices {
+						accumulator := (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator[index]
+						part := []byte(`{"functionCall":{"name":"","args":{}}}`)
+						part, _ = sjson.SetBytes(part, "functionCall.name", accumulator.Name)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(parseArgsToObjectRaw(accumulator.Arguments.String())))
+						parts = append(parts, part)
+					}
+					template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts", internalpayload.BuildRaw(parts))
 
 					// Clear accumulators
 					(*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
@@ -290,12 +298,6 @@ func parseArgsToObjectRaw(argsStr string) string {
 	return "{}"
 }
 
-func escapeSjsonPathKey(key string) string {
-	key = strings.ReplaceAll(key, `\`, `\\`)
-	key = strings.ReplaceAll(key, `.`, `\.`)
-	return key
-}
-
 // tolerantParseJSONObjectRaw attempts to parse a JSON-like object string into a JSON object string, tolerating
 // bareword values (unquoted strings) commonly seen during streamed tool calls.
 // Example input: {"location": 北京, "unit": celsius}
@@ -311,7 +313,21 @@ func tolerantParseJSONObjectRaw(s string) string {
 	runes := []rune(content)
 	n := len(runes)
 	i := 0
-	result := []byte(`{}`)
+	type rawPair struct {
+		keyToken string
+		value    []byte
+	}
+	pairs := make([]rawPair, 0)
+	pairIndex := make(map[string]int)
+	appendPair := func(keyToken string, value []byte) {
+		key := gjson.Parse(keyToken).String()
+		if index, ok := pairIndex[key]; ok {
+			pairs[index].value = value
+			return
+		}
+		pairIndex[key] = len(pairs)
+		pairs = append(pairs, rawPair{keyToken: keyToken, value: value})
+	}
 
 	for i < n {
 		// Skip whitespace and commas
@@ -336,8 +352,6 @@ func tolerantParseJSONObjectRaw(s string) string {
 		if nextIdx == -1 {
 			break
 		}
-		keyName := jsonStringTokenToRawString(keyToken)
-		sjsonKey := escapeSjsonPathKey(keyName)
 		i = nextIdx
 
 		// Skip whitespace
@@ -363,10 +377,10 @@ func tolerantParseJSONObjectRaw(s string) string {
 			valToken, ni := parseJSONStringRunes(runes, i)
 			if ni == -1 {
 				// Malformed; treat as empty string
-				result, _ = sjson.SetBytes(result, sjsonKey, "")
+				appendPair(keyToken, []byte(`""`))
 				i = n
 			} else {
-				result, _ = sjson.SetBytes(result, sjsonKey, jsonStringTokenToRawString(valToken))
+				appendPair(keyToken, []byte(valToken))
 				i = ni
 			}
 		case '{', '[':
@@ -376,9 +390,10 @@ func tolerantParseJSONObjectRaw(s string) string {
 				i = n
 			} else {
 				if gjson.Valid(seg) {
-					result, _ = sjson.SetRawBytes(result, sjsonKey, []byte(seg))
+					appendPair(keyToken, []byte(seg))
 				} else {
-					result, _ = sjson.SetBytes(result, sjsonKey, seg)
+					encoded, _ := json.Marshal(seg)
+					appendPair(keyToken, encoded)
 				}
 				i = ni
 			}
@@ -391,15 +406,18 @@ func tolerantParseJSONObjectRaw(s string) string {
 			token := strings.TrimSpace(string(runes[i:j]))
 			// Interpret common JSON atoms and numbers; otherwise treat as string
 			if token == "true" {
-				result, _ = sjson.SetBytes(result, sjsonKey, true)
+				appendPair(keyToken, []byte("true"))
 			} else if token == "false" {
-				result, _ = sjson.SetBytes(result, sjsonKey, false)
+				appendPair(keyToken, []byte("false"))
 			} else if token == "null" {
-				result, _ = sjson.SetBytes(result, sjsonKey, nil)
-			} else if numVal, ok := tryParseNumber(token); ok {
-				result, _ = sjson.SetBytes(result, sjsonKey, numVal)
+				appendPair(keyToken, []byte("null"))
+			} else if number, ok := tryParseNumber(token); ok {
+				if encoded, err := json.Marshal(number); err == nil {
+					appendPair(keyToken, encoded)
+				}
 			} else {
-				result, _ = sjson.SetBytes(result, sjsonKey, token)
+				encoded, _ := json.Marshal(token)
+				appendPair(keyToken, encoded)
 			}
 			i = j
 		}
@@ -413,7 +431,19 @@ func tolerantParseJSONObjectRaw(s string) string {
 		}
 	}
 
-	return string(result)
+	var result bytes.Buffer
+	result.Grow(len(content) + 2)
+	result.WriteByte('{')
+	for i := range pairs {
+		if i > 0 {
+			result.WriteByte(',')
+		}
+		result.WriteString(pairs[i].keyToken)
+		result.WriteByte(':')
+		result.Write(pairs[i].value)
+	}
+	result.WriteByte('}')
+	return result.String()
 }
 
 // parseJSONStringRunes returns the JSON string token (including quotes) and the index just after it.
@@ -437,19 +467,6 @@ func parseJSONStringRunes(runes []rune, start int) (string, int) {
 		i++
 	}
 	return string(runes[start:]), -1
-}
-
-// jsonStringTokenToRawString converts a JSON string token (including quotes) to a raw Go string value.
-func jsonStringTokenToRawString(token string) string {
-	r := gjson.Parse(token)
-	if r.Type == gjson.String {
-		return r.String()
-	}
-	// Fallback: strip surrounding quotes if present
-	if len(token) >= 2 && token[0] == '"' && token[len(token)-1] == '"' {
-		return token[1 : len(token)-1]
-	}
-	return token
 }
 
 // captureBracketed captures a balanced JSON object/array starting at index i.
@@ -538,6 +555,11 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 	// Base Gemini response template without finishReason; set when known
 	out := []byte(`{"candidates":[{"content":{"parts":[],"role":"model"},"index":0}]}`)
+	parts := make([][]byte, 0)
+	lastChoiceIndex := 0
+	hasChoice := false
+	lastFinishReason := ""
+	hasFinishReason := false
 
 	// Set model if available
 	if model := root.Get("model"); model.Exists() {
@@ -546,18 +568,18 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 	// Process choices
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
-		choices.ForEach(func(choiceIndex, choice gjson.Result) bool {
+		choices.ForEach(func(_ gjson.Result, choice gjson.Result) bool {
+			partIndex := 0
+			setPart := func(part []byte) {
+				if partIndex < len(parts) {
+					parts[partIndex] = part
+				} else {
+					parts = append(parts, part)
+				}
+				partIndex++
+			}
 			choiceIdx := int(choice.Get("index").Int())
 			message := choice.Get("message")
-
-			// Set role
-			if role := message.Get("role"); role.Exists() {
-				if role.String() == "assistant" {
-					out, _ = sjson.SetBytes(out, "candidates.0.content.role", "model")
-				}
-			}
-
-			partIndex := 0
 
 			// Handle reasoning content before visible text
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
@@ -565,16 +587,17 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 					if reasoningText == "" {
 						continue
 					}
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.thought", partIndex), true)
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), reasoningText)
-					partIndex++
+					part := []byte(`{"thought":true,"text":""}`)
+					part, _ = sjson.SetBytes(part, "text", reasoningText)
+					setPart(part)
 				}
 			}
 
 			// Handle content first
 			if content := message.Get("content"); content.Exists() && content.String() != "" {
-				out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), content.String())
-				partIndex++
+				part := []byte(`{"text":""}`)
+				part, _ = sjson.SetBytes(part, "text", content.String())
+				setPart(part)
 			}
 
 			// Handle tool calls
@@ -585,11 +608,10 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 						functionName := function.Get("name").String()
 						functionArgs := function.Get("arguments").String()
 
-						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
-						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
-						out, _ = sjson.SetBytes(out, namePath, functionName)
-						out, _ = sjson.SetRawBytes(out, argsPath, []byte(parseArgsToObjectRaw(functionArgs)))
-						partIndex++
+						part := []byte(`{"functionCall":{"name":"","args":{}}}`)
+						part, _ = sjson.SetBytes(part, "functionCall.name", functionName)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(parseArgsToObjectRaw(functionArgs)))
+						setPart(part)
 					}
 					return true
 				})
@@ -597,15 +619,24 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 			// Handle finish reason
 			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
-				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
-				out, _ = sjson.SetBytes(out, "candidates.0.finishReason", geminiFinishReason)
+				lastFinishReason = mapOpenAIFinishReasonToGemini(finishReason.String())
+				hasFinishReason = true
 			}
 
-			// Set index
-			out, _ = sjson.SetBytes(out, "candidates.0.index", choiceIdx)
+			lastChoiceIndex = choiceIdx
+			hasChoice = true
 
 			return true
 		})
+	}
+	if hasFinishReason {
+		out, _ = sjson.SetBytes(out, "candidates.0.finishReason", lastFinishReason)
+	}
+	if hasChoice {
+		out, _ = sjson.SetBytes(out, "candidates.0.index", lastChoiceIndex)
+	}
+	if len(parts) > 0 {
+		out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts", internalpayload.BuildRaw(parts))
 	}
 
 	// Handle usage information

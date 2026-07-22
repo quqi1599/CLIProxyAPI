@@ -6,17 +6,19 @@
 package gemini
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 
 	"github.com/google/uuid"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -104,6 +106,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// functionCalls, so we keep a FIFO queue of generated tool IDs and
 	// consume them in order when functionResponses arrive.
 	var pendingToolIDs []string
+	messageItems := make([][]byte, 0)
 
 	// Model mapping to specify which Claude Code model to use
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -241,14 +244,14 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				// Create system message in Claude Code format
 				systemMessage := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
 				systemMessage, _ = sjson.SetBytes(systemMessage, "content.0.text", systemText.String())
-				out, _ = sjson.SetRawBytes(out, "messages.-1", systemMessage)
+				messageItems = append(messageItems, systemMessage)
 			}
 		}
 	}
 
 	// Contents conversion to messages with proper role mapping
 	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
-		contents.ForEach(func(_, content gjson.Result) bool {
+		for _, content := range contents.Array() {
 			role := content.Get("role").String()
 			// Map Gemini roles to Claude Code roles
 			if role == "model" {
@@ -266,15 +269,16 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			// Create message structure in Claude Code format
 			msg := []byte(`{"role":"","content":[]}`)
 			msg, _ = sjson.SetBytes(msg, "role", role)
+			contentItems := make([][]byte, 0)
 
 			if parts := content.Get("parts"); parts.Exists() && parts.IsArray() {
-				parts.ForEach(func(_, part gjson.Result) bool {
+				for _, part := range parts.Array() {
 					// Text content conversion
 					if text := part.Get("text"); text.Exists() {
 						textContent := []byte(`{"type":"text","text":""}`)
 						textContent, _ = sjson.SetBytes(textContent, "text", text.String())
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", textContent)
-						return true
+						contentItems = append(contentItems, textContent)
+						continue
 					}
 
 					// Function call (from model/assistant) conversion to tool use
@@ -295,8 +299,8 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						if args := fc.Get("args"); args.Exists() && args.IsObject() {
 							toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(args.Raw))
 						}
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", toolUse)
-						return true
+						contentItems = append(contentItems, toolUse)
+						continue
 					}
 
 					// Function response (from user) conversion to tool result
@@ -325,8 +329,8 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						} else if response := fr.Get("response"); response.Exists() {
 							toolResult, _ = sjson.SetBytes(toolResult, "content", response.Raw)
 						}
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", toolResult)
-						return true
+						contentItems = append(contentItems, toolResult)
+						continue
 					}
 
 					// Image content (inline_data) conversion to Claude Code format
@@ -338,8 +342,8 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						if data := inlineData.Get("data"); data.Exists() {
 							imageContent, _ = sjson.SetBytes(imageContent, "source.data", data.String())
 						}
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", imageContent)
-						return true
+						contentItems = append(contentItems, imageContent)
+						continue
 					}
 
 					// File data conversion to text content with file info
@@ -351,26 +355,25 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 							fileInfo += " (Type: " + mimeType.String() + ")"
 						}
 						textContent, _ = sjson.SetBytes(textContent, "text", fileInfo)
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", textContent)
-						return true
+						contentItems = append(contentItems, textContent)
 					}
-
-					return true
-				})
+				}
 			}
 
 			// Only add message if it has content
-			if contentArray := gjson.GetBytes(msg, "content"); contentArray.Exists() && len(contentArray.Array()) > 0 {
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+			if len(contentItems) > 0 {
+				msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentItems))
+				messageItems = append(messageItems, msg)
 			}
-
-			return true
-		})
+		}
+	}
+	if len(messageItems) > 0 {
+		out, _ = sjson.SetRawBytes(out, "messages", internalpayload.BuildRaw(messageItems))
 	}
 
 	// Tools mapping: Gemini functionDeclarations -> Claude Code tools
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		var anthropicTools []interface{}
+		anthropicTools := make([][]byte, 0)
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if funcDecls := tool.Get("functionDeclarations"); funcDecls.Exists() && funcDecls.IsArray() {
@@ -385,19 +388,19 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					}
 					if params := funcDecl.Get("parameters"); params.Exists() {
 						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := []byte(params.Raw)
+						cleaned := lowercaseSchemaTypes([]byte(params.Raw))
 						cleaned, _ = sjson.SetBytes(cleaned, "additionalProperties", false)
 						cleaned, _ = sjson.SetBytes(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
 						anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", cleaned)
 					} else if params = funcDecl.Get("parametersJsonSchema"); params.Exists() {
 						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := []byte(params.Raw)
+						cleaned := lowercaseSchemaTypes([]byte(params.Raw))
 						cleaned, _ = sjson.SetBytes(cleaned, "additionalProperties", false)
 						cleaned, _ = sjson.SetBytes(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
 						anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", cleaned)
 					}
 
-					anthropicTools = append(anthropicTools, gjson.ParseBytes(anthropicTool).Value())
+					anthropicTools = append(anthropicTools, anthropicTool)
 					return true
 				})
 			}
@@ -405,7 +408,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		})
 
 		if len(anthropicTools) > 0 {
-			out, _ = sjson.SetBytes(out, "tools", anthropicTools)
+			out, _ = sjson.SetRawBytes(out, "tools", internalpayload.BuildRaw(anthropicTools))
 		}
 	}
 
@@ -428,14 +431,45 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Stream setting configuration
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// Convert tool parameter types to lowercase for Claude Code compatibility
-	var pathsToLower []string
-	toolsResult := gjson.GetBytes(out, "tools")
-	util.Walk(toolsResult, "", "type", &pathsToLower)
-	for _, p := range pathsToLower {
-		fullPath := fmt.Sprintf("tools.%s", p)
-		out, _ = sjson.SetBytes(out, fullPath, strings.ToLower(gjson.GetBytes(out, fullPath).String()))
-	}
-
 	return out
+}
+
+func lowercaseSchemaTypes(raw []byte) []byte {
+	var schema any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&schema); err != nil {
+		return raw
+	}
+	var walk func(any)
+	walk = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if key == "type" {
+					switch typeValue := child.(type) {
+					case string:
+						value[key] = strings.ToLower(typeValue)
+					case []any:
+						for i, typeName := range typeValue {
+							if name, ok := typeName.(string); ok {
+								typeValue[i] = strings.ToLower(name)
+							}
+						}
+					}
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range value {
+				walk(child)
+			}
+		}
+	}
+	walk(schema)
+	normalized, err := json.Marshal(schema)
+	if err != nil {
+		return raw
+	}
+	return normalized
 }

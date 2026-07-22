@@ -27,8 +27,32 @@ const MessageCountMetadataKey = "message_count"
 // RequestBodyBytesMetadataKey stores the inbound JSON request body size.
 const RequestBodyBytesMetadataKey = "request_body_bytes"
 
+// RequestWireBytesMetadataKey stores the inbound body size before content decoding.
+const RequestWireBytesMetadataKey = "request_wire_bytes"
+
 // ContentPartCountMetadataKey stores the inbound content part count.
 const ContentPartCountMetadataKey = "content_part_count"
+
+// ToolCallCountMetadataKey stores the inbound tool call count, excluding tool results.
+const ToolCallCountMetadataKey = "tool_call_count"
+
+// ToolOutputBytesMetadataKey stores the decoded tool result payload bytes.
+const ToolOutputBytesMetadataKey = "tool_output_bytes"
+
+// InlineImageBytesMetadataKey stores the estimated decoded bytes of inline images.
+const InlineImageBytesMetadataKey = "inline_image_bytes"
+
+// ReasoningBytesMetadataKey stores inbound reasoning and thinking content bytes.
+const ReasoningBytesMetadataKey = "reasoning_bytes"
+
+// RequestSourceFormatMetadataKey stores a bounded inbound protocol family.
+const RequestSourceFormatMetadataKey = "request_source_format"
+
+// RequestEndpointMetadataKey stores a bounded endpoint class.
+const RequestEndpointMetadataKey = "request_endpoint"
+
+// RequestStreamMetadataKey reports whether the downstream execution is streaming.
+const RequestStreamMetadataKey = "request_stream"
 
 // ToolCountMetadataKey stores the inbound request tool/tool-call item count for safe failure logs.
 const ToolCountMetadataKey = "tool_count"
@@ -166,7 +190,7 @@ type Response struct {
 // StreamChunk represents a single streaming payload unit emitted by provider executors.
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.
-	// Executors must treat emitted payload bytes as immutable after send.
+	// Executors transfer read-only ownership on send and must not mutate it afterward.
 	Payload []byte
 	// Err reports any terminal error encountered while producing chunks.
 	Err error

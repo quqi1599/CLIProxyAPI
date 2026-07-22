@@ -1,0 +1,2 @@
+# Historical findings are listed as: rule repository-relative-path fingerprint count.
+# Remove entries as legacy payload transformations are migrated to linear builders.

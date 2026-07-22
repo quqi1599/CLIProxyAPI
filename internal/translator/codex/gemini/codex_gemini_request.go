@@ -8,7 +8,6 @@ package gemini
 import (
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
@@ -103,6 +102,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
+	inputItems := make([]json.RawMessage, 0)
 
 	// System instruction -> as a user message with input_text parts
 	sysParts := root.Get("system_instruction.parts")
@@ -111,6 +111,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	}
 	if sysParts.IsArray() {
 		msg := []byte(`{"type":"message","role":"developer","content":[]}`)
+		contentItems := make([]json.RawMessage, 0)
 		arr := sysParts.Array()
 		for i := 0; i < len(arr); i++ {
 			p := arr[i]
@@ -118,11 +119,13 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				part := []byte(`{}`)
 				part, _ = sjson.SetBytes(part, "type", "input_text")
 				part, _ = sjson.SetBytes(part, "text", t.String())
-				msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
+				contentItems = append(contentItems, json.RawMessage(part))
 			}
 		}
-		if len(gjson.GetBytes(msg, "content").Array()) > 0 {
-			out, _ = sjson.SetRawBytes(out, "input.-1", msg)
+		if len(contentItems) > 0 {
+			content, _ := json.Marshal(contentItems)
+			msg, _ = sjson.SetRawBytes(msg, "content", content)
+			inputItems = append(inputItems, json.RawMessage(msg))
 		}
 	}
 
@@ -155,8 +158,9 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					part := []byte(`{}`)
 					part, _ = sjson.SetBytes(part, "type", partType)
 					part, _ = sjson.SetBytes(part, "text", t.String())
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-					out, _ = sjson.SetRawBytes(out, "input.-1", msg)
+					content, _ := json.Marshal([]json.RawMessage{json.RawMessage(part)})
+					msg, _ = sjson.SetRawBytes(msg, "content", content)
+					inputItems = append(inputItems, json.RawMessage(msg))
 					continue
 				}
 
@@ -183,7 +187,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					}
 					fn, _ = sjson.SetBytes(fn, "call_id", id)
 					pendingCallIDs = append(pendingCallIDs, id)
-					out, _ = sjson.SetRawBytes(out, "input.-1", fn)
+					inputItems = append(inputItems, json.RawMessage(fn))
 					continue
 				}
 
@@ -211,18 +215,20 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						id = genCallID()
 					}
 					fno, _ = sjson.SetBytes(fno, "call_id", id)
-					out, _ = sjson.SetRawBytes(out, "input.-1", fno)
+					inputItems = append(inputItems, json.RawMessage(fno))
 					continue
 				}
 			}
 		}
 	}
+	input, _ := json.Marshal(inputItems)
+	out, _ = sjson.SetRawBytes(out, "input", input)
 
 	// Tools mapping: Gemini functionDeclarations -> Codex tools
 	tools := root.Get("tools")
 	if tools.IsArray() {
-		out, _ = sjson.SetRawBytes(out, "tools", []byte(`[]`))
 		out, _ = sjson.SetBytes(out, "tool_choice", "auto")
+		toolItems := make([]json.RawMessage, 0)
 		tarr := tools.Array()
 		for i := 0; i < len(tarr); i++ {
 			td := tarr[i]
@@ -256,9 +262,11 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					tool, _ = sjson.SetRawBytes(tool, "parameters", cleanCodexGeminiToolSchema(""))
 				}
 				tool, _ = sjson.SetBytes(tool, "strict", false)
-				out, _ = sjson.SetRawBytes(out, "tools.-1", tool)
+				toolItems = append(toolItems, json.RawMessage(tool))
 			}
 		}
+		toolsJSON, _ := json.Marshal(toolItems)
+		out, _ = sjson.SetRawBytes(out, "tools", toolsJSON)
 	}
 
 	// Fixed flags aligning with Codex expectations
@@ -302,18 +310,6 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	out, _ = sjson.SetBytes(out, "store", false)
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 
-	var pathsToLower []string
-	toolsResult := gjson.GetBytes(out, "tools")
-	util.Walk(toolsResult, "", "type", &pathsToLower)
-	for _, p := range pathsToLower {
-		fullPath := fmt.Sprintf("tools.%s", p)
-		typeValue := gjson.GetBytes(out, fullPath)
-		if typeValue.Type != gjson.String {
-			continue
-		}
-		out, _ = sjson.SetBytes(out, fullPath, strings.ToLower(typeValue.String()))
-	}
-
 	return out
 }
 
@@ -337,11 +333,30 @@ func restoreCodexGeminiSchemaDefaults(cleaned []byte, original []byte) []byte {
 		return cleaned
 	}
 	restoreCodexGeminiSchemaDefaultValues(cleanedValue, originalValue)
+	lowercaseCodexGeminiSchemaTypes(cleanedValue)
 	out, err := json.Marshal(cleanedValue)
 	if err != nil || !gjson.ValidBytes(out) {
 		return cleaned
 	}
 	return out
+}
+
+func lowercaseCodexGeminiSchemaTypes(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "type" {
+				if typeName, ok := child.(string); ok {
+					value[key] = strings.ToLower(typeName)
+				}
+			}
+			lowercaseCodexGeminiSchemaTypes(child)
+		}
+	case []any:
+		for _, child := range value {
+			lowercaseCodexGeminiSchemaTypes(child)
+		}
+	}
 }
 
 func restoreCodexGeminiSchemaDefaultValues(cleaned any, original any) {

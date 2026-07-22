@@ -16,15 +16,23 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	defaultAPICallTimeout       = 60 * time.Second
-	maxAPICallStreamErrorBytes  = 64 << 10
-	maxAPICallConcurrentPerHost = 8
+	defaultAPICallTimeout          = 60 * time.Second
+	maxAPICallRequestBodyBytes     = 8 << 20
+	maxAPICallResponseBodyBytes    = 16 << 20
+	maxAPICallResponseWireBytes    = 24 << 20
+	maxAPICallStreamErrorBytes     = 64 << 10
+	maxOAuthTokenResponseBytes     = 1 << 20
+	maxOAuthTokenResponseWireBytes = 2 << 20
+	maxAPICallConcurrentPerHost    = 8
 )
 
 var apiCallHostLimiters sync.Map
@@ -115,8 +123,8 @@ type apiCallStreamEvent struct {
 //	  -d '{"auth_index":"<AUTH_INDEX>","method":"POST","url":"https://api.example.com/v1/fetchAvailableModels","header":{"Authorization":"Bearer $TOKEN$","Content-Type":"application/json","User-Agent":"cliproxyapi"},"data":"{}"}'
 func (h *Handler) APICall(c *gin.Context) {
 	var body apiCallRequest
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+	if errDecode := decodeManagementJSONBody(c, maxAPICallRequestBodyBytes, &body); errDecode != nil {
+		writeManagementRequestBodyError(c, errDecode)
 		return
 	}
 
@@ -219,28 +227,100 @@ func (h *Handler) APICall(c *gin.Context) {
 		})
 		return
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-
 	if body.Stream {
+		defer func() {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+		}()
 		h.writeAPICallStream(c, resp)
 		return
 	}
 
-	respBody, errReadAll := io.ReadAll(resp.Body)
-	if errReadAll != nil {
+	respBody, errRead := readAPICallResponseBody(resp, maxAPICallResponseBodyBytes, maxAPICallResponseWireBytes)
+	if errRead != nil {
+		if isAPICallUpstreamBodyTooLarge(errRead) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "upstream response too large"})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
-		Header:     resp.Header,
+		Header:     decodedAPICallResponseHeaders(resp.Header),
 		Body:       string(respBody),
 	})
+}
+
+func readAPICallResponseBody(resp *http.Response, maxBytes, maxWireBytes int64) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = maxAPICallResponseBodyBytes
+	}
+	if maxWireBytes <= 0 {
+		maxWireBytes = maxAPICallResponseWireBytes
+	}
+	errorBytes := min(maxBytes, helps.DefaultUpstreamErrorBodyBytes)
+	errorWireBytes := min(maxWireBytes, helps.DefaultUpstreamErrorWireBytes)
+	successWireBytes := min(maxWireBytes, helps.UpstreamSuccessEmergencyBytes)
+	wireLimit := errorWireBytes
+	decodedLimit := errorBytes
+	bodyClass := "error"
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		wireLimit = successWireBytes
+		decodedLimit = maxBytes
+		bodyClass = "success"
+	}
+	contentLengthLimit := wireLimit
+	if !resp.Uncompressed && strings.TrimSpace(resp.Header.Get("Content-Encoding")) == "" {
+		contentLengthLimit = min(contentLengthLimit, decodedLimit)
+	}
+	if resp.ContentLength > contentLengthLimit {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close oversized management API response")
+		}
+		return nil, &failurecontract.Failure{
+			Kind:          failurecontract.UpstreamProtocolError,
+			Scope:         failurecontract.ScopeProvider,
+			HTTPStatus:    http.StatusBadGateway,
+			ProviderCode:  "upstream_" + bodyClass + "_wire_body_too_large",
+			Cause:         fmt.Errorf("upstream %s body content length %d exceeds %d bytes", bodyClass, resp.ContentLength, contentLengthLimit),
+			PublicMessage: "upstream response exceeded the configured limit",
+		}
+	}
+	return helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{
+		ErrorBytes:       errorBytes,
+		SuccessBytes:     maxBytes,
+		ErrorWireBytes:   errorWireBytes,
+		SuccessWireBytes: successWireBytes,
+	})
+}
+
+func decodedAPICallResponseHeaders(headers http.Header) map[string][]string {
+	clean := headers.Clone()
+	for _, name := range []string{
+		"Content-Encoding",
+		"Content-Length",
+		"Content-MD5",
+		"Digest",
+		"Content-Digest",
+		"Repr-Digest",
+		"ETag",
+		"Signature",
+		"Signature-Input",
+	} {
+		clean.Del(name)
+	}
+	return clean
+}
+
+func isAPICallUpstreamBodyTooLarge(err error) bool {
+	typed, ok := failurecontract.As(err)
+	return ok && typed.Kind == failurecontract.UpstreamProtocolError && strings.HasSuffix(typed.ProviderCode, "body_too_large")
 }
 
 func normalizeAPICallMiniMaxClaudeMessagesBody(parsedURL *url.URL, data string) string {
@@ -609,18 +689,12 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	if errDo != nil {
 		return "", errDo
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, errRead := io.ReadAll(resp.Body)
+	bodyBytes, errRead := readAPICallResponseBody(resp, maxOAuthTokenResponseBytes, maxOAuthTokenResponseWireBytes)
 	if errRead != nil {
 		return "", errRead
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("antigravity oauth token refresh failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return "", fmt.Errorf("antigravity oauth token refresh failed: status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	var tokenResp struct {
@@ -1282,7 +1356,7 @@ func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, tok
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Drain body so the connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxAPICallStreamErrorBytes))
 
 	return resp.StatusCode, nil
 }

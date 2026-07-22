@@ -1,8 +1,10 @@
 package claude
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -245,6 +247,133 @@ func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConvertClaudeRequestToOpenAI_LargeMixedHistoryPreservesOrder(t *testing.T) {
+	const messageCount = 256
+	result := ConvertClaudeRequestToOpenAI("gpt-5", buildLargeClaudeRequest(messageCount), false)
+	if got := gjson.GetBytes(result, "messages.#").Int(); got != messageCount+1 {
+		t.Fatalf("messages count = %d, want %d", got, messageCount+1)
+	}
+	for _, index := range []int{0, messageCount / 2, messageCount - 1} {
+		message := gjson.GetBytes(result, fmt.Sprintf("messages.%d", index))
+		if got := message.Get("content.0.text").String(); got != fmt.Sprintf("text-%03d", index) {
+			t.Fatalf("messages.%d text = %q", index, got)
+		}
+		if got := message.Get("content.1.image_url.url").String(); got != fmt.Sprintf("https://example.test/%03d.png", index) {
+			t.Fatalf("messages.%d image URL = %q", index, got)
+		}
+	}
+	assistant := gjson.GetBytes(result, fmt.Sprintf("messages.%d", messageCount))
+	if got := assistant.Get("reasoning_content").String(); got != "provider state" {
+		t.Fatalf("reasoning_content = %q", got)
+	}
+	if got := assistant.Get("tool_calls.0.function.name").String(); got != "lookup" {
+		t.Fatalf("tool name = %q", got)
+	}
+	arguments := assistant.Get("tool_calls.0.function.arguments").String()
+	if gjson.Get(arguments, "z").Int() != 1 || gjson.Get(arguments, "a.b").Int() != 2 {
+		t.Fatalf("tool arguments lost unknown fields: %s", arguments)
+	}
+}
+
+var benchmarkClaudeRequestResult []byte
+
+func BenchmarkConvertClaudeRequestToOpenAI_LargeMixedHistory(b *testing.B) {
+	raw := buildLargeClaudeRequest(512)
+	for b.Loop() {
+		benchmarkClaudeRequestResult = ConvertClaudeRequestToOpenAI("gpt-5", raw, false)
+	}
+}
+
+func buildLargeClaudeRequest(messageCount int) []byte {
+	var input strings.Builder
+	input.WriteString(`{"messages":[`)
+	for i := 0; i < messageCount; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"role":"user","content":[{"type":"text","text":"text-%03d","unknown":{"index":%d}},{"type":"image","source":{"type":"url","url":"https://example.test/%03d.png"}}]}`, i, i, i)
+	}
+	if messageCount > 0 {
+		input.WriteByte(',')
+	}
+	fmt.Fprintf(&input, `{"role":"assistant","content":[{"type":"thinking","thinking":"provider state","signature":%q},{"type":"text","text":"answer"},{"type":"tool_use","id":"call-1","name":"lookup","input":{"z":1,"a":{"b":2}}}]}]}`, validGPTChatReasoningSignature())
+	return []byte(input.String())
+}
+
+func TestConvertClaudeToolResultContentPayloadGrowth(t *testing.T) {
+	for _, size := range []int{16, 64, 256, 1024} {
+		t.Run(fmt.Sprintf("items_%d", size), func(t *testing.T) {
+			input := buildClaudeToolResultContent(size)
+			original := bytes.Clone(input)
+			content, raw := convertClaudeToolResultContent(gjson.ParseBytes(input))
+
+			if !raw {
+				t.Fatal("content should remain a raw multimodal array")
+			}
+			if !bytes.Equal(input, original) {
+				t.Fatal("converter mutated the input payload")
+			}
+			items := gjson.Parse(content).Array()
+			if len(items) != size {
+				t.Fatalf("content item count = %d, want %d", len(items), size)
+			}
+			for index, item := range items {
+				switch index % 3 {
+				case 0:
+					if got, want := item.Get("text").String(), fmt.Sprintf("string-%04d", index); got != want {
+						t.Fatalf("item %d text = %q, want %q", index, got, want)
+					}
+				case 1:
+					if got, want := item.Get("text").String(), fmt.Sprintf("text-%04d", index); got != want {
+						t.Fatalf("item %d text = %q, want %q", index, got, want)
+					}
+				case 2:
+					if got, want := item.Get("image_url.url").String(), fmt.Sprintf("https://example.test/%04d.png", index); got != want {
+						t.Fatalf("item %d image URL = %q, want %q", index, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+var benchmarkClaudeToolResultContent string
+
+func BenchmarkPayloadGrowthClaudeToolResultContent(b *testing.B) {
+	for _, size := range []int{16, 64, 256, 1024} {
+		b.Run(fmt.Sprintf("items_%d", size), func(b *testing.B) {
+			input := buildClaudeToolResultContent(size)
+			content := gjson.ParseBytes(input)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				benchmarkClaudeToolResultContent, _ = convertClaudeToolResultContent(content)
+			}
+		})
+	}
+}
+
+func buildClaudeToolResultContent(size int) []byte {
+	var input strings.Builder
+	input.Grow(size * 96)
+	input.WriteByte('[')
+	for index := 0; index < size; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		switch index % 3 {
+		case 0:
+			fmt.Fprintf(&input, `%q`, fmt.Sprintf("string-%04d", index))
+		case 1:
+			fmt.Fprintf(&input, `{"type":"text","text":"text-%04d","unknown":{"index":%d}}`, index, index)
+		case 2:
+			fmt.Fprintf(&input, `{"type":"image","source":{"type":"url","url":"https://example.test/%04d.png"},"unknown":{"index":%d}}`, index, index)
+		}
+	}
+	input.WriteByte(']')
+	return []byte(input.String())
 }
 
 func TestConvertClaudeRequestToOpenAI_SignedThinkingCompatibility(t *testing.T) {

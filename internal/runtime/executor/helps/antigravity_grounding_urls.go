@@ -2,12 +2,12 @@ package helps
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -78,11 +78,14 @@ func ResolveAntigravityGroundingURLs(ctx context.Context, cfg *config.Config, au
 		return payload
 	}
 
-	output := payload
+	chunkResults := chunks.Array()
+	outChunks := make([][]byte, 0, len(chunkResults))
 	resolved := map[string]string{}
-	for i, chunk := range chunks.Array() {
+	changed := false
+	for _, chunk := range chunkResults {
 		uri := strings.TrimSpace(chunk.Get("web.uri").String())
 		if uri == "" {
+			outChunks = append(outChunks, []byte(chunk.Raw))
 			continue
 		}
 		resolvedURI, ok := resolved[uri]
@@ -91,14 +94,25 @@ func ResolveAntigravityGroundingURLs(ctx context.Context, cfg *config.Config, au
 			resolved[uri] = resolvedURI
 		}
 		if resolvedURI == uri {
+			outChunks = append(outChunks, []byte(chunk.Raw))
 			continue
 		}
-		updated, errSet := sjson.SetBytes(output, fmt.Sprintf("%s.%d.web.uri", basePath, i), resolvedURI)
+		updated, errSet := sjson.SetBytes([]byte(chunk.Raw), "web.uri", resolvedURI)
 		if errSet != nil {
 			log.WithError(errSet).Debug("antigravity grounding url: set resolved url failed")
+			outChunks = append(outChunks, []byte(chunk.Raw))
 			continue
 		}
-		output = updated
+		outChunks = append(outChunks, updated)
+		changed = true
+	}
+	if !changed {
+		return payload
+	}
+	output, errSet := sjson.SetRawBytes(payload, basePath, internalpayload.BuildRaw(outChunks))
+	if errSet != nil {
+		log.WithError(errSet).Debug("antigravity grounding url: update grounding chunks failed")
+		return payload
 	}
 	return output
 }

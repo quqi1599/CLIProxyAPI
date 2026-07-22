@@ -7,6 +7,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -133,20 +134,25 @@ func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte
 
 	if system.IsArray() {
 		modified := false
-		system.ForEach(func(key, value gjson.Result) bool {
+		blocks := make([][]byte, 0, len(system.Array()))
+		system.ForEach(func(_, value gjson.Result) bool {
+			block := []byte(value.Raw)
 			if value.Get("type").String() == "text" {
 				text := value.Get("text").String()
 				obfuscated := matcher.obfuscateText(text)
 				if obfuscated != text {
-					path := "system." + key.String() + ".text"
-					payload, _ = sjson.SetBytes(payload, path, obfuscated)
+					block, _ = sjson.SetBytes(block, "text", obfuscated)
 					modified = true
 				}
 			}
+			blocks = append(blocks, block)
 			return true
 		})
 		if modified {
-			return payload
+			updated, errSet := sjson.SetRawBytes(payload, "system", internalpayload.BuildRaw(blocks))
+			if errSet == nil {
+				return updated
+			}
 		}
 	} else if system.Type == gjson.String {
 		text := system.String()
@@ -166,38 +172,55 @@ func obfuscateMessages(payload []byte, matcher *SensitiveWordMatcher) []byte {
 		return payload
 	}
 
-	messages.ForEach(func(msgKey, msg gjson.Result) bool {
+	modified := false
+	updatedMessages := make([][]byte, 0, len(messages.Array()))
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		updatedMessage := []byte(msg.Raw)
 		content := msg.Get("content")
 		if !content.Exists() {
+			updatedMessages = append(updatedMessages, updatedMessage)
 			return true
 		}
 
-		msgPath := "messages." + msgKey.String()
-
 		if content.Type == gjson.String {
-			// Simple string content
 			text := content.String()
 			obfuscated := matcher.obfuscateText(text)
 			if obfuscated != text {
-				payload, _ = sjson.SetBytes(payload, msgPath+".content", obfuscated)
+				updatedMessage, _ = sjson.SetBytes(updatedMessage, "content", obfuscated)
+				modified = true
 			}
 		} else if content.IsArray() {
-			// Array of content blocks
-			content.ForEach(func(blockKey, block gjson.Result) bool {
+			contentModified := false
+			updatedContent := make([][]byte, 0, len(content.Array()))
+			content.ForEach(func(_, block gjson.Result) bool {
+				updatedBlock := []byte(block.Raw)
 				if block.Get("type").String() == "text" {
 					text := block.Get("text").String()
 					obfuscated := matcher.obfuscateText(text)
 					if obfuscated != text {
-						path := msgPath + ".content." + blockKey.String() + ".text"
-						payload, _ = sjson.SetBytes(payload, path, obfuscated)
+						updatedBlock, _ = sjson.SetBytes(updatedBlock, "text", obfuscated)
+						contentModified = true
 					}
 				}
+				updatedContent = append(updatedContent, updatedBlock)
 				return true
 			})
+			if contentModified {
+				updatedMessage, _ = sjson.SetRawBytes(updatedMessage, "content", internalpayload.BuildRaw(updatedContent))
+				modified = true
+			}
 		}
 
+		updatedMessages = append(updatedMessages, updatedMessage)
 		return true
 	})
 
-	return payload
+	if !modified {
+		return payload
+	}
+	updated, errSet := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(updatedMessages))
+	if errSet != nil {
+		return payload
+	}
+	return updated
 }

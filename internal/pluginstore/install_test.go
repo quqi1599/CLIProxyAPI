@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -297,6 +299,166 @@ func TestInstallArchiveRejectsUnsafeArchives(t *testing.T) {
 	}
 }
 
+func TestInstallArchiveRejectsTooManyEntries(t *testing.T) {
+	t.Parallel()
+
+	files := make(map[string]string, pluginArchiveMaxEntries+1)
+	files["sample-provider.dylib"] = "library"
+	for index := 0; index < pluginArchiveMaxEntries; index++ {
+		files[fmt.Sprintf("docs/%03d.txt", index)] = "ignored"
+	}
+	_, errInstall := InstallArchive(makeZip(t, files), testPlugin(), InstallOptions{
+		PluginsDir: t.TempDir(),
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if !errors.Is(errInstall, ErrPluginArchiveTooManyEntries) {
+		t.Fatalf("InstallArchive() error = %v, want ErrPluginArchiveTooManyEntries", errInstall)
+	}
+}
+
+func TestInstallArchiveRejectsUnderreportedEntryCountBeforeZipReader(t *testing.T) {
+	t.Parallel()
+
+	files := make(map[string]string, pluginArchiveMaxEntries+1)
+	files["sample-provider.dylib"] = "library"
+	for index := 0; index < pluginArchiveMaxEntries; index++ {
+		files[fmt.Sprintf("docs/%03d.txt", index)] = "ignored"
+	}
+	archiveData := makeZip(t, files)
+	directoryEnd := bytes.LastIndex(archiveData, []byte{'P', 'K', 0x05, 0x06})
+	if directoryEnd < 0 {
+		t.Fatal("ZIP directory end not found")
+	}
+	binary.LittleEndian.PutUint16(archiveData[directoryEnd+8:], 1)
+	binary.LittleEndian.PutUint16(archiveData[directoryEnd+10:], 1)
+	lastDirectoryEntry := bytes.LastIndex(archiveData[:directoryEnd], []byte{'P', 'K', 0x01, 0x02})
+	if lastDirectoryEntry < 0 {
+		t.Fatal("ZIP directory entry not found")
+	}
+	binary.LittleEndian.PutUint32(archiveData[directoryEnd+12:], uint32(directoryEnd-lastDirectoryEntry))
+
+	_, errInstall := InstallArchive(archiveData, testPlugin(), InstallOptions{
+		PluginsDir: t.TempDir(),
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if !errors.Is(errInstall, ErrPluginArchiveTooManyEntries) {
+		t.Fatalf("InstallArchive() error = %v, want ErrPluginArchiveTooManyEntries", errInstall)
+	}
+}
+
+func TestInstallArchiveRejectsMalformedCentralDirectory(t *testing.T) {
+	t.Parallel()
+
+	archiveData := makeZip(t, map[string]string{"sample-provider.dylib": "library"})
+	directoryEnd := bytes.LastIndex(archiveData, []byte{'P', 'K', 0x05, 0x06})
+	if directoryEnd < 0 {
+		t.Fatal("ZIP directory end not found")
+	}
+	directoryOffset := int(binary.LittleEndian.Uint32(archiveData[directoryEnd+16:]))
+	archiveData[directoryOffset] = 0
+
+	_, errInstall := InstallArchive(archiveData, testPlugin(), InstallOptions{
+		PluginsDir: t.TempDir(),
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if !errors.Is(errInstall, ErrPluginArchiveInvalidDirectory) {
+		t.Fatalf("InstallArchive() error = %v, want ErrPluginArchiveInvalidDirectory", errInstall)
+	}
+}
+
+func TestInstallArchiveRejectsMissingCentralZip64Extra(t *testing.T) {
+	t.Parallel()
+
+	archiveData := makeZip(t, map[string]string{"sample-provider.dylib": "library"})
+	directoryEnd := bytes.LastIndex(archiveData, []byte{'P', 'K', 0x05, 0x06})
+	if directoryEnd < 0 {
+		t.Fatal("ZIP directory end not found")
+	}
+	directoryOffset := int(binary.LittleEndian.Uint32(archiveData[directoryEnd+16:]))
+	binary.LittleEndian.PutUint32(archiveData[directoryOffset+20:], 1<<32-1)
+
+	_, errInstall := InstallArchive(archiveData, testPlugin(), InstallOptions{
+		PluginsDir: t.TempDir(),
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if !errors.Is(errInstall, ErrPluginArchiveInvalidDirectory) {
+		t.Fatalf("InstallArchive() error = %v, want ErrPluginArchiveInvalidDirectory", errInstall)
+	}
+}
+
+func TestInstallArchiveAcceptsZip64Directory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	_, errInstall := InstallArchive(makeZip64(t, map[string]string{
+		"sample-provider.dylib": "library",
+	}), testPlugin(), InstallOptions{
+		PluginsDir: root,
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if errInstall != nil {
+		t.Fatalf("InstallArchive() error = %v", errInstall)
+	}
+	data, errRead := os.ReadFile(filepath.Join(root, "darwin", "arm64", "sample-provider.dylib"))
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	if string(data) != "library" {
+		t.Fatalf("installed data = %q, want library", data)
+	}
+}
+
+func TestInstallArchiveRejectsMalformedZip64Directory(t *testing.T) {
+	t.Parallel()
+
+	archiveData := makeZip64(t, map[string]string{"sample-provider.dylib": "library"})
+	directoryEnd := bytes.LastIndex(archiveData, []byte{'P', 'K', 0x05, 0x06})
+	if directoryEnd < zipDirectory64LocatorSize {
+		t.Fatal("ZIP64 locator not found")
+	}
+	archiveData[directoryEnd-zipDirectory64LocatorSize] = 0
+
+	_, errInstall := InstallArchive(archiveData, testPlugin(), InstallOptions{
+		PluginsDir: t.TempDir(),
+		GOOS:       "darwin",
+		GOARCH:     "arm64",
+	})
+	if !errors.Is(errInstall, ErrPluginArchiveInvalidDirectory) {
+		t.Fatalf("InstallArchive() error = %v, want ErrPluginArchiveInvalidDirectory", errInstall)
+	}
+}
+
+func TestReadTargetLibraryRejectsDeclaredUncompressedSize(t *testing.T) {
+	t.Parallel()
+
+	reader := &zip.Reader{File: []*zip.File{{FileHeader: zip.FileHeader{
+		Name:               "sample-provider.dylib",
+		UncompressedSize64: pluginLibraryMaxBytes + 1,
+	}}}}
+	_, _, errRead := readTargetLibrary(reader, "sample-provider", "darwin")
+	if errRead == nil || !strings.Contains(errRead.Error(), "uncompressed size") {
+		t.Fatalf("readTargetLibrary() error = %v, want uncompressed size error", errRead)
+	}
+}
+
+func TestReadArchiveEntryStopsAtLimitPlusOne(t *testing.T) {
+	t.Parallel()
+
+	reader := &countingArchiveReader{Reader: strings.NewReader("123456")}
+	_, errRead := readArchiveEntry(reader, 4)
+	if errRead == nil || !strings.Contains(errRead.Error(), "maximum allowed size") {
+		t.Fatalf("readArchiveEntry() error = %v, want size limit error", errRead)
+	}
+	if reader.read != 5 {
+		t.Fatalf("bytes read = %d, want limit+1 (5)", reader.read)
+	}
+}
+
 func TestInstallUsesLatestReleaseVersion(t *testing.T) {
 	t.Parallel()
 
@@ -414,6 +576,44 @@ func makeZip(t *testing.T, files map[string]string) []byte {
 	return buffer.Bytes()
 }
 
+func makeZip64(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+
+	archiveData := makeZip(t, files)
+	directoryEnd := bytes.LastIndex(archiveData, []byte{'P', 'K', 0x05, 0x06})
+	if directoryEnd < 0 {
+		t.Fatal("ZIP directory end not found")
+	}
+	endRecord := append([]byte(nil), archiveData[directoryEnd:]...)
+	directorySize := binary.LittleEndian.Uint32(endRecord[12:16])
+	directoryOffset := binary.LittleEndian.Uint32(endRecord[16:20])
+	entries := binary.LittleEndian.Uint16(endRecord[10:12])
+
+	zip64Records := make([]byte, zipDirectory64EndSize+zipDirectory64LocatorSize)
+	binary.LittleEndian.PutUint32(zip64Records[0:4], zipDirectory64EndSignature)
+	binary.LittleEndian.PutUint64(zip64Records[4:12], zipDirectory64EndSize-12)
+	binary.LittleEndian.PutUint16(zip64Records[12:14], 45)
+	binary.LittleEndian.PutUint16(zip64Records[14:16], 45)
+	binary.LittleEndian.PutUint64(zip64Records[24:32], uint64(entries))
+	binary.LittleEndian.PutUint64(zip64Records[32:40], uint64(entries))
+	binary.LittleEndian.PutUint64(zip64Records[40:48], uint64(directorySize))
+	binary.LittleEndian.PutUint64(zip64Records[48:56], uint64(directoryOffset))
+	locator := zip64Records[zipDirectory64EndSize:]
+	binary.LittleEndian.PutUint32(locator[0:4], zipDirectory64LocatorSignature)
+	binary.LittleEndian.PutUint64(locator[8:16], uint64(directoryEnd))
+	binary.LittleEndian.PutUint32(locator[16:20], 1)
+	binary.LittleEndian.PutUint16(endRecord[8:10], 1<<16-1)
+	binary.LittleEndian.PutUint16(endRecord[10:12], 1<<16-1)
+	binary.LittleEndian.PutUint32(endRecord[12:16], 1<<32-1)
+	binary.LittleEndian.PutUint32(endRecord[16:20], 1<<32-1)
+
+	result := make([]byte, 0, len(archiveData)+len(zip64Records))
+	result = append(result, archiveData[:directoryEnd]...)
+	result = append(result, zip64Records...)
+	result = append(result, endRecord...)
+	return result
+}
+
 type failingHTTPDoer struct{}
 
 func (failingHTTPDoer) Do(*http.Request) (*http.Response, error) {
@@ -449,4 +649,15 @@ func testPlugin() Plugin {
 		Version:     "0.1.0",
 		Repository:  "https://github.com/author-name/cliproxy-sample-provider-plugin",
 	}
+}
+
+type countingArchiveReader struct {
+	io.Reader
+	read int
+}
+
+func (r *countingArchiveReader) Read(buffer []byte) (int, error) {
+	n, errRead := r.Reader.Read(buffer)
+	r.read += n
+	return n, errRead
 }

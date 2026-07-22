@@ -2,10 +2,34 @@ package responses
 
 import (
 	"encoding/base64"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertOpenAIResponsesRequestToGemini_LargeInputArrayStaysOrdered(t *testing.T) {
+	const messageCount = 1024
+	var input strings.Builder
+	input.WriteString(`{"input":[`)
+	for index := 0; index < messageCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"type":"message","role":"user","content":[{"type":"input_text","text":"message-%d"}]}`, index)
+	}
+	input.WriteString(`]}`)
+
+	output := ConvertOpenAIResponsesRequestToGemini("gemini-test", []byte(input.String()), false)
+	contents := gjson.GetBytes(output, "contents").Array()
+	if len(contents) != messageCount {
+		t.Fatalf("contents length = %d, want %d", len(contents), messageCount)
+	}
+	if got := contents[len(contents)-1].Get("parts.0.text").String(); got != "message-1023" {
+		t.Fatalf("last message = %q, want message-1023", got)
+	}
+}
 
 const testResponsesGeminiThoughtSignature = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
 

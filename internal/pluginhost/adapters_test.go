@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -1224,6 +1225,71 @@ func TestResponseNormalizersChainByPriority(t *testing.T) {
 	after := host.NormalizeResponseAfter(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", []byte("original-request"), []byte("translated-request"), []byte("body"), true)
 	if string(after) != "body|after-high|after-low" {
 		t.Fatalf("NormalizeResponseAfter() = %q, want %q", after, "body|after-high|after-low")
+	}
+}
+
+func TestResponseNormalizerTracksScopedPayloadCopies(t *testing.T) {
+	const payloadBytes = 2 << 20
+	originalRequest := bytes.Repeat([]byte{'o'}, payloadBytes)
+	translatedRequest := bytes.Repeat([]byte{'t'}, payloadBytes)
+	body := bytes.Repeat([]byte{'b'}, payloadBytes)
+	entered := make(chan pluginapi.ResponseTransformRequest, 1)
+	unblock := make(chan struct{})
+	defer func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+	}()
+	host := newHostWithRecords(capabilityRecord{
+		id: "blocking-normalizer",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			ResponseBeforeTranslator: responseNormalizerFunc(func(_ context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
+				entered <- req
+				<-unblock
+				return pluginapi.PayloadResponse{Body: req.Body}, nil
+			}),
+		}},
+	})
+
+	baseline := internalpayload.CurrentLargeCloneMetrics()
+	result := make(chan []byte, 1)
+	go func() {
+		result <- host.NormalizeResponseBefore(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", originalRequest, translatedRequest, body, false)
+	}()
+
+	var retained pluginapi.ResponseTransformRequest
+	select {
+	case retained = <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("response normalizer was not called")
+	}
+	during := internalpayload.CurrentLargeCloneMetrics()
+	if during.ActiveScopedCount != baseline.ActiveScopedCount+3 || during.ActiveScopedBytes != baseline.ActiveScopedBytes+3*payloadBytes {
+		t.Fatalf("active scoped clones = (%d, %d), want (%d, %d)", during.ActiveScopedCount, during.ActiveScopedBytes, baseline.ActiveScopedCount+3, baseline.ActiveScopedBytes+3*payloadBytes)
+	}
+	originalRequest[0] = 'x'
+	translatedRequest[0] = 'x'
+	body[0] = 'x'
+	if retained.OriginalRequest[0] != 'o' || retained.TranslatedRequest[0] != 't' || retained.Body[0] != 'b' {
+		t.Fatal("plugin request aliases mutable caller payloads")
+	}
+
+	close(unblock)
+	var output []byte
+	select {
+	case output = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("response normalizer did not complete")
+	}
+	after := internalpayload.CurrentLargeCloneMetrics()
+	if after.ActiveScopedCount != baseline.ActiveScopedCount || after.ActiveScopedBytes != baseline.ActiveScopedBytes {
+		t.Fatalf("active scoped clones after completion = (%d, %d), want baseline (%d, %d)", after.ActiveScopedCount, after.ActiveScopedBytes, baseline.ActiveScopedCount, baseline.ActiveScopedBytes)
+	}
+	retained.Body[0] = 'y'
+	if output[0] != 'b' {
+		t.Fatal("normalizer output aliases plugin-owned response payload")
 	}
 }
 
@@ -2532,6 +2598,67 @@ func TestAccessAdapterBodyReadFailureReturnsInternalError(t *testing.T) {
 	}
 }
 
+func TestAccessAdapterRejectsKnownOversizeBeforeCallingPlugin(t *testing.T) {
+	host := New()
+	called := false
+	adapter := &accessAdapter{
+		host:     host,
+		pluginID: "auth-plugin",
+		provider: frontendAuthProviderFunc{
+			identifier: "custom-auth",
+			authenticate: func(context.Context, pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
+				called = true
+				return pluginapi.FrontendAuthResponse{Authenticated: true}, nil
+			},
+		},
+	}
+	req, errNewRequest := http.NewRequest(http.MethodPost, "http://example.test/v1/chat/completions", bytes.NewBufferString("{}"))
+	if errNewRequest != nil {
+		t.Fatal(errNewRequest)
+	}
+	req.ContentLength = defaultPluginRequestBodyBytes + 1
+
+	result, authErr := adapter.Authenticate(context.Background(), req)
+	if result != nil || !sdkaccess.IsAuthErrorCode(authErr, sdkaccess.AuthErrorCodeRequestTooLarge) || authErr.HTTPStatusCode() != http.StatusRequestEntityTooLarge {
+		t.Fatalf("result=%#v error=%v, want request-too-large", result, authErr)
+	}
+	if called {
+		t.Fatal("plugin provider was called after known body overflow")
+	}
+}
+
+func TestReadAndRestoreRequestBodyDetectsChunkedOverflowAtLimitPlusOne(t *testing.T) {
+	req, errNewRequest := http.NewRequest(http.MethodPost, "http://example.test/v1/chat/completions", nil)
+	if errNewRequest != nil {
+		t.Fatal(errNewRequest)
+	}
+	req.Body = io.NopCloser(strings.NewReader("12345"))
+	req.ContentLength = -1
+
+	body, err := readAndRestoreRequestBody(req, 4)
+	if body != nil || !errors.Is(err, errPluginRequestBodyTooLarge) {
+		t.Fatalf("body=%q error=%v, want request-too-large", body, err)
+	}
+	restored, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if string(restored) != "12345" {
+		t.Fatalf("restored body = %q, want limit+1 bytes", restored)
+	}
+}
+
+func TestFrontendAuthBodyLimitPreservesMultipartImageBudget(t *testing.T) {
+	req, errNewRequest := http.NewRequest(http.MethodPost, "http://example.test/v1/images/edits", nil)
+	if errNewRequest != nil {
+		t.Fatal(errNewRequest)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=test")
+	if got := frontendAuthRequestBodyLimit(req); got != imageEditPluginRequestBodyBytes {
+		t.Fatalf("limit = %d, want %d", got, imageEditPluginRequestBodyBytes)
+	}
+}
+
 func TestAccessAdapterErrorReturnsNotHandledAndRestoresBody(t *testing.T) {
 	host := New()
 	adapter := &accessAdapter{
@@ -3005,10 +3132,202 @@ func TestExecutorAdapterPanicFusesAndReturnsError(t *testing.T) {
 	}
 }
 
+func TestExecutorAdapterTracksScopedRequestCopies(t *testing.T) {
+	const payloadBytes = 2 << 20
+	newAdapter := func(executor pluginapi.ProviderExecutor) *executorAdapter {
+		return &executorAdapter{
+			host:          New(),
+			pluginID:      "scoped-executor",
+			provider:      "plugin-provider",
+			inputFormats:  []sdktranslator.Format{sdktranslator.FormatOpenAI},
+			outputFormats: []sdktranslator.Format{sdktranslator.FormatOpenAI},
+			executor:      executor,
+		}
+	}
+	newRequest := func(stream bool) (coreexecutor.Request, coreexecutor.Options) {
+		return coreexecutor.Request{
+				Model:   "model",
+				Format:  sdktranslator.FormatOpenAI,
+				Payload: bytes.Repeat([]byte{'p'}, payloadBytes),
+			}, coreexecutor.Options{
+				Stream:          stream,
+				SourceFormat:    sdktranslator.FormatOpenAI,
+				ResponseFormat:  sdktranslator.FormatOpenAI,
+				OriginalRequest: bytes.Repeat([]byte{'o'}, payloadBytes),
+			}
+	}
+
+	t.Run("non-stream", func(t *testing.T) {
+		entered := make(chan pluginapi.ExecutorRequest, 1)
+		unblock := make(chan struct{})
+		defer func() {
+			select {
+			case <-unblock:
+			default:
+				close(unblock)
+			}
+		}()
+		adapter := newAdapter(&fakeExecutor{
+			execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+				entered <- req
+				<-unblock
+				return pluginapi.ExecutorResponse{Payload: req.Payload}, nil
+			},
+		})
+		req, opts := newRequest(false)
+		baseline := internalpayload.CurrentLargeCloneMetrics()
+		type executeResult struct {
+			resp coreexecutor.Response
+			err  error
+		}
+		result := make(chan executeResult, 1)
+		go func() {
+			resp, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, req, opts)
+			result <- executeResult{resp: resp, err: errExecute}
+		}()
+
+		retained := <-entered
+		during := internalpayload.CurrentLargeCloneMetrics()
+		if during.ActiveScopedCount != baseline.ActiveScopedCount+2 || during.ActiveScopedBytes != baseline.ActiveScopedBytes+2*payloadBytes {
+			t.Fatalf("active executor request clones = (%d, %d), want (%d, %d)", during.ActiveScopedCount, during.ActiveScopedBytes, baseline.ActiveScopedCount+2, baseline.ActiveScopedBytes+2*payloadBytes)
+		}
+		req.Payload[0] = 'x'
+		opts.OriginalRequest[0] = 'x'
+		if retained.Payload[0] != 'p' || retained.OriginalRequest[0] != 'o' {
+			t.Fatal("plugin executor request aliases mutable caller payloads")
+		}
+
+		close(unblock)
+		completed := <-result
+		if completed.err != nil {
+			t.Fatalf("Execute() error = %v", completed.err)
+		}
+		if completed.resp.Payload[0] != 'p' {
+			t.Fatal("executor response aliases caller payload")
+		}
+		after := internalpayload.CurrentLargeCloneMetrics()
+		if after.ActiveScopedCount != baseline.ActiveScopedCount || after.ActiveScopedBytes != baseline.ActiveScopedBytes {
+			t.Fatalf("active executor request clones after completion = (%d, %d), want baseline (%d, %d)", after.ActiveScopedCount, after.ActiveScopedBytes, baseline.ActiveScopedCount, baseline.ActiveScopedBytes)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		entered := make(chan pluginapi.ExecutorRequest, 1)
+		pluginChunks := make(chan pluginapi.ExecutorStreamChunk)
+		adapter := newAdapter(&fakeExecutor{
+			executeStream: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+				entered <- req
+				return pluginapi.ExecutorStreamResponse{Chunks: pluginChunks}, nil
+			},
+		})
+		req, opts := newRequest(true)
+		baseline := internalpayload.CurrentLargeCloneMetrics()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result, errExecute := adapter.ExecuteStream(ctx, &coreauth.Auth{}, req, opts)
+		if errExecute != nil {
+			t.Fatalf("ExecuteStream() error = %v", errExecute)
+		}
+		retained := <-entered
+		during := internalpayload.CurrentLargeCloneMetrics()
+		if during.ActiveScopedCount != baseline.ActiveScopedCount+2 || during.ActiveScopedBytes != baseline.ActiveScopedBytes+2*payloadBytes {
+			t.Fatalf("active stream request clones = (%d, %d), want (%d, %d)", during.ActiveScopedCount, during.ActiveScopedBytes, baseline.ActiveScopedCount+2, baseline.ActiveScopedBytes+2*payloadBytes)
+		}
+		req.Payload[0] = 'x'
+		opts.OriginalRequest[0] = 'x'
+		if retained.Payload[0] != 'p' || retained.OriginalRequest[0] != 'o' {
+			t.Fatal("plugin stream request aliases mutable caller payloads")
+		}
+
+		chunkPayload := bytes.Repeat([]byte{'c'}, payloadBytes)
+		produced := make(chan struct{})
+		go func() {
+			pluginChunks <- pluginapi.ExecutorStreamChunk{Payload: chunkPayload}
+			close(pluginChunks)
+			close(produced)
+		}()
+		<-produced
+		blocked := internalpayload.CurrentLargeCloneMetrics()
+		if blocked.ActiveScopedCount != baseline.ActiveScopedCount+2 || blocked.ActiveScopedBytes != baseline.ActiveScopedBytes+2*payloadBytes {
+			t.Fatalf("stream request clones released before output drain: (%d, %d)", blocked.ActiveScopedCount, blocked.ActiveScopedBytes)
+		}
+		chunk, ok := <-result.Chunks
+		if !ok {
+			t.Fatal("stream output closed before payload")
+		}
+		if len(chunk.Payload) == 0 || &chunk.Payload[0] != &chunkPayload[0] {
+			t.Fatal("stream bridge copied transferred payload")
+		}
+		if _, ok = <-result.Chunks; ok {
+			t.Fatal("stream output remained open after plugin channel closed")
+		}
+		after := internalpayload.CurrentLargeCloneMetrics()
+		if after.ActiveScopedCount != baseline.ActiveScopedCount || after.ActiveScopedBytes != baseline.ActiveScopedBytes {
+			t.Fatalf("active stream request clones after drain = (%d, %d), want baseline (%d, %d)", after.ActiveScopedCount, after.ActiveScopedBytes, baseline.ActiveScopedCount, baseline.ActiveScopedBytes)
+		}
+	})
+}
+
+func TestSendExecutorPluginStreamChunkTransfersOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan pluginapi.ExecutorStreamChunk)
+	payload := bytes.Repeat([]byte{'c'}, 2<<20)
+	sent := make(chan bool, 1)
+	go func() {
+		sent <- sendExecutorPluginStreamChunk(ctx, out, pluginapi.ExecutorStreamChunk{Payload: payload})
+	}()
+	chunk := <-out
+	if !<-sent {
+		t.Fatal("stream chunk send failed")
+	}
+	if len(chunk.Payload) == 0 || &chunk.Payload[0] != &payload[0] {
+		t.Fatal("translated stream bridge copied transferred payload")
+	}
+}
+
+func TestScopedPluginResponseBodyReleasesOwnedCopy(t *testing.T) {
+	const payloadBytes = 2 << 20
+	for _, mode := range []string{"eof", "close"} {
+		t.Run(mode, func(t *testing.T) {
+			source := bytes.Repeat([]byte{'b'}, payloadBytes)
+			baseline := internalpayload.CurrentLargeCloneMetrics()
+			response := httpResponseFromPlugin(pluginapi.ExecutorHTTPResponse{Body: source}, nil)
+			during := internalpayload.CurrentLargeCloneMetrics()
+			if during.ActiveScopedCount != baseline.ActiveScopedCount+1 || during.ActiveScopedBytes != baseline.ActiveScopedBytes+payloadBytes {
+				t.Fatalf("active response body clone = (%d, %d), want (%d, %d)", during.ActiveScopedCount, during.ActiveScopedBytes, baseline.ActiveScopedCount+1, baseline.ActiveScopedBytes+payloadBytes)
+			}
+			source[0] = 'x'
+			switch mode {
+			case "eof":
+				payload, errRead := io.ReadAll(response.Body)
+				if errRead != nil {
+					t.Fatalf("read response body: %v", errRead)
+				}
+				if payload[0] != 'b' {
+					t.Fatal("response body aliases plugin payload")
+				}
+			case "close":
+				if errClose := response.Body.Close(); errClose != nil {
+					t.Fatalf("close response body: %v", errClose)
+				}
+			}
+			if errClose := response.Body.Close(); errClose != nil {
+				t.Fatalf("repeat close response body: %v", errClose)
+			}
+			after := internalpayload.CurrentLargeCloneMetrics()
+			if after.ActiveScopedCount != baseline.ActiveScopedCount || after.ActiveScopedBytes != baseline.ActiveScopedBytes {
+				t.Fatalf("active response body clone after %s = (%d, %d), want baseline (%d, %d)", mode, after.ActiveScopedCount, after.ActiveScopedBytes, baseline.ActiveScopedCount, baseline.ActiveScopedBytes)
+			}
+		})
+	}
+}
+
 func TestMapExecutorStreamChunksExitsWhenContextCanceledWithoutDownstreamConsumer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	in := make(chan pluginapi.ExecutorStreamChunk)
-	out := mapExecutorStreamChunks(ctx, in)
+	released := make(chan struct{})
+	out := mapExecutorStreamChunks(ctx, in, func() { close(released) })
 	sent := make(chan struct{})
 
 	go func() {
@@ -3031,6 +3350,11 @@ func TestMapExecutorStreamChunksExitsWhenContextCanceledWithoutDownstreamConsume
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("output channel was not closed after context cancellation")
+	}
+	select {
+	case <-released:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stream request ownership was not released after context cancellation")
 	}
 }
 

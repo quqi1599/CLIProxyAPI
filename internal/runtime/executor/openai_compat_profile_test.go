@@ -2,6 +2,7 @@ package executor
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,15 +71,16 @@ func TestNewOpenAICompatStatusErr_EmptyBodyHasErrorCode(t *testing.T) {
 	if err.ErrorCode() != openAICompatEmptyUpstreamResponseCode {
 		t.Fatalf("ErrorCode() = %q, want %q", err.ErrorCode(), openAICompatEmptyUpstreamResponseCode)
 	}
-	if err.Error() != "empty upstream response" {
-		t.Fatalf("Error() = %q, want empty upstream response", err.Error())
+	if !strings.Contains(err.Error(), "empty upstream response") || !strings.Contains(err.Error(), `"bytes":0`) || !strings.Contains(err.Error(), `"sha256":`) {
+		t.Fatalf("Error() = %q, want safe empty-body metadata", err.Error())
 	}
 }
 
 func TestNewOpenAICompatStatusErr_ParsesSSEDataErrorBody(t *testing.T) {
 	t.Parallel()
 
-	body := []byte("event: error\ndata: {\"error\":{\"message\":\"invalid function arguments json string\",\"type\":\"invalid_request_error\",\"code\":\"invalid_function_arguments\"}}\n\n")
+	const secret = "openai-compat-sse-error-sentinel"
+	body := []byte("event: error\ndata: {\"error\":{\"message\":\"invalid function arguments json string " + secret + "\",\"type\":\"invalid_request_error\",\"code\":\"invalid_function_arguments\"}}\n\n")
 	err := newOpenAICompatStatusErr(openAICompatProfileForKind("mimo"), nil, "mimo-v2.5-pro", http.StatusBadRequest, nil, "text/event-stream", body)
 
 	if err.StatusCode() != http.StatusBadRequest {
@@ -87,8 +89,8 @@ func TestNewOpenAICompatStatusErr_ParsesSSEDataErrorBody(t *testing.T) {
 	if err.ErrorCode() != "invalid_function_arguments" {
 		t.Fatalf("ErrorCode() = %q, want invalid_function_arguments", err.ErrorCode())
 	}
-	if got := err.Error(); got != "invalid_request_error: invalid function arguments json string" {
-		t.Fatalf("Error() = %q, want parsed SSE JSON message", got)
+	if got := err.Error(); strings.Contains(got, secret) || !strings.Contains(got, "error_code=invalid_function_arguments") || !strings.Contains(got, `"sha256":`) || !strings.Contains(got, `"content_type":"text/event-stream"`) {
+		t.Fatalf("Error() = %q, want safe parsed classification and metadata", got)
 	}
 }
 

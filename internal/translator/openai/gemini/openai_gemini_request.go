@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -115,6 +116,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Process contents (Gemini messages) -> OpenAI messages
 	var toolCallIDs []string // Track tool call IDs for matching with tool results
 	toolCallConsumeIdx := 0
+	var messages [][]byte
 
 	// System instruction -> OpenAI system message
 	// Gemini may provide `systemInstruction` or `system_instruction`; support both keys.
@@ -125,7 +127,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	if systemInstruction.Exists() {
 		parts := systemInstruction.Get("parts")
 		msg := []byte(`{"role":"system","content":[]}`)
-		hasContent := false
+		var contentParts [][]byte
 
 		if parts.Exists() && parts.IsArray() {
 			parts.ForEach(func(_, part gjson.Result) bool {
@@ -133,8 +135,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				if text := part.Get("text"); text.Exists() {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", text.String())
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
-					hasContent = true
+					contentParts = append(contentParts, contentPart)
 				}
 
 				// Handle inline data (e.g., images)
@@ -145,15 +146,15 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 					contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
-					hasContent = true
+					contentParts = append(contentParts, contentPart)
 				}
 				return true
 			})
 		}
 
-		if hasContent {
-			out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+		if len(contentParts) > 0 {
+			msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentParts))
+			messages = append(messages, msg)
 		}
 	}
 
@@ -171,11 +172,9 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			msg, _ = sjson.SetBytes(msg, "role", role)
 
 			var textBuilder strings.Builder
-			contentWrapper := []byte(`{"arr":[]}`)
-			contentPartsCount := 0
+			var contentParts [][]byte
 			onlyTextContent := true
-			toolCallsWrapper := []byte(`{"arr":[]}`)
-			toolCallsCount := 0
+			var toolCalls [][]byte
 
 			if parts.Exists() && parts.IsArray() {
 				parts.ForEach(func(_, part gjson.Result) bool {
@@ -185,8 +184,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						textBuilder.WriteString(formattedText)
 						contentPart := []byte(`{"type":"text","text":""}`)
 						contentPart, _ = sjson.SetBytes(contentPart, "text", formattedText)
-						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+						contentParts = append(contentParts, contentPart)
 					}
 
 					// Handle inline data (e.g., images)
@@ -199,8 +197,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 						contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 						contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
-						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+						contentParts = append(contentParts, contentPart)
 					}
 
 					// Handle function calls (Gemini) -> tool calls (OpenAI)
@@ -219,8 +216,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 							toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", "{}")
 						}
 
-						toolCallsWrapper, _ = sjson.SetRawBytes(toolCallsWrapper, "arr.-1", toolCall)
-						toolCallsCount++
+						toolCalls = append(toolCalls, toolCall)
 					}
 
 					// Handle function responses (Gemini) -> tool role messages (OpenAI)
@@ -245,7 +241,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", genToolCallID())
 						}
 
-						out, _ = sjson.SetRawBytes(out, "messages.-1", toolMsg)
+						messages = append(messages, toolMsg)
 					}
 
 					return true
@@ -253,25 +249,27 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			}
 
 			// Set content
-			if contentPartsCount > 0 {
+			if len(contentParts) > 0 {
 				if onlyTextContent {
 					msg, _ = sjson.SetBytes(msg, "content", textBuilder.String())
 				} else {
-					msg, _ = sjson.SetRawBytes(msg, "content", []byte(gjson.GetBytes(contentWrapper, "arr").Raw))
+					msg, _ = sjson.SetRawBytes(msg, "content", internalpayload.BuildRaw(contentParts))
 				}
 			}
 
 			// Set tool calls if any
-			if toolCallsCount > 0 {
-				msg, _ = sjson.SetRawBytes(msg, "tool_calls", []byte(gjson.GetBytes(toolCallsWrapper, "arr").Raw))
+			if len(toolCalls) > 0 {
+				msg, _ = sjson.SetRawBytes(msg, "tool_calls", internalpayload.BuildRaw(toolCalls))
 			}
 
-			out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+			messages = append(messages, msg)
 			return true
 		})
 	}
+	out, _ = sjson.SetRawBytes(out, "messages", internalpayload.BuildRaw(messages))
 
 	// Tools mapping: Gemini tools -> OpenAI tools
+	var openAITools [][]byte
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if functionDeclarations := tool.Get("functionDeclarations"); functionDeclarations.Exists() && functionDeclarations.IsArray() {
@@ -295,12 +293,15 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						openAITool, _ = sjson.SetRawBytes(openAITool, "function.parameters", []byte(util.CleanJSONSchemaForStrictUpstream("")))
 					}
 
-					out, _ = sjson.SetRawBytes(out, "tools.-1", openAITool)
+					openAITools = append(openAITools, openAITool)
 					return true
 				})
 			}
 			return true
 		})
+	}
+	if len(openAITools) > 0 {
+		out, _ = sjson.SetRawBytes(out, "tools", internalpayload.BuildRaw(openAITools))
 	}
 
 	// Tool choice mapping (Gemini doesn't have direct equivalent, but we can handle it)

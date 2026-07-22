@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 )
 
@@ -72,6 +73,33 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got != "当前对话上下文已超过模型限制。请清理或压缩历史消息，或新建对话后重试。" {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+}
+
+func TestWriteClaudeErrorResponseOnlyAllowsRetryAfterByDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(nil, nil))
+
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("retry later"),
+		Addon: http.Header{
+			"Retry-After":   {"2"},
+			"Authorization": {"Bearer secret"},
+			"Cookie":        {"session=secret"},
+			"X-Debug":       {"private"},
+		},
+	})
+
+	if got := recorder.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	for _, key := range []string{"Authorization", "Cookie", "X-Debug"} {
+		if got := recorder.Header().Get(key); got != "" {
+			t.Fatalf("%s leaked while passthrough is disabled: %q", key, got)
+		}
 	}
 }
 

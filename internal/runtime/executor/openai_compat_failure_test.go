@@ -168,12 +168,14 @@ func legacyOpenAICompatStatusErrForParity(statusCode int, headers http.Header, b
 
 func assertOpenAICompatStatusErrParity(t *testing.T, got, legacy statusErr) {
 	t.Helper()
-	if got.Error() != legacy.Error() ||
-		got.StatusCode() != legacy.StatusCode() ||
+	if got.StatusCode() != legacy.StatusCode() ||
 		got.ProviderStatusCode() != legacy.ProviderStatusCode() ||
 		got.ErrorCode() != legacy.ErrorCode() ||
 		!equalRetryAfter(got.RetryAfter(), legacy.RetryAfter()) {
 		t.Fatalf("statusErr parity mismatch:\n got=%s\nwant=%s", statusErrSnapshot(got), statusErrSnapshot(legacy))
+	}
+	if !strings.Contains(got.Error(), "[BODY METADATA v1]") || !strings.Contains(got.Error(), `"sha256":`) {
+		t.Fatalf("statusErr missing safe body metadata: %s", got.Error())
 	}
 }
 

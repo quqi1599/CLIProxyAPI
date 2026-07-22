@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -326,6 +327,15 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
 	*handlers.BaseAPIHandler
+
+	responsesWebsocketLimiterOnce sync.Once
+	responsesWebsocketLimiter     *responsesWebsocketConnectionLimiter
+
+	responsesWebsocketFrameLimiterOnce sync.Once
+	responsesWebsocketFrameLimiter     *responsesWebsocketFrameLimiter
+
+	responsesWebsocketRetainedLimiterOnce sync.Once
+	responsesWebsocketRetainedLimiter     *responsesWebsocketFrameLimiter
 }
 
 // NewOpenAIResponsesAPIHandler creates a new OpenAIResponses API handlers instance.
@@ -503,52 +513,32 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 	framer := &responsesSSEFramer{}
 
-	// Peek at the first chunk
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				// Err channel closed cleanly; wait for data channel.
-				errChan = nil
-				continue
-			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				// Stream closed without data? Send headers and done.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
-					_, _ = w.Write([]byte("\n"))
-				})
-				cliCancel(nil)
-				return
-			}
-
-			// Success! Set headers.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-
-			// Write first chunk logic (matching forwardResponsesStream)
-			handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
-				framer.WriteChunk(w, chunk)
-			})
-
-			// Continue
-			h.forwardResponsesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
-			return
-		}
+	chunk, errMsg, streamDone, errBootstrap := handlers.AwaitStreamBootstrap(c.Request.Context(), dataChan, errChan)
+	if errBootstrap != nil {
+		cliCancel(errBootstrap)
+		return
 	}
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	if streamDone {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+			_, _ = w.Write([]byte("\n"))
+		})
+		cliCancel(nil)
+		return
+	}
+
+	setSSEHeaders()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+		framer.WriteChunk(w, chunk)
+	})
+	h.forwardResponsesStream(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(summaryCtx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {

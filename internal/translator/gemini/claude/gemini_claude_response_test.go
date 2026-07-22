@@ -3,9 +3,37 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
+
+func TestConvertGeminiResponseToClaudeNonStream_LargePartsStayOrdered(t *testing.T) {
+	const partCount = 1024
+	var input strings.Builder
+	input.WriteString(`{"responseId":"response-1","modelVersion":"gemini-test","candidates":[{"content":{"parts":[`)
+	for index := 0; index < partCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"text":"part-%d","thought":%t}`, index, index%2 == 0)
+	}
+	input.WriteString(`]}}]}`)
+
+	output := ConvertGeminiResponseToClaudeNonStream(context.Background(), "gemini-test", nil, nil, []byte(input.String()), nil)
+	blocks := gjson.GetBytes(output, "content").Array()
+	if len(blocks) != partCount {
+		t.Fatalf("content length = %d, want %d", len(blocks), partCount)
+	}
+	if got := blocks[0].Get("thinking").String(); got != "part-0" {
+		t.Fatalf("first thinking block = %q, want part-0", got)
+	}
+	if got := blocks[len(blocks)-1].Get("text").String(); got != "part-1023" {
+		t.Fatalf("last text block = %q, want part-1023", got)
+	}
+}
 
 func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBlock(t *testing.T) {
 	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)

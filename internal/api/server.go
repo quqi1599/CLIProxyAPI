@@ -302,6 +302,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
+	baseAPIHandlers := handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager)
 
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
@@ -309,6 +310,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
+	engine.Use(baseAPIHandlers.PreAuthIngressAdmissionMiddleware())
 
 	// Add request logging middleware (positioned after recovery, before auth)
 	// Resolve logs directory relative to the configuration file directory.
@@ -340,7 +342,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Create server instance
 	s := &Server{
 		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
+		handlers:            baseAPIHandlers,
 		cfg:                 cfg,
 		accessManager:       accessManager,
 		requestLogger:       requestLogger,
@@ -430,7 +432,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if path == "/livez" || path == "/readyz" || path == "/healthz" || strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if path == "/livez" || path == "/readyz" || path == "/healthz" || path == "/healthz/details" || strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -458,7 +460,7 @@ func (s *Server) setupRoutes() {
 	readinessHandler := func(c *gin.Context) {
 		status := http.StatusOK
 		bodyStatus := "ready"
-		if !s.ready.Load() || (s.handlers != nil && !s.handlers.AdmissionReady()) {
+		if !s.readyForTraffic() {
 			status = http.StatusServiceUnavailable
 			bodyStatus = "not_ready"
 		}
@@ -473,6 +475,7 @@ func (s *Server) setupRoutes() {
 	// /healthz remains a compatibility alias for liveness only.
 	s.engine.GET("/healthz", livenessHandler)
 	s.engine.HEAD("/healthz", livenessHandler)
+	s.engine.GET("/healthz/details", s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.healthDetails)
 	s.engine.GET("/readyz", readinessHandler)
 	s.engine.HEAD("/readyz", readinessHandler)
 
@@ -484,7 +487,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -505,7 +508,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
-	openaiV1.Use(AuthMiddleware(s.accessManager))
+	openaiV1.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
 	{
 		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
 		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
@@ -514,7 +517,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager))
+	codexDirect.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -524,7 +527,7 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -633,7 +636,7 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		return
 	}
 
-	body, err := handlers.ReadRequestBodyWithLimits(c, codexAlphaSearchRequestMaxBytes, codexAlphaSearchRequestMaxBytes)
+	body, err := handlers.ReadRequestBodyWithPolicy(c, codexAlphaSearchRequestMaxBytes, codexAlphaSearchRequestMaxBytes)
 	if err != nil {
 		handlers.WriteRequestBodyError(c, err)
 		return
@@ -2085,6 +2088,15 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		statusCode := err.HTTPStatusCode()
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
+		}
+		if sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeRequestTooLarge) {
+			c.Abort()
+			c.JSON(statusCode, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+				Message: err.Message,
+				Type:    "invalid_request_error",
+				Code:    string(sdkaccess.AuthErrorCodeRequestTooLarge),
+			}})
+			return
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}

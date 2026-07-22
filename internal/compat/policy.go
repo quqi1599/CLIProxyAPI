@@ -11,8 +11,16 @@ type ExecutionMode string
 // Format identifies a source or target wire format.
 type Format string
 
+// TransformResult contains the transformed payload and controlled accounting
+// metadata. Downgrades must be declared by the owning policy.
+type TransformResult struct {
+	Payload        []byte
+	SyntheticBytes int64
+	Downgrades     []string
+}
+
 // TransformFunc applies one compatibility policy to an immutable input payload.
-type TransformFunc func(context.Context, []byte) ([]byte, error)
+type TransformFunc func(context.Context, []byte) (TransformResult, error)
 
 // MatchSpec describes the requests to which a policy applies. Empty fields are
 // wildcards.
@@ -68,5 +76,6 @@ type Policy struct {
 	RemovalCondition string            `json:"removal_condition"`
 	Lifecycle        LifecycleMetadata `json:"lifecycle"`
 	MutatedFields    []string          `json:"mutated_fields,omitempty"`
+	DowngradeIDs     []string          `json:"downgrade_ids,omitempty"`
 	Apply            TransformFunc     `json:"-"`
 }

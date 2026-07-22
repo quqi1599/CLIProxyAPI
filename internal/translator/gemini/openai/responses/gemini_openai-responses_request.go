@@ -2,7 +2,6 @@ package responses
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -25,12 +24,14 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	out := []byte(`{"contents":[]}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	systemParts := make([][]byte, 0)
+	contentNodes := make([][]byte, 0)
 
 	// Extract system instruction from OpenAI "instructions" field
 	if instructions := root.Get("instructions"); instructions.Exists() {
-		systemInstr := []byte(`{"parts":[{"text":""}]}`)
-		systemInstr, _ = sjson.SetBytes(systemInstr, "parts.0.text", instructions.String())
-		out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstr)
+		part := []byte(`{"text":""}`)
+		part, _ = sjson.SetBytes(part, "text", instructions.String())
+		systemParts = append(systemParts, part)
 	}
 
 	// Convert input messages to Gemini contents format
@@ -39,6 +40,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 		// Normalize consecutive function calls and outputs so each call is immediately followed by its response
 		normalized := make([]gjson.Result, 0, len(items))
+		functionNames := make(map[string]string)
 		for i := 0; i < len(items); {
 			item := items[i]
 			itemType := item.Get("type").String()
@@ -87,6 +89,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					for _, call := range calls {
 						normalized = append(normalized, call)
 						callID := call.Get("call_id").String()
+						if _, exists := functionNames[callID]; !exists {
+							functionNames[callID] = call.Get("name").String()
+						}
 						if resp, ok := outputMap[callID]; ok {
 							normalized = append(normalized, resp)
 							delete(outputMap, callID)
@@ -122,27 +127,18 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			case "message":
 				if strings.EqualFold(itemRole, "system") || strings.EqualFold(itemRole, "developer") {
 					if contentArray := item.Get("content"); contentArray.Exists() {
-						systemInstr := []byte(`{"parts":[]}`)
-						if systemInstructionResult := gjson.GetBytes(out, "systemInstruction"); systemInstructionResult.Exists() {
-							systemInstr = []byte(systemInstructionResult.Raw)
-						}
-
 						if contentArray.IsArray() {
 							contentArray.ForEach(func(_, contentItem gjson.Result) bool {
 								part := []byte(`{"text":""}`)
 								text := contentItem.Get("text").String()
 								part, _ = sjson.SetBytes(part, "text", text)
-								systemInstr, _ = sjson.SetRawBytes(systemInstr, "parts.-1", part)
+								systemParts = append(systemParts, part)
 								return true
 							})
 						} else if contentArray.Type == gjson.String {
 							part := []byte(`{"text":""}`)
 							part, _ = sjson.SetBytes(part, "text", contentArray.String())
-							systemInstr, _ = sjson.SetRawBytes(systemInstr, "parts.-1", part)
-						}
-
-						if gjson.GetBytes(systemInstr, "parts.#").Int() > 0 {
-							out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstr)
+							systemParts = append(systemParts, part)
 						}
 					}
 					continue
@@ -163,10 +159,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						}
 						one := []byte(`{"role":"","parts":[]}`)
 						one, _ = sjson.SetBytes(one, "role", currentRole)
-						for _, part := range currentParts {
-							one, _ = sjson.SetRawBytes(one, "parts.-1", part)
-						}
-						out, _ = sjson.SetRawBytes(out, "contents.-1", one)
+						one, _ = sjson.SetRawBytes(one, "parts", common.RawJSONArray(currentParts))
+						contentNodes = append(contentNodes, one)
 						currentParts = currentParts[:0]
 					}
 
@@ -263,7 +257,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					one := []byte(`{"role":"","parts":[{"text":""}]}`)
 					one, _ = sjson.SetBytes(one, "role", effRole)
 					one, _ = sjson.SetBytes(one, "parts.0.text", contentArray.String())
-					out, _ = sjson.SetRawBytes(out, "contents.-1", one)
+					contentNodes = append(contentNodes, one)
 				}
 
 			case "function_call":
@@ -283,8 +277,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsResult.Raw))
 				}
 
-				modelContent, _ = sjson.SetRawBytes(modelContent, "parts.-1", functionCall)
-				out, _ = sjson.SetRawBytes(out, "contents.-1", modelContent)
+				modelContent, _ = sjson.SetRawBytes(modelContent, "parts", common.RawJSONArray([][]byte{functionCall}))
+				contentNodes = append(contentNodes, modelContent)
 
 			case "function_call_output":
 				// Handle function call outputs - convert to function message with functionResponse
@@ -297,18 +291,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 				// We need to extract the function name from the previous function_call
 				// For now, we'll use a placeholder or extract from context if available
-				functionName := "unknown" // This should ideally be matched with the corresponding function_call
-
-				// Find the corresponding function call name by matching call_id
-				// We need to look back through the input array to find the matching call
-				if inputArray := root.Get("input"); inputArray.Exists() && inputArray.IsArray() {
-					inputArray.ForEach(func(_, prevItem gjson.Result) bool {
-						if prevItem.Get("type").String() == "function_call" && prevItem.Get("call_id").String() == callID {
-							functionName = prevItem.Get("name").String()
-							return false // Stop iteration
-						}
-						return true
-					})
+				functionName := functionNames[callID]
+				if functionName == "" {
+					functionName = "unknown"
 				}
 				functionName = util.SanitizeFunctionName(functionName)
 
@@ -324,8 +309,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.response.result", outputRaw)
 					}
 				}
-				functionContent, _ = sjson.SetRawBytes(functionContent, "parts.-1", functionResponse)
-				out, _ = sjson.SetRawBytes(out, "contents.-1", functionContent)
+				functionContent, _ = sjson.SetRawBytes(functionContent, "parts", common.RawJSONArray([][]byte{functionResponse}))
+				contentNodes = append(contentNodes, functionContent)
 
 			case "reasoning":
 				thoughtContent := []byte(`{"role":"model","parts":[]}`)
@@ -333,30 +318,35 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				thought, _ = sjson.SetBytes(thought, "text", item.Get("summary.0.text").String())
 				thought, _ = sjson.SetBytes(thought, "thoughtSignature", openAIResponsesGeminiThoughtSignature(item.Get("encrypted_content").String()))
 
-				thoughtContent, _ = sjson.SetRawBytes(thoughtContent, "parts.-1", thought)
-				out, _ = sjson.SetRawBytes(out, "contents.-1", thoughtContent)
+				thoughtContent, _ = sjson.SetRawBytes(thoughtContent, "parts", common.RawJSONArray([][]byte{thought}))
+				contentNodes = append(contentNodes, thoughtContent)
 			}
 		}
 	} else if input.Exists() && input.Type == gjson.String {
 		// Simple string input conversion to user message
 		userContent := []byte(`{"role":"user","parts":[{"text":""}]}`)
 		userContent, _ = sjson.SetBytes(userContent, "parts.0.text", input.String())
-		out, _ = sjson.SetRawBytes(out, "contents.-1", userContent)
+		contentNodes = append(contentNodes, userContent)
 	}
 
 	// Gemini/Vertex accepts assistant/model turns in history, but some model
 	// surfaces reject requests whose final turn is model-authored prefill.
-	contents := gjson.GetBytes(out, "contents")
-	if contents.Exists() && contents.IsArray() {
-		arr := contents.Array()
-		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" && !openAIResponsesGeminiModelTurnCarriesThought(arr[len(arr)-1]) {
-			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+	if len(contentNodes) > 0 {
+		last := gjson.ParseBytes(contentNodes[len(contentNodes)-1])
+		if last.Get("role").String() == "model" && !openAIResponsesGeminiModelTurnCarriesThought(last) {
+			contentNodes = contentNodes[:len(contentNodes)-1]
 		}
 	}
+	if len(systemParts) > 0 {
+		systemInstruction := []byte(`{"parts":[]}`)
+		systemInstruction, _ = sjson.SetRawBytes(systemInstruction, "parts", common.RawJSONArray(systemParts))
+		out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstruction)
+	}
+	out, _ = sjson.SetRawBytes(out, "contents", common.RawJSONArray(contentNodes))
 
 	// Convert tools to Gemini functionDeclarations format
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		geminiTools := []byte(`[{"functionDeclarations":[]}]`)
+		functionDeclarations := make([][]byte, 0, int(tools.Get("#").Int()))
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if tool.Get("type").String() == "function" {
@@ -373,14 +363,16 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(util.CleanJSONSchemaForGemini(params.Raw)))
 				}
 
-				geminiTools, _ = sjson.SetRawBytes(geminiTools, "0.functionDeclarations.-1", funcDecl)
+				functionDeclarations = append(functionDeclarations, funcDecl)
 			}
 			return true
 		})
 
 		// Only add tools if there are function declarations
-		if funcDecls := gjson.GetBytes(geminiTools, "0.functionDeclarations"); funcDecls.Exists() && len(funcDecls.Array()) > 0 {
-			out, _ = sjson.SetRawBytes(out, "tools", geminiTools)
+		if len(functionDeclarations) > 0 {
+			functionTool := []byte(`{"functionDeclarations":[]}`)
+			functionTool, _ = sjson.SetRawBytes(functionTool, "functionDeclarations", common.RawJSONArray(functionDeclarations))
+			out, _ = sjson.SetRawBytes(out, "tools", common.RawJSONArray([][]byte{functionTool}))
 		}
 	}
 

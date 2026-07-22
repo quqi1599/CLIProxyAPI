@@ -1,7 +1,9 @@
 package responses
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -501,6 +503,84 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_OmitsTop
 	if got := data.Get("output.0.content.0.text").String(); got != "ping" {
 		t.Fatalf("output text = %q, want %q; response=%s", got, "ping", resp)
 	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStreamPayloadGrowth(t *testing.T) {
+	request := []byte(`{"model":"gpt-5.4","reasoning":{"effort":"medium"},"tools":[{"type":"custom","name":"custom_exec"}]}`)
+	for _, size := range []int{16, 64, 256, 1024} {
+		t.Run(fmt.Sprintf("items_%d", size), func(t *testing.T) {
+			raw := buildOpenAIChatCompletionsGrowthResponse(size)
+			rawOriginal := bytes.Clone(raw)
+			requestOriginal := bytes.Clone(request)
+
+			response := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+
+			if !bytes.Equal(raw, rawOriginal) || !bytes.Equal(request, requestOriginal) {
+				t.Fatal("converter mutated an input payload")
+			}
+			outputs := gjson.GetBytes(response, "output").Array()
+			if len(outputs) != 1+size*3 {
+				t.Fatalf("output count = %d, want %d", len(outputs), 1+size*3)
+			}
+			if outputs[0].Get("type").String() != "reasoning" || outputs[0].Get("summary.0.text").String() != "reason-0000" {
+				t.Fatalf("reasoning output was not first: %s", outputs[0].Raw)
+			}
+			for index := 0; index < size; index++ {
+				base := 1 + index*3
+				message := outputs[base]
+				regularCall := outputs[base+1]
+				customCall := outputs[base+2]
+				if got, want := message.Get("content.0.text").String(), fmt.Sprintf("text-%04d", index); got != want {
+					t.Fatalf("message %d text = %q, want %q", index, got, want)
+				}
+				if got, want := regularCall.Get("call_id").String(), fmt.Sprintf("call_regular_%04d", index); got != want {
+					t.Fatalf("regular call %d id = %q, want %q", index, got, want)
+				}
+				arguments := gjson.Parse(regularCall.Get("arguments").String())
+				if arguments.Get("index").Int() != int64(index) || !arguments.Get("unknown.keep").Bool() {
+					t.Fatalf("regular call %d arguments lost fields: %s", index, arguments.Raw)
+				}
+				if customCall.Get("type").String() != "custom_tool_call" || customCall.Get("name").String() != "custom_exec" {
+					t.Fatalf("custom call %d changed type or name: %s", index, customCall.Raw)
+				}
+				if got, want := customCall.Get("input").String(), fmt.Sprintf("cmd-%04d", index); got != want {
+					t.Fatalf("custom call %d input = %q, want %q", index, got, want)
+				}
+			}
+		})
+	}
+}
+
+var benchmarkOpenAIResponsesNonStreamOutput []byte
+
+func BenchmarkPayloadGrowthOpenAIResponsesNonStreamOutput(b *testing.B) {
+	request := []byte(`{"model":"gpt-5.4","reasoning":{"effort":"medium"},"tools":[{"type":"custom","name":"custom_exec"}]}`)
+	for _, size := range []int{16, 64, 256, 1024} {
+		b.Run(fmt.Sprintf("items_%d", size), func(b *testing.B) {
+			raw := buildOpenAIChatCompletionsGrowthResponse(size)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(raw) + len(request)))
+			for b.Loop() {
+				benchmarkOpenAIResponsesNonStreamOutput = ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+			}
+		})
+	}
+}
+
+func buildOpenAIChatCompletionsGrowthResponse(size int) []byte {
+	var response strings.Builder
+	response.Grow(size * 520)
+	response.WriteString(`{"id":"chatcmpl_growth","object":"chat.completion","created":1773896263,"model":"model","choices":[`)
+	for index := 0; index < size; index++ {
+		if index > 0 {
+			response.WriteByte(',')
+		}
+		regularArguments := fmt.Sprintf(`{"index":%d,"unknown":{"keep":true}}`, index)
+		customArguments := fmt.Sprintf(`{"input":"cmd-%04d","unknown":%d}`, index, index)
+		fmt.Fprintf(&response, `{"index":%d,"message":{"role":"assistant","content":"text-%04d","reasoning_content":"reason-%04d","tool_calls":[{"id":"call_regular_%04d","type":"function","function":{"name":"regular","arguments":%q}},{"id":"call_custom_%04d","type":"function","function":{"name":"custom_exec","arguments":%q}}]},"finish_reason":"tool_calls"}`, index, index, index, index, regularArguments, index, customArguments)
+	}
+	response.WriteString(`],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`)
+	return []byte(response.String())
 }
 
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresNamespaceFunctionCall(t *testing.T) {

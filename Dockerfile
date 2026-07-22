@@ -37,6 +37,16 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM debian:bookworm
 
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="CLIProxyAPI" \
+      org.opencontainers.image.source="https://github.com/router-for-me/CLIProxyAPI" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates wget && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir /CLIProxyAPI

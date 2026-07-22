@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -18,7 +20,13 @@ import (
 )
 
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
+	var upstreamRequestBytes int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read upstream request: %v", errRead)
+		}
+		upstreamRequestBytes = int64(len(requestBody))
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]},\"output_index\":0}\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.4-mini-2026-03-17\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":28,\"total_tokens\":36}}}\n\n"))
@@ -31,10 +39,13 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 		"api_key":  "test",
 	}}
 
-	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	request := cliproxyexecutor.Request{
 		Model:   "gpt-5.4-mini",
 		Payload: []byte(`{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"Say ok"}]}`),
-	}, cliproxyexecutor.Options{
+	}
+	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(request.Payload)))
+	releaseReport := internalpayload.RetainTransformReport(ctx)
+	resp, err := executor.Execute(ctx, auth, request, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai"),
 		Stream:       false,
 	})
@@ -46,6 +57,7 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 	if gotContent != "ok" {
 		t.Fatalf("choices.0.message.content = %q, want %q; payload=%s", gotContent, "ok", string(resp.Payload))
 	}
+	assertTransformStageContract(t, ctx, releaseReport, "request_plan.codex", upstreamRequestBytes)
 }
 
 func TestCodexExecutorExecuteSurfacesTerminalStreamError(t *testing.T) {

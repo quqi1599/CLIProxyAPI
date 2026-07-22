@@ -1157,6 +1157,9 @@ func TestConvertClaudeRequestToAntigravity_ToolDeclarations(t *testing.T) {
 			{
 				"name": "test_tool",
 				"description": "A test tool",
+				"behavior": "BLOCKING",
+				"vendor_extension": {"keep": false},
+				"parametersJsonSchema": {"type": "string"},
 				"input_schema": {
 					"type": "object",
 					"properties": {
@@ -1188,6 +1191,18 @@ func TestConvertClaudeRequestToAntigravity_ToolDeclarations(t *testing.T) {
 	}
 	if funcDecl.Get("input_schema").Exists() {
 		t.Error("input_schema should be removed")
+	}
+	if funcDecl.Get("vendor_extension").Exists() {
+		t.Error("unsupported tool fields should be removed")
+	}
+	if got := funcDecl.Get("description").String(); got != "A test tool" {
+		t.Errorf("description = %q", got)
+	}
+	if got := funcDecl.Get("behavior").String(); got != "BLOCKING" {
+		t.Errorf("behavior = %q", got)
+	}
+	if got := funcDecl.Get("parametersJsonSchema.properties.name.type").String(); got != "string" {
+		t.Errorf("input schema was not used: %s", funcDecl.Raw)
 	}
 }
 
@@ -1509,6 +1524,32 @@ func TestConvertClaudeRequestToAntigravity_ReorderParallelFunctionCalls(t *testi
 	}
 	if parts[3].Get("functionCall.name").String() != "Read" || parts[3].Get("functionCall.id").String() != "call_2" {
 		t.Errorf("Expected fc2 fourth, got %s", parts[3].Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_LargeTextPartsPreserveOrder(t *testing.T) {
+	const partCount = 2048
+
+	var input strings.Builder
+	input.WriteString(`{"messages":[{"role":"assistant","content":[`)
+	for i := 0; i < partCount; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, `{"type":"text","text":"part-%04d"}`, i)
+	}
+	input.WriteString(`]}]}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", []byte(input.String()), false)
+	parts := gjson.GetBytes(output, "request.contents.0.parts").Array()
+	if len(parts) != partCount {
+		t.Fatalf("part count = %d, want %d", len(parts), partCount)
+	}
+	for _, index := range []int{0, partCount / 2, partCount - 1} {
+		want := fmt.Sprintf("part-%04d", index)
+		if got := parts[index].Get("text").String(); got != want {
+			t.Fatalf("part %d = %q, want %q", index, got, want)
+		}
 	}
 }
 

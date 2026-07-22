@@ -59,6 +59,28 @@ func TestRefreshTokensWithRetry_429BlocksImmediateReplay(t *testing.T) {
 	}
 }
 
+func TestRefreshTokensErrorDoesNotExposeBody(t *testing.T) {
+	resetClaudeRefreshState()
+	t.Cleanup(resetClaudeRefreshState)
+	const secret = "claude-oauth-secret-marker"
+	auth := &ClaudeAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"` + secret + `"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}, nil
+	})}}
+
+	_, err := auth.RefreshTokens(context.Background(), "refresh-token")
+	if err == nil {
+		t.Fatal("RefreshTokens() error = nil")
+	}
+	if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("unsafe refresh error: %v", err)
+	}
+}
+
 func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
 	resetClaudeRefreshState()
 	defer resetClaudeRefreshState()

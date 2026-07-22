@@ -113,6 +113,24 @@ func TestRefreshTokensPostsClientIDAndRefreshToken(t *testing.T) {
 	}
 }
 
+func TestRefreshTokensErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "xai-oauth-secret-marker"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"` + secret + `"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := NewXAIAuth(nil).RefreshTokens(context.Background(), "refresh-token", server.URL)
+	if err == nil {
+		t.Fatal("RefreshTokens() error = nil")
+	}
+	if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("unsafe refresh error: %v", err)
+	}
+}
+
 func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
 	resetXAIRefreshGroupForTest()
 	t.Cleanup(resetXAIRefreshGroupForTest)

@@ -8,7 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -430,7 +430,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 
 	// Set tool calls if any were accumulated during processing
 	if len(toolCallsAccumulator) > 0 {
-		toolCallsCount := 0
+		toolCalls := make([]json.RawMessage, 0, len(toolCallsAccumulator))
 		maxIndex := -1
 		for index := range toolCallsAccumulator {
 			if index > maxIndex {
@@ -445,19 +445,15 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 			}
 
 			arguments := accumulator.Arguments.String()
-
-			idPath := fmt.Sprintf("choices.0.message.tool_calls.%d.id", toolCallsCount)
-			typePath := fmt.Sprintf("choices.0.message.tool_calls.%d.type", toolCallsCount)
-			namePath := fmt.Sprintf("choices.0.message.tool_calls.%d.function.name", toolCallsCount)
-			argumentsPath := fmt.Sprintf("choices.0.message.tool_calls.%d.function.arguments", toolCallsCount)
-
-			out, _ = sjson.SetBytes(out, idPath, accumulator.ID)
-			out, _ = sjson.SetBytes(out, typePath, "function")
-			out, _ = sjson.SetBytes(out, namePath, accumulator.Name)
-			out, _ = sjson.SetBytes(out, argumentsPath, arguments)
-			toolCallsCount++
+			toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
+			toolCall, _ = sjson.SetBytes(toolCall, "id", accumulator.ID)
+			toolCall, _ = sjson.SetBytes(toolCall, "function.name", accumulator.Name)
+			toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments)
+			toolCalls = append(toolCalls, toolCall)
 		}
-		if toolCallsCount > 0 {
+		if len(toolCalls) > 0 {
+			toolCallsJSON, _ := json.Marshal(toolCalls)
+			out, _ = sjson.SetRawBytes(out, "choices.0.message.tool_calls", toolCallsJSON)
 			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", "tool_calls")
 		} else {
 			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))

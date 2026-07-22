@@ -1,9 +1,9 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +15,7 @@ import (
 
 	kimiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -25,6 +26,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const kimiRequestPlanTransformStage = "request_plan.kimi"
 
 // KimiExecutor is a stateless executor for Kimi API using OpenAI-compatible chat completions.
 type KimiExecutor struct {
@@ -78,12 +81,9 @@ func sanitizeKimiHTTPRequestBody(req *http.Request) error {
 	if req == nil || req.Body == nil || req.Body == http.NoBody {
 		return nil
 	}
-	body, errRead := io.ReadAll(req.Body)
+	body, errRead := readAndCloseExecutorHTTPRequestBody(req, "kimi executor")
 	if errRead != nil {
 		return errRead
-	}
-	if errClose := req.Body.Close(); errClose != nil {
-		log.Errorf("kimi executor: request body close error: %v", errClose)
 	}
 	updated, err := sanitizeKimiOpenAICompatibleRequestBody(body)
 	if err != nil {
@@ -119,6 +119,8 @@ func resolveKimiBaseURL(auth *cliproxyauth.Auth) string {
 
 // Execute performs a non-streaming chat completion request to Kimi.
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	planStarted := time.Now()
+	planInputBytes := int64(len(req.Payload))
 	from := opts.SourceFormat
 	if from.String() == "claude" {
 		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
@@ -146,9 +148,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		originalPayloadSource = downgradeClaudeToolSearchForCompat(baseURL, originalPayloadSource)
 		req.Payload = downgradeClaudeToolSearchForCompat(baseURL, req.Payload)
 	}
-	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
+	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.kimi", from, to, baseModel, originalPayloadSource, req.Payload, false, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return resp, err
+	}
 
 	// Strip kimi- prefix for upstream API
 	upstreamModel := stripKimiPrefix(baseModel)
@@ -167,6 +170,14 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, err = sanitizeKimiOpenAICompatibleRequestBodyForModel(body, baseModel, baseURL)
 	if err != nil {
+		return resp, err
+	}
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       kimiRequestPlanTransformStage,
+		InputBytes:  planInputBytes,
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(planStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
 		return resp, err
 	}
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
@@ -207,22 +218,17 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("kimi executor: close response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
-		return resp, err
-	}
-	data, err := io.ReadAll(httpResp.Body)
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
+	responseHeaders := decodedResponseHeaders(httpResp.Header)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
@@ -231,12 +237,14 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// Note: TranslateNonStream uses req.Model (original with suffix) to preserve
 	// the original model name in the response for client compatibility.
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}
 	return resp, nil
 }
 
 // ExecuteStream performs a streaming chat completion request to Kimi.
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	planStarted := time.Now()
+	planInputBytes := int64(len(req.Payload))
 	from := opts.SourceFormat
 	if from.String() == "claude" {
 		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
@@ -259,13 +267,14 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload := bytes.Clone(originalPayloadSource)
 	if from.String() == "claude" {
-		originalPayload = downgradeClaudeToolSearchForCompat(baseURL, originalPayload)
+		originalPayloadSource = downgradeClaudeToolSearchForCompat(baseURL, originalPayloadSource)
 		req.Payload = downgradeClaudeToolSearchForCompat(baseURL, req.Payload)
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
+	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.kimi.stream", from, to, baseModel, originalPayloadSource, req.Payload, true, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return nil, err
+	}
 
 	// Strip kimi- prefix for upstream API
 	upstreamModel := stripKimiPrefix(baseModel)
@@ -290,11 +299,21 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       kimiRequestPlanTransformStage,
+		InputBytes:  planInputBytes,
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(planStarted),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return nil, err
+	}
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/v1/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		cancelRequest()
 		return nil, err
 	}
 	applyKimiHeadersWithAuth(httpReq, token, true, auth)
@@ -325,48 +344,70 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cancelRequest()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		cancelRequest()
+		if errRead != nil {
+			if responseLog != nil {
+				responseLog.RecordError(errRead)
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+			return nil, errRead
+		}
 		if responseLog != nil {
 			responseLog.AppendChunk(b)
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("kimi executor: close response body error: %v", errClose)
-		}
 		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
 		return nil, err
 	}
+	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
+	if errStream != nil {
+		cancelRequest()
+		if responseLog != nil {
+			responseLog.RecordError(errStream)
+		}
+		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+		return nil, errStream
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "kimi executor")
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("kimi executor: close response body error: %v", errClose)
-			}
-		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 1_048_576) // 1MB
+		defer closeResponse()
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if responseLog != nil {
-				responseLog.AppendChunk(line)
-			}
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
+		var streamErr error
+		for {
+			event, errRead := sseStream.ReadEvent()
+			if errRead != nil {
+				if requestCtx.Err() != nil {
 					return
+				}
+				if !errors.Is(errRead, io.EOF) {
+					streamErr = errRead
+				}
+				break
+			}
+			if responseLog != nil {
+				responseLog.AppendChunk(event)
+			}
+			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
+				if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
+					reporter.Publish(ctx, detail)
+				}
+				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, internalpayload.CloneBytes(line), &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-requestCtx.Done():
+						return
+					}
 				}
 			}
 		}
@@ -374,26 +415,27 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		for i := range doneChunks {
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
-			case <-ctx.Done():
+			case <-requestCtx.Done():
 				return
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil {
+		if streamErr != nil {
 			if responseLog != nil {
-				responseLog.RecordError(errScan)
+				responseLog.RecordError(streamErr)
 			}
-			reporter.PublishFailure(ctx, errScan)
+			reporter.PublishFailure(ctx, streamErr)
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-requestCtx.Done():
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
 }
 
 // CountTokens estimates token count for Kimi requests.
 func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	transformInputBytes := int64(len(req.Payload))
 	var err error
 	if opts.SourceFormat.String() == "claude" {
 		req, opts, err = repairKimiClaudeToolUseRequest(req, opts)
@@ -409,7 +451,7 @@ func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 		}
 		authForCount.Attributes["base_url"] = resolveKimiBaseURL(auth)
 	}
-	return e.ClaudeExecutor.CountTokens(ctx, authForCount, req, opts)
+	return e.ClaudeExecutor.countTokens(ctx, authForCount, req, opts, kimiRequestPlanTransformStage, transformInputBytes)
 }
 
 func repairKimiClaudeToolUseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
@@ -514,26 +556,26 @@ func coalesceAdjacentClaudeToolResultMessages(body []byte) ([]byte, int, error) 
 	}
 
 	msgs := messages.Array()
-	outMessages := []byte(`[]`)
+	outMessages := make([]string, 0, len(msgs))
 	changed := false
 	merged := 0
 
 	for msgIdx := 0; msgIdx < len(msgs); msgIdx++ {
 		msg := msgs[msgIdx]
 		if strings.TrimSpace(msg.Get("role").String()) != "assistant" || !claudeMessageHasToolUse(msg) || msgIdx+1 >= len(msgs) {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 			continue
 		}
 
 		firstResults, ok := claudeToolResultOnlyContent(msgs[msgIdx+1])
 		if !ok {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 			continue
 		}
 
-		mergedContent := []byte(`[]`)
+		mergedContent := make([]string, 0, len(firstResults))
 		for _, part := range firstResults {
-			mergedContent, _ = sjson.SetRawBytes(mergedContent, "-1", []byte(part.Raw))
+			mergedContent = append(mergedContent, part.Raw)
 		}
 
 		lastResultIdx := msgIdx + 1
@@ -543,19 +585,19 @@ func coalesceAdjacentClaudeToolResultMessages(body []byte) ([]byte, int, error) 
 				break
 			}
 			for _, part := range nextResults {
-				mergedContent, _ = sjson.SetRawBytes(mergedContent, "-1", []byte(part.Raw))
+				mergedContent = append(mergedContent, part.Raw)
 			}
 			lastResultIdx = nextIdx
 			merged++
 			changed = true
 		}
 
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
-		firstMsg, err := sjson.SetRawBytes([]byte(msgs[msgIdx+1].Raw), "content", mergedContent)
+		outMessages = append(outMessages, msg.Raw)
+		firstMsg, err := sjson.SetRawBytes([]byte(msgs[msgIdx+1].Raw), "content", internalpayload.BuildRaw(mergedContent))
 		if err != nil {
 			return body, 0, fmt.Errorf("failed to merge Claude tool_result messages: %w", err)
 		}
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", firstMsg)
+		outMessages = append(outMessages, string(firstMsg))
 		msgIdx = lastResultIdx
 	}
 
@@ -563,7 +605,7 @@ func coalesceAdjacentClaudeToolResultMessages(body []byte) ([]byte, int, error) 
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
 	}
@@ -614,7 +656,7 @@ func dropUnansweredClaudeToolUses(body []byte) ([]byte, int, error) {
 	}
 
 	msgs := messages.Array()
-	outMessages := []byte(`[]`)
+	outMessages := make([]string, 0, len(msgs))
 	changed := false
 	removed := 0
 
@@ -622,12 +664,12 @@ func dropUnansweredClaudeToolUses(body []byte) ([]byte, int, error) {
 		role := strings.TrimSpace(msg.Get("role").String())
 		content := msg.Get("content")
 		if role != "assistant" || !content.IsArray() {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 			continue
 		}
 
 		nextToolResults := claudeToolResultIDsInNextUserMessage(msgs, msgIdx)
-		contentOut := []byte(`[]`)
+		contentOut := make([]string, 0, len(content.Array()))
 		contentChanged := false
 		keptParts := 0
 
@@ -641,12 +683,12 @@ func dropUnansweredClaudeToolUses(body []byte) ([]byte, int, error) {
 				}
 			}
 
-			contentOut, _ = sjson.SetRawBytes(contentOut, "-1", []byte(part.Raw))
+			contentOut = append(contentOut, part.Raw)
 			keptParts++
 		}
 
 		if !contentChanged {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 			continue
 		}
 
@@ -655,18 +697,18 @@ func dropUnansweredClaudeToolUses(body []byte) ([]byte, int, error) {
 			continue
 		}
 
-		msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", contentOut)
+		msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(contentOut))
 		if err != nil {
 			return body, 0, fmt.Errorf("failed to drop unanswered Claude tool_use: %w", err)
 		}
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+		outMessages = append(outMessages, string(msgOut))
 	}
 
 	if !changed {
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
 	}
@@ -684,7 +726,7 @@ func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
 	}
 
 	msgs := messages.Array()
-	outMessages := []byte(`[]`)
+	outMessages := make([]string, 0, len(msgs))
 	pending := map[string]bool{}
 	changed := false
 	removed := 0
@@ -694,16 +736,16 @@ func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
 		switch role {
 		case "assistant":
 			pending = claudeToolUseIDsInMessage(msg)
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 		case "user":
 			content := msg.Get("content")
 			if !content.IsArray() {
 				pending = map[string]bool{}
-				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				outMessages = append(outMessages, msg.Raw)
 				continue
 			}
 
-			contentOut := []byte(`[]`)
+			contentOut := make([]string, 0, len(content.Array()))
 			contentChanged := false
 			keptParts := 0
 			for _, part := range content.Array() {
@@ -717,11 +759,11 @@ func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
 					}
 					delete(pending, toolUseID)
 				}
-				contentOut, _ = sjson.SetRawBytes(contentOut, "-1", []byte(part.Raw))
+				contentOut = append(contentOut, part.Raw)
 				keptParts++
 			}
 			if !contentChanged {
-				outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+				outMessages = append(outMessages, msg.Raw)
 				pending = map[string]bool{}
 				continue
 			}
@@ -729,15 +771,15 @@ func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
 				pending = map[string]bool{}
 				continue
 			}
-			msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", contentOut)
+			msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(contentOut))
 			if err != nil {
 				return body, 0, fmt.Errorf("failed to drop orphan Claude tool_result: %w", err)
 			}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgOut)
+			outMessages = append(outMessages, string(msgOut))
 			pending = map[string]bool{}
 		default:
 			pending = map[string]bool{}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", []byte(msg.Raw))
+			outMessages = append(outMessages, msg.Raw)
 		}
 	}
 
@@ -745,7 +787,7 @@ func dropOrphanClaudeToolResults(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to update Claude messages: %w", err)
 	}
@@ -849,7 +891,12 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 
 	messages = gjson.GetBytes(out, "messages")
 	msgs = messages.Array()
-	pending := make([]string, 0)
+	updatedMessages := make([]string, len(msgs))
+	for msgIdx, msg := range msgs {
+		updatedMessages[msgIdx] = msg.Raw
+	}
+	pending := make(map[string]int)
+	pendingCount := 0
 	patched := 0
 	patchedReasoning := 0
 	ambiguous := 0
@@ -857,17 +904,21 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 	hasLatestReasoning := false
 
 	removePending := func(id string) {
-		for idx := range pending {
-			if pending[idx] != id {
-				continue
-			}
-			pending = append(pending[:idx], pending[idx+1:]...)
+		count := pending[id]
+		if count == 0 {
 			return
 		}
+		if count == 1 {
+			delete(pending, id)
+		} else {
+			pending[id] = count - 1
+		}
+		pendingCount--
 	}
 
 	for msgIdx := range msgs {
 		msg := msgs[msgIdx]
+		msgRaw := []byte(msg.Raw)
 		role := strings.TrimSpace(msg.Get("role").String())
 		switch role {
 		case "assistant":
@@ -887,12 +938,11 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 
 			if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
 				reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
-				path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
-				next, err := sjson.SetBytes(out, path, reasoningText)
+				next, err := sjson.SetBytes(msgRaw, "reasoning_content", reasoningText)
 				if err != nil {
 					return body, fmt.Errorf("%s: failed to set assistant reasoning_content: %w", logScope, err)
 				}
-				out = next
+				updatedMessages[msgIdx] = string(next)
 				patchedReasoning++
 			}
 
@@ -901,33 +951,34 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 				if id == "" {
 					continue
 				}
-				pending = append(pending, id)
+				pending[id]++
+				pendingCount++
 			}
 		case "tool":
 			toolCallID := strings.TrimSpace(msg.Get("tool_call_id").String())
 			if toolCallID == "" {
 				toolCallID = strings.TrimSpace(msg.Get("call_id").String())
 				if toolCallID != "" {
-					path := fmt.Sprintf("messages.%d.tool_call_id", msgIdx)
-					next, err := sjson.SetBytes(out, path, toolCallID)
+					next, err := sjson.SetBytes(msgRaw, "tool_call_id", toolCallID)
 					if err != nil {
 						return body, fmt.Errorf("%s: failed to set tool_call_id from call_id: %w", logScope, err)
 					}
-					out = next
+					updatedMessages[msgIdx] = string(next)
 					patched++
 				}
 			}
 			if toolCallID == "" {
-				if len(pending) == 1 {
-					toolCallID = pending[0]
-					path := fmt.Sprintf("messages.%d.tool_call_id", msgIdx)
-					next, err := sjson.SetBytes(out, path, toolCallID)
+				if pendingCount == 1 {
+					for id := range pending {
+						toolCallID = id
+					}
+					next, err := sjson.SetBytes(msgRaw, "tool_call_id", toolCallID)
 					if err != nil {
 						return body, fmt.Errorf("%s: failed to infer tool_call_id: %w", logScope, err)
 					}
-					out = next
+					updatedMessages[msgIdx] = string(next)
 					patched++
-				} else if len(pending) > 1 {
+				} else if pendingCount > 1 {
 					ambiguous++
 				}
 			}
@@ -946,8 +997,15 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 	if ambiguous > 0 {
 		log.WithFields(log.Fields{
 			"ambiguous_tool_messages": ambiguous,
-			"pending_tool_calls":      len(pending),
+			"pending_tool_calls":      pendingCount,
 		}).Warn(logScope + ": tool messages missing tool_call_id with ambiguous candidates")
+	}
+	if patched > 0 || patchedReasoning > 0 {
+		updated, err := sjson.SetRawBytes(out, "messages", internalpayload.BuildRaw(updatedMessages))
+		if err != nil {
+			return body, fmt.Errorf("%s: failed to update messages: %w", logScope, err)
+		}
+		out = updated
 	}
 
 	return out, nil
@@ -967,7 +1025,7 @@ func filterOpenAICompatEmptyAssistantMessages(body []byte, msgs []gjson.Result) 
 		return body, 0, nil
 	}
 
-	rawMessages := []byte("[" + strings.Join(kept, ",") + "]")
+	rawMessages := internalpayload.BuildRaw(kept)
 	out, err := sjson.SetRawBytes(body, "messages", rawMessages)
 	if err != nil {
 		return body, 0, fmt.Errorf("openai compat executor: failed to drop empty assistant messages: %w", err)

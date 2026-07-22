@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -29,6 +29,7 @@ const (
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
+	maxClaudeTokenResponse  = 1 << 20
 )
 
 var (
@@ -277,22 +278,13 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	if err != nil {
 		return nil, fmt.Errorf("token exchange request failed: %w", err)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("failed to close response body: %v", errClose)
-		}
-	}()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpfetch.ReadResponseBytes(resp, maxClaudeTokenResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
-	// log.Debugf("Token response: %s", string(body))
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body))
 	}
-	// log.Debugf("Token response: %s", string(body))
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
@@ -384,17 +376,13 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	if err != nil {
 		return nil, fmt.Errorf("token refresh request failed: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpfetch.ReadResponseBytes(resp, maxClaudeTokenResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		message := string(body)
+		message := httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseClaudeRetryAfter(resp)
 			setClaudeRefreshBlockedUntil(refreshToken, time.Now().Add(retryAfter))
@@ -406,8 +394,6 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 			retryable: resp.StatusCode >= http.StatusInternalServerError,
 		}
 	}
-
-	// log.Debugf("Token response: %s", string(body))
 
 	var tokenResp tokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {

@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const maxPolicyDowngradeIDs = 32
+
 // Registry is an immutable, explicitly constructed compatibility policy set.
 type Registry struct {
 	policies []Policy
@@ -81,6 +83,9 @@ func validatePolicy(policy Policy) error {
 	if policy.ID == "" {
 		return fmt.Errorf("compat: policy ID is required")
 	}
+	if !isControlledID(policy.ID) {
+		return fmt.Errorf("compat: policy ID %q is not a controlled identifier", policy.ID)
+	}
 	if phaseRank(policy.Phase) < 0 {
 		return fmt.Errorf("compat: policy %q has unknown phase %q", policy.ID, policy.Phase)
 	}
@@ -111,6 +116,14 @@ func validatePolicy(policy Policy) error {
 			return fmt.Errorf("compat: policy %q repeats mutated field %q", policy.ID, field)
 		}
 		seenFields[field] = struct{}{}
+	}
+	for _, downgradeID := range policy.DowngradeIDs {
+		if !isControlledID(downgradeID) {
+			return fmt.Errorf("compat: policy %q downgrade ID %q is not a controlled identifier", policy.ID, downgradeID)
+		}
+	}
+	if len(policy.DowngradeIDs) > maxPolicyDowngradeIDs {
+		return fmt.Errorf("compat: policy %q declares too many downgrade IDs", policy.ID)
 	}
 	return nil
 }
@@ -256,6 +269,7 @@ func clonePolicy(policy Policy) Policy {
 	policy.Match.SourceFormats = slices.Clone(policy.Match.SourceFormats)
 	policy.Match.TargetFormats = slices.Clone(policy.Match.TargetFormats)
 	policy.MutatedFields = slices.Clone(policy.MutatedFields)
+	policy.DowngradeIDs = slices.Clone(policy.DowngradeIDs)
 	return policy
 }
 
@@ -269,8 +283,28 @@ func policyMatches(match MatchSpec, query MatchContext) bool {
 		listPolicyMatches(match.TargetFormats, query.TargetFormat)
 }
 
+// policyMatchesExecution applies a policy to one concrete request. Unlike the
+// diagnostic matcher above, a missing request dimension must not satisfy a
+// constrained policy: incomplete execution metadata should fail closed.
+func policyMatchesExecution(match MatchSpec, query MatchContext) bool {
+	return scalarExecutionMatches(match.ProviderFamily, query.ProviderFamily) &&
+		scalarExecutionMatches(match.CompatKind, query.CompatKind) &&
+		modelExecutionMatches(match.ModelPattern, query.Model) &&
+		listExecutionMatches(match.Endpoints, query.Endpoint) &&
+		listExecutionMatches(match.Modes, query.Mode) &&
+		listExecutionMatches(match.SourceFormats, query.SourceFormat) &&
+		listExecutionMatches(match.TargetFormats, query.TargetFormat)
+}
+
 func scalarPolicyMatches(policyValue, queryValue string) bool {
 	return queryValue == "" || policyValue == "" || policyValue == "*" || policyValue == queryValue
+}
+
+func scalarExecutionMatches(policyValue, queryValue string) bool {
+	if queryValue == "" {
+		return policyValue == "" || policyValue == "*"
+	}
+	return policyValue == "" || policyValue == "*" || policyValue == queryValue
 }
 
 func modelPolicyMatches(pattern, model string) bool {
@@ -281,8 +315,22 @@ func modelPolicyMatches(pattern, model string) bool {
 	return matched
 }
 
+func modelExecutionMatches(pattern, model string) bool {
+	if model == "" {
+		return pattern == "" || pattern == "*"
+	}
+	return modelPolicyMatches(pattern, model)
+}
+
 func listPolicyMatches[T ~string](policyValues []T, queryValue T) bool {
 	return queryValue == "" || len(policyValues) == 0 || slices.Contains(policyValues, T("*")) || slices.Contains(policyValues, queryValue)
+}
+
+func listExecutionMatches[T ~string](policyValues []T, queryValue T) bool {
+	if queryValue == "" {
+		return len(policyValues) == 0 || slices.Contains(policyValues, T("*"))
+	}
+	return len(policyValues) == 0 || slices.Contains(policyValues, T("*")) || slices.Contains(policyValues, queryValue)
 }
 
 func normalizePolicy(policy *Policy) {
@@ -307,6 +355,30 @@ func normalizePolicy(policy *Policy) {
 		policy.MutatedFields[i] = strings.TrimSpace(policy.MutatedFields[i])
 	}
 	slices.Sort(policy.MutatedFields)
+	for i := range policy.DowngradeIDs {
+		policy.DowngradeIDs[i] = strings.TrimSpace(policy.DowngradeIDs[i])
+	}
+	slices.Sort(policy.DowngradeIDs)
+	policy.DowngradeIDs = slices.Compact(policy.DowngradeIDs)
+}
+
+func isControlledID(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for i := range len(value) {
+		char := value[i]
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' {
+			continue
+		}
+		switch char {
+		case '.', '_', '-', ':', '/', '@', '+':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeStringList[T ~string](values []T) []T {

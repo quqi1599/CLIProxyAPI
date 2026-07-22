@@ -5,9 +5,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/andybalholm/brotli"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -185,7 +187,9 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
+		w.Header().Set("Content-Encoding", "br")
+		encoded := brotli.NewWriter(w)
+		_, _ = encoded.Write([]byte(`{
 			"id":"chatcmpl-test",
 			"object":"chat.completion",
 			"created":1,
@@ -193,6 +197,7 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
 			"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
 		}`))
+		_ = encoded.Close()
 	}))
 	defer server.Close()
 
@@ -209,7 +214,8 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"max"}
 	}`)
-	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(body))
+	resp, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "kimi-k2.6",
 		Payload: body,
 	}, cliproxyexecutor.Options{
@@ -229,6 +235,10 @@ func TestKimiExecutorExecuteClaudeSourceUsesChatCompletionsEndpoint(t *testing.T
 	if len(resp.Payload) == 0 {
 		t.Fatal("expected translated response payload")
 	}
+	if got := resp.Headers.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want decoded response headers", got)
+	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, kimiRequestPlanTransformStage, len(gotBody))
 }
 
 func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *testing.T) {
@@ -243,6 +253,8 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "br")
+		encoded := brotli.NewWriter(w)
 		flusher, _ := w.(http.Flusher)
 		lines := []string{
 			`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"kimi-k2.6","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
@@ -251,11 +263,13 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 			`data: [DONE]`,
 		}
 		for _, line := range lines {
-			_, _ = io.WriteString(w, line+"\n\n")
+			_, _ = io.WriteString(encoded, line+"\n\n")
+			_ = encoded.Flush()
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
+		_ = encoded.Close()
 	}))
 	defer server.Close()
 
@@ -272,7 +286,8 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"max"}
 	}`)
-	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(body))
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
 		Model:   "kimi-k2.6",
 		Payload: body,
 	}, cliproxyexecutor.Options{
@@ -283,6 +298,12 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
+	if result.Cancel == nil {
+		t.Fatal("expected stream cancel callback")
+	}
+	if got := result.Headers.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want decoded response headers", got)
+	}
 	var combined strings.Builder
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
@@ -290,6 +311,7 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 		}
 		combined.Write(chunk.Payload)
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, kimiRequestPlanTransformStage, len(gotBody))
 	if gotPath != "/coding/v1/chat/completions" {
 		t.Fatalf("upstream path = %q, want %q", gotPath, "/coding/v1/chat/completions")
 	}
@@ -300,6 +322,8 @@ func TestKimiExecutorExecuteStreamClaudeSourceUsesChatCompletionsEndpoint(t *tes
 	if strings.Contains(combined.String(), "missing message_start") {
 		t.Fatalf("unexpected missing_message_start failure in translated output: %q", combined.String())
 	}
+	result.Cancel()
+	result.Cancel()
 }
 
 func assertKimiEnabledThinkingWire(t *testing.T, body []byte) {
@@ -782,4 +806,88 @@ func TestNormalizeKimiToolMessageLinks_PreservesAssistantWithToolLinkOrReasoning
 	if got := messages[3].Get("content.0.text").String(); got != " visible " {
 		t.Fatalf("messages.3.content.0.text = %q, want %q", got, " visible ")
 	}
+}
+
+func TestNormalizeKimiToolMessageLinksLargePreservesOrderAndInput(t *testing.T) {
+	const cycles = 512
+	input := buildLargeKimiToolMessagePayload(cycles)
+	original := string(input)
+
+	out, err := normalizeKimiToolMessageLinks(input)
+	if err != nil {
+		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
+	}
+	if string(input) != original {
+		t.Fatal("normalizeKimiToolMessageLinks mutated its input")
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	if len(messages) != cycles+1 {
+		t.Fatalf("messages length = %d, want %d", len(messages), cycles+1)
+	}
+	assistant := messages[0]
+	if got := assistant.Get("reasoning_content").String(); got != "thinking" {
+		t.Fatalf("assistant reasoning = %q, want thinking", got)
+	}
+	if !assistant.Get("unknown.keep").Bool() {
+		t.Fatalf("assistant lost unknown field: %s", assistant.Raw)
+	}
+	for _, cycle := range []int{0, cycles / 2, cycles - 1} {
+		tool := messages[cycle+1]
+		wantID := "call_" + strconv.Itoa(cycle)
+		if got := assistant.Get("tool_calls." + strconv.Itoa(cycle) + ".id").String(); got != wantID {
+			t.Fatalf("assistant cycle %d id = %q, want %q", cycle, got, wantID)
+		}
+		if got := tool.Get("tool_call_id").String(); got != wantID {
+			t.Fatalf("tool cycle %d tool_call_id = %q, want %q", cycle, got, wantID)
+		}
+		if got := tool.Get("unknown.marker").Int(); got != int64(cycle) {
+			t.Fatalf("tool cycle %d lost unknown field: %s", cycle, tool.Raw)
+		}
+	}
+	outText := string(out)
+	if before, messagesPos, after := strings.Index(outText, `"before"`), strings.Index(outText, `"messages"`), strings.Index(outText, `"after"`); !(before < messagesPos && messagesPos < after) {
+		t.Fatalf("root field order changed: %s", out)
+	}
+}
+
+func BenchmarkPayloadGrowthKimiToolMessageLinks(b *testing.B) {
+	for _, cycles := range []int{64, 256, 1024} {
+		b.Run(strconv.Itoa(cycles), func(b *testing.B) {
+			input := buildLargeKimiToolMessagePayload(cycles)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for range b.N {
+				if _, err := normalizeKimiToolMessageLinks(input); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func buildLargeKimiToolMessagePayload(cycles int) []byte {
+	var payload strings.Builder
+	payload.Grow(cycles * 260)
+	payload.WriteString(`{"before":1,"messages":[{"role":"assistant","content":"thinking","tool_calls":[`)
+	for cycle := 0; cycle < cycles; cycle++ {
+		if cycle > 0 {
+			payload.WriteByte(',')
+		}
+		id := "call_" + strconv.Itoa(cycle)
+		payload.WriteString(`{"id":"`)
+		payload.WriteString(id)
+		payload.WriteString(`","type":"function","function":{"name":"read","arguments":"{}"}}`)
+	}
+	payload.WriteString(`],"unknown":{"keep":true}}`)
+	for cycle := 0; cycle < cycles; cycle++ {
+		id := "call_" + strconv.Itoa(cycle)
+		payload.WriteByte(',')
+		payload.WriteString(`{"role":"tool","call_id":"`)
+		payload.WriteString(id)
+		payload.WriteString(`","content":"ok","unknown":{"marker":`)
+		payload.WriteString(strconv.Itoa(cycle))
+		payload.WriteString(`}}`)
+	}
+	payload.WriteString(`],"after":2}`)
+	return []byte(payload.String())
 }

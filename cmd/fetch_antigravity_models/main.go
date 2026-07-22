@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -42,6 +42,7 @@ const (
 	antigravitySandboxBaseURLDaily = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 	antigravityBaseURLProd         = "https://cloudcode-pa.googleapis.com"
 	antigravityModelsPath          = "/v1internal:fetchAvailableModels"
+	maxAntigravityModelsBytes      = 4 << 20
 )
 
 func init() {
@@ -229,8 +230,7 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
 			continue
 		}
 
-		bodyBytes, errRead := io.ReadAll(httpResp.Body)
-		httpResp.Body.Close()
+		bodyBytes, errRead := httpfetch.ReadResponseBytes(httpResp, maxAntigravityModelsBytes)
 		if errRead != nil {
 			continue
 		}

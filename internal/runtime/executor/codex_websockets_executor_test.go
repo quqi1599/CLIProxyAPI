@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -77,12 +78,16 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
-	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(req.Payload)))
+	releaseReport := internalpayload.RetainTransformReport(ctx)
+	if _, err := exec.Execute(ctx, auth, req, opts); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
+	var upstreamRequestBytes int64
 	select {
 	case payload := <-capturedPayload:
+		upstreamRequestBytes = int64(len(payload))
 		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
 			t.Fatalf("upstream type = %s, want response.create; payload=%s", got, payload)
 		}
@@ -92,6 +97,7 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
 	}
+	assertTransformStageContract(t, ctx, releaseReport, "request_plan.codex.websocket", upstreamRequestBytes)
 }
 
 func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDownstreamWebsocket(t *testing.T) {
@@ -279,11 +285,11 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		if !ok {
 			t.Fatalf("error type %T does not expose StatusCode", chunk.Err)
 		}
-		if got := statusErr.StatusCode(); got != http.StatusRequestEntityTooLarge {
-			t.Fatalf("status = %d, want %d", got, http.StatusRequestEntityTooLarge)
+		if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+			t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
 		}
-		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
-			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
+		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "upstream_response_too_large" {
+			t.Fatalf("error code = %q, want upstream_response_too_large; err=%v", got, chunk.Err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error stream chunk")
@@ -944,5 +950,24 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+	if dialer.EnableCompression {
+		t.Fatal("upstream websocket compression must stay disabled so the wire read limit is authoritative")
+	}
+}
+
+func TestMapCodexWebsocketReadLimitAsUpstreamFailure(t *testing.T) {
+	t.Parallel()
+
+	err := mapCodexWebsocketReadError(websocket.ErrReadLimit)
+	statusError, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error type %T does not expose StatusCode", err)
+	}
+	if got := statusError.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "upstream_response_too_large" {
+		t.Fatalf("error code = %q, want upstream_response_too_large", got)
 	}
 }

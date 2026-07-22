@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,22 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/cpu"
+)
+
+const (
+	pluginArchiveMaxEntries = 128
+	pluginLibraryMaxBytes   = 256 << 20
+
+	zipDirectoryHeaderSignature    = 0x02014b50
+	zipDirectoryEndSignature       = 0x06054b50
+	zipDirectory64EndSignature     = 0x06064b50
+	zipDirectory64LocatorSignature = 0x07064b50
+	zipDirectorySignatureSignature = 0x05054b50
+	zipDirectoryHeaderSize         = 46
+	zipDirectoryEndSize            = 22
+	zipDirectory64EndSize          = 56
+	zipDirectory64LocatorSize      = 20
+	zipMaxCommentSize              = 1<<16 - 1
 )
 
 type InstallOptions struct {
@@ -31,9 +48,17 @@ type InstallOptions struct {
 	BeforeWrite func() error
 }
 
-// ErrLoadedPluginLocked is returned when an install would overwrite a plugin
-// library that is loaded by the running process on Windows.
-var ErrLoadedPluginLocked = errors.New("loaded plugin library cannot be overwritten while the server is running")
+var (
+	// ErrLoadedPluginLocked is returned when an install would overwrite a plugin
+	// library that is loaded by the running process on Windows.
+	ErrLoadedPluginLocked = errors.New("loaded plugin library cannot be overwritten while the server is running")
+	// ErrPluginArchiveTooManyEntries is returned before archive/zip allocates
+	// file records for an archive that exceeds the plugin entry limit.
+	ErrPluginArchiveTooManyEntries = errors.New("plugin archive contains too many entries")
+	// ErrPluginArchiveInvalidDirectory is returned when the ZIP central
+	// directory is structurally invalid.
+	ErrPluginArchiveInvalidDirectory = errors.New("plugin archive has invalid central directory")
+)
 
 type InstallResult struct {
 	ID          string `json:"id"`
@@ -125,6 +150,12 @@ func InstallArchive(archiveData []byte, plugin Plugin, options InstallOptions) (
 	if !validPluginID(id) {
 		return InstallResult{}, fmt.Errorf("invalid plugin id %q", plugin.ID)
 	}
+	if int64(len(archiveData)) > pluginArchiveMaxBytes {
+		return InstallResult{}, fmt.Errorf("plugin archive size %d exceeds maximum allowed size of %d bytes", len(archiveData), pluginArchiveMaxBytes)
+	}
+	if errPreflight := preflightZipDirectory(archiveData); errPreflight != nil {
+		return InstallResult{}, errPreflight
+	}
 	reader, errZip := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
 	if errZip != nil {
 		return InstallResult{}, fmt.Errorf("open zip: %w", errZip)
@@ -181,6 +212,233 @@ func InstallArchive(archiveData []byte, plugin Plugin, options InstallOptions) (
 	}, nil
 }
 
+type zipDirectoryEnd struct {
+	offset          int
+	directoryOffset uint64
+	directorySize   uint64
+	entries         uint64
+}
+
+func preflightZipDirectory(archiveData []byte) error {
+	end, errEnd := readZipDirectoryEnd(archiveData)
+	if errEnd != nil {
+		return errEnd
+	}
+	if end.entries > pluginArchiveMaxEntries {
+		return tooManyPluginArchiveEntries(end.entries)
+	}
+	if end.directorySize > uint64(end.offset) {
+		return invalidPluginArchiveDirectory("directory size exceeds archive bounds")
+	}
+
+	start := end.offset - int(end.directorySize)
+	if end.directoryOffset > uint64(start) {
+		return invalidPluginArchiveDirectory("directory offset exceeds directory start")
+	}
+	// Match archive/zip's compatibility fallback for archives whose recorded
+	// offset already includes a prepended executable or other prefix.
+	if end.directoryOffset < uint64(start) && validZipDirectoryHeaderAt(archiveData, int(end.directoryOffset), end.offset) {
+		start = int(end.directoryOffset)
+	}
+
+	entries, errScan := scanZipDirectory(archiveData, start, end.offset)
+	if errScan != nil {
+		return errScan
+	}
+	if entries != end.entries {
+		return invalidPluginArchiveDirectory(fmt.Sprintf("entry count is %d, declared %d", entries, end.entries))
+	}
+	return nil
+}
+
+func readZipDirectoryEnd(archiveData []byte) (zipDirectoryEnd, error) {
+	offset := findZipDirectoryEnd(archiveData)
+	if offset < 0 {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("end record not found")
+	}
+	endRecord := archiveData[offset : offset+zipDirectoryEndSize]
+	diskNumber := binary.LittleEndian.Uint16(endRecord[4:6])
+	directoryDisk := binary.LittleEndian.Uint16(endRecord[6:8])
+	entriesOnDisk := uint64(binary.LittleEndian.Uint16(endRecord[8:10]))
+	entries := uint64(binary.LittleEndian.Uint16(endRecord[10:12]))
+	directorySize := uint64(binary.LittleEndian.Uint32(endRecord[12:16]))
+	directoryOffset := uint64(binary.LittleEndian.Uint32(endRecord[16:20]))
+
+	zip64 := entriesOnDisk == 1<<16-1 || entries == 1<<16-1 || directorySize == 1<<32-1 || directoryOffset == 1<<32-1
+	if zip64 {
+		zip64End, errZip64 := readZip64DirectoryEnd(archiveData, offset)
+		if errZip64 != nil {
+			return zipDirectoryEnd{}, errZip64
+		}
+		return zip64End, nil
+	}
+	if diskNumber != 0 || directoryDisk != 0 || entriesOnDisk != entries {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("multi-disk archives are not supported")
+	}
+	return zipDirectoryEnd{
+		offset:          offset,
+		directoryOffset: directoryOffset,
+		directorySize:   directorySize,
+		entries:         entries,
+	}, nil
+}
+
+func findZipDirectoryEnd(archiveData []byte) int {
+	start := len(archiveData) - (zipDirectoryEndSize + zipMaxCommentSize)
+	if start < 0 {
+		start = 0
+	}
+	for offset := len(archiveData) - zipDirectoryEndSize; offset >= start; offset-- {
+		if binary.LittleEndian.Uint32(archiveData[offset:]) != zipDirectoryEndSignature {
+			continue
+		}
+		commentSize := int(binary.LittleEndian.Uint16(archiveData[offset+20:]))
+		if offset+zipDirectoryEndSize+commentSize <= len(archiveData) {
+			return offset
+		}
+	}
+	return -1
+}
+
+func readZip64DirectoryEnd(archiveData []byte, directoryEndOffset int) (zipDirectoryEnd, error) {
+	locatorOffset := directoryEndOffset - zipDirectory64LocatorSize
+	if locatorOffset < 0 || binary.LittleEndian.Uint32(archiveData[locatorOffset:]) != zipDirectory64LocatorSignature {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("ZIP64 locator not found")
+	}
+	locator := archiveData[locatorOffset:directoryEndOffset]
+	if binary.LittleEndian.Uint32(locator[4:8]) != 0 || binary.LittleEndian.Uint32(locator[16:20]) != 1 {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("multi-disk ZIP64 archives are not supported")
+	}
+	recordOffset64 := binary.LittleEndian.Uint64(locator[8:16])
+	if recordOffset64 > uint64(locatorOffset) {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("ZIP64 end record offset exceeds archive bounds")
+	}
+	recordOffset := int(recordOffset64)
+	if locatorOffset-recordOffset < zipDirectory64EndSize {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("truncated ZIP64 end record")
+	}
+	record := archiveData[recordOffset:locatorOffset]
+	if binary.LittleEndian.Uint32(record) != zipDirectory64EndSignature {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("ZIP64 end record not found")
+	}
+	recordSize := binary.LittleEndian.Uint64(record[4:12])
+	wantRecordSize := locatorOffset - recordOffset - 12
+	if recordSize < zipDirectory64EndSize-12 || recordSize != uint64(wantRecordSize) {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("invalid ZIP64 end record size")
+	}
+	if binary.LittleEndian.Uint32(record[16:20]) != 0 || binary.LittleEndian.Uint32(record[20:24]) != 0 {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("multi-disk ZIP64 archives are not supported")
+	}
+	entriesOnDisk := binary.LittleEndian.Uint64(record[24:32])
+	entries := binary.LittleEndian.Uint64(record[32:40])
+	if entriesOnDisk != entries {
+		return zipDirectoryEnd{}, invalidPluginArchiveDirectory("ZIP64 entry counts do not match")
+	}
+	return zipDirectoryEnd{
+		offset:          recordOffset,
+		directoryOffset: binary.LittleEndian.Uint64(record[48:56]),
+		directorySize:   binary.LittleEndian.Uint64(record[40:48]),
+		entries:         entries,
+	}, nil
+}
+
+func scanZipDirectory(archiveData []byte, start int, end int) (uint64, error) {
+	var entries uint64
+	for offset := start; offset < end; {
+		if end-offset < 4 {
+			return 0, invalidPluginArchiveDirectory("truncated directory record")
+		}
+		switch binary.LittleEndian.Uint32(archiveData[offset:]) {
+		case zipDirectoryHeaderSignature:
+			recordSize, ok := zipDirectoryHeaderSizeAt(archiveData, offset, end)
+			if !ok {
+				return 0, invalidPluginArchiveDirectory("truncated directory entry")
+			}
+			entries++
+			if entries > pluginArchiveMaxEntries {
+				return 0, tooManyPluginArchiveEntries(entries)
+			}
+			offset += recordSize
+		case zipDirectorySignatureSignature:
+			if end-offset < 6 {
+				return 0, invalidPluginArchiveDirectory("truncated directory signature")
+			}
+			recordSize := 6 + int(binary.LittleEndian.Uint16(archiveData[offset+4:]))
+			if offset+recordSize != end {
+				return 0, invalidPluginArchiveDirectory("invalid directory signature size")
+			}
+			offset = end
+		default:
+			return 0, invalidPluginArchiveDirectory("unexpected record in central directory")
+		}
+	}
+	return entries, nil
+}
+
+func validZipDirectoryHeaderAt(archiveData []byte, offset int, end int) bool {
+	if offset < 0 || offset >= end || end > len(archiveData) {
+		return false
+	}
+	_, ok := zipDirectoryHeaderSizeAt(archiveData, offset, end)
+	return ok
+}
+
+func zipDirectoryHeaderSizeAt(archiveData []byte, offset int, end int) (int, bool) {
+	if end-offset < zipDirectoryHeaderSize || binary.LittleEndian.Uint32(archiveData[offset:]) != zipDirectoryHeaderSignature {
+		return 0, false
+	}
+	nameSize := int(binary.LittleEndian.Uint16(archiveData[offset+28:]))
+	extraSize := int(binary.LittleEndian.Uint16(archiveData[offset+30:]))
+	commentSize := int(binary.LittleEndian.Uint16(archiveData[offset+32:]))
+	recordSize := zipDirectoryHeaderSize + nameSize + extraSize + commentSize
+	if recordSize > end-offset {
+		return 0, false
+	}
+	extraStart := offset + zipDirectoryHeaderSize + nameSize
+	if !validZip64DirectoryExtra(archiveData[offset:offset+zipDirectoryHeaderSize], archiveData[extraStart:extraStart+extraSize]) {
+		return 0, false
+	}
+	return recordSize, true
+}
+
+func validZip64DirectoryExtra(header []byte, extra []byte) bool {
+	needUncompressedSize := binary.LittleEndian.Uint32(header[24:28]) == 1<<32-1
+	needCompressedSize := binary.LittleEndian.Uint32(header[20:24]) == 1<<32-1
+	needHeaderOffset := binary.LittleEndian.Uint32(header[42:46]) == 1<<32-1
+	for len(extra) >= 4 {
+		fieldTag := binary.LittleEndian.Uint16(extra[0:2])
+		fieldSize := int(binary.LittleEndian.Uint16(extra[2:4]))
+		extra = extra[4:]
+		if fieldSize > len(extra) {
+			break
+		}
+		field := extra[:fieldSize]
+		extra = extra[fieldSize:]
+		if fieldTag != 0x0001 {
+			continue
+		}
+		for _, needed := range []bool{needUncompressedSize, needCompressedSize, needHeaderOffset} {
+			if !needed {
+				continue
+			}
+			if len(field) < 8 {
+				return false
+			}
+			field = field[8:]
+		}
+		return true
+	}
+	return !needCompressedSize && !needHeaderOffset
+}
+
+func tooManyPluginArchiveEntries(entries uint64) error {
+	return fmt.Errorf("%w: zip contains %d entries, maximum allowed is %d", ErrPluginArchiveTooManyEntries, entries, pluginArchiveMaxEntries)
+}
+
+func invalidPluginArchiveDirectory(reason string) error {
+	return fmt.Errorf("%w: %s", ErrPluginArchiveInvalidDirectory, reason)
+}
+
 func installTargetPath(options InstallOptions, id string) (string, error) {
 	defaultPath := filepath.Join(options.PluginsDir, options.GOOS, options.GOARCH, id+pluginExtension(options.GOOS))
 	if options.GOOS != runtime.GOOS || options.GOARCH != runtime.GOARCH {
@@ -229,6 +487,9 @@ func readTargetLibrary(reader *zip.Reader, id string, goos string) ([]byte, os.F
 	if target == nil {
 		return nil, 0, fmt.Errorf("zip does not contain %s", targetName)
 	}
+	if target.UncompressedSize64 > pluginLibraryMaxBytes {
+		return nil, 0, fmt.Errorf("%s uncompressed size %d exceeds maximum allowed size of %d bytes", targetName, target.UncompressedSize64, pluginLibraryMaxBytes)
+	}
 
 	handle, errOpen := target.Open()
 	if errOpen != nil {
@@ -239,7 +500,7 @@ func readTargetLibrary(reader *zip.Reader, id string, goos string) ([]byte, os.F
 			log.WithError(errClose).Debug("failed to close plugin archive entry")
 		}
 	}()
-	data, errRead := io.ReadAll(handle)
+	data, errRead := readArchiveEntry(handle, pluginLibraryMaxBytes)
 	if errRead != nil {
 		return nil, 0, fmt.Errorf("read %s: %w", targetName, errRead)
 	}
@@ -248,6 +509,17 @@ func readTargetLibrary(reader *zip.Reader, id string, goos string) ([]byte, os.F
 		mode = 0o755
 	}
 	return data, mode, nil
+}
+
+func readArchiveEntry(reader io.Reader, maxBytes int64) ([]byte, error) {
+	data, errRead := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("entry exceeds maximum allowed size of %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 func cleanZipName(name string) (string, error) {

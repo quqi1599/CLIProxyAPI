@@ -2,6 +2,8 @@ package chat_completions
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -42,6 +44,46 @@ func TestFinishReasonToolCallsNotOverwritten(t *testing.T) {
 	nfr2 := gjson.GetBytes(result2[0], "choices.0.native_finish_reason").String()
 	if nfr2 != "stop" {
 		t.Errorf("Expected native_finish_reason 'stop', got: %s", nfr2)
+	}
+}
+
+func TestConvertAntigravityResponseToOpenAILargeToolCallOrder(t *testing.T) {
+	const callCount = 2048
+	parts := make([]map[string]any, 0, callCount)
+	for index := 0; index < callCount; index++ {
+		parts = append(parts, map[string]any{
+			"functionCall": map[string]any{
+				"name": fmt.Sprintf("tool_%04d", index),
+				"args": map[string]any{"index": index},
+			},
+		})
+	}
+	input, err := json.Marshal(map[string]any{
+		"response": map[string]any{
+			"candidates": []any{map[string]any{"content": map[string]any{"parts": parts}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var param any
+	result := ConvertAntigravityResponseToOpenAI(context.Background(), "model", nil, nil, input, &param)
+	if len(result) != 1 {
+		t.Fatalf("results length = %d, want 1", len(result))
+	}
+	toolCalls := gjson.GetBytes(result[0], "choices.0.delta.tool_calls").Array()
+	if len(toolCalls) != callCount {
+		t.Fatalf("tool calls length = %d, want %d", len(toolCalls), callCount)
+	}
+	for _, index := range []int{0, callCount / 2, callCount - 1} {
+		wantName := fmt.Sprintf("tool_%04d", index)
+		if got := toolCalls[index].Get("function.name").String(); got != wantName {
+			t.Fatalf("tool_calls[%d].name = %q, want %q", index, got, wantName)
+		}
+		if got := gjson.Get(toolCalls[index].Get("function.arguments").String(), "index").Int(); got != int64(index) {
+			t.Fatalf("tool_calls[%d] argument index = %d", index, got)
+		}
 	}
 }
 

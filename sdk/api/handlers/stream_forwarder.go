@@ -102,57 +102,31 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		flushC = flushTimer.C
 	}
 
-	var terminalErr *interfaces.ErrorMessage
-	for {
+	for data != nil || errs != nil {
 		select {
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
 			return
 		case chunk, ok := <-data:
 			if !ok {
-				// Prefer surfacing a terminal error if one is pending.
-				if terminalErr == nil {
-					select {
-					case errMsg, ok := <-errs:
-						if ok && errMsg != nil {
-							terminalErr = errMsg
-						}
-					default:
-					}
-				}
-				if terminalErr != nil {
-					if opts.WriteTerminalError != nil {
-						opts.WriteTerminalError(writer, terminalErr)
-					}
-					flushImmediate()
-					cancel(terminalErr.Error)
-					return
-				}
-				if opts.WriteDone != nil {
-					opts.WriteDone(writer)
-				}
-				flushImmediate()
-				cancel(nil)
-				return
+				data = nil
+				continue
 			}
 			writeChunk(writer, chunk)
 			flushChunk()
 		case errMsg, ok := <-errs:
 			if !ok {
+				errs = nil
 				continue
 			}
-			if errMsg != nil {
-				terminalErr = errMsg
-				if opts.WriteTerminalError != nil {
-					opts.WriteTerminalError(writer, errMsg)
-					flushImmediate()
-				}
+			if errMsg == nil {
+				continue
 			}
-			var execErr error
-			if errMsg != nil {
-				execErr = errMsg.Error
+			if opts.WriteTerminalError != nil {
+				opts.WriteTerminalError(writer, errMsg)
+				flushImmediate()
 			}
-			cancel(execErr)
+			cancel(errMsg.Error)
 			return
 		case <-keepAliveC:
 			writeKeepAlive(writer)
@@ -166,4 +140,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			flushC = nil
 		}
 	}
+
+	if opts.WriteDone != nil {
+		opts.WriteDone(writer)
+	}
+	flushImmediate()
+	cancel(nil)
 }

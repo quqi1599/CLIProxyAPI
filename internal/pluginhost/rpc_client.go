@@ -1,17 +1,21 @@
 package pluginhost
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func pluginCallError(method string, returnCode int64, body []byte) error {
+	return fmt.Errorf("plugin call %s returned %d: %s", method, returnCode, httpfetch.ErrorBodyMetadata("", body))
+}
 
 type rpcPluginAdapter struct {
 	id     string
@@ -58,7 +62,7 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 		return pluginapi.Plugin{}, fmt.Errorf("plugin client is nil")
 	}
 	resp, errCall := callPlugin[rpcRegistration](ctx, client, method, rpcLifecycleRequest{
-		ConfigYAML:    bytes.Clone(configYAML),
+		ConfigYAML:    internalpayload.CloneBytes(configYAML),
 		SchemaVersion: pluginabi.SchemaVersion,
 	})
 	if errCall != nil {
@@ -559,7 +563,7 @@ func httpResponseFromPlugin(resp pluginapi.ExecutorHTTPResponse, req *http.Reque
 		StatusCode: status,
 		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
 		Header:     cloneHeader(resp.Headers),
-		Body:       io.NopCloser(bytes.NewReader(bytes.Clone(resp.Body))),
+		Body:       newScopedPluginResponseBody(resp.Body, "pluginhost.rpc_http.response"),
 		Request:    req,
 	}
 }

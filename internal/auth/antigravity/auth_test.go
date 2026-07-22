@@ -33,6 +33,26 @@ func TestFetchProjectIDFromLoadCodeAssist(t *testing.T) {
 	}
 }
 
+func TestFetchProjectIDErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "antigravity-oauth-secret-marker"
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"` + secret + `"}`)),
+			Request:    req,
+		}, nil
+	})})
+
+	_, err := auth.FetchProjectID(context.Background(), "access-token")
+	if err == nil {
+		t.Fatal("FetchProjectID() error = nil")
+	}
+	if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("unsafe control-plane error: %v", err)
+	}
+}
+
 func TestFetchProjectIDFallsBackToDailyOnboardUser(t *testing.T) {
 	var sawOnboard bool
 	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {

@@ -13,13 +13,33 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
+
+func TestHostHTTPDoRejectsOversizedNonStreamResponse(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), int(helps.DefaultUpstreamErrorBodyBytes)+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	_, errDo := New().newHTTPClient(nil).Do(context.Background(), pluginapi.HTTPRequest{URL: server.URL})
+	typed, okTyped := failurecontract.As(errDo)
+	if !okTyped {
+		t.Fatalf("Do() error = %v, want typed failure", errDo)
+	}
+	if typed.Kind != failurecontract.UpstreamProtocolError || typed.Scope != failurecontract.ScopeProvider || typed.HTTPStatus != http.StatusBadGateway || typed.ProviderCode != "upstream_error_body_too_large" {
+		t.Fatalf("Do() failure = %#v", typed)
+	}
+}
 
 type fakeHostModelExecutor struct {
 	executeModel       func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage)
@@ -110,8 +130,8 @@ func TestHostHTTPDoCallbackRestoresRegisteredRequestContext(t *testing.T) {
 		t.Fatal("API_REQUEST was not captured on the original Gin context")
 	}
 	apiRequest, _ := rawAPIRequest.([]byte)
-	if !bytes.Contains(apiRequest, []byte("=== API REQUEST 1 ===")) || !bytes.Contains(apiRequest, []byte(`{"request":true}`)) {
-		t.Fatalf("API_REQUEST = %q, want upstream request details", apiRequest)
+	if !bytes.Contains(apiRequest, []byte("=== API REQUEST 1 ===")) || !bytes.Contains(apiRequest, []byte("[BODY METADATA v1]")) || bytes.Contains(apiRequest, []byte(`{"request":true}`)) {
+		t.Fatalf("API_REQUEST = %q, want metadata-only upstream request", apiRequest)
 	}
 
 	rawAPIResponse, okResponse := ginCtx.Get("API_RESPONSE")
@@ -119,8 +139,8 @@ func TestHostHTTPDoCallbackRestoresRegisteredRequestContext(t *testing.T) {
 		t.Fatal("API_RESPONSE was not captured on the original Gin context")
 	}
 	apiResponse, _ := rawAPIResponse.([]byte)
-	if !bytes.Contains(apiResponse, []byte("=== API RESPONSE 1 ===")) || !bytes.Contains(apiResponse, []byte("upstream-body")) {
-		t.Fatalf("API_RESPONSE = %q, want upstream response details", apiResponse)
+	if !bytes.Contains(apiResponse, []byte("=== API RESPONSE 1 ===")) || !bytes.Contains(apiResponse, []byte("[BODY METADATA v1]")) || bytes.Contains(apiResponse, []byte("upstream-body")) {
+		t.Fatalf("API_RESPONSE = %q, want metadata-only upstream response", apiResponse)
 	}
 }
 
@@ -584,13 +604,18 @@ func TestHostModelExecuteStreamStartupErrorCleansUp(t *testing.T) {
 			}
 		},
 	})
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	defer closeCallback()
 
-	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "openai",
-		Model:         "model-1",
-		Stream:        true,
-		Body:          []byte(`{"stream":true}`),
+	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+			Stream:        true,
+			Body:          []byte(`{"stream":true}`),
+		},
+		HostCallbackID: callbackID,
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal request: %v", errMarshal)
@@ -730,7 +755,8 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 		},
 	})
 
-	streamID := openHostModelStreamForTest(t, host)
+	streamID, closeCallback := openHostModelStreamForTest(t, host)
+	defer closeCallback()
 	readReq, errMarshal := json.Marshal(pluginapi.HostModelStreamReadRequest{StreamID: streamID})
 	if errMarshal != nil {
 		t.Fatalf("marshal read request: %v", errMarshal)
@@ -773,7 +799,8 @@ func TestHostModelStreamExplicitCloseCancelsStream(t *testing.T) {
 		},
 	})
 
-	streamID := openHostModelStreamForTest(t, host)
+	streamID, closeCallback := openHostModelStreamForTest(t, host)
+	defer closeCallback()
 	var streamCtx context.Context
 	select {
 	case streamCtx = <-ctxSeen:
@@ -797,30 +824,38 @@ func TestHostModelStreamExplicitCloseCancelsStream(t *testing.T) {
 	}
 }
 
-func openHostModelStreamForTest(t *testing.T, host *Host) string {
+func openHostModelStreamForTest(t *testing.T, host *Host) (string, func()) {
 	t.Helper()
-	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "openai",
-		Model:         "model-1",
-		Stream:        true,
-		Body:          []byte(`{"stream":true}`),
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+			Stream:        true,
+			Body:          []byte(`{"stream":true}`),
+		},
+		HostCallbackID: callbackID,
 	})
 	if errMarshal != nil {
+		closeCallback()
 		t.Fatalf("marshal request: %v", errMarshal)
 	}
 	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelExecuteStream, rawReq)
 	if errCall != nil {
+		closeCallback()
 		t.Fatalf("execute stream callback error = %v", errCall)
 	}
 	resp, errDecode := decodeRPCEnvelope[pluginapi.HostModelStreamResponse](rawResp)
 	if errDecode != nil {
+		closeCallback()
 		t.Fatalf("decode stream response: %v", errDecode)
 	}
 	if resp.StreamID == "" {
+		closeCallback()
 		t.Fatalf("stream id is empty: %#v", resp)
 	}
-	return resp.StreamID
+	return resp.StreamID, closeCallback
 }
 
 func hostModelStreamCountForTest(t *testing.T, host *Host) int {

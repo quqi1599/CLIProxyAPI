@@ -898,6 +898,7 @@ type ExecutorStreamResponse struct {
 // ExecutorStreamChunk carries one streaming payload chunk or an error.
 type ExecutorStreamChunk struct {
 	// Payload contains the raw stream chunk bytes.
+	// Producers transfer read-only ownership on send and must not mutate it afterward.
 	Payload []byte
 	// Err reports a stream error associated with this chunk.
 	Err error

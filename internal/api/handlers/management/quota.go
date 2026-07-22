@@ -33,8 +33,8 @@ func (h *Handler) ResetQuota(c *gin.Context) {
 	var req struct {
 		AuthIndex string `json:"auth_index"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&req); errBindJSON != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &req); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
 		return
 	}
 

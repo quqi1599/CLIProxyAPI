@@ -16,6 +16,26 @@ import (
 
 const miniMaxImageGenerationAlt = "minimax/image_generation"
 
+type miniMaxImageGenerationRequest struct {
+	Model            string          `json:"model"`
+	Prompt           string          `json:"prompt"`
+	ResponseFormat   string          `json:"response_format"`
+	N                json.RawMessage `json:"n,omitempty"`
+	Seed             json.RawMessage `json:"seed,omitempty"`
+	PromptOptimizer  json.RawMessage `json:"prompt_optimizer,omitempty"`
+	AIGCWatermark    json.RawMessage `json:"aigc_watermark,omitempty"`
+	AspectRatio      string          `json:"aspect_ratio,omitempty"`
+	Width            *int64          `json:"width,omitempty"`
+	Height           *int64          `json:"height,omitempty"`
+	Style            json.RawMessage `json:"style,omitempty"`
+	SubjectReference any             `json:"subject_reference,omitempty"`
+}
+
+type miniMaxImageSubject struct {
+	Type      string `json:"type"`
+	ImageFile string `json:"image_file"`
+}
+
 func isMiniMaxImageModelName(model string) bool {
 	switch miniMaxImageBaseModel(model) {
 	case "image-01", "image-01-live":
@@ -45,10 +65,6 @@ func buildMiniMaxImageGenerationRequest(rawJSON []byte, model string, prompt str
 		return nil, "", fmt.Errorf("model is required")
 	}
 
-	out := []byte(`{"model":"","prompt":""}`)
-	out, _ = sjson.SetBytes(out, "model", baseModel)
-	out, _ = sjson.SetBytes(out, "prompt", prompt)
-
 	responseFormat := "b64_json"
 	miniMaxResponseFormat := "base64"
 	if len(rawJSON) > 0 && json.Valid(rawJSON) {
@@ -64,88 +80,93 @@ func buildMiniMaxImageGenerationRequest(rawJSON []byte, model string, prompt str
 		responseFormat = "b64_json"
 		miniMaxResponseFormat = "base64"
 	}
-	out, _ = sjson.SetBytes(out, "response_format", miniMaxResponseFormat)
-
+	request := miniMaxImageGenerationRequest{Model: baseModel, Prompt: prompt, ResponseFormat: miniMaxResponseFormat}
 	if len(rawJSON) > 0 && json.Valid(rawJSON) {
-		out = copyMiniMaxImageScalarFields(out, rawJSON)
-		out = copyMiniMaxImageSizeFields(out, rawJSON, baseModel)
+		copyMiniMaxImageScalarFields(&request, rawJSON)
+		copyMiniMaxImageSizeFields(&request, rawJSON, baseModel)
 		if style := gjson.GetBytes(rawJSON, "style"); style.Exists() && style.IsObject() {
-			out, _ = sjson.SetRawBytes(out, "style", []byte(style.Raw))
+			request.Style = json.RawMessage(style.Raw)
 		}
 		if subjectReference := gjson.GetBytes(rawJSON, "subject_reference"); subjectReference.Exists() && subjectReference.IsArray() {
-			out, _ = sjson.SetRawBytes(out, "subject_reference", []byte(subjectReference.Raw))
-			return out, responseFormat, nil
+			request.SubjectReference = json.RawMessage(subjectReference.Raw)
+			out, errMarshal := json.Marshal(request)
+			return out, responseFormat, errMarshal
 		}
 	}
 
 	if len(images) > 0 {
-		subjects := []byte(`[]`)
+		subjects := make([]miniMaxImageSubject, 0, min(len(images), maxImagesEditReferences))
 		for _, image := range images {
 			image = strings.TrimSpace(image)
 			if image == "" {
 				continue
 			}
-			subject := []byte(`{"type":"character","image_file":""}`)
-			subject, _ = sjson.SetBytes(subject, "image_file", image)
-			subjects, _ = sjson.SetRawBytes(subjects, "-1", subject)
+			subjects = append(subjects, miniMaxImageSubject{Type: "character", ImageFile: image})
 		}
-		if len(gjson.ParseBytes(subjects).Array()) > 0 {
-			out, _ = sjson.SetRawBytes(out, "subject_reference", subjects)
+		if len(subjects) > 0 {
+			request.SubjectReference = subjects
 		}
 	}
 
+	out, errMarshal := json.Marshal(request)
+	if errMarshal != nil {
+		return nil, "", fmt.Errorf("encode MiniMax image request: %w", errMarshal)
+	}
 	return out, responseFormat, nil
 }
 
-func copyMiniMaxImageScalarFields(out []byte, rawJSON []byte) []byte {
-	for _, field := range []string{"n", "seed"} {
-		value := gjson.GetBytes(rawJSON, field)
-		if value.Exists() && value.Type == gjson.Number {
-			out, _ = sjson.SetRawBytes(out, field, []byte(value.Raw))
-		}
+func copyMiniMaxImageScalarFields(request *miniMaxImageGenerationRequest, rawJSON []byte) {
+	if request == nil {
+		return
 	}
-	for _, field := range []string{"prompt_optimizer", "aigc_watermark"} {
-		value := gjson.GetBytes(rawJSON, field)
-		if value.Exists() && (value.Type == gjson.True || value.Type == gjson.False) {
-			out, _ = sjson.SetRawBytes(out, field, []byte(value.Raw))
-		}
+	if value := gjson.GetBytes(rawJSON, "n"); value.Exists() && value.Type == gjson.Number {
+		request.N = json.RawMessage(value.Raw)
+	}
+	if value := gjson.GetBytes(rawJSON, "seed"); value.Exists() && value.Type == gjson.Number {
+		request.Seed = json.RawMessage(value.Raw)
+	}
+	if value := gjson.GetBytes(rawJSON, "prompt_optimizer"); value.Exists() && (value.Type == gjson.True || value.Type == gjson.False) {
+		request.PromptOptimizer = json.RawMessage(value.Raw)
+	}
+	if value := gjson.GetBytes(rawJSON, "aigc_watermark"); value.Exists() && (value.Type == gjson.True || value.Type == gjson.False) {
+		request.AIGCWatermark = json.RawMessage(value.Raw)
 	}
 	if aspectRatio := strings.TrimSpace(gjson.GetBytes(rawJSON, "aspect_ratio").String()); aspectRatio != "" {
-		out, _ = sjson.SetBytes(out, "aspect_ratio", aspectRatio)
+		request.AspectRatio = aspectRatio
 	}
-	return out
 }
 
-func copyMiniMaxImageSizeFields(out []byte, rawJSON []byte, baseModel string) []byte {
+func copyMiniMaxImageSizeFields(request *miniMaxImageGenerationRequest, rawJSON []byte, baseModel string) {
+	if request == nil {
+		return
+	}
 	if baseModel != "image-01" || strings.TrimSpace(gjson.GetBytes(rawJSON, "aspect_ratio").String()) != "" {
-		return out
+		return
 	}
 
 	width := gjson.GetBytes(rawJSON, "width")
 	height := gjson.GetBytes(rawJSON, "height")
 	if width.Exists() && width.Type == gjson.Number && height.Exists() && height.Type == gjson.Number {
-		out, _ = sjson.SetBytes(out, "width", width.Int())
-		out, _ = sjson.SetBytes(out, "height", height.Int())
-		return out
+		parsedWidth, parsedHeight := width.Int(), height.Int()
+		request.Width, request.Height = &parsedWidth, &parsedHeight
+		return
 	}
 
 	size := strings.TrimSpace(gjson.GetBytes(rawJSON, "size").String())
 	if size == "" || strings.EqualFold(size, "auto") {
-		return out
+		return
 	}
 	parsedWidth, parsedHeight, ok := parseOpenAIImageSize(size)
 	if !ok {
-		return out
+		return
 	}
 	if aspectRatio := miniMaxAspectRatioForSize(parsedWidth, parsedHeight); aspectRatio != "" {
-		out, _ = sjson.SetBytes(out, "aspect_ratio", aspectRatio)
-		return out
+		request.AspectRatio = aspectRatio
+		return
 	}
 	if miniMaxImageDimensionAllowed(parsedWidth) && miniMaxImageDimensionAllowed(parsedHeight) {
-		out, _ = sjson.SetBytes(out, "width", parsedWidth)
-		out, _ = sjson.SetBytes(out, "height", parsedHeight)
+		request.Width, request.Height = &parsedWidth, &parsedHeight
 	}
-	return out
 }
 
 func parseOpenAIImageSize(size string) (int64, int64, bool) {
@@ -197,6 +218,7 @@ func gcdInt64(a int64, b int64) int64 {
 
 func (h *OpenAIAPIHandler) collectMiniMaxImages(c *gin.Context, miniMaxReq []byte, imageModel string) {
 	c.Header("Content-Type", "application/json")
+	handlers.MarkRequestWithoutToolCompatibility(c)
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
@@ -220,6 +242,7 @@ func (h *OpenAIAPIHandler) collectMiniMaxImages(c *gin.Context, miniMaxReq []byt
 }
 
 func (h *OpenAIAPIHandler) streamMiniMaxImages(c *gin.Context, miniMaxReq []byte, imageModel string, streamPrefix string) {
+	handlers.MarkRequestWithoutToolCompatibility(c)
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{

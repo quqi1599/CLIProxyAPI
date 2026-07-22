@@ -2,11 +2,63 @@ package claude
 
 import (
 	"encoding/base64"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertClaudeRequestToCodex_LargeMixedPayloadPreservesOrder(t *testing.T) {
+	const textParts = 1024
+	var input strings.Builder
+	input.WriteString(`{"system":[{"type":"text","text":"rules"}],"messages":[{"role":"user","content":[`)
+	for i := 0; i < textParts; i++ {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		input.WriteString(`{"type":"text","text":"text-`)
+		input.WriteString(strconv.Itoa(i))
+		input.WriteString(`"}`)
+	}
+	input.WriteString(`,{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]},{"role":"assistant","content":[{"type":"thinking","signature":"`)
+	input.WriteString(validCodexReasoningSignature())
+	input.WriteString(`"},{"type":"text","text":"answer"},{"type":"tool_use","id":"call-1","name":"lookup","input":{"q":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"ok"},{"type":"image","source":{"media_type":"image/jpeg","data":"aW1hZ2U="}}]}]}],"tools":[{"name":"lookup","description":"d","input_schema":{"type":"object","properties":{"q":{"type":"string"}}},"x_unknown":{"keep":true}}]}`)
+
+	out := ConvertClaudeRequestToCodex("gpt-5.4", []byte(input.String()), false)
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 6 {
+		t.Fatalf("input item count = %d, want 6", len(items))
+	}
+	if got := items[0].Get("content.0.text").String(); got != "rules" {
+		t.Fatalf("developer text = %q", got)
+	}
+	content := items[1].Get("content").Array()
+	if len(content) != textParts+1 {
+		t.Fatalf("user content count = %d, want %d", len(content), textParts+1)
+	}
+	if got := content[textParts-1].Get("text").String(); got != "text-1023" {
+		t.Fatalf("last text = %q", got)
+	}
+	if got := content[textParts].Get("image_url").String(); got != "data:image/png;base64,aW1hZ2U=" {
+		t.Fatalf("image url = %q", got)
+	}
+	if got := items[2].Get("type").String(); got != "reasoning" {
+		t.Fatalf("item 2 type = %q", got)
+	}
+	if got := items[3].Get("content.0.text").String(); got != "answer" {
+		t.Fatalf("assistant text = %q", got)
+	}
+	if got := items[4].Get("type").String(); got != "function_call" {
+		t.Fatalf("item 4 type = %q", got)
+	}
+	if got := items[5].Get("output.1.image_url").String(); got != "data:image/jpeg;base64,aW1hZ2U=" {
+		t.Fatalf("tool result image = %q", got)
+	}
+	if !gjson.GetBytes(out, "tools.0.x_unknown.keep").Bool() {
+		t.Fatalf("unknown tool field was lost: %s", out)
+	}
+}
 
 func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	tests := []struct {

@@ -15,15 +15,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
@@ -43,6 +42,8 @@ const (
 
 	// fMyProv represents our custom provider's chat format.
 	fMyProv = sdktr.Format("myprov.chat")
+
+	maxExampleResponseBytes = 4 << 20
 )
 
 // init registers trivial translators for demonstration purposes.
@@ -131,12 +132,10 @@ func (MyExecutor) Execute(ctx context.Context, a *coreauth.Auth, req clipexec.Re
 	if errDo != nil {
 		return clipexec.Response{}, errDo
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			fmt.Fprintf(os.Stderr, "close response body error: %v\n", errClose)
-		}
-	}()
-	body, _ := io.ReadAll(resp.Body)
+	body, errRead := httpfetch.ReadResponseBytes(resp, maxExampleResponseBytes)
+	if errRead != nil {
+		return clipexec.Response{}, fmt.Errorf("read custom provider response: %w", errRead)
+	}
 	return clipexec.Response{Payload: body}, nil
 }
 
@@ -220,6 +219,5 @@ func main() {
 	if errRun := svc.Run(ctx); errRun != nil && !errors.Is(errRun, context.Canceled) {
 		panic(errRun)
 	}
-	_ = os.Stderr // keep os import used (demo only)
 	_ = time.Second
 }

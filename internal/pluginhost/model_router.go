@@ -1,10 +1,10 @@
 package pluginhost
 
 import (
-	"bytes"
 	"context"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
@@ -122,7 +122,7 @@ func normalizeModelRouteResponse(routerPluginID string, resp pluginapi.ModelRout
 func cloneModelRouteRequest(req pluginapi.ModelRouteRequest) pluginapi.ModelRouteRequest {
 	req.Headers = cloneHeader(req.Headers)
 	req.Query = cloneValues(req.Query)
-	req.Body = bytes.Clone(req.Body)
+	req.Body = internalpayload.CloneBytes(req.Body)
 	req.Metadata = cloneInterceptorMetadata(req.Metadata)
 	req.AvailableProviders = cloneStringSlice(req.AvailableProviders)
 	return req

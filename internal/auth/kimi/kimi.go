@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,8 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -38,6 +37,8 @@ const (
 	maxPollDuration = 15 * time.Minute
 	// refreshThresholdSeconds is when to refresh token before expiry (5 minutes).
 	refreshThresholdSeconds = 300
+	// maxKimiOAuthResponseBytes bounds device and token endpoint JSON responses.
+	maxKimiOAuthResponseBytes = 1 << 20
 )
 
 var kimiRefreshGroup singleflight.Group
@@ -195,19 +196,13 @@ func (c *DeviceFlowClient) RequestDeviceCode(ctx context.Context) (*DeviceCodeRe
 	if err != nil {
 		return nil, fmt.Errorf("kimi: device code request failed: %w", err)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("kimi device code: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := httpfetch.ReadResponseBytes(resp, maxKimiOAuthResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to read device code response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kimi: device code request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("kimi: device code request failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	var deviceCode DeviceCodeResponse
@@ -283,13 +278,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 	if err != nil {
 		return nil, fmt.Errorf("kimi: token request failed: %w", err), false
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("kimi token exchange: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := httpfetch.ReadResponseBytes(resp, maxKimiOAuthResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to read token response: %w", err), false
 	}
@@ -320,7 +309,12 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 		case "access_denied":
 			return nil, fmt.Errorf("kimi: access denied by user"), false
 		default:
-			return nil, fmt.Errorf("kimi: OAuth error: %s - %s", oauthResp.Error, oauthResp.ErrorDescription), false
+			reason := ""
+			switch strings.ToLower(strings.TrimSpace(oauthResp.Error)) {
+			case "invalid_grant", "invalid_client", "invalid_request", "unsupported_grant_type":
+				reason = " reason=" + strings.ToLower(strings.TrimSpace(oauthResp.Error))
+			}
+			return nil, fmt.Errorf("kimi: OAuth error%s: %s", reason, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes)), false
 		}
 	}
 
@@ -385,13 +379,7 @@ func (c *DeviceFlowClient) refreshTokenSingleFlight(ctx context.Context, refresh
 	if err != nil {
 		return nil, fmt.Errorf("kimi: refresh request failed: %w", err)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("kimi refresh token: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := httpfetch.ReadResponseBytes(resp, maxKimiOAuthResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to read refresh response: %w", err)
 	}
@@ -401,7 +389,7 @@ func (c *DeviceFlowClient) refreshTokenSingleFlight(ctx context.Context, refresh
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kimi: refresh failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("kimi: refresh failed with status %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), bodyBytes))
 	}
 
 	var tokenResp struct {

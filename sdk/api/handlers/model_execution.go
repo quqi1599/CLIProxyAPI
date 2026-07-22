@@ -22,6 +22,7 @@ type modelExecutionOptions struct {
 	SkipRouterPluginID      string
 	complexity              *complexityVector
 	complexityValid         bool
+	complexityDimensions    complexityDimensions
 }
 
 // ModelExecutionRequest describes an internal model execution request.
@@ -84,6 +85,9 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteModel requires Stream=false")
 	}
+	if _, err := enforceRequestBodyLimit(req.Body, maxDecodedRequestBodyBytes, true); err != nil {
+		return ModelExecutionResponse{}, admissionErrorMessage(err)
+	}
 	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
@@ -108,6 +112,9 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecutionRequest) (ModelExecutionStream, *interfaces.ErrorMessage) {
 	if !req.Stream {
 		return ModelExecutionStream{}, modelExecutionModeError("ExecuteModelStream requires Stream=true")
+	}
+	if _, err := enforceRequestBodyLimit(req.Body, maxDecodedRequestBodyBytes, true); err != nil {
+		return ModelExecutionStream{}, admissionErrorMessage(err)
 	}
 	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
 		Headers:                 req.Headers,
@@ -139,10 +146,15 @@ func modelExecutionResponseProtocol(entryProtocol, exitProtocol string) string {
 }
 
 func modelExecutionHeaders(ctx context.Context, headers http.Header) http.Header {
+	var cloned http.Header
 	if len(headers) > 0 {
-		return cloneHeader(headers)
+		cloned = cloneHeader(headers)
+	} else {
+		cloned = headersFromContext(ctx)
 	}
-	return headersFromContext(ctx)
+	cloned.Del("Content-Encoding")
+	cloned.Del("Content-Length")
+	return cloned
 }
 
 // modelExecutionQuery prefers an explicitly provided query and otherwise falls

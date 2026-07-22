@@ -3,7 +3,6 @@
 package chat_completions
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -148,7 +147,8 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			}
 		}
 
-		systemPartIndex := 0
+		systemParts := make([][]byte, 0)
+		contentNodes := make([][]byte, 0, len(arr))
 		for i := 0; i < len(arr); i++ {
 			m := arr[i]
 			role := m.Get("role").String()
@@ -157,46 +157,48 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			if (role == "system" || role == "developer") && len(arr) > 1 {
 				// system -> systemInstruction as a user message style
 				if content.Type == gjson.String {
-					out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), content.String())
-					systemPartIndex++
+					part := []byte(`{"text":""}`)
+					part, _ = sjson.SetBytes(part, "text", content.String())
+					systemParts = append(systemParts, part)
 				} else if content.IsObject() && content.Get("type").String() == "text" {
-					out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), content.Get("text").String())
-					systemPartIndex++
+					part := []byte(`{"text":""}`)
+					part, _ = sjson.SetBytes(part, "text", content.Get("text").String())
+					systemParts = append(systemParts, part)
 				} else if content.IsArray() {
 					contents := content.Array()
-					if len(contents) > 0 {
-						out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-						for j := 0; j < len(contents); j++ {
-							out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), contents[j].Get("text").String())
-							systemPartIndex++
-						}
+					for j := 0; j < len(contents); j++ {
+						part := []byte(`{"text":""}`)
+						part, _ = sjson.SetBytes(part, "text", contents[j].Get("text").String())
+						systemParts = append(systemParts, part)
 					}
 				}
 			} else if role == "user" || ((role == "system" || role == "developer") && len(arr) == 1) {
 				// Build single user content node to avoid splitting into multiple contents
 				node := []byte(`{"role":"user","parts":[]}`)
+				parts := make([][]byte, 0)
 				if content.Type == gjson.String {
-					node, _ = sjson.SetBytes(node, "parts.0.text", content.String())
+					part := []byte(`{"text":""}`)
+					part, _ = sjson.SetBytes(part, "text", content.String())
+					parts = append(parts, part)
 				} else if content.IsArray() {
 					items := content.Array()
-					p := 0
 					for _, item := range items {
 						switch item.Get("type").String() {
 						case "text":
 							text := item.Get("text").String()
 							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
+								part := []byte(`{"text":""}`)
+								part, _ = sjson.SetBytes(part, "text", text)
+								parts = append(parts, part)
 							}
 						case "image_url":
 							imageURL := util.OpenAIImageURLFromPart(item)
 							if mime, data, ok := util.ParseDataURL(imageURL); ok {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
-								p++
+								part := []byte(`{"inlineData":{"mime_type":"","data":""},"thoughtSignature":""}`)
+								part, _ = sjson.SetBytes(part, "inlineData.mime_type", mime)
+								part, _ = sjson.SetBytes(part, "inlineData.data", data)
+								part, _ = sjson.SetBytes(part, "thoughtSignature", geminiFunctionThoughtSignature)
+								parts = append(parts, part)
 							}
 						case "video_url":
 							videoURL := item.Get("video_url.url").String()
@@ -205,9 +207,10 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 								if len(pieces) == 2 && len(pieces[1]) > 7 {
 									mime := pieces[0]
 									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									p++
+									part := []byte(`{"inlineData":{"mime_type":"","data":""}}`)
+									part, _ = sjson.SetBytes(part, "inlineData.mime_type", mime)
+									part, _ = sjson.SetBytes(part, "inlineData.data", data)
+									parts = append(parts, part)
 								}
 							}
 						case "file":
@@ -218,9 +221,10 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 								ext = sp[len(sp)-1]
 							}
 							if mimeType, ok := misc.MimeTypes[ext]; ok {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", fileData)
-								p++
+								part := []byte(`{"inlineData":{"mime_type":"","data":""}}`)
+								part, _ = sjson.SetBytes(part, "inlineData.mime_type", mimeType)
+								part, _ = sjson.SetBytes(part, "inlineData.data", fileData)
+								parts = append(parts, part)
 							} else {
 								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
 							}
@@ -228,27 +232,30 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							audioData := item.Get("input_audio.data").String()
 							if audioData != "" {
 								mimeType := openAIInputAudioMimeType(item.Get("input_audio.format").String())
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", audioData)
-								p++
+								part := []byte(`{"inlineData":{"mime_type":"","data":""}}`)
+								part, _ = sjson.SetBytes(part, "inlineData.mime_type", mimeType)
+								part, _ = sjson.SetBytes(part, "inlineData.data", audioData)
+								parts = append(parts, part)
 							}
 						}
 					}
 				}
-				out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+				node, _ = sjson.SetRawBytes(node, "parts", common.RawJSONArray(parts))
+				contentNodes = append(contentNodes, node)
 			} else if role == "assistant" {
 				node := []byte(`{"role":"model","parts":[]}`)
-				p := 0
+				parts := make([][]byte, 0)
 				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == gjson.String && reasoningContent.String() != "" {
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", reasoningContent.String())
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thought", true)
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
-					p++
+					part := []byte(`{"text":"","thought":true,"thoughtSignature":""}`)
+					part, _ = sjson.SetBytes(part, "text", reasoningContent.String())
+					part, _ = sjson.SetBytes(part, "thoughtSignature", geminiFunctionThoughtSignature)
+					parts = append(parts, part)
 				}
 				if content.Type == gjson.String && content.String() != "" {
 					// Assistant text -> single model content
-					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
-					p++
+					part := []byte(`{"text":""}`)
+					part, _ = sjson.SetBytes(part, "text", content.String())
+					parts = append(parts, part)
 				} else if content.IsArray() {
 					// Assistant multimodal content (e.g. text + image) -> single model content with parts
 					for _, item := range content.Array() {
@@ -256,17 +263,19 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						case "text":
 							text := item.Get("text").String()
 							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
+								part := []byte(`{"text":""}`)
+								part, _ = sjson.SetBytes(part, "text", text)
+								parts = append(parts, part)
 							}
 						case "image_url":
 							// If the assistant returned an inline data URL, preserve it for history fidelity.
 							imageURL := util.OpenAIImageURLFromPart(item)
 							if mime, data, ok := util.ParseDataURL(imageURL); ok {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
-								p++
+								part := []byte(`{"inlineData":{"mime_type":"","data":""},"thoughtSignature":""}`)
+								part, _ = sjson.SetBytes(part, "inlineData.mime_type", mime)
+								part, _ = sjson.SetBytes(part, "inlineData.data", data)
+								part, _ = sjson.SetBytes(part, "thoughtSignature", geminiFunctionThoughtSignature)
+								parts = append(parts, part)
 							}
 						}
 					}
@@ -286,57 +295,61 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							continue
 						}
 						fargs := tc.Get("function.arguments").String()
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
-						node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
-						p++
+						part := []byte(`{"functionCall":{"name":"","args":{}},"thoughtSignature":""}`)
+						part, _ = sjson.SetBytes(part, "functionCall.name", fname)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(fargs))
+						part, _ = sjson.SetBytes(part, "thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
+						parts = append(parts, part)
 						if fid != "" {
 							fIDs = append(fIDs, fid)
 						}
 					}
-					if p > 0 {
-						out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+					if len(parts) > 0 {
+						node, _ = sjson.SetRawBytes(node, "parts", common.RawJSONArray(parts))
+						contentNodes = append(contentNodes, node)
 					}
 
 					// Append a single tool content combining name + response per function
 					toolNode := []byte(`{"role":"user","parts":[]}`)
-					pp := 0
+					toolParts := make([][]byte, 0, len(fIDs))
 					for _, fid := range fIDs {
 						if name, ok := tcID2Name[fid]; ok {
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", util.SanitizeFunctionName(name))
+							part := []byte(`{"functionResponse":{"name":"","response":{"result":null}}}`)
+							part, _ = sjson.SetBytes(part, "functionResponse.name", util.SanitizeFunctionName(name))
 							resp := toolResponses[fid]
 							if resp == "" {
 								resp = "{}"
 							}
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(resp))
-							pp++
+							part, _ = sjson.SetBytes(part, "functionResponse.response.result", []byte(resp))
+							toolParts = append(toolParts, part)
 						}
 					}
-					if pp > 0 {
-						out, _ = sjson.SetRawBytes(out, "contents.-1", toolNode)
+					if len(toolParts) > 0 {
+						toolNode, _ = sjson.SetRawBytes(toolNode, "parts", common.RawJSONArray(toolParts))
+						contentNodes = append(contentNodes, toolNode)
 					}
-				} else if p > 0 {
-					out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+				} else if len(parts) > 0 {
+					node, _ = sjson.SetRawBytes(node, "parts", common.RawJSONArray(parts))
+					contentNodes = append(contentNodes, node)
 				}
 			}
 		}
-	}
 
-	// Gemini/Vertex accepts assistant/model turns in history, but some model
-	// surfaces reject requests whose final turn is model-authored prefill.
-	contents := gjson.GetBytes(out, "contents")
-	if contents.Exists() && contents.IsArray() {
-		arr := contents.Array()
-		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
-			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		if len(systemParts) > 0 {
+			systemInstruction := []byte(`{"role":"user","parts":[]}`)
+			systemInstruction, _ = sjson.SetRawBytes(systemInstruction, "parts", common.RawJSONArray(systemParts))
+			out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstruction)
 		}
+		if len(contentNodes) > 0 && gjson.GetBytes(contentNodes[len(contentNodes)-1], "role").String() == "model" {
+			contentNodes = contentNodes[:len(contentNodes)-1]
+		}
+		out, _ = sjson.SetRawBytes(out, "contents", common.RawJSONArray(contentNodes))
 	}
 
 	// tools -> tools[].functionDeclarations + tools[].googleSearch/codeExecution/urlContext passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
-		functionToolNode := []byte(`{}`)
-		hasFunction := false
+		functionDeclarations := make([][]byte, 0)
 		googleSearchNodes := make([][]byte, 0)
 		codeExecutionNodes := make([][]byte, 0)
 		urlContextNodes := make([][]byte, 0)
@@ -377,16 +390,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema", util.CleanJSONSchemaForGemini(parameters.Raw))
 					}
 					fnRaw, _ = sjson.Delete(fnRaw, "strict")
-					if !hasFunction {
-						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
-					}
-					tmp, errSet := sjson.SetRawBytes(functionToolNode, "functionDeclarations.-1", []byte(fnRaw))
-					if errSet != nil {
-						log.Warnf("Failed to append tool declaration for '%s': %v", fn.Get("name").String(), errSet)
-						continue
-					}
-					functionToolNode = tmp
-					hasFunction = true
+					functionDeclarations = append(functionDeclarations, []byte(fnRaw))
 				}
 			}
 			if gs := t.Get("google_search"); gs.Exists() {
@@ -420,21 +424,17 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
-		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
-			toolsNode := []byte("[]")
-			if hasFunction {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolNode)
+		if len(functionDeclarations) > 0 || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
+			toolNodes := make([][]byte, 0, 1+len(googleSearchNodes)+len(codeExecutionNodes)+len(urlContextNodes))
+			if len(functionDeclarations) > 0 {
+				functionToolNode := []byte(`{"functionDeclarations":[]}`)
+				functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", common.RawJSONArray(functionDeclarations))
+				toolNodes = append(toolNodes, functionToolNode)
 			}
-			for _, googleNode := range googleSearchNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleNode)
-			}
-			for _, codeNode := range codeExecutionNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", codeNode)
-			}
-			for _, urlNode := range urlContextNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", urlNode)
-			}
-			out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
+			toolNodes = append(toolNodes, googleSearchNodes...)
+			toolNodes = append(toolNodes, codeExecutionNodes...)
+			toolNodes = append(toolNodes, urlContextNodes...)
+			out, _ = sjson.SetRawBytes(out, "tools", common.RawJSONArray(toolNodes))
 		}
 	}
 
@@ -456,9 +456,6 @@ func openAIToolCallGeminiThoughtSignature(toolCall gjson.Result) string {
 	}
 	return geminiFunctionThoughtSignature
 }
-
-// itoa converts int to string without strconv import for few usages.
-func itoa(i int) string { return fmt.Sprintf("%d", i) }
 
 func openAIInputAudioMimeType(audioFormat string) string {
 	switch audioFormat {

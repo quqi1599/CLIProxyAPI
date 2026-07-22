@@ -75,6 +75,26 @@ func TestBuildMiniMaxImageRequestPreservesExplicitSubjectReference(t *testing.T)
 	}
 }
 
+func TestBuildMiniMaxImageRequestPreservesFalseScalarsAndFieldOrder(t *testing.T) {
+	raw := []byte(`{"n":0,"seed":7,"prompt_optimizer":false,"aigc_watermark":false,"aspect_ratio":"1:1","style":{"name":"raw"}}`)
+
+	payload, _, err := buildMiniMaxImageGenerationRequest(raw, "image-01-live", "draw", nil)
+	if err != nil {
+		t.Fatalf("buildMiniMaxImageGenerationRequest() error = %v", err)
+	}
+	for _, field := range []string{"n", "seed", "prompt_optimizer", "aigc_watermark"} {
+		if !gjson.GetBytes(payload, field).Exists() {
+			t.Fatalf("%s missing from %s", field, payload)
+		}
+	}
+	if gjson.GetBytes(payload, "prompt_optimizer").Bool() || gjson.GetBytes(payload, "aigc_watermark").Bool() {
+		t.Fatalf("false scalar changed: %s", payload)
+	}
+	if got := gjson.GetBytes(payload, "style.name").String(); got != "raw" {
+		t.Fatalf("style.name = %q", got)
+	}
+}
+
 func TestBuildMiniMaxImageStreamEvents(t *testing.T) {
 	body := []byte(`{"created":1,"data":[{"b64_json":"abc"},{"url":"https://example.com/a.png"}]}`)
 

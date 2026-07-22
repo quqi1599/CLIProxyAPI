@@ -10,15 +10,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/klauspost/compress/zstd"
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -1220,7 +1221,8 @@ func TestClaudeExecutor_ExecuteStripsOpenAIEncryptedThinkingBeforeUpstream(t *te
 		]
 	}`)
 
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "claude-3-5-sonnet-20241022",
 		Payload: payload,
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
@@ -1240,6 +1242,7 @@ func TestClaudeExecutor_ExecuteStripsOpenAIEncryptedThinkingBeforeUpstream(t *te
 	if got := content[0].Get("text").String(); got != "Answer" {
 		t.Fatalf("remaining content text = %q, want Answer", got)
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, claudeFinalSanitizeTransformStage, len(seenBody))
 }
 
 func TestClaudeExecutor_ExecuteStripsForeignToolUseSignaturesBeforeUpstream(t *testing.T) {
@@ -1549,7 +1552,8 @@ func TestClaudeExecutor_ExecuteStreamStripsOpenAIEncryptedThinkingBeforeUpstream
 		]
 	}`)
 
-	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
 		Model:   "claude-3-5-sonnet-20241022",
 		Payload: payload,
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
@@ -1561,6 +1565,7 @@ func TestClaudeExecutor_ExecuteStreamStripsOpenAIEncryptedThinkingBeforeUpstream
 			t.Fatalf("unexpected chunk error: %v", chunk.Err)
 		}
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, claudeFinalSanitizeTransformStage, len(seenBody))
 	if len(seenBody) == 0 {
 		t.Fatal("expected request body to be captured")
 	}
@@ -2574,11 +2579,19 @@ func TestClaudeExecutor_Execute_DropsUnansweredToolUseHistory(t *testing.T) {
 
 func TestClaudeExecutor_HttpRequest_SanitizesDirectMessagesToolNames(t *testing.T) {
 	var seenBody []byte
+	var encodedResponse bytes.Buffer
+	gzipWriter := gzip.NewWriter(&encodedResponse)
+	_, _ = gzipWriter.Write([]byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"skill_pet_animals","id":"toolu_1"},"index":0}` + "\n\n"))
+	_ = gzipWriter.Close()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		seenBody = bytes.Clone(body)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"skill_pet_animals","id":"toolu_1"},"index":0}` + "\n\n"))
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(encodedResponse.Len()))
+		w.Header().Set("ETag", `"encoded"`)
+		w.Header().Set("Digest", "sha-256=encoded")
+		_, _ = w.Write(encodedResponse.Bytes())
 	}))
 	defer server.Close()
 
@@ -2602,6 +2615,14 @@ func TestClaudeExecutor_HttpRequest_SanitizesDirectMessagesToolNames(t *testing.
 	if err != nil {
 		t.Fatalf("HttpRequest error: %v", err)
 	}
+	for _, name := range []string{"Content-Encoding", "Content-Length", "ETag", "Digest"} {
+		if got := resp.Header.Get(name); got != "" {
+			t.Fatalf("response %s = %q, want empty after decoding", name, got)
+		}
+	}
+	if resp.ContentLength != -1 {
+		t.Fatalf("response ContentLength = %d, want -1", resp.ContentLength)
+	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			t.Fatalf("response body close error: %v", errClose)
@@ -2620,6 +2641,55 @@ func TestClaudeExecutor_HttpRequest_SanitizesDirectMessagesToolNames(t *testing.
 	}
 	if !bytes.Contains(data, []byte(`"name":"skill:pet_animals"`)) {
 		t.Fatalf("downstream stream did not restore tool name: %s", string(data))
+	}
+}
+
+func TestClaudeExecutor_HttpRequest_BoundsAndRestoresCompressedNonStreamResponse(t *testing.T) {
+	responseBody := []byte(`{"content":[{"type":"tool_use","name":"skill_pet_animals","id":"toolu_1","input":{}}]}`)
+	var encodedResponse bytes.Buffer
+	gzipWriter := gzip.NewWriter(&encodedResponse)
+	_, _ = gzipWriter.Write(responseBody)
+	_ = gzipWriter.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("ETag", `"encoded"`)
+		w.Header().Set("Content-MD5", "encoded")
+		_, _ = w.Write(encodedResponse.Bytes())
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	payload := []byte(`{
+		"tools":[{"name":"skill:pet_animals","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+	req, errReq := http.NewRequest(http.MethodPost, server.URL+"/v1/messages?beta=true", bytes.NewReader(payload))
+	if errReq != nil {
+		t.Fatalf("new request: %v", errReq)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := executor.HttpRequest(context.Background(), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}, req)
+	if err != nil {
+		t.Fatalf("HttpRequest error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		t.Fatalf("read response body: %v", errRead)
+	}
+	if !bytes.Contains(data, []byte(`"name":"skill:pet_animals"`)) {
+		t.Fatalf("downstream response did not restore tool name: %s", data)
+	}
+	if resp.ContentLength != int64(len(data)) || resp.Header.Get("Content-Length") != strconv.Itoa(len(data)) {
+		t.Fatalf("decoded content length = %d/%q, want %d", resp.ContentLength, resp.Header.Get("Content-Length"), len(data))
+	}
+	for _, name := range []string{"Content-Encoding", "ETag", "Content-MD5"} {
+		if got := resp.Header.Get(name); got != "" {
+			t.Fatalf("response %s = %q, want empty after decoding", name, got)
+		}
 	}
 }
 
@@ -2911,7 +2981,7 @@ func hasTTLOrderingViolation(payload []byte) bool {
 	return violates
 }
 
-func TestClaudeExecutor_Execute_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_Execute_InvalidGzipErrorBodyReturnsTypedProtocolFailure(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -2921,7 +2991,7 @@ func TestClaudeExecutor_Execute_InvalidGzipErrorBodyReturnsDecodeMessage(t *test
 	})
 }
 
-func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsTypedProtocolFailure(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -2931,7 +3001,7 @@ func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsDecodeMessage(t
 	})
 }
 
-func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
+func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyReturnsTypedProtocolFailure(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
 			Model:   "claude-3-5-sonnet-20241022",
@@ -2966,11 +3036,15 @@ func testClaudeExecutorInvalidCompressedErrorBody(
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to decode error response body") {
-		t.Fatalf("expected decode failure message, got: %v", err)
+	typed, ok := failurecontract.As(err)
+	if !ok {
+		t.Fatalf("error = %T %v, want typed failure", err, err)
 	}
-	if statusProvider, ok := err.(interface{ StatusCode() int }); !ok || statusProvider.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("expected status code 400, got: %v", err)
+	if typed.Kind != failurecontract.UpstreamProtocolError || typed.Scope != failurecontract.ScopeProvider {
+		t.Fatalf("failure = %q/%q, want upstream_protocol_error/provider", typed.Kind, typed.Scope)
+	}
+	if typed.HTTPStatus != http.StatusBadGateway || typed.ProviderCode != "upstream_response_decode_failed" || typed.Retryable {
+		t.Fatalf("failure metadata = status:%d code:%q retryable:%t", typed.HTTPStatus, typed.ProviderCode, typed.Retryable)
 	}
 }
 
@@ -3251,6 +3325,10 @@ func TestClaudeExecutor_ExecuteStream_GzipSuccessBodyDecoded(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(compressedBody)))
+		w.Header().Set("ETag", `"encoded"`)
+		w.Header().Set("Content-MD5", "encoded")
+		w.Header().Set("Digest", "sha-256=encoded")
 		_, _ = w.Write(compressedBody)
 	}))
 	defer server.Close()
@@ -3271,6 +3349,11 @@ func TestClaudeExecutor_ExecuteStream_GzipSuccessBodyDecoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
+	for _, name := range []string{"Content-Encoding", "Content-Length", "ETag", "Content-MD5", "Digest"} {
+		if got := result.Headers.Get(name); got != "" {
+			t.Fatalf("stream response %s = %q, want empty after decoding", name, got)
+		}
+	}
 
 	var combined strings.Builder
 	for chunk := range result.Chunks {
@@ -3288,85 +3371,80 @@ func TestClaudeExecutor_ExecuteStream_GzipSuccessBodyDecoded(t *testing.T) {
 	}
 }
 
-// TestDecodeResponseBody_MagicByteGzipNoHeader verifies that decodeResponseBody
-// detects gzip-compressed content via magic bytes even when Content-Encoding is absent.
-func TestDecodeResponseBody_MagicByteGzipNoHeader(t *testing.T) {
-	const plaintext = "data: {\"type\":\"message_stop\"}\n"
+func TestClaudeExecutor_ExecuteStream_CancelClosesUpstream(t *testing.T) {
+	requestCancelled := make(chan struct{})
+	releaseServer := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			close(requestCancelled)
+		case <-releaseServer:
+		}
+	}))
+	defer func() {
+		close(releaseServer)
+		server.Close()
+	}()
 
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	_, _ = gz.Write([]byte(plaintext))
-	_ = gz.Close()
-
-	rc := io.NopCloser(&buf)
-	decoded, err := decodeResponseBody(rc, "")
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
 	if err != nil {
-		t.Fatalf("decodeResponseBody error: %v", err)
+		t.Fatalf("ExecuteStream error: %v", err)
 	}
-	defer decoded.Close()
 
-	got, err := io.ReadAll(decoded)
-	if err != nil {
-		t.Fatalf("ReadAll error: %v", err)
+	select {
+	case chunk := <-result.Chunks:
+		if chunk.Err != nil || !bytes.Contains(chunk.Payload, []byte("message_stop")) {
+			t.Fatalf("first chunk = %q, error = %v", chunk.Payload, chunk.Err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first stream chunk")
 	}
-	if string(got) != plaintext {
-		t.Errorf("decoded = %q, want %q", got, plaintext)
+	result.Close()
+	result.Close()
+
+	select {
+	case <-requestCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream request was not cancelled")
+	}
+	select {
+	case _, ok := <-result.Chunks:
+		if ok {
+			t.Fatal("stream channel remained open after cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream channel did not close after cancellation")
 	}
 }
 
-// TestDecodeResponseBody_MagicByteZstdNoHeader verifies that decodeResponseBody
-// detects zstd-compressed content via magic bytes even when Content-Encoding is absent.
-func TestDecodeResponseBody_MagicByteZstdNoHeader(t *testing.T) {
-	const plaintext = "data: {\"type\":\"message_stop\"}\n"
-
-	var buf bytes.Buffer
-	enc, err := zstd.NewWriter(&buf)
-	if err != nil {
-		t.Fatalf("zstd.NewWriter: %v", err)
-	}
-	_, _ = enc.Write([]byte(plaintext))
-	_ = enc.Close()
-
-	rc := io.NopCloser(&buf)
-	decoded, err := decodeResponseBody(rc, "")
-	if err != nil {
-		t.Fatalf("decodeResponseBody error: %v", err)
-	}
-	defer decoded.Close()
-
-	got, err := io.ReadAll(decoded)
-	if err != nil {
-		t.Fatalf("ReadAll error: %v", err)
-	}
-	if string(got) != plaintext {
-		t.Errorf("decoded = %q, want %q", got, plaintext)
-	}
-}
-
-// TestDecodeResponseBody_PlainTextNoHeader verifies that decodeResponseBody returns
-// plain text untouched when Content-Encoding is absent and no magic bytes match.
-func TestDecodeResponseBody_PlainTextNoHeader(t *testing.T) {
-	const plaintext = "data: {\"type\":\"message_stop\"}\n"
-	rc := io.NopCloser(strings.NewReader(plaintext))
-	decoded, err := decodeResponseBody(rc, "")
-	if err != nil {
-		t.Fatalf("decodeResponseBody error: %v", err)
-	}
-	defer decoded.Close()
-
-	got, err := io.ReadAll(decoded)
-	if err != nil {
-		t.Fatalf("ReadAll error: %v", err)
-	}
-	if string(got) != plaintext {
-		t.Errorf("decoded = %q, want %q", got, plaintext)
+func TestRewriteClaudeSSEEventPreservesLineEndings(t *testing.T) {
+	event := []byte("data: one\nid: two\r\nretry: three\rdata: four")
+	got := rewriteClaudeSSEEvent(event, func(line []byte) []byte {
+		return append([]byte("rewritten:"), line...)
+	})
+	want := []byte("rewritten:data: one\nrewritten:id: two\r\nrewritten:retry: three\rrewritten:data: four")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("rewritten event = %q, want %q", got, want)
 	}
 }
 
 // TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader verifies the full
 // pipeline: when the upstream returns a gzip-compressed SSE body WITHOUT setting
-// Content-Encoding (a misbehaving upstream), the magic-byte sniff in
-// decodeResponseBody still decompresses it, so chunks reach the caller.
+// Content-Encoding (a misbehaving upstream), the shared bounded reader still
+// decompresses it, so chunks reach the caller.
 func TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -3415,11 +3493,10 @@ func TestClaudeExecutor_ExecuteStream_GzipNoContentEncodingHeader(t *testing.T) 
 }
 
 // TestClaudeExecutor_Execute_GzipErrorBodyNoContentEncodingHeader verifies that the
-// error path (4xx) correctly decompresses a gzip body even when the upstream omits
-// the Content-Encoding header.  This closes the gap left by PR #1771, which only
-// fixed header-declared compression on the error path.
+// error path decodes gzip for classification without exposing the upstream body.
 func TestClaudeExecutor_Execute_GzipErrorBodyNoContentEncodingHeader(t *testing.T) {
-	const errJSON = `{"type":"error","error":{"type":"invalid_request_error","message":"test error"}}`
+	const secret = "gzip-error-body-sentinel"
+	const errJSON = `{"type":"error","error":{"type":"invalid_request_error","message":"` + secret + `"}}`
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -3451,16 +3528,22 @@ func TestClaudeExecutor_Execute_GzipErrorBodyNoContentEncodingHeader(t *testing.
 	if err == nil {
 		t.Fatal("expected an error for 400 response, got nil")
 	}
-	if !strings.Contains(err.Error(), "test error") {
-		t.Errorf("error message should contain decompressed JSON, got: %q", err.Error())
+	assertStatusErr(t, err, http.StatusBadRequest)
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), `"message"`) {
+		t.Fatalf("error exposed decompressed upstream body: %q", err.Error())
+	}
+	for _, want := range []string{"error_type=invalid_request_error", `"bytes":`, `"sha256":`, `"content_type":"application/json"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("safe error metadata = %q, want %q", err.Error(), want)
+		}
 	}
 }
 
 // TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader verifies
-// the same for the streaming executor: 4xx gzip body without Content-Encoding is
-// decoded and the error message is readable.
+// the same safe classification behavior for the streaming executor.
 func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *testing.T) {
-	const errJSON = `{"type":"error","error":{"type":"invalid_request_error","message":"stream test error"}}`
+	const secret = "gzip-stream-error-body-sentinel"
+	const errJSON = `{"type":"error","error":{"type":"invalid_request_error","message":"` + secret + `"}}`
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -3492,8 +3575,14 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	if err == nil {
 		t.Fatal("expected an error for 400 response, got nil")
 	}
-	if !strings.Contains(err.Error(), "stream test error") {
-		t.Errorf("error message should contain decompressed JSON, got: %q", err.Error())
+	assertStatusErr(t, err, http.StatusBadRequest)
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), `"message"`) {
+		t.Fatalf("error exposed decompressed upstream body: %q", err.Error())
+	}
+	for _, want := range []string{"error_type=invalid_request_error", `"bytes":`, `"sha256":`, `"content_type":"application/json"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("safe error metadata = %q, want %q", err.Error(), want)
+		}
 	}
 }
 
@@ -4425,4 +4514,286 @@ func TestReverseRemapOAuthToolNamesFromStreamLine_HonorsPerRequestMap(t *testing
 	if !bytes.Contains(out, []byte(`"name":"glob"`)) {
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
 	}
+}
+
+func TestRemapOAuthToolNamesLargePreservesOrderAndUnknownFields(t *testing.T) {
+	for _, messageCount := range []int{16, 64, 256, 1024} {
+		t.Run(strconv.Itoa(messageCount), func(t *testing.T) {
+			input := buildLargeClaudeOAuthToolNamePayload(messageCount)
+			original := bytes.Clone(input)
+
+			out, reverseMap := remapOAuthToolNames(input)
+
+			if !bytes.Equal(input, original) {
+				t.Fatal("remapOAuthToolNames mutated its input")
+			}
+			for upstream, client := range map[string]string{"Bash": "bash", "Glob": "glob", "Grep": "grep"} {
+				if got := reverseMap[upstream]; got != client {
+					t.Fatalf("reverseMap[%q] = %q, want %q", upstream, got, client)
+				}
+			}
+			tools := gjson.GetBytes(out, "tools").Array()
+			if len(tools) != messageCount+1 {
+				t.Fatalf("tools length = %d, want %d", len(tools), messageCount+1)
+			}
+			if got := tools[messageCount].Get("name").String(); got != "web_search" {
+				t.Fatalf("built-in tool name = %q, want web_search", got)
+			}
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != messageCount {
+				t.Fatalf("messages length = %d, want %d", len(messages), messageCount)
+			}
+			for _, index := range []int{0, messageCount / 2, messageCount - 1} {
+				if got := tools[index].Get("name").String(); got != "Bash" {
+					t.Fatalf("tools[%d].name = %q, want Bash", index, got)
+				}
+				message := messages[index]
+				for path, want := range map[string]string{
+					"content.0.name":                "Bash",
+					"content.1.tool_name":           "Glob",
+					"content.2.content.0.tool_name": "Grep",
+					"content.2.content.1.text":      "keep",
+				} {
+					if got := message.Get(path).String(); got != want {
+						t.Fatalf("messages[%d].%s = %q, want %q", index, path, got, want)
+					}
+				}
+				if got := message.Get("marker").Int(); got != int64(index) || !message.Get("unknown.keep").Bool() {
+					t.Fatalf("messages[%d] lost marker or unknown field: %s", index, message.Raw)
+				}
+			}
+			outText := string(out)
+			if before, toolsKey, choice, messagesKey, after := strings.Index(outText, `"before"`), strings.Index(outText, `"tools"`), strings.Index(outText, `"tool_choice"`), strings.Index(outText, `"messages"`), strings.Index(outText, `"after"`); !(before < toolsKey && toolsKey < choice && choice < messagesKey && messagesKey < after) {
+				t.Fatalf("root field order changed")
+			}
+
+			response := buildLargeClaudeOAuthToolNameResponse(messageCount)
+			restored := reverseRemapOAuthToolNames(response, reverseMap)
+			content := gjson.GetBytes(restored, "content").Array()
+			if len(content) != messageCount*2 {
+				t.Fatalf("response content length = %d, want %d", len(content), messageCount*2)
+			}
+			for _, index := range []int{0, messageCount / 2, messageCount - 1} {
+				base := index * 2
+				if got := content[base].Get("name").String(); got != "bash" {
+					t.Fatalf("content[%d].name = %q, want bash", base, got)
+				}
+				if got := content[base+1].Get("tool_name").String(); got != "glob" {
+					t.Fatalf("content[%d].tool_name = %q, want glob", base+1, got)
+				}
+				if !content[base].Get("unknown.keep").Bool() || !content[base+1].Get("unknown.keep").Bool() {
+					t.Fatalf("response content near %d lost unknown fields", base)
+				}
+			}
+		})
+	}
+}
+
+func buildLargeClaudeOAuthToolNamePayload(messageCount int) []byte {
+	var payload strings.Builder
+	payload.Grow(messageCount * 520)
+	payload.WriteString(`{"before":1,"tools":[`)
+	for index := 0; index < messageCount; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"name":"bash","marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`,"input_schema":{"type":"object"},"unknown":{"keep":true}}`)
+	}
+	payload.WriteString(`,{"type":"web_search_20250305","name":"web_search","unknown":{"keep":true}}],"tool_choice":{"type":"tool","name":"bash","unknown":{"keep":true}},"messages":[`)
+	for index := 0; index < messageCount; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		marker := strconv.Itoa(index)
+		payload.WriteString(`{"role":"assistant","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"content":[{"type":"tool_use","name":"bash","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"unknown":{"keep":true}},{"type":"tool_reference","tool_name":"glob","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"unknown":{"keep":true}},{"type":"tool_result","tool_use_id":"call_`)
+		payload.WriteString(marker)
+		payload.WriteString(`","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"content":[{"type":"tool_reference","tool_name":"grep","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"unknown":{"keep":true}},{"type":"text","text":"keep"}],"unknown":{"keep":true}}],"unknown":{"keep":true}}`)
+	}
+	payload.WriteString(`],"after":2}`)
+	return []byte(payload.String())
+}
+
+func buildLargeClaudeOAuthToolNameResponse(messageCount int) []byte {
+	var payload strings.Builder
+	payload.Grow(messageCount * 180)
+	payload.WriteString(`{"before":1,"content":[`)
+	for index := 0; index < messageCount; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		marker := strconv.Itoa(index)
+		payload.WriteString(`{"type":"tool_use","name":"Bash","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"unknown":{"keep":true}},{"type":"tool_reference","tool_name":"Glob","marker":`)
+		payload.WriteString(marker)
+		payload.WriteString(`,"unknown":{"keep":true}}`)
+	}
+	payload.WriteString(`],"after":2}`)
+	return []byte(payload.String())
+}
+
+func TestNormalizeClaudeEmptyToolResultsLargePreservesOrderAndInput(t *testing.T) {
+	const parts = 1024
+	input := buildLargeClaudeEmptyToolResultsPayload(parts)
+	original := append([]byte(nil), input...)
+
+	out, repairs, err := normalizeClaudeEmptyToolResults(input)
+	if err != nil {
+		t.Fatalf("normalizeClaudeEmptyToolResults() error = %v", err)
+	}
+	if repairs != parts {
+		t.Fatalf("repairs = %d, want %d", repairs, parts)
+	}
+	if !bytes.Equal(input, original) {
+		t.Fatal("normalizeClaudeEmptyToolResults mutated its input")
+	}
+	content := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(content) != parts {
+		t.Fatalf("content length = %d, want %d", len(content), parts)
+	}
+	for _, index := range []int{0, parts / 2, parts - 1} {
+		if got := content[index].Get("marker").Int(); got != int64(index) {
+			t.Fatalf("content[%d].marker = %d, want %d", index, got, index)
+		}
+		if !content[index].Get("unknown.keep").Bool() {
+			t.Fatalf("content[%d] lost unknown field: %s", index, content[index].Raw)
+		}
+	}
+	outText := string(out)
+	if before, messages, after := strings.Index(outText, `"before"`), strings.Index(outText, `"messages"`), strings.Index(outText, `"after"`); !(before < messages && messages < after) {
+		t.Fatalf("root field order changed: %s", out)
+	}
+	first := content[0].Raw
+	if marker, toolContent, unknown := strings.Index(first, `"marker"`), strings.Index(first, `"content"`), strings.Index(first, `"unknown"`); !(marker < toolContent && toolContent < unknown) {
+		t.Fatalf("content field order changed: %s", first)
+	}
+}
+
+func BenchmarkPayloadGrowthClaudeEmptyToolResults(b *testing.B) {
+	for _, parts := range []int{128, 512, 2048} {
+		b.Run(strconv.Itoa(parts), func(b *testing.B) {
+			input := buildLargeClaudeEmptyToolResultsPayload(parts)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for range b.N {
+				_, repairs, err := normalizeClaudeEmptyToolResults(input)
+				if err != nil || repairs != parts {
+					b.Fatalf("repairs = %d, err = %v", repairs, err)
+				}
+			}
+		})
+	}
+}
+
+func buildLargeClaudeEmptyToolResultsPayload(parts int) []byte {
+	var payload strings.Builder
+	payload.Grow(parts * 120)
+	payload.WriteString(`{"before":1,"messages":[{"role":"user","content":[`)
+	for index := 0; index < parts; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"type":"tool_result","tool_use_id":"call_`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`","marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`,"content":[],"unknown":{"keep":true}}`)
+	}
+	payload.WriteString(`]}],"after":2}`)
+	return []byte(payload.String())
+}
+
+func TestEnforceCacheControlLimitLargePreservesPriorityAndInput(t *testing.T) {
+	const (
+		systemBlocks  = 400
+		toolBlocks    = 300
+		messageBlocks = 324
+	)
+	input := buildLargeClaudeCacheControlPayload(systemBlocks, toolBlocks, messageBlocks)
+	original := append([]byte(nil), input...)
+
+	out := enforceCacheControlLimit(input, 4)
+	if !bytes.Equal(input, original) {
+		t.Fatal("enforceCacheControlLimit mutated its input")
+	}
+	if got := countCacheControls(out); got != 4 {
+		t.Fatalf("cache controls = %d, want 4", got)
+	}
+	if gjson.GetBytes(out, "system.0.cache_control").Exists() || !gjson.GetBytes(out, "system.399.cache_control").Exists() {
+		t.Fatalf("system deletion priority changed: %s", gjson.GetBytes(out, "system").Raw)
+	}
+	if gjson.GetBytes(out, "tools.0.cache_control").Exists() || !gjson.GetBytes(out, "tools.299.cache_control").Exists() {
+		t.Fatalf("tool deletion priority changed: %s", gjson.GetBytes(out, "tools").Raw)
+	}
+	if gjson.GetBytes(out, "messages.0.content.321.cache_control").Exists() || !gjson.GetBytes(out, "messages.0.content.322.cache_control").Exists() {
+		t.Fatalf("message deletion priority changed near cutoff: %s", gjson.GetBytes(out, "messages.0.content").Raw)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.323.unknown.marker").Int(); got != 323 {
+		t.Fatalf("unknown field marker = %d, want 323", got)
+	}
+	outText := string(out)
+	if before, tools, system, messages, after := strings.Index(outText, `"before"`), strings.Index(outText, `"tools"`), strings.Index(outText, `"system"`), strings.Index(outText, `"messages"`), strings.Index(outText, `"after"`); !(before < tools && tools < system && system < messages && messages < after) {
+		t.Fatalf("root field order changed")
+	}
+}
+
+func BenchmarkPayloadGrowthClaudeCacheControlLimit1024(b *testing.B) {
+	input := buildLargeClaudeCacheControlPayload(400, 300, 324)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	var out []byte
+	for range b.N {
+		out = enforceCacheControlLimit(input, 4)
+	}
+	if got := countCacheControls(out); got != 4 {
+		b.Fatalf("cache controls = %d, want 4", got)
+	}
+}
+
+func buildLargeClaudeCacheControlPayload(systemBlocks, toolBlocks, messageBlocks int) []byte {
+	var payload strings.Builder
+	payload.Grow((systemBlocks + toolBlocks + messageBlocks) * 110)
+	payload.WriteString(`{"before":1,"tools":[`)
+	for index := 0; index < toolBlocks; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"name":"tool_`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`","unknown":{"marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`},"cache_control":{"type":"ephemeral","ttl":"1h"}}`)
+	}
+	payload.WriteString(`],"system":[`)
+	for index := 0; index < systemBlocks; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"type":"text","text":"system","unknown":{"marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`},"cache_control":{"type":"ephemeral","ttl":"1h"}}`)
+	}
+	payload.WriteString(`],"messages":[{"role":"user","content":[`)
+	for index := 0; index < messageBlocks; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"type":"text","text":"message","unknown":{"marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		payload.WriteString(`},"cache_control":{"type":"ephemeral","ttl":"1h"}}`)
+	}
+	payload.WriteString(`]}],"after":2}`)
+	return []byte(payload.String())
 }

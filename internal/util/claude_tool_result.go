@@ -1,8 +1,8 @@
 package util
 
 import (
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ClaudeToolResultImage represents a base64-encoded image extracted from a Claude
@@ -52,9 +52,7 @@ func ConvertClaudeToolResultContent(content gjson.Result) ClaudeToolResult {
 		return ClaudeToolResult{Result: content.String()}
 	case content.IsArray():
 		var images []ClaudeToolResultImage
-		nonImageCount := 0
-		lastNonImageRaw := ""
-		filtered := []byte(`[]`)
+		nonImages := make([][]byte, 0, len(content.Array()))
 		content.ForEach(func(_, block gjson.Result) bool {
 			if isClaudeBase64Image(block) {
 				if img, ok := claudeImageFromBlock(block); ok {
@@ -62,18 +60,16 @@ func ConvertClaudeToolResultContent(content gjson.Result) ClaudeToolResult {
 				}
 				return true
 			}
-			nonImageCount++
-			lastNonImageRaw = block.Raw
-			filtered, _ = sjson.SetRawBytes(filtered, "-1", []byte(block.Raw))
+			nonImages = append(nonImages, []byte(block.Raw))
 			return true
 		})
-		switch {
-		case nonImageCount == 1:
-			return ClaudeToolResult{Result: lastNonImageRaw, ResultIsRaw: true, Images: images}
-		case nonImageCount > 1:
-			return ClaudeToolResult{Result: string(filtered), ResultIsRaw: true, Images: images}
-		default:
+		switch len(nonImages) {
+		case 1:
+			return ClaudeToolResult{Result: string(nonImages[0]), ResultIsRaw: true, Images: images}
+		case 0:
 			return ClaudeToolResult{Images: images}
+		default:
+			return ClaudeToolResult{Result: string(internalpayload.BuildRaw(nonImages)), ResultIsRaw: true, Images: images}
 		}
 	case content.IsObject():
 		if isClaudeBase64Image(content) {

@@ -15,8 +15,15 @@ import (
 
 var (
 	proxyTransportCache sync.Map
-	defaultTransport    = proxyutil.NewDefaultTransport()
+	defaultTransport    = executorTransport(proxyutil.NewDefaultTransport())
 )
+
+func executorTransport(transport *http.Transport) *http.Transport {
+	if transport != nil {
+		transport.DisableCompression = true
+	}
+	return transport
+}
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
@@ -92,6 +99,7 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 		log.Errorf("%v", errBuild)
 		return nil
 	}
+	transport = executorTransport(transport)
 	actual, _ := proxyTransportCache.LoadOrStore(proxyURL, transport)
 	cached, ok := actual.(*http.Transport)
 	if ok && cached != nil {

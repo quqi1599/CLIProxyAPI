@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -37,10 +41,35 @@ const (
 	wsDoneMarker         = "[DONE]"
 	wsTurnStateHeader    = "x-codex-turn-state"
 	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
+
+	responsesWebsocketMaxInputItems       = 4096
+	responsesWebsocketTimelineMaxEvents   = 4096
+	responsesWebsocketTimelineMaxBytes    = 64 << 20
+	responsesWebsocketMaxConnections      = 128
+	responsesWebsocketMaxConnectionsPerIP = 16
+	responsesWebsocketFrameBudgetBytes    = 128 << 20
+	responsesWebsocketRetainedBudgetBytes = 128 << 20
+	responsesWebsocketReadChunkBytes      = 32 << 10
+	websocketTimelineTruncationReserve    = 256
+	websocketTimelineTruncationEventType  = "timeline_truncated"
+
+	responsesWebsocketConnectionLimitCode      = "responses_websocket_connection_limit"
+	responsesWebsocketConnectionLimitPerIPCode = "responses_websocket_connection_limit_per_ip"
+	responsesWebsocketFrameCapacityCode        = "responses_websocket_frame_capacity"
+	responsesWebsocketFrameTooLargeCode        = "responses_websocket_frame_too_large"
+	responsesWebsocketRetainedCapacityCode     = "responses_websocket_retained_capacity"
 )
 
-var responsesWebsocketReadLimit int64 = 32 << 20 // 32 MiB
+var responsesWebsocketReadLimit int64 = responsesWebsocketFrameBudgetBytes
 var responsesWebsocketTranscriptReplayLimitBytes = 64 << 20
+
+var (
+	errResponsesWebsocketInputNotArray     = errors.New("websocket request requires array field: input")
+	errResponsesWebsocketInputTooManyItems = errors.New("websocket input item limit exceeded")
+	errResponsesWebsocketFrameCapacity     = errors.New("responses websocket frame capacity exhausted")
+	errResponsesWebsocketFrameTooLarge     = errors.New("responses websocket frame too large")
+	errResponsesWebsocketRetainedCapacity  = errors.New("responses websocket retained capacity exhausted")
+)
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -48,6 +77,308 @@ var responsesWebsocketUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+type responsesWebsocketConnectionLimiter struct {
+	mu       sync.Mutex
+	maxTotal int
+	maxPerIP int
+	total    int
+	byIP     map[string]int
+}
+
+type responsesWebsocketConnectionLease struct {
+	limiter *responsesWebsocketConnectionLimiter
+	peerIP  string
+	once    sync.Once
+}
+
+type responsesWebsocketFrameLimiter struct {
+	mu       sync.Mutex
+	maxBytes int64
+	inUse    int64
+	peak     int64
+}
+
+type responsesWebsocketFrameLease struct {
+	limiter  *responsesWebsocketFrameLimiter
+	mu       sync.Mutex
+	weight   int64
+	released bool
+}
+
+func newResponsesWebsocketConnectionLimiter(maxTotal, maxPerIP int) *responsesWebsocketConnectionLimiter {
+	if maxTotal <= 0 {
+		maxTotal = responsesWebsocketMaxConnections
+	}
+	if maxPerIP <= 0 {
+		maxPerIP = responsesWebsocketMaxConnectionsPerIP
+	}
+	if maxPerIP > maxTotal {
+		maxPerIP = maxTotal
+	}
+	return &responsesWebsocketConnectionLimiter{
+		maxTotal: maxTotal,
+		maxPerIP: maxPerIP,
+		byIP:     make(map[string]int),
+	}
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketConnectionLimiter() *responsesWebsocketConnectionLimiter {
+	if h == nil {
+		return nil
+	}
+	h.responsesWebsocketLimiterOnce.Do(func() {
+		if h.responsesWebsocketLimiter == nil {
+			h.responsesWebsocketLimiter = newResponsesWebsocketConnectionLimiter(0, 0)
+		}
+	})
+	return h.responsesWebsocketLimiter
+}
+
+func (l *responsesWebsocketConnectionLimiter) acquire(peerIP string) (*responsesWebsocketConnectionLease, string) {
+	if l == nil {
+		return nil, responsesWebsocketConnectionLimitCode
+	}
+	peerIP = strings.TrimSpace(peerIP)
+	if peerIP == "" {
+		peerIP = "unknown"
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.total >= l.maxTotal {
+		return nil, responsesWebsocketConnectionLimitCode
+	}
+	if l.byIP[peerIP] >= l.maxPerIP {
+		return nil, responsesWebsocketConnectionLimitPerIPCode
+	}
+	l.total++
+	l.byIP[peerIP]++
+	return &responsesWebsocketConnectionLease{limiter: l, peerIP: peerIP}, ""
+}
+
+func (l *responsesWebsocketConnectionLease) release() {
+	if l == nil || l.limiter == nil {
+		return
+	}
+	l.once.Do(func() {
+		limiter := l.limiter
+		limiter.mu.Lock()
+		if limiter.total > 0 {
+			limiter.total--
+		}
+		if count := limiter.byIP[l.peerIP]; count <= 1 {
+			delete(limiter.byIP, l.peerIP)
+		} else {
+			limiter.byIP[l.peerIP] = count - 1
+		}
+		limiter.mu.Unlock()
+	})
+}
+
+func newResponsesWebsocketFrameLimiter(maxBytes int64) *responsesWebsocketFrameLimiter {
+	if maxBytes <= 0 {
+		maxBytes = responsesWebsocketFrameBudgetBytes
+	}
+	return &responsesWebsocketFrameLimiter{maxBytes: maxBytes}
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketFrameTransformLimiter() *responsesWebsocketFrameLimiter {
+	if h == nil {
+		return nil
+	}
+	h.responsesWebsocketFrameLimiterOnce.Do(func() {
+		if h.responsesWebsocketFrameLimiter == nil {
+			h.responsesWebsocketFrameLimiter = newResponsesWebsocketFrameLimiter(0)
+		}
+	})
+	return h.responsesWebsocketFrameLimiter
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketRetainedStateLimiter() *responsesWebsocketFrameLimiter {
+	if h == nil {
+		return nil
+	}
+	h.responsesWebsocketRetainedLimiterOnce.Do(func() {
+		if h.responsesWebsocketRetainedLimiter == nil {
+			h.responsesWebsocketRetainedLimiter = newResponsesWebsocketFrameLimiter(responsesWebsocketRetainedBudgetBytes)
+		}
+	})
+	return h.responsesWebsocketRetainedLimiter
+}
+
+func (l *responsesWebsocketFrameLimiter) acquire(weight int64) *responsesWebsocketFrameLease {
+	if l == nil || weight < 0 {
+		return nil
+	}
+	lease := &responsesWebsocketFrameLease{limiter: l}
+	if !lease.resize(weight) {
+		return nil
+	}
+	return lease
+}
+
+func (l *responsesWebsocketFrameLease) resize(weight int64) bool {
+	if l == nil || l.limiter == nil || weight < 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return false
+	}
+
+	limiter := l.limiter
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	delta := weight - l.weight
+	if delta > 0 && (delta > limiter.maxBytes || limiter.inUse > limiter.maxBytes-delta) {
+		return false
+	}
+	limiter.inUse += delta
+	if limiter.inUse > limiter.peak {
+		limiter.peak = limiter.inUse
+	}
+	l.weight = weight
+	return true
+}
+
+func (l *responsesWebsocketFrameLease) release() {
+	if l == nil || l.limiter == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return
+	}
+	l.released = true
+	limiter := l.limiter
+	limiter.mu.Lock()
+	limiter.inUse -= l.weight
+	if limiter.inUse < 0 {
+		limiter.inUse = 0
+	}
+	limiter.mu.Unlock()
+	l.weight = 0
+}
+
+func responsesWebsocketPeerIP(req *http.Request) string {
+	if req == nil {
+		return "unknown"
+	}
+	remoteAddr := strings.TrimSpace(req.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String()
+		}
+		return strings.ToLower(host)
+	}
+	if ip := net.ParseIP(strings.Trim(remoteAddr, "[]")); ip != nil {
+		return ip.String()
+	}
+	if remoteAddr == "" {
+		return "unknown"
+	}
+	return strings.ToLower(remoteAddr)
+}
+
+func writeResponsesWebsocketConnectionLimit(c *gin.Context, code string) {
+	message := "responses websocket connection limit reached"
+	if code == responsesWebsocketConnectionLimitPerIPCode {
+		message = "responses websocket connection limit reached for client IP"
+	}
+	c.Header("Retry-After", "1")
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+		Message: message,
+		Type:    "rate_limit_error",
+		Code:    code,
+	}})
+}
+
+func readResponsesWebsocketFrame(reader io.Reader, limit int64, lease *responsesWebsocketFrameLease) ([]byte, error) {
+	if reader == nil || limit <= 0 || lease == nil {
+		return nil, errResponsesWebsocketFrameTooLarge
+	}
+	payload := make([]byte, 0, min(limit, int64(responsesWebsocketReadChunkBytes)))
+	chunk := make([]byte, responsesWebsocketReadChunkBytes)
+	emptyReads := 0
+	for int64(len(payload)) < limit {
+		remaining := limit - int64(len(payload))
+		readBuffer := chunk
+		if remaining < int64(len(readBuffer)) {
+			readBuffer = readBuffer[:remaining]
+		}
+		n, errRead := reader.Read(readBuffer)
+		if n > 0 {
+			emptyReads = 0
+			targetBytes := int64(len(payload) + n)
+			if !lease.resize(targetBytes) {
+				return nil, errResponsesWebsocketFrameCapacity
+			}
+			payload = append(payload, readBuffer[:n]...)
+		} else if errRead == nil {
+			emptyReads++
+			if emptyReads >= 100 {
+				return nil, io.ErrNoProgress
+			}
+		}
+		if errRead != nil {
+			if errors.Is(errRead, io.EOF) {
+				return payload, nil
+			}
+			if strings.Contains(strings.ToLower(errRead.Error()), "read limit") {
+				return nil, errResponsesWebsocketFrameTooLarge
+			}
+			return nil, errRead
+		}
+	}
+
+	var probe [1]byte
+	n, errRead := reader.Read(probe[:])
+	if n > 0 {
+		return nil, errResponsesWebsocketFrameTooLarge
+	}
+	if errRead != nil && !errors.Is(errRead, io.EOF) {
+		if strings.Contains(strings.ToLower(errRead.Error()), "read limit") {
+			return nil, errResponsesWebsocketFrameTooLarge
+		}
+		return nil, errRead
+	}
+	return payload, nil
+}
+
+func writeResponsesWebsocketFrameCapacityError(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender) error {
+	payload := []byte(`{"type":"error","status":503,"error":{"message":"responses websocket frame capacity exhausted","type":"server_error","code":"responses_websocket_frame_capacity"}}`)
+	if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now()); errWrite != nil {
+		return errWrite
+	}
+	return conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseTryAgainLater, responsesWebsocketFrameCapacityCode),
+		time.Now().Add(time.Second),
+	)
+}
+
+func writeResponsesWebsocketRetainedCapacityError(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender) error {
+	payload := []byte(`{"type":"error","status":503,"error":{"message":"responses websocket retained capacity exhausted","type":"server_error","code":"responses_websocket_retained_capacity"}}`)
+	if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payload, time.Now()); errWrite != nil {
+		return errWrite
+	}
+	return conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseTryAgainLater, responsesWebsocketRetainedCapacityCode),
+		time.Now().Add(time.Second),
+	)
+}
+
+func writeResponsesWebsocketFrameTooLargeClose(conn *websocket.Conn) error {
+	return conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseMessageTooBig, responsesWebsocketFrameTooLargeCode),
+		time.Now().Add(time.Second),
+	)
 }
 
 type websocketTimelineAppender interface {
@@ -59,8 +390,11 @@ type websocketTimelineLog struct {
 	source  *requestlogging.FileBodySource
 	builder *strings.Builder
 
-	currentPart       io.WriteCloser
-	currentPartHasLog bool
+	eventCount int
+	byteCount  int
+	truncated  bool
+	maxEvents  int
+	maxBytes   int
 }
 
 func newWebsocketTimelineLog(enabled bool, source *requestlogging.FileBodySource) *websocketTimelineLog {
@@ -71,15 +405,19 @@ func newWebsocketTimelineLog(enabled bool, source *requestlogging.FileBodySource
 		return newInMemoryWebsocketTimelineLog()
 	}
 	return &websocketTimelineLog{
-		enabled: true,
-		source:  source,
+		enabled:   true,
+		source:    source,
+		maxEvents: responsesWebsocketTimelineMaxEvents,
+		maxBytes:  responsesWebsocketTimelineMaxBytes,
 	}
 }
 
 func newInMemoryWebsocketTimelineLog() *websocketTimelineLog {
 	return &websocketTimelineLog{
-		enabled: true,
-		builder: &strings.Builder{},
+		enabled:   true,
+		builder:   &strings.Builder{},
+		maxEvents: responsesWebsocketTimelineMaxEvents,
+		maxBytes:  responsesWebsocketTimelineMaxBytes,
 	}
 }
 
@@ -99,51 +437,41 @@ func websocketTimelineSourceFromContext(c *gin.Context) *requestlogging.FileBody
 }
 
 func (l *websocketTimelineLog) BeginRequest() {
-	if l == nil || !l.enabled || l.source == nil {
-		return
-	}
-	l.closeCurrentPart()
-	part, errCreate := l.source.CreatePart("request")
-	if errCreate != nil {
-		log.WithError(errCreate).Warn("failed to create websocket request detail log")
-		return
-	}
-	l.currentPart = part
-	l.currentPartHasLog = false
+	// Events share one append-only FileBodySource part for the session. Keeping
+	// this method preserves request-boundary call sites without creating a temp
+	// file for every websocket frame.
 }
 
 func (l *websocketTimelineLog) Append(eventType string, payload []byte, timestamp time.Time) {
-	if l == nil || !l.enabled {
+	if l == nil || !l.enabled || l.truncated {
 		return
 	}
-	data := formatWebsocketTimelineEvent(eventType, payload, timestamp)
-	if len(data) == 0 {
+	payloadMetadata := websocketTimelinePayloadMetadata(payload)
+	if len(payloadMetadata) == 0 {
 		return
 	}
-	if l.source != nil {
-		if l.currentPart == nil {
-			l.BeginRequest()
-		}
-		if l.currentPart == nil {
-			return
-		}
-		if errWrite := writeWebsocketTimelinePart(l.currentPart, data, l.currentPartHasLog); errWrite != nil {
-			log.WithError(errWrite).Warn("failed to write websocket request detail log")
-			return
-		}
-		l.currentPartHasLog = true
+	timestampText := timestamp.Format(time.RFC3339Nano)
+	separatorBytes := 0
+	if l.byteCount > 0 {
+		separatorBytes = 1
+	}
+	dataByteLimit := l.maxBytes - min(l.maxBytes, websocketTimelineTruncationReserve)
+	dataBytes := websocketTimelineEventSize(eventType, payloadMetadata, timestampText)
+	if l.eventCount >= l.maxEvents || l.byteCount+separatorBytes+dataBytes > dataByteLimit {
+		l.appendTruncationMarker(timestamp)
 		return
 	}
-	if l.builder != nil {
-		writeWebsocketTimelineBuilder(l.builder, data)
+	data := formatWebsocketTimelineEventParts(eventType, payloadMetadata, timestampText, dataBytes)
+	if !l.write(data) {
+		return
 	}
+	l.eventCount++
 }
 
 func (l *websocketTimelineLog) SetContext(c *gin.Context) {
 	if l == nil || !l.enabled {
 		return
 	}
-	l.closeCurrentPart()
 	if l.source != nil {
 		if l.source.HasPayload() {
 			c.Set(requestlogging.WebsocketTimelineSourceContextKey, l.source)
@@ -162,7 +490,6 @@ func (l *websocketTimelineLog) String() string {
 	if l == nil || !l.enabled {
 		return ""
 	}
-	l.closeCurrentPart()
 	if l.source != nil {
 		data, errRead := l.source.Bytes()
 		if errRead != nil {
@@ -176,28 +503,56 @@ func (l *websocketTimelineLog) String() string {
 	return l.builder.String()
 }
 
-func (l *websocketTimelineLog) closeCurrentPart() {
-	if l == nil || l.currentPart == nil {
+func (l *websocketTimelineLog) appendTruncationMarker(timestamp time.Time) {
+	if l == nil || l.truncated {
 		return
 	}
-	if errClose := l.currentPart.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close websocket request detail log")
+	l.truncated = true
+	marker := formatWebsocketTimelineEvent(
+		websocketTimelineTruncationEventType,
+		[]byte(`{"reason":"session_budget_exceeded"}`),
+		timestamp,
+	)
+	separatorBytes := 0
+	if l.byteCount > 0 {
+		separatorBytes = 1
 	}
-	l.currentPart = nil
-	l.currentPartHasLog = false
+	if len(marker) == 0 || l.byteCount+separatorBytes+len(marker) > l.maxBytes {
+		return
+	}
+	if l.write(marker) {
+		l.eventCount++
+	}
 }
 
-func writeWebsocketTimelinePart(w io.Writer, data []byte, prependNewline bool) error {
-	if w == nil || len(data) == 0 {
-		return nil
+func (l *websocketTimelineLog) write(data []byte) bool {
+	if l == nil || len(data) == 0 {
+		return false
 	}
-	if prependNewline {
-		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-			return errWrite
+	prependNewline := l.byteCount > 0
+	if l.source != nil {
+		if prependNewline {
+			if errWrite := l.source.AppendBytes([]byte("\n")); errWrite != nil {
+				log.WithError(errWrite).Warn("failed to write websocket request detail log separator")
+				return false
+			}
+			l.byteCount++
 		}
+		if errWrite := l.source.AppendBytes(data); errWrite != nil {
+			log.WithError(errWrite).Warn("failed to write websocket request detail log")
+			return false
+		}
+	} else if l.builder != nil {
+		if prependNewline {
+			l.builder.WriteByte('\n')
+			l.byteCount++
+		}
+		l.builder.Write(data)
+	} else {
+		return false
 	}
-	_, errWrite := w.Write(data)
-	return errWrite
+	l.byteCount += len(data)
+	return true
 }
 
 func writeWebsocketTimelineBuilder(builder *strings.Builder, data []byte) {
@@ -214,14 +569,26 @@ func writeWebsocketTimelineBuilder(builder *strings.Builder, data []byte) {
 // It accepts `response.create` and `response.append` requests and streams
 // response events back as JSON websocket text messages.
 func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+	frameReadLimit, _ := handlers.WebsocketPayloadBodyLimits(c, responsesWebsocketReadLimit)
+	frameReadLimit = min(frameReadLimit, int64(responsesWebsocketFrameBudgetBytes))
+	limiter := h.responsesWebsocketConnectionLimiter()
+	lease, limitCode := limiter.acquire(responsesWebsocketPeerIP(c.Request))
+	if lease == nil {
+		writeResponsesWebsocketConnectionLimit(c, limitCode)
+		return
+	}
+	defer lease.release()
+
 	conn, err := responsesWebsocketUpgrader.Upgrade(c.Writer, c.Request, websocketUpgradeHeaders(c.Request))
 	if err != nil {
 		return
 	}
-	conn.SetReadLimit(responsesWebsocketReadLimit)
+	conn.SetReadLimit(frameReadLimit + 1)
 	passthroughSessionID := uuid.NewString()
-	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
-	retainResponsesWebsocketToolCaches(downstreamSessionKey)
+	toolCacheKey := websocketDownstreamSessionKey(c.Request)
+	retainedLimiter := h.responsesWebsocketRetainedStateLimiter()
+	toolOutputCache := newWebsocketToolOutputCacheWithRetainedBudget(0, websocketToolOutputCacheMaxPerSession, websocketToolOutputCacheMaxBytes, retainedLimiter)
+	toolCallCache := newWebsocketToolOutputCacheWithRetainedBudget(0, websocketToolOutputCacheMaxPerSession, websocketToolOutputCacheMaxBytes, retainedLimiter)
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 
@@ -258,7 +625,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	var wsTerminateErr error
 	defer func() {
-		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
+		toolOutputCache.close()
+		toolCallCache.close()
 		if wsTerminateErr != nil {
 			appendWebsocketTimelineDisconnect(wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
@@ -277,6 +645,63 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
+	lastRequestLease := retainedLimiter.acquire(0)
+	lastResponseOutputLease := retainedLimiter.acquire(int64(len(lastResponseOutput)))
+	if lastRequestLease == nil || lastResponseOutputLease == nil {
+		lastRequestLease.release()
+		lastResponseOutputLease.release()
+		wsTerminateErr = errResponsesWebsocketRetainedCapacity
+		if errWrite := writeResponsesWebsocketRetainedCapacityError(conn, wsTimelineLog); errWrite != nil {
+			wsTerminateErr = errWrite
+		}
+		return
+	}
+	lastRequestRelease := func() {}
+	lastResponseOutputRelease := func() {}
+	defer func() {
+		lastRequestRelease()
+		lastResponseOutputRelease()
+		lastRequestLease.release()
+		lastResponseOutputLease.release()
+	}()
+	installLastRequest := func(next []byte, nextLease *responsesWebsocketFrameLease, nextRelease func()) {
+		lastRequestRelease()
+		lastRequestLease.release()
+		lastRequest = next
+		lastRequestLease = nextLease
+		lastRequestRelease = nextRelease
+	}
+	replaceLastRequest := func(next []byte) bool {
+		nextLease := retainedLimiter.acquire(int64(len(next)))
+		if nextLease == nil {
+			return false
+		}
+		nextRelease := internalpayload.RetainBytesScoped(next)
+		installLastRequest(next, nextLease, nextRelease)
+		return true
+	}
+	installLastResponseOutput := func(next []byte, nextLease *responsesWebsocketFrameLease, nextRelease func()) {
+		lastResponseOutputRelease()
+		lastResponseOutputLease.release()
+		lastResponseOutput = next
+		lastResponseOutputLease = nextLease
+		lastResponseOutputRelease = nextRelease
+	}
+	replaceLastResponseOutput := func(next []byte) bool {
+		nextLease := retainedLimiter.acquire(int64(len(next)))
+		if nextLease == nil {
+			return false
+		}
+		nextRelease := internalpayload.RetainBytesScoped(next)
+		installLastResponseOutput(next, nextLease, nextRelease)
+		return true
+	}
+	writeRetainedCapacityError := func() {
+		wsTerminateErr = errResponsesWebsocketRetainedCapacity
+		if errWrite := writeResponsesWebsocketRetainedCapacityError(conn, wsTimelineLog); errWrite != nil {
+			wsTerminateErr = errWrite
+		}
+	}
 	lastResponseID := ""
 	var lastResponsePendingToolCallIDs []string
 	pinnedAuthID := ""
@@ -291,28 +716,49 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return h.AuthManager.GetByID(authID)
 	}
 	forceTranscriptReplayNextRequest := false
+	var activeFrameLease *responsesWebsocketFrameLease
+	defer func() {
+		activeFrameLease.release()
+	}()
 
 	for {
-		msgType, payload, errReadMessage := conn.ReadMessage()
+		msgType, frameReader, errReadMessage := conn.NextReader()
 		if errReadMessage != nil {
 			wsTerminateErr = errReadMessage
 			if websocket.IsCloseError(errReadMessage, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
-				log.Infof("responses websocket: client disconnected id=%s error=%v", passthroughSessionID, errReadMessage)
-			} else {
-				// log.Warnf("responses websocket: read message failed id=%s error=%v", passthroughSessionID, errReadMessage)
+				log.Infof("responses websocket: client disconnected id=%s", passthroughSessionID)
 			}
 			return
 		}
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
-		// log.Infof(
-		// 	"responses websocket: downstream_in id=%s type=%d event=%s payload=%s",
-		// 	passthroughSessionID,
-		// 	msgType,
-		// 	websocketPayloadEventType(payload),
-		// 	websocketPayloadPreview(payload),
-		// )
+		frameLease := h.responsesWebsocketFrameTransformLimiter().acquire(0)
+		if frameLease == nil {
+			wsTerminateErr = errResponsesWebsocketFrameCapacity
+			if errWrite := writeResponsesWebsocketFrameCapacityError(conn, wsTimelineLog); errWrite != nil {
+				wsTerminateErr = errWrite
+			}
+			return
+		}
+		activeFrameLease = frameLease
+		payload, errReadFrame := readResponsesWebsocketFrame(frameReader, frameReadLimit, frameLease)
+		if errReadFrame != nil {
+			frameLease.release()
+			wsTerminateErr = errReadFrame
+			if errors.Is(errReadFrame, errResponsesWebsocketFrameCapacity) {
+				if errWrite := writeResponsesWebsocketFrameCapacityError(conn, wsTimelineLog); errWrite != nil {
+					wsTerminateErr = errWrite
+				}
+			} else if errors.Is(errReadFrame, errResponsesWebsocketFrameTooLarge) {
+				handlers.RecordWebsocketPayloadBodyWithLimit(c, frameReadLimit+1, frameReadLimit, true)
+				if errWrite := writeResponsesWebsocketFrameTooLargeClose(conn); errWrite != nil {
+					wsTerminateErr = errWrite
+				}
+			}
+			return
+		}
+		handlers.RecordWebsocketPayloadBodyWithLimit(c, int64(len(payload)), frameReadLimit, false)
 		wsTimelineLog.BeginRequest()
 		wsTimelineLog.Append("request", payload, time.Now())
 
@@ -358,9 +804,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
-			errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+			errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg, handlers.PassthroughHeadersEnabled(h.Cfg))
 			log.Infof(
-				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+				"responses websocket: downstream_out id=%s type=%d event=%s payload_metadata=%s",
 				passthroughSessionID,
 				websocket.TextMessage,
 				websocketPayloadEventType(errorPayload),
@@ -368,35 +814,65 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			)
 			if errWrite != nil {
 				log.Warnf(
-					"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+					"responses websocket: downstream_out write failed id=%s event=%s",
 					passthroughSessionID,
 					websocketPayloadEventType(errorPayload),
-					errWrite,
 				)
+				frameLease.release()
 				return
 			}
+			frameLease.release()
 			continue
 		}
 		if !useUpstreamWebsocketPassthrough && shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
+			updatedLastRequest = internalpayload.CloneBytes(requestJSON)
 			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
 				requestJSON = updated
 			}
 			if updated, errDelete := sjson.DeleteBytes(updatedLastRequest, "generate"); errDelete == nil {
 				updatedLastRequest = updated
 			}
-			lastRequest = updatedLastRequest
-			lastResponseOutput = []byte("[]")
+			if !replaceLastRequest(updatedLastRequest) || !replaceLastResponseOutput([]byte("[]")) {
+				writeRetainedCapacityError()
+				frameLease.release()
+				return
+			}
 			lastResponseID = ""
 			lastResponsePendingToolCallIDs = nil
 			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, wsTimelineLog, passthroughSessionID); errWrite != nil {
 				wsTerminateErr = errWrite
+				frameLease.release()
 				return
 			}
+			frameLease.release()
 			continue
 		}
 
-		previousLastRequest := bytes.Clone(lastRequest)
-		previousLastResponseOutput := bytes.Clone(lastResponseOutput)
+		previousLastRequest := []byte(nil)
+		previousLastResponseOutput := []byte(nil)
+		var previousLastRequestLease *responsesWebsocketFrameLease
+		var previousLastResponseOutputLease *responsesWebsocketFrameLease
+		releasePreviousLastRequest := func() {}
+		releasePreviousLastResponseOutput := func() {}
+		if !useUpstreamWebsocketPassthrough {
+			previousLastRequestLease = retainedLimiter.acquire(int64(len(lastRequest)))
+			previousLastResponseOutputLease = retainedLimiter.acquire(int64(len(lastResponseOutput)))
+			if previousLastRequestLease == nil || previousLastResponseOutputLease == nil {
+				previousLastRequestLease.release()
+				previousLastResponseOutputLease.release()
+				writeRetainedCapacityError()
+				frameLease.release()
+				return
+			}
+			previousLastRequest, releasePreviousLastRequest = internalpayload.CloneBytesScoped(lastRequest, "responses_websocket.rollback.last_request")
+			previousLastResponseOutput, releasePreviousLastResponseOutput = internalpayload.CloneBytesScoped(lastResponseOutput, "responses_websocket.rollback.last_response_output")
+		}
+		releasePreviousState := func() {
+			releasePreviousLastRequest()
+			releasePreviousLastResponseOutput()
+			previousLastRequestLease.release()
+			previousLastResponseOutputLease.release()
+		}
 		previousLastResponseID := lastResponseID
 		previousLastResponsePendingToolCallIDs := append([]string(nil), lastResponsePendingToolCallIDs...)
 		forcedTranscriptReplay := forceTranscriptReplayNextRequest
@@ -408,10 +884,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				forceTranscriptReplayNextRequest = false
 			}
 		} else {
-			requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
+			requestJSON = repairResponsesWebsocketToolCallsWithCaches(toolOutputCache, toolCallCache, toolCacheKey, requestJSON)
 			requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
-			updatedLastRequest = bytes.Clone(requestJSON)
-			lastRequest = updatedLastRequest
+			updatedLastRequestLease := retainedLimiter.acquire(int64(len(requestJSON)))
+			if updatedLastRequestLease == nil {
+				releasePreviousState()
+				writeRetainedCapacityError()
+				frameLease.release()
+				return
+			}
+			updatedLastRequest, updatedLastRequestRelease := internalpayload.CloneBytesScoped(requestJSON, "responses_websocket.last_request")
+			installLastRequest(updatedLastRequest, updatedLastRequestLease, updatedLastRequestRelease)
 			if forcedTranscriptReplay {
 				forceTranscriptReplayNextRequest = false
 			}
@@ -442,10 +925,26 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID)
+		completedOutputLease := retainedLimiter.acquire(int64(len([]byte("[]"))))
+		if completedOutputLease == nil {
+			cliCancel(errResponsesWebsocketRetainedCapacity)
+			releasePreviousState()
+			writeRetainedCapacityError()
+			frameLease.release()
+			return
+		}
+		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID, toolCallCache, toolCacheKey, completedOutputLease)
 		if errForward != nil {
+			releasePreviousState()
+			completedOutputLease.release()
+			if errors.Is(errForward, errResponsesWebsocketRetainedCapacity) {
+				writeRetainedCapacityError()
+				frameLease.release()
+				return
+			}
 			wsTerminateErr = errForward
-			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
+			log.Warnf("responses websocket: forward failed id=%s", passthroughSessionID)
+			frameLease.release()
 			return
 		}
 		if forwardErrMsg == nil && !useUpstreamWebsocketPassthrough && lastAttemptedAuthID != "" {
@@ -456,23 +955,43 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 		}
 		if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+			completedOutputLease.release()
 			pinnedAuthID = ""
 			forceTranscriptReplayNextRequest = true
 			if useUpstreamWebsocketPassthrough {
 				passthroughModelName = ""
 			} else {
+				lastRequestRelease()
+				lastResponseOutputRelease()
+				lastRequestLease.release()
+				lastResponseOutputLease.release()
 				lastRequest = previousLastRequest
+				lastRequestLease = previousLastRequestLease
+				previousLastRequestLease = nil
+				lastRequestRelease = releasePreviousLastRequest
+				releasePreviousLastRequest = func() {}
 				lastResponseOutput = previousLastResponseOutput
+				lastResponseOutputLease = previousLastResponseOutputLease
+				previousLastResponseOutputLease = nil
+				lastResponseOutputRelease = releasePreviousLastResponseOutput
+				releasePreviousLastResponseOutput = func() {}
 				lastResponseID = previousLastResponseID
 				lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			}
+			releasePreviousState()
+			frameLease.release()
 			continue
 		}
 		if !useUpstreamWebsocketPassthrough {
-			lastResponseOutput = completedOutput
+			installLastResponseOutput(completedOutput, completedOutputLease, internalpayload.RetainBytesScoped(completedOutput))
+			completedOutputLease = nil
 			lastResponseID = strings.TrimSpace(completedResponseID)
 			lastResponsePendingToolCallIDs = append([]string(nil), completedPendingToolCallIDs...)
+		} else {
+			completedOutputLease.release()
 		}
+		releasePreviousState()
+		frameLease.release()
 	}
 }
 
@@ -510,6 +1029,12 @@ func normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON []byte, lastRe
 }
 
 func normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	if !json.Valid(rawJSON) {
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("invalid websocket request JSON"),
+		}
+	}
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	switch requestType {
 	case wsRequestTypeCreate:
@@ -532,11 +1057,14 @@ func normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON []byte, last
 func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
+		normalized = internalpayload.CloneBytes(rawJSON)
 	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	if !gjson.GetBytes(normalized, "input").Exists() {
+	input := gjson.GetBytes(normalized, "input")
+	if !input.Exists() {
 		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
+	} else if _, errScan := scanResponsesWebsocketInput(input); errScan != nil {
+		return nil, nil, responsesWebsocketInputError(errScan)
 	}
 
 	modelName := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
@@ -546,7 +1074,7 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 			Error:      fmt.Errorf("missing model in response.create request"),
 		}
 	}
-	return normalized, bytes.Clone(normalized), nil
+	return normalized, normalized, nil
 }
 
 func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
@@ -558,20 +1086,21 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	}
 
 	nextInput := gjson.GetBytes(rawJSON, "input")
-	if !nextInput.Exists() || !nextInput.IsArray() {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("websocket request requires array field: input"),
-		}
+	if !nextInput.Exists() {
+		return nil, lastRequest, responsesWebsocketInputError(errResponsesWebsocketInputNotArray)
+	}
+	nextInputSummary, errScanInput := scanResponsesWebsocketInput(nextInput)
+	if errScanInput != nil {
+		return nil, lastRequest, responsesWebsocketInputError(errScanInput)
 	}
 
 	// Compaction can cause clients to replace local websocket history with a new
 	// compact transcript on the next `response.create`. When the input already
 	// contains historical model output items, treating it as an incremental append
 	// duplicates stale turn-state and can leave late orphaned function_call items.
-	if shouldReplaceWebsocketTranscript(rawJSON, nextInput) {
+	if shouldReplaceWebsocketTranscriptFromSummary(rawJSON, nextInputSummary) {
 		normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
-		return normalized, bytes.Clone(normalized), nil
+		return normalized, normalized, nil
 	}
 
 	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
@@ -579,16 +1108,16 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	if allowIncrementalInputWithPreviousResponseID {
 		prev := strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String())
 		if prev == "" {
-			if !inputSatisfiesPendingToolCalls(nextInput, lastResponsePendingToolCallIDs) {
+			if !nextInputSummary.satisfiesPendingToolCalls(lastResponsePendingToolCallIDs) {
 				normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
-				return normalized, bytes.Clone(normalized), nil
+				return normalized, normalized, nil
 			}
 			prev = strings.TrimSpace(lastResponseID)
 		}
 		if prev != "" {
 			normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 			if errDelete != nil {
-				normalized = bytes.Clone(rawJSON)
+				normalized = internalpayload.CloneBytes(rawJSON)
 			}
 			normalized, _ = sjson.SetBytes(normalized, "previous_response_id", prev)
 			if !gjson.GetBytes(normalized, "model").Exists() {
@@ -604,7 +1133,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 				}
 			}
 			normalized, _ = sjson.SetBytes(normalized, "stream", true)
-			return normalized, bytes.Clone(normalized), nil
+			return normalized, normalized, nil
 		}
 	}
 
@@ -614,13 +1143,16 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	// function_call / function_call_output pairings.
 	// See: https://github.com/router-for-me/CLIProxyAPI/issues/2207
 	var mergedInput string
-	if allowCompactionReplayBypass && inputContainsFullTranscript(nextInput) {
-		log.Infof("responses websocket: full transcript detected, skipping stale merge (input items=%d)", len(nextInput.Array()))
+	if allowCompactionReplayBypass && nextInputSummary.containsFullTranscript {
+		log.Infof("responses websocket: full transcript detected, skipping stale merge (input items=%d)", nextInputSummary.count)
 		mergedInput = nextInput.Raw
+		if dedupedInput, errDedupeInput := dedupeResponsesWebsocketInput(mergedInput); errDedupeInput == nil {
+			mergedInput = dedupedInput
+		}
 	} else {
 		appendInputRaw := nextInput.Raw
-		if inputContainsFullTranscript(nextInput) {
-			appendInputRaw = inputWithoutCompactionItems(nextInput)
+		if nextInputSummary.containsFullTranscript {
+			appendInputRaw = nextInputSummary.withoutCompactionItems()
 		}
 
 		existingInput := gjson.GetBytes(lastRequest, "input")
@@ -636,29 +1168,16 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 			}
 		}
 		var errMerge error
-		mergedInput, errMerge = mergeJSONArrayRaw(existingInputRaw, normalizedLastResponseOutput)
+		mergedInput, errMerge = mergeAndDedupeResponsesWebsocketInputs(existingInputRaw, normalizedLastResponseOutput, appendInputRaw)
 		if errMerge != nil {
-			return nil, lastRequest, &interfaces.ErrorMessage{
-				StatusCode: http.StatusBadRequest,
-				Error:      fmt.Errorf("invalid previous response output: %w", errMerge),
+			if errors.Is(errMerge, errResponsesWebsocketInputTooManyItems) {
+				return nil, lastRequest, responsesWebsocketInputError(errMerge)
 			}
-		}
-
-		mergedInput, errMerge = mergeJSONArrayRaw(mergedInput, appendInputRaw)
-		if errMerge != nil {
 			return nil, lastRequest, &interfaces.ErrorMessage{
 				StatusCode: http.StatusBadRequest,
 				Error:      fmt.Errorf("invalid request input: %w", errMerge),
 			}
 		}
-	}
-	dedupedInput, errDedupeFunctionCalls := dedupeFunctionCallsByCallID(mergedInput)
-	if errDedupeFunctionCalls == nil {
-		mergedInput = dedupedInput
-	}
-	dedupedInput, errDedupeItemIDs := dedupeInputItemsByID(mergedInput)
-	if errDedupeItemIDs == nil {
-		mergedInput = dedupedInput
 	}
 	if len(mergedInput) > responsesWebsocketTranscriptReplayLimitBytes {
 		return nil, lastRequest, &interfaces.ErrorMessage{
@@ -672,7 +1191,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
+		normalized = internalpayload.CloneBytes(rawJSON)
 	}
 	normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
 	var errSet error
@@ -696,10 +1215,98 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	return normalized, bytes.Clone(normalized), nil
+	return normalized, normalized, nil
 }
 
-func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bool {
+type responsesWebsocketInputItem struct {
+	raw      string
+	itemType string
+	role     string
+	id       string
+	callID   string
+}
+
+type responsesWebsocketInputSummary struct {
+	items                    []responsesWebsocketInputItem
+	count                    int
+	hasTranscriptReplacement bool
+	containsFullTranscript   bool
+	outputCallIDs            map[string]struct{}
+}
+
+func scanResponsesWebsocketInput(input gjson.Result) (responsesWebsocketInputSummary, error) {
+	if !input.IsArray() {
+		return responsesWebsocketInputSummary{}, errResponsesWebsocketInputNotArray
+	}
+
+	summary := responsesWebsocketInputSummary{
+		items: make([]responsesWebsocketInputItem, 0, min(responsesWebsocketMaxInputItems, 16)),
+	}
+	var scanErr error
+	input.ForEach(func(_, value gjson.Result) bool {
+		summary.count++
+		if summary.count > responsesWebsocketMaxInputItems {
+			scanErr = errResponsesWebsocketInputTooManyItems
+			return false
+		}
+
+		fields := gjson.GetMany(value.Raw, "type", "role", "id", "call_id")
+		item := responsesWebsocketInputItem{
+			raw:      value.Raw,
+			itemType: strings.TrimSpace(fields[0].String()),
+			role:     strings.TrimSpace(fields[1].String()),
+			id:       strings.TrimSpace(fields[2].String()),
+			callID:   strings.TrimSpace(fields[3].String()),
+		}
+		summary.items = append(summary.items, item)
+
+		switch item.itemType {
+		case "function_call", "custom_tool_call":
+			summary.hasTranscriptReplacement = true
+		case "message":
+			if item.role == "assistant" {
+				summary.hasTranscriptReplacement = true
+			}
+		case "compaction", "compaction_summary":
+			summary.containsFullTranscript = true
+		case "function_call_output", "custom_tool_call_output":
+			if item.callID != "" {
+				if summary.outputCallIDs == nil {
+					summary.outputCallIDs = make(map[string]struct{})
+				}
+				summary.outputCallIDs[item.callID] = struct{}{}
+			}
+		}
+		return true
+	})
+	return summary, scanErr
+}
+
+func scanResponsesWebsocketRawArray(raw string) (responsesWebsocketInputSummary, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = "[]"
+	}
+	if !gjson.Valid(raw) {
+		return responsesWebsocketInputSummary{}, fmt.Errorf("invalid JSON array")
+	}
+	return scanResponsesWebsocketInput(gjson.Parse(raw))
+}
+
+func responsesWebsocketInputError(err error) *interfaces.ErrorMessage {
+	if errors.Is(err, errResponsesWebsocketInputTooManyItems) {
+		return &interfaces.ErrorMessage{
+			StatusCode: http.StatusRequestEntityTooLarge,
+			Error:      fmt.Errorf("websocket input exceeds %d items", responsesWebsocketMaxInputItems),
+		}
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errResponsesWebsocketInputNotArray,
+	}
+}
+
+func shouldReplaceWebsocketTranscriptFromSummary(rawJSON []byte, summary responsesWebsocketInputSummary) bool {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return false
@@ -707,58 +1314,74 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" {
 		return false
 	}
-	if !nextInput.Exists() || !nextInput.IsArray() {
-		return false
-	}
-
-	for _, item := range nextInput.Array() {
-		switch strings.TrimSpace(item.Get("type").String()) {
-		case "function_call", "custom_tool_call":
-			return true
-		case "message":
-			role := strings.TrimSpace(item.Get("role").String())
-			if role == "assistant" {
-				return true
-			}
-		}
-	}
-
-	return false
+	return summary.hasTranscriptReplacement
 }
 
-func inputSatisfiesPendingToolCalls(input gjson.Result, pendingCallIDs []string) bool {
-	if len(pendingCallIDs) == 0 {
-		return true
-	}
-	if !input.IsArray() {
-		return false
-	}
-	outputs := make(map[string]struct{}, len(pendingCallIDs))
-	for _, item := range input.Array() {
-		switch strings.TrimSpace(item.Get("type").String()) {
-		case "function_call_output", "custom_tool_call_output":
-			callID := strings.TrimSpace(item.Get("call_id").String())
-			if callID != "" {
-				outputs[callID] = struct{}{}
-			}
-		}
-	}
+func (summary responsesWebsocketInputSummary) satisfiesPendingToolCalls(pendingCallIDs []string) bool {
 	for _, callID := range pendingCallIDs {
 		callID = strings.TrimSpace(callID)
 		if callID == "" {
 			continue
 		}
-		if _, ok := outputs[callID]; !ok {
+		if _, ok := summary.outputCallIDs[callID]; !ok {
 			return false
 		}
 	}
 	return true
 }
 
+func (summary responsesWebsocketInputSummary) withoutCompactionItems() string {
+	return buildResponsesWebsocketInput(summary.items, func(_ int, item responsesWebsocketInputItem) bool {
+		return item.itemType != "compaction" && item.itemType != "compaction_summary"
+	})
+}
+
+func buildResponsesWebsocketInput(items []responsesWebsocketInputItem, keep func(int, responsesWebsocketInputItem) bool) string {
+	var builder strings.Builder
+	capacity := 2 + len(items)
+	for _, item := range items {
+		capacity += len(item.raw)
+	}
+	builder.Grow(capacity)
+	builder.WriteByte('[')
+	wrote := false
+	for index, item := range items {
+		if keep != nil && !keep(index, item) {
+			continue
+		}
+		if wrote {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(item.raw)
+		wrote = true
+	}
+	builder.WriteByte(']')
+	return builder.String()
+}
+
+func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bool {
+	if !nextInput.Exists() {
+		return false
+	}
+	summary, errScan := scanResponsesWebsocketInput(nextInput)
+	return errScan == nil && shouldReplaceWebsocketTranscriptFromSummary(rawJSON, summary)
+}
+
+func inputSatisfiesPendingToolCalls(input gjson.Result, pendingCallIDs []string) bool {
+	if len(pendingCallIDs) == 0 {
+		return true
+	}
+	summary, errScan := scanResponsesWebsocketInput(input)
+	if errScan != nil {
+		return false
+	}
+	return summary.satisfiesPendingToolCalls(pendingCallIDs)
+}
+
 func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) []byte {
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
+		normalized = internalpayload.CloneBytes(rawJSON)
 	}
 	normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
 	if !gjson.GetBytes(normalized, "model").Exists() {
@@ -774,43 +1397,87 @@ func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) 
 		}
 	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	return bytes.Clone(normalized)
+	return internalpayload.CloneBytes(normalized)
 }
 
 func dedupeFunctionCallsByCallID(rawArray string) (string, error) {
-	rawArray = strings.TrimSpace(rawArray)
-	if rawArray == "" {
-		return "[]", nil
+	summary, errScan := scanResponsesWebsocketRawArray(rawArray)
+	if errScan != nil {
+		return "", errScan
 	}
-	var items []json.RawMessage
-	if errUnmarshal := json.Unmarshal([]byte(rawArray), &items); errUnmarshal != nil {
-		return "", errUnmarshal
-	}
+	seenCallIDs := make(map[string]struct{}, summary.count)
+	out := buildResponsesWebsocketInput(summary.items, func(_ int, item responsesWebsocketInputItem) bool {
+		if !isResponsesToolCallType(item.itemType) || item.callID == "" {
+			return true
+		}
+		if _, exists := seenCallIDs[item.callID]; exists {
+			return false
+		}
+		seenCallIDs[item.callID] = struct{}{}
+		return true
+	})
+	return out, nil
+}
 
+func dedupeResponsesWebsocketInput(rawArray string) (string, error) {
+	summary, errScan := scanResponsesWebsocketRawArray(rawArray)
+	if errScan != nil {
+		return "", errScan
+	}
+	return dedupeResponsesWebsocketInputItems(summary.items), nil
+}
+
+func dedupeResponsesWebsocketInputItems(items []responsesWebsocketInputItem) string {
+	active := make([]bool, len(items))
 	seenCallIDs := make(map[string]struct{}, len(items))
-	filtered := make([]json.RawMessage, 0, len(items))
-	for _, item := range items {
-		if len(item) == 0 {
+	for index, item := range items {
+		active[index] = true
+		if !isResponsesToolCallType(item.itemType) || item.callID == "" {
 			continue
 		}
-		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
-		if isResponsesToolCallType(itemType) {
-			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
-			if callID != "" {
-				if _, ok := seenCallIDs[callID]; ok {
-					continue
-				}
-				seenCallIDs[callID] = struct{}{}
-			}
+		if _, exists := seenCallIDs[item.callID]; exists {
+			active[index] = false
+			continue
 		}
-		filtered = append(filtered, item)
+		seenCallIDs[item.callID] = struct{}{}
 	}
 
-	out, errMarshal := json.Marshal(filtered)
-	if errMarshal != nil {
-		return "", errMarshal
+	referencedCallIDs := make(map[string]struct{}, len(items))
+	for index, item := range items {
+		if !active[index] {
+			continue
+		}
+		switch item.itemType {
+		case "function_call_output", "custom_tool_call_output":
+			if item.callID != "" {
+				referencedCallIDs[item.callID] = struct{}{}
+			}
+		}
 	}
-	return string(out), nil
+
+	keepIndexByID := make(map[string]int, len(items))
+	keepReferencedByID := make(map[string]bool, len(items))
+	for index, item := range items {
+		if !active[index] || item.id == "" {
+			continue
+		}
+		_, referenced := referencedCallIDs[item.callID]
+		referenced = referenced && item.callID != ""
+		if _, seen := keepIndexByID[item.id]; !seen {
+			keepIndexByID[item.id] = index
+			keepReferencedByID[item.id] = referenced
+			continue
+		}
+		if referenced || !keepReferencedByID[item.id] {
+			keepIndexByID[item.id] = index
+			keepReferencedByID[item.id] = referenced
+		}
+	}
+
+	out := buildResponsesWebsocketInput(items, func(index int, item responsesWebsocketInputItem) bool {
+		return active[index] && (item.id == "" || keepIndexByID[item.id] == index)
+	})
+	return out
 }
 
 func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
@@ -830,35 +1497,11 @@ func dedupeResponsesWebsocketInputItemsByID(payload []byte) []byte {
 }
 
 func dedupeInputItemsByID(rawArray string) (string, error) {
-	rawArray = strings.TrimSpace(rawArray)
-	if rawArray == "" {
-		return "[]", nil
+	summary, errScan := scanResponsesWebsocketRawArray(rawArray)
+	if errScan != nil {
+		return "", errScan
 	}
-	var items []json.RawMessage
-	if errUnmarshal := json.Unmarshal([]byte(rawArray), &items); errUnmarshal != nil {
-		return "", errUnmarshal
-	}
-
-	// Parse each item's type, id and call_id once; gjson is a scan-based
-	// parser, so reusing this metadata avoids rescanning every item in each of
-	// the loops below as the conversation history grows.
-	type itemMetadata struct {
-		itemType string
-		id       string
-		callID   string
-	}
-	meta := make([]itemMetadata, len(items))
-	for i, item := range items {
-		if len(item) == 0 {
-			continue
-		}
-		res := gjson.GetManyBytes(item, "type", "id", "call_id")
-		meta[i] = itemMetadata{
-			itemType: strings.TrimSpace(res[0].String()),
-			id:       strings.TrimSpace(res[1].String()),
-			callID:   strings.TrimSpace(res[2].String()),
-		}
-	}
+	items := summary.items
 
 	// Collect the call_ids that are still referenced by tool-call output
 	// items. When several input items share the same id, the one we keep must
@@ -866,10 +1509,10 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 	// rejects the request with "No tool call found for function call output".
 	referencedCallIDs := make(map[string]struct{}, len(items))
 	for i := range items {
-		switch meta[i].itemType {
+		switch items[i].itemType {
 		case "function_call_output", "custom_tool_call_output":
-			if meta[i].callID != "" {
-				referencedCallIDs[meta[i].callID] = struct{}{}
+			if items[i].callID != "" {
+				referencedCallIDs[items[i].callID] = struct{}{}
 			}
 		}
 	}
@@ -882,12 +1525,12 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 	keepIndexByID := make(map[string]int, len(items))
 	keepReferencedByID := make(map[string]bool, len(items))
 	for i := range items {
-		itemID := meta[i].id
+		itemID := items[i].id
 		if itemID == "" {
 			continue
 		}
-		_, referenced := referencedCallIDs[meta[i].callID]
-		referenced = referenced && meta[i].callID != ""
+		_, referenced := referencedCallIDs[items[i].callID]
+		referenced = referenced && items[i].callID != ""
 		if _, seen := keepIndexByID[itemID]; !seen {
 			keepIndexByID[itemID] = i
 			keepReferencedByID[itemID] = referenced
@@ -899,25 +1542,10 @@ func dedupeInputItemsByID(rawArray string) (string, error) {
 		}
 	}
 
-	filtered := make([]json.RawMessage, 0, len(items))
-	for i, item := range items {
-		if len(item) == 0 {
-			continue
-		}
-		itemID := meta[i].id
-		if itemID != "" {
-			if keepIndexByID[itemID] != i {
-				continue
-			}
-		}
-		filtered = append(filtered, item)
-	}
-
-	out, errMarshal := json.Marshal(filtered)
-	if errMarshal != nil {
-		return "", errMarshal
-	}
-	return string(out), nil
+	out := buildResponsesWebsocketInput(items, func(index int, item responsesWebsocketInputItem) bool {
+		return item.id == "" || keepIndexByID[item.id] == index
+	})
+	return out, nil
 }
 
 func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
@@ -1052,8 +1680,13 @@ func normalizeResponsesWebsocketPassthroughRequest(rawJSON []byte, modelName str
 			Error:      fmt.Errorf("unsupported websocket request type: %s", requestType),
 		}
 	}
+	if input := gjson.GetBytes(rawJSON, "input"); input.Exists() {
+		if _, errScan := scanResponsesWebsocketInput(input); errScan != nil {
+			return nil, responsesWebsocketInputError(errScan)
+		}
+	}
 
-	normalized := bytes.Clone(rawJSON)
+	normalized := internalpayload.CloneBytes(rawJSON)
 	if strings.TrimSpace(gjson.GetBytes(normalized, "model").String()) == "" {
 		modelName = strings.TrimSpace(modelName)
 		if modelName == "" {
@@ -1188,19 +1821,11 @@ func writeResponsesWebsocketSyntheticPrewarm(
 	}
 	for i := 0; i < len(payloads); i++ {
 		markAPIResponseTimestamp(c)
-		// log.Infof(
-		// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-		// 	sessionID,
-		// 	websocket.TextMessage,
-		// 	websocketPayloadEventType(payloads[i]),
-		// 	websocketPayloadPreview(payloads[i]),
-		// )
 		if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
 			log.Warnf(
-				"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+				"responses websocket: downstream_out write failed id=%s event=%s",
 				sessionID,
 				websocketPayloadEventType(payloads[i]),
-				errWrite,
 			)
 			return errWrite
 		}
@@ -1250,30 +1875,38 @@ func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, e
 }
 
 func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
-	existingRaw = strings.TrimSpace(existingRaw)
-	appendRaw = strings.TrimSpace(appendRaw)
-	if existingRaw == "" {
-		existingRaw = "[]"
-	}
-	if appendRaw == "" {
-		appendRaw = "[]"
-	}
+	return mergeJSONArraysRaw(existingRaw, appendRaw)
+}
 
-	var existing []json.RawMessage
-	if err := json.Unmarshal([]byte(existingRaw), &existing); err != nil {
-		return "", err
+func mergeJSONArraysRaw(rawArrays ...string) (string, error) {
+	items, errCollect := collectResponsesWebsocketInputItems(rawArrays...)
+	if errCollect != nil {
+		return "", errCollect
 	}
-	var appendItems []json.RawMessage
-	if err := json.Unmarshal([]byte(appendRaw), &appendItems); err != nil {
-		return "", err
-	}
+	return buildResponsesWebsocketInput(items, nil), nil
+}
 
-	merged := append(existing, appendItems...)
-	out, err := json.Marshal(merged)
-	if err != nil {
-		return "", err
+func mergeAndDedupeResponsesWebsocketInputs(rawArrays ...string) (string, error) {
+	items, errCollect := collectResponsesWebsocketInputItems(rawArrays...)
+	if errCollect != nil {
+		return "", errCollect
 	}
-	return string(out), nil
+	return dedupeResponsesWebsocketInputItems(items), nil
+}
+
+func collectResponsesWebsocketInputItems(rawArrays ...string) ([]responsesWebsocketInputItem, error) {
+	items := make([]responsesWebsocketInputItem, 0)
+	for _, rawArray := range rawArrays {
+		summary, errScan := scanResponsesWebsocketRawArray(rawArray)
+		if errScan != nil {
+			return nil, errScan
+		}
+		if len(items)+summary.count > responsesWebsocketMaxInputItems {
+			return nil, errResponsesWebsocketInputTooManyItems
+		}
+		items = append(items, summary.items...)
+	}
+	return items, nil
 }
 
 func websocketTranscriptReplayTooLarge(existingInputRaw, lastResponseOutputRaw, appendInputRaw string) bool {
@@ -1293,31 +1926,16 @@ func websocketTranscriptReplayTooLarge(existingInputRaw, lastResponseOutputRaw, 
 // Assistant messages alone are not enough to classify the payload as a replay:
 // incremental websocket requests may legitimately append assistant items.
 func inputContainsFullTranscript(input gjson.Result) bool {
-	if !input.IsArray() {
-		return false
-	}
-	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
-			return true
-		}
-	}
-	return false
+	summary, errScan := scanResponsesWebsocketInput(input)
+	return errScan == nil && summary.containsFullTranscript
 }
 
 func inputWithoutCompactionItems(input gjson.Result) string {
-	if !input.IsArray() {
+	summary, errScan := scanResponsesWebsocketInput(input)
+	if errScan != nil {
 		return normalizeJSONArrayRaw([]byte(input.Raw))
 	}
-	filtered := make([]string, 0, len(input.Array()))
-	for _, item := range input.Array() {
-		t := item.Get("type").String()
-		if t == "compaction" || t == "compaction_summary" {
-			continue
-		}
-		filtered = append(filtered, item.Raw)
-	}
-	return "[" + strings.Join(filtered, ",") + "]"
+	return summary.withoutCompactionItems()
 }
 
 func normalizeJSONArrayRaw(raw []byte) string {
@@ -1340,16 +1958,14 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	errs <-chan *interfaces.ErrorMessage,
 	wsTimelineLog websocketTimelineAppender,
 	sessionID string,
+	toolCallCache *websocketToolOutputCache,
+	toolCacheKey string,
+	completedOutputLease *responsesWebsocketFrameLease,
 ) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
 	completed := false
 	completedOutput := []byte("[]")
 	completedResponseID := ""
 	pendingToolCallIDs := make(map[string]struct{})
-	downstreamSessionKey := ""
-	if c != nil && c.Request != nil {
-		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
-	}
-
 	for {
 		if data == nil && errs == nil {
 			if !completed {
@@ -1359,9 +1975,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				}
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg, handlers.PassthroughHeadersEnabled(h.Cfg))
 				log.Infof(
-					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					"responses websocket: downstream_out id=%s type=%d event=%s payload_metadata=%s",
 					sessionID,
 					websocket.TextMessage,
 					websocketPayloadEventType(errorPayload),
@@ -1369,10 +1985,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				)
 				if errWrite != nil {
 					log.Warnf(
-						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+						"responses websocket: downstream_out write failed id=%s event=%s",
 						sessionID,
 						websocketPayloadEventType(errorPayload),
-						errWrite,
 					)
 					cancel(errMsg.Error)
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
@@ -1396,21 +2011,15 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			if errMsg != nil {
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg, handlers.PassthroughHeadersEnabled(h.Cfg))
 				log.Infof(
-					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					"responses websocket: downstream_out id=%s type=%d event=%s payload_metadata=%s",
 					sessionID,
 					websocket.TextMessage,
 					websocketPayloadEventType(errorPayload),
 					websocketPayloadPreview(errorPayload),
 				)
 				if errWrite != nil {
-					// log.Warnf(
-					// 	"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-					// 	sessionID,
-					// 	websocketPayloadEventType(errorPayload),
-					// 	errWrite,
-					// )
 					cancel(errMsg.Error)
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
 				}
@@ -1429,7 +2038,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				recordResponsesWebsocketToolCallsFromPayloadWithCache(toolCallCache, toolCacheKey, payloads[i])
 				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				var payloadErrMsg *interfaces.ErrorMessage
@@ -1439,24 +2048,21 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
 					}
 				} else if isResponsesWebsocketCompletionEvent(eventType) {
+					nextCompletedOutput := responseCompletedOutputRawFromPayload(payloads[i])
+					if completedOutputLease != nil && !completedOutputLease.resize(int64(len(nextCompletedOutput))) {
+						cancel(errResponsesWebsocketRetainedCapacity)
+						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errResponsesWebsocketRetainedCapacity
+					}
 					completed = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					completedOutput = internalpayload.CloneStringBytes(nextCompletedOutput)
 					completedResponseID = responseCompletedIDFromPayload(payloads[i])
 				}
 				markAPIResponseTimestamp(c)
-				// log.Infof(
-				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-				// 	sessionID,
-				// 	websocket.TextMessage,
-				// 	websocketPayloadEventType(payloads[i]),
-				// 	websocketPayloadPreview(payloads[i]),
-				// )
 				if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
 					log.Warnf(
-						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+						"responses websocket: downstream_out write failed id=%s event=%s",
 						sessionID,
 						websocketPayloadEventType(payloads[i]),
-						errWrite,
 					)
 					cancel(errWrite)
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
@@ -1506,11 +2112,15 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {
+	return internalpayload.CloneStringBytes(responseCompletedOutputRawFromPayload(payload))
+}
+
+func responseCompletedOutputRawFromPayload(payload []byte) string {
 	output := gjson.GetBytes(payload, "response.output")
 	if output.Exists() && output.IsArray() {
-		return bytes.Clone([]byte(output.Raw))
+		return output.Raw
 	}
-	return []byte("[]")
+	return "[]"
 }
 
 func responseCompletedIDFromPayload(payload []byte) string {
@@ -1524,9 +2134,10 @@ func recordPendingToolCallIDsFromPayload(pending map[string]struct{}, payload []
 	updatePendingToolCallIDsFromItem(pending, gjson.GetBytes(payload, "item"))
 	output := gjson.GetBytes(payload, "response.output")
 	if output.IsArray() {
-		for _, item := range output.Array() {
+		output.ForEach(func(_, item gjson.Result) bool {
 			updatePendingToolCallIDsFromItem(pending, item)
-		}
+			return true
+		})
 	}
 }
 
@@ -1578,7 +2189,7 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 			continue
 		}
 		if json.Valid(line) {
-			payloads = append(payloads, bytes.Clone(line))
+			payloads = append(payloads, internalpayload.CloneBytes(line))
 		}
 	}
 
@@ -1591,12 +2202,12 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
 	}
 	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(wsDoneMarker)) && json.Valid(trimmed) {
-		payloads = append(payloads, bytes.Clone(trimmed))
+		payloads = append(payloads, internalpayload.CloneBytes(trimmed))
 	}
 	return payloads
 }
 
-func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender, errMsg *interfaces.ErrorMessage) ([]byte, error) {
+func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender, errMsg *interfaces.ErrorMessage, passthroughHeaders bool) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
 	if errMsg != nil {
@@ -1623,21 +2234,19 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketT
 	}
 
 	if errMsg != nil && errMsg.Addon != nil {
-		headers := []byte(`{}`)
-		hasHeaders := false
-		for key, values := range errMsg.Addon {
+		headers := make(map[string]string)
+		for key, values := range handlers.FilterErrorAddonHeaders(errMsg.Addon, passthroughHeaders) {
 			if len(values) == 0 {
 				continue
 			}
-			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			headers, errSet = sjson.SetBytes(headers, headerPath, values[0])
-			if errSet != nil {
-				return nil, errSet
-			}
-			hasHeaders = true
+			headers[key] = values[0]
 		}
-		if hasHeaders {
-			payload, errSet = sjson.SetRawBytes(payload, "headers", headers)
+		if len(headers) > 0 {
+			headersJSON, errMarshal := json.Marshal(headers)
+			if errMarshal != nil {
+				return nil, errMarshal
+			}
+			payload, errSet = sjson.SetRawBytes(payload, "headers", headersJSON)
 			if errSet != nil {
 				return nil, errSet
 			}
@@ -1674,8 +2283,8 @@ func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []
 	if builder == nil {
 		return
 	}
-	trimmedPayload := bytes.TrimSpace(payload)
-	if len(trimmedPayload) == 0 {
+	payloadMetadata := websocketTimelinePayloadMetadata(payload)
+	if len(payloadMetadata) == 0 {
 		return
 	}
 	if builder.Len() > 0 {
@@ -1684,26 +2293,20 @@ func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []
 	builder.WriteString("websocket.")
 	builder.WriteString(eventType)
 	builder.WriteString("\n")
-	builder.Write(trimmedPayload)
+	builder.Write(payloadMetadata)
 	builder.WriteString("\n")
 }
 
 func websocketPayloadEventType(payload []byte) string {
 	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-	if eventType == "" {
+	if !safeResponsesWebsocketErrorCode(eventType) {
 		return "-"
 	}
 	return eventType
 }
 
 func websocketPayloadPreview(payload []byte) string {
-	trimmedPayload := bytes.TrimSpace(payload)
-	if len(trimmedPayload) == 0 {
-		return "<empty>"
-	}
-	previewText := strings.ReplaceAll(string(trimmedPayload), "\n", "\\n")
-	previewText = strings.ReplaceAll(previewText, "\r", "\\r")
-	return previewText
+	return string(requestlogging.SummarizeBodyForLog(payload, "application/json"))
 }
 
 func isResponsesWebsocketCompletionEvent(eventType string) bool {
@@ -1719,17 +2322,29 @@ func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.Error
 		status = http.StatusInternalServerError
 	}
 
-	errText := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
-	if errText == "" {
-		errText = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+	errText := "upstream websocket error"
+	code := strings.TrimSpace(gjson.GetBytes(payload, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(payload, "code").String())
 	}
-	if errText == "" {
-		errText = strings.TrimSpace(string(payload))
-	}
-	if errText == "" {
-		errText = http.StatusText(status)
+	if safeResponsesWebsocketErrorCode(code) {
+		errText += " code=" + code
 	}
 	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", errText)}
+}
+
+func safeResponsesWebsocketErrorCode(code string) bool {
+	if code == "" || len(code) > 64 {
+		return false
+	}
+	for _, character := range code {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func setWebsocketTimelineBody(c *gin.Context, body string) {
@@ -1771,20 +2386,38 @@ func appendWebsocketTimelineEvent(builder *strings.Builder, eventType string, pa
 }
 
 func formatWebsocketTimelineEvent(eventType string, payload []byte, timestamp time.Time) []byte {
+	payloadMetadata := websocketTimelinePayloadMetadata(payload)
+	if len(payloadMetadata) == 0 {
+		return nil
+	}
+	timestampText := timestamp.Format(time.RFC3339Nano)
+	size := websocketTimelineEventSize(eventType, payloadMetadata, timestampText)
+	return formatWebsocketTimelineEventParts(eventType, payloadMetadata, timestampText, size)
+}
+
+func websocketTimelinePayloadMetadata(payload []byte) []byte {
 	trimmedPayload := bytes.TrimSpace(payload)
 	if len(trimmedPayload) == 0 {
 		return nil
 	}
-	var builder strings.Builder
+	return requestlogging.SummarizeBodyForLog(trimmedPayload, "application/websocket-frame")
+}
+
+func websocketTimelineEventSize(eventType string, trimmedPayload []byte, timestampText string) int {
+	return len("Timestamp: ") + len(timestampText) + len("\nEvent: websocket.") + len(eventType) + 1 + len(trimmedPayload) + 1
+}
+
+func formatWebsocketTimelineEventParts(eventType string, trimmedPayload []byte, timestampText string, size int) []byte {
+	var builder bytes.Buffer
+	builder.Grow(size)
 	builder.WriteString("Timestamp: ")
-	builder.WriteString(timestamp.Format(time.RFC3339Nano))
-	builder.WriteString("\n")
-	builder.WriteString("Event: websocket.")
+	builder.WriteString(timestampText)
+	builder.WriteString("\nEvent: websocket.")
 	builder.WriteString(eventType)
-	builder.WriteString("\n")
+	builder.WriteByte('\n')
 	builder.Write(trimmedPayload)
-	builder.WriteString("\n")
-	return []byte(builder.String())
+	builder.WriteByte('\n')
+	return builder.Bytes()
 }
 
 func markAPIResponseTimestamp(c *gin.Context) {

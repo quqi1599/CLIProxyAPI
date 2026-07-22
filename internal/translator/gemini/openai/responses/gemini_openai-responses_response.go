@@ -9,6 +9,7 @@ import (
 	"time"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	geminicommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -501,21 +502,21 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		}
 
 		// Compose outputs in output_index order.
-		outputsWrapper := []byte(`{"arr":[]}`)
+		outputs := make([][]byte, 0, st.NextIndex)
 		for idx := 0; idx < st.NextIndex; idx++ {
 			if st.ReasoningOpened && idx == st.ReasoningIndex {
 				item := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[{"type":"summary_text","text":""}]}`)
 				item, _ = sjson.SetBytes(item, "id", st.ReasoningItemID)
 				item, _ = sjson.SetBytes(item, "encrypted_content", st.ReasoningEnc)
 				item, _ = sjson.SetBytes(item, "summary.0.text", st.ReasoningBuf.String())
-				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+				outputs = append(outputs, item)
 				continue
 			}
 			if st.MsgOpened && idx == st.MsgIndex {
 				item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 				item, _ = sjson.SetBytes(item, "id", st.CurrentMsgID)
 				item, _ = sjson.SetBytes(item, "content.0.text", st.TextBuf.String())
-				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+				outputs = append(outputs, item)
 				continue
 			}
 
@@ -529,11 +530,11 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				item, _ = sjson.SetBytes(item, "arguments", args)
 				item, _ = sjson.SetBytes(item, "call_id", callID)
 				item, _ = sjson.SetBytes(item, "name", st.FuncNames[idx])
-				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+				outputs = append(outputs, item)
 			}
 		}
-		if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-			completed, _ = sjson.SetRawBytes(completed, "response.output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+		if len(outputs) > 0 {
+			completed, _ = sjson.SetRawBytes(completed, "response.output", geminicommon.RawJSONArray(outputs))
 		}
 
 		// usage mapping
@@ -671,18 +672,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	var messageText strings.Builder
 	var haveMessage bool
 
-	haveOutput := false
-	ensureOutput := func() {
-		if haveOutput {
-			return
-		}
-		resp, _ = sjson.SetRawBytes(resp, "output", []byte("[]"))
-		haveOutput = true
-	}
-	appendOutput := func(itemJSON []byte) {
-		ensureOutput()
-		resp, _ = sjson.SetRawBytes(resp, "output.-1", itemJSON)
-	}
+	outputItems := make([][]byte, 0)
 
 	if parts := root.Get("candidates.0.content.parts"); parts.Exists() && parts.IsArray() {
 		parts.ForEach(func(_, p gjson.Result) bool {
@@ -713,7 +703,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					argsStr = args.Raw
 				}
 				itemJSON, _ = sjson.SetBytes(itemJSON, "arguments", argsStr)
-				appendOutput(itemJSON)
+				outputItems = append(outputItems, itemJSON)
 				return true
 			}
 			return true
@@ -732,7 +722,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			itemJSON, _ = sjson.SetRawBytes(itemJSON, "summary", []byte(`[]`))
 			itemJSON, _ = sjson.SetRawBytes(itemJSON, "summary.-1", summaryJSON)
 		}
-		appendOutput(itemJSON)
+		outputItems = append(outputItems, itemJSON)
 	}
 
 	// Assistant message output item
@@ -740,7 +730,10 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		itemJSON := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 		itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("msg_%s_0", strings.TrimPrefix(id, "resp_")))
 		itemJSON, _ = sjson.SetBytes(itemJSON, "content.0.text", messageText.String())
-		appendOutput(itemJSON)
+		outputItems = append(outputItems, itemJSON)
+	}
+	if len(outputItems) > 0 {
+		resp, _ = sjson.SetRawBytes(resp, "output", geminicommon.RawJSONArray(outputItems))
 	}
 
 	// usage mapping

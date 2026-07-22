@@ -1,7 +1,7 @@
 services:
   cli-proxy-api:
     init: true
-    image: ${CLIPROXY_IMAGE:?set CLIPROXY_IMAGE to an immutable sha-<12> image}
+    image: ghcr.io/quqi1599/cliproxyapi:sha-${CLIPROXY_COMMIT12:?set CLIPROXY_COMMIT12 to the candidate commit prefix}
     pull_policy: always
     container_name: cli-proxy-api
     environment:

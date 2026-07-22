@@ -12,9 +12,9 @@ import (
 
 // Generic helpers for list[string]
 func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []string
@@ -42,8 +42,8 @@ func (h *Handler) patchStringList(c *gin.Context, target *[]string, after func()
 		Index *int    `json:"index"`
 		Value *string `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
@@ -450,9 +450,9 @@ func (h *Handler) GetGeminiKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"gemini-api-key": h.geminiKeysWithAuthIndex()})
 }
 func (h *Handler) PutGeminiKeys(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []config.GeminiKey
@@ -492,7 +492,11 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		Match *string         `json:"match"`
 		Value *geminiKeyPatch `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
@@ -623,9 +627,9 @@ func (h *Handler) GetClaudeKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"claude-api-key": h.claudeKeysWithAuthIndex()})
 }
 func (h *Handler) PutClaudeKeys(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []config.ClaudeKey
@@ -670,7 +674,11 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		Match *string         `json:"match"`
 		Value *claudeKeyPatch `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
@@ -801,9 +809,9 @@ func (h *Handler) GetOpenAICompat(c *gin.Context) {
 	c.JSON(200, gin.H{"openai-compatibility": h.openAICompatibilityWithAuthIndex()})
 }
 func (h *Handler) PutOpenAICompat(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []config.OpenAICompatibility
@@ -854,7 +862,11 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		Index   *int               `json:"index"`
 		Value   *openAICompatPatch `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
@@ -985,9 +997,9 @@ func (h *Handler) GetVertexCompatKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"vertex-api-key": h.vertexCompatKeysWithAuthIndex()})
 }
 func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []config.VertexCompatKey
@@ -1035,7 +1047,11 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		Match *string            `json:"match"`
 		Value *vertexCompatPatch `json:"value"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
@@ -1172,9 +1188,9 @@ func (h *Handler) GetOAuthExcludedModels(c *gin.Context) {
 }
 
 func (h *Handler) PutOAuthExcludedModels(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var entries map[string][]string
@@ -1197,7 +1213,11 @@ func (h *Handler) PatchOAuthExcludedModels(c *gin.Context) {
 		Provider *string  `json:"provider"`
 		Models   []string `json:"models"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Provider == nil {
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Provider == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
@@ -1257,9 +1277,9 @@ func (h *Handler) GetOAuthModelAlias(c *gin.Context) {
 }
 
 func (h *Handler) PutOAuthModelAlias(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var entries map[string][]config.OAuthModelAlias
@@ -1283,8 +1303,8 @@ func (h *Handler) PatchOAuthModelAlias(c *gin.Context) {
 		Channel  *string                  `json:"channel"`
 		Aliases  []config.OAuthModelAlias `json:"aliases"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
 		return
 	}
 	channelRaw := ""
@@ -1354,9 +1374,9 @@ func (h *Handler) GetCodexKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"codex-api-key": h.codexKeysWithAuthIndex()})
 }
 func (h *Handler) PutCodexKeys(c *gin.Context) {
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementConfigBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	var arr []config.CodexKey
@@ -1407,7 +1427,11 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		Match *string        `json:"match"`
 		Value *codexKeyPatch `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementConfigBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}

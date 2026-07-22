@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -38,6 +39,7 @@ const (
 	defaultVideosSize        = "720x1280"
 	defaultVideosResolution  = "720p"
 	maxXAIVideoReferences    = 7
+	maxVideosFormBodyBytes   = 32 << 20
 )
 
 const defaultVideoAuthBindingTTL = 3 * time.Hour
@@ -51,6 +53,34 @@ type xaiVideoCreateMetadata struct {
 	Seconds       string
 	Size          string
 	CreatedAt     int64
+}
+
+type videosCreateFormInputReference struct {
+	ImageURL string `json:"image_url,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+}
+
+type videosCreateFormPayload struct {
+	Model              string                          `json:"model,omitempty"`
+	Prompt             string                          `json:"prompt,omitempty"`
+	Seconds            string                          `json:"seconds,omitempty"`
+	Size               string                          `json:"size,omitempty"`
+	AspectRatio        string                          `json:"aspect_ratio,omitempty"`
+	Resolution         string                          `json:"resolution,omitempty"`
+	InputReference     *videosCreateFormInputReference `json:"input_reference,omitempty"`
+	ReferenceImageURLs *[]string                       `json:"reference_image_urls,omitempty"`
+}
+
+type xaiVideoRetrieveBase struct {
+	Object             string          `json:"object"`
+	ID                 string          `json:"id"`
+	Model              string          `json:"model"`
+	CreatedAt          json.RawMessage `json:"created_at,omitempty"`
+	CompletedAt        json.RawMessage `json:"completed_at,omitempty"`
+	ExpiresAt          json.RawMessage `json:"expires_at,omitempty"`
+	Prompt             json.RawMessage `json:"prompt,omitempty"`
+	RemixedFromVideoID json.RawMessage `json:"remixed_from_video_id,omitempty"`
+	Size               json.RawMessage `json:"size,omitempty"`
 }
 
 type videoAuthBinding struct {
@@ -224,31 +254,74 @@ func readXAIVideosNativeRequest(c *gin.Context) ([]byte, error) {
 }
 
 func videosCreateRequestFromForm(c *gin.Context) ([]byte, error) {
-	rawJSON := []byte(`{}`)
-	for _, field := range []string{"model", "prompt", "seconds", "size", "aspect_ratio", "resolution"} {
-		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
-			rawJSON, _ = sjson.SetBytes(rawJSON, field, value)
+	var values url.Values
+	switch strings.ToLower(strings.TrimSpace(c.ContentType())) {
+	case "multipart/form-data":
+		form, err := handlers.ParseMultipartFormWithPolicy(c, maxVideosFormBodyBytes, 8<<20, maxVideosFormBodyBytes)
+		if err != nil {
+			return nil, err
 		}
+		if form != nil && len(form.File) > 0 {
+			return nil, fmt.Errorf("file uploads are not supported for video creation; use an image URL or file_id")
+		}
+		if form == nil {
+			values = make(url.Values)
+		} else {
+			values = url.Values(form.Value)
+		}
+	case "application/x-www-form-urlencoded":
+		body, err := handlers.ReadRequestBodyWithPolicy(c, maxVideosFormBodyBytes, maxVideosFormBodyBytes)
+		if err != nil {
+			return nil, err
+		}
+		parsed, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, fmt.Errorf("invalid form body: %w", err)
+		}
+		values = parsed
+	default:
+		return nil, fmt.Errorf("unsupported form Content-Type %q", c.ContentType())
 	}
-	if value := strings.TrimSpace(firstPostForm(c, "input_reference[image_url]", "input_reference.image_url", "image_url")); value != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "input_reference.image_url", value)
+
+	payload := videosCreateFormPayload{
+		Model:       strings.TrimSpace(values.Get("model")),
+		Prompt:      strings.TrimSpace(values.Get("prompt")),
+		Seconds:     strings.TrimSpace(values.Get("seconds")),
+		Size:        strings.TrimSpace(values.Get("size")),
+		AspectRatio: strings.TrimSpace(values.Get("aspect_ratio")),
+		Resolution:  strings.TrimSpace(values.Get("resolution")),
 	}
-	if value := strings.TrimSpace(firstPostForm(c, "input_reference[file_id]", "input_reference.file_id", "file_id")); value != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "input_reference.file_id", value)
+	imageURL := strings.TrimSpace(firstFormValue(values, "input_reference[image_url]", "input_reference.image_url", "image_url"))
+	fileID := strings.TrimSpace(firstFormValue(values, "input_reference[file_id]", "input_reference.file_id", "file_id"))
+	if imageURL != "" || fileID != "" {
+		payload.InputReference = &videosCreateFormInputReference{ImageURL: imageURL, FileID: fileID}
 	}
-	if refs := strings.TrimSpace(c.PostForm("reference_image_urls")); refs != "" {
-		for _, ref := range strings.Split(refs, ",") {
+	if refs := strings.TrimSpace(values.Get("reference_image_urls")); refs != "" {
+		parts := strings.SplitN(refs, ",", maxXAIVideoReferences+1)
+		if len(parts) > maxXAIVideoReferences {
+			return nil, fmt.Errorf("reference_image_urls supports at most %d images", maxXAIVideoReferences)
+		}
+		references := make([]string, 0, min(len(parts), maxXAIVideoReferences))
+		for _, ref := range parts {
 			if ref = strings.TrimSpace(ref); ref != "" {
-				rawJSON, _ = sjson.SetBytes(rawJSON, "reference_image_urls.-1", ref)
+				if len(references) == maxXAIVideoReferences {
+					return nil, fmt.Errorf("reference_image_urls supports at most %d images", maxXAIVideoReferences)
+				}
+				references = append(references, ref)
 			}
 		}
+		payload.ReferenceImageURLs = &references
+	}
+	rawJSON, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode video form request: %w", errMarshal)
 	}
 	return rawJSON, nil
 }
 
-func firstPostForm(c *gin.Context, keys ...string) string {
+func firstFormValue(values url.Values, keys ...string) string {
 	for _, key := range keys {
-		if value := c.PostForm(key); strings.TrimSpace(value) != "" {
+		if value := values.Get(key); strings.TrimSpace(value) != "" {
 			return value
 		}
 	}
@@ -316,9 +389,9 @@ func buildXAIVideosCreateRequest(rawJSON []byte, model string) ([]byte, xaiVideo
 	if err != nil {
 		return nil, xaiVideoCreateMetadata{}, err
 	}
-	referenceImages := collectXAIVideoReferenceImages(rawJSON)
-	if len(referenceImages) > maxXAIVideoReferences {
-		return nil, xaiVideoCreateMetadata{}, fmt.Errorf("reference_images supports at most %d images on xAI", maxXAIVideoReferences)
+	referenceImages, err := collectXAIVideoReferenceImages(rawJSON)
+	if err != nil {
+		return nil, xaiVideoCreateMetadata{}, err
 	}
 	if imageURL != "" && len(referenceImages) > 0 {
 		return nil, xaiVideoCreateMetadata{}, fmt.Errorf("image and reference_images cannot be combined on xAI")
@@ -338,8 +411,14 @@ func buildXAIVideosCreateRequest(rawJSON []byte, model string) ([]byte, xaiVideo
 	if imageURL != "" {
 		req, _ = sjson.SetBytes(req, "image.url", imageURL)
 	}
-	for _, image := range referenceImages {
-		req, _ = sjson.SetBytes(req, "reference_images.-1.url", image)
+	if len(referenceImages) > 0 {
+		items := make([][]byte, 0, len(referenceImages))
+		for _, image := range referenceImages {
+			item := []byte(`{"url":""}`)
+			item, _ = sjson.SetBytes(item, "url", image)
+			items = append(items, item)
+		}
+		req, _ = sjson.SetRawBytes(req, "reference_images", internalpayload.BuildRaw(items))
 	}
 
 	meta := xaiVideoCreateMetadata{
@@ -450,36 +529,45 @@ func xaiVideosInputImageURL(rawJSON []byte) (string, error) {
 	return strings.TrimSpace(gjson.GetBytes(rawJSON, "image_url").String()), nil
 }
 
-func collectXAIVideoReferenceImages(rawJSON []byte) []string {
-	out := make([]string, 0)
-	appendRef := func(value string) {
+func collectXAIVideoReferenceImages(rawJSON []byte) ([]string, error) {
+	out := make([]string, 0, maxXAIVideoReferences)
+	appendRef := func(value string) bool {
 		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
+		if value == "" {
+			return true
 		}
+		if len(out) == maxXAIVideoReferences {
+			return false
+		}
+		out = append(out, value)
+		return true
 	}
-	collectArray := func(result gjson.Result) {
+	collectArray := func(result gjson.Result) bool {
 		if !result.IsArray() {
-			return
+			return true
 		}
+		ok := true
 		result.ForEach(func(_, item gjson.Result) bool {
 			if item.Type == gjson.String {
-				appendRef(item.String())
-				return true
+				ok = appendRef(item.String())
+				return ok
 			}
 			if value := item.Get("url").String(); value != "" {
-				appendRef(value)
-				return true
+				ok = appendRef(value)
+				return ok
 			}
 			if value := item.Get("image_url.url").String(); value != "" {
-				appendRef(value)
+				ok = appendRef(value)
+				return ok
 			}
 			return true
 		})
+		return ok
 	}
-	collectArray(gjson.GetBytes(rawJSON, "reference_images"))
-	collectArray(gjson.GetBytes(rawJSON, "reference_image_urls"))
-	return out
+	if !collectArray(gjson.GetBytes(rawJSON, "reference_images")) || !collectArray(gjson.GetBytes(rawJSON, "reference_image_urls")) {
+		return nil, fmt.Errorf("reference_images supports at most %d images on xAI", maxXAIVideoReferences)
+	}
+	return out, nil
 }
 
 func buildVideosCreateAPIResponseFromXAI(payload []byte, meta xaiVideoCreateMetadata) ([]byte, error) {
@@ -537,18 +625,23 @@ func writeVideosFailedError(c *gin.Context, status int, model string, code strin
 }
 
 func buildVideosRetrieveAPIResponseFromXAI(videoID string, payload []byte, fallbackModel string) ([]byte, error) {
-	out := []byte(`{"object":"video"}`)
-	out, _ = sjson.SetBytes(out, "id", videoID)
 	model := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 	if model == "" {
 		model = responseVideosModel(fallbackModel)
 	}
-	out, _ = sjson.SetBytes(out, "model", model)
-
-	for _, field := range []string{"created_at", "completed_at", "expires_at", "prompt", "remixed_from_video_id", "size"} {
-		if value := gjson.GetBytes(payload, field); value.Exists() {
-			out, _ = sjson.SetRawBytes(out, field, []byte(value.Raw))
-		}
+	out, errMarshal := json.Marshal(xaiVideoRetrieveBase{
+		Object:             "video",
+		ID:                 videoID,
+		Model:              model,
+		CreatedAt:          xaiVideoRawField(payload, "created_at"),
+		CompletedAt:        xaiVideoRawField(payload, "completed_at"),
+		ExpiresAt:          xaiVideoRawField(payload, "expires_at"),
+		Prompt:             xaiVideoRawField(payload, "prompt"),
+		RemixedFromVideoID: xaiVideoRawField(payload, "remixed_from_video_id"),
+		Size:               xaiVideoRawField(payload, "size"),
+	})
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode video retrieve response: %w", errMarshal)
 	}
 
 	if status := openAIVideoStatus(gjson.GetBytes(payload, "status").String()); status != "" {
@@ -567,6 +660,14 @@ func buildVideosRetrieveAPIResponseFromXAI(videoID string, payload []byte, fallb
 	}
 	out = setOpenAIVideoErrorFromXAI(out, payload)
 	return out, nil
+}
+
+func xaiVideoRawField(payload []byte, path string) json.RawMessage {
+	value := gjson.GetBytes(payload, path)
+	if !value.Exists() {
+		return nil
+	}
+	return json.RawMessage(value.Raw)
 }
 
 func setOpenAIVideoErrorFromXAI(out []byte, payload []byte) []byte {
@@ -648,7 +749,7 @@ func openAIVideoStatus(status string) string {
 func (h *OpenAIAPIHandler) VideosCreate(c *gin.Context) {
 	rawJSON, err := readVideosCreateRequest(c)
 	if err != nil {
-		if handlers.IsRequestBodyTooLarge(err) {
+		if handlers.IsRequestBodyTooLarge(err) || handlers.IsAdmissionError(err) {
 			handlers.WriteRequestBodyError(c, err)
 			return
 		}
@@ -688,7 +789,7 @@ func (h *OpenAIAPIHandler) XAIVideosExtensions(c *gin.Context) {
 func (h *OpenAIAPIHandler) handleXAIVideosNativePost(c *gin.Context) {
 	rawJSON, err := readXAIVideosNativeRequest(c)
 	if err != nil {
-		if handlers.IsRequestBodyTooLarge(err) {
+		if handlers.IsRequestBodyTooLarge(err) || handlers.IsAdmissionError(err) {
 			handlers.WriteRequestBodyError(c, err)
 			return
 		}
@@ -852,6 +953,7 @@ func (h *OpenAIAPIHandler) writeVideoContentFromURL(c *gin.Context, contentURL s
 		h.WriteErrorResponse(c, errMsg)
 		return err
 	}
+	req.Header.Set("Accept-Encoding", "identity")
 
 	httpClient := h.videoContentHTTPClient(c)
 	resp, err := httpClient.Do(req)
@@ -860,22 +962,35 @@ func (h *OpenAIAPIHandler) writeVideoContentFromURL(c *gin.Context, contentURL s
 		h.WriteErrorResponse(c, errMsg)
 		return err
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, errRead := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{})
+		if errRead != nil {
+			errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errRead}
+			h.WriteErrorResponse(c, errMsg)
+			return errRead
+		}
+		errDownloadStatus := fmt.Errorf(
+			"video content download failed: %s: %s",
+			resp.Status,
+			helps.SummarizeErrorBody(resp.Header.Get("Content-Type"), body),
+		)
+		errMsg := &interfaces.ErrorMessage{StatusCode: resp.StatusCode, Error: errDownloadStatus}
+		h.WriteErrorResponse(c, errMsg)
+		return errDownloadStatus
+	}
+	if hasNonIdentityContentEncoding(resp.Header.Get("Content-Encoding")) {
+		errEncoding := fmt.Errorf("video content download returned unsupported Content-Encoding %q", resp.Header.Get("Content-Encoding"))
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("video content body close error: %v", errClose)
+		}
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errEncoding})
+		return errEncoding
+	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("video content body close error: %v", errClose)
 		}
 	}()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		errDownloadStatus := fmt.Errorf("video content download failed: %s", strings.TrimSpace(string(body)))
-		if strings.TrimSpace(string(body)) == "" {
-			errDownloadStatus = fmt.Errorf("video content download failed: %s", resp.Status)
-		}
-		errMsg := &interfaces.ErrorMessage{StatusCode: resp.StatusCode, Error: errDownloadStatus}
-		h.WriteErrorResponse(c, errMsg)
-		return errDownloadStatus
-	}
 
 	copyVideoContentHeaders(c.Writer.Header(), resp.Header)
 	if c.Writer.Header().Get("Content-Type") == "" {
@@ -884,6 +999,16 @@ func (h *OpenAIAPIHandler) writeVideoContentFromURL(c *gin.Context, contentURL s
 	c.Status(resp.StatusCode)
 	_, err = io.Copy(c.Writer, resp.Body)
 	return err
+}
+
+func hasNonIdentityContentEncoding(raw string) bool {
+	for _, part := range strings.Split(raw, ",") {
+		encoding := strings.TrimSpace(part)
+		if encoding != "" && !strings.EqualFold(encoding, "identity") {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *OpenAIAPIHandler) videoContentHTTPClient(c *gin.Context) *http.Client {
@@ -960,6 +1085,7 @@ func (h *OpenAIAPIHandler) collectXAIVideosNative(c *gin.Context, rawJSON []byte
 
 func (h *OpenAIAPIHandler) collectXAIVideosCreate(c *gin.Context, xaiReq []byte, meta xaiVideoCreateMetadata) {
 	c.Header("Content-Type", "application/json")
+	handlers.MarkRequestWithoutToolCompatibility(c)
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuthID := ""

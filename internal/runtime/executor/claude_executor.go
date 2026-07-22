@@ -1,14 +1,12 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,9 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
-	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -39,6 +35,21 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	claudeRequestPlanTransformStage              = "request_plan.claude"
+	claudeProviderConfigTransformStage           = "request_plan.claude.provider_config"
+	claudeProviderCompatibilityTransformStage    = "request_plan.claude.provider_compatibility"
+	claudeToolHistoryTransformStage              = "request_plan.claude.tool_history"
+	claudeFinalSanitizeTransformStage            = "request_plan.claude.final_sanitize"
+	claudeProviderConfigPolicy                   = "claude.provider_config"
+	claudeProviderCompatibilityPolicy            = "claude.provider_compatibility"
+	claudeToolHistoryPolicy                      = "claude.tool_history"
+	claudeFinalSanitizePolicy                    = "claude.final_sanitize"
+	claudeForcedToolChoiceThinkingDowngrade      = "claude.forced_tool_choice_thinking_disabled"
+	claudeToolSearchCompatibilityDowngrade       = "claude.tool_search_compatibility"
+	claudeStructuredOutputCompatibilityDowngrade = "claude.structured_output_compatibility"
 )
 
 // ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
@@ -86,22 +97,42 @@ func sanitizeClaudeWebSearchDomains(body []byte) []byte {
 	if !tools.Exists() || !tools.IsArray() {
 		return body
 	}
-	tools.ForEach(func(index, tool gjson.Result) bool {
+	toolItems := tools.Array()
+	updatedTools := make([]string, 0, len(toolItems))
+	changed := false
+	for _, tool := range toolItems {
+		toolRaw := []byte(tool.Raw)
 		if !strings.HasPrefix(tool.Get("type").String(), "web_search_") {
-			return true
+			updatedTools = append(updatedTools, tool.Raw)
+			continue
 		}
-		for _, field := range []string{"allowed_domains", "blocked_domains"} {
-			value := tool.Get(field)
-			if value.Exists() && value.IsArray() && len(value.Array()) == 0 {
-				path := fmt.Sprintf("tools.%d.%s", index.Int(), field)
-				if updated, errDelete := sjson.DeleteBytes(body, path); errDelete == nil {
-					body = updated
-				}
-			}
-		}
-		return true
-	})
-	return body
+		var removed bool
+		toolRaw, removed = deleteEmptyClaudeToolArrayField(toolRaw, "allowed_domains")
+		changed = changed || removed
+		toolRaw, removed = deleteEmptyClaudeToolArrayField(toolRaw, "blocked_domains")
+		changed = changed || removed
+		updatedTools = append(updatedTools, string(toolRaw))
+	}
+	if !changed {
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "tools", internalpayload.BuildRaw(updatedTools))
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func deleteEmptyClaudeToolArrayField(tool []byte, field string) ([]byte, bool) {
+	value := gjson.GetBytes(tool, field)
+	if !value.Exists() || !value.IsArray() || len(value.Array()) != 0 {
+		return tool, false
+	}
+	updated, err := sjson.DeleteBytes(tool, field)
+	if err != nil {
+		return tool, false
+	}
+	return updated, true
 }
 
 func logClaudeSignatureSanitizeReport(ctx context.Context, baseModel string, report sigcompat.SignatureSanitizeReport) {
@@ -228,7 +259,9 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if errDo != nil {
 		return nil, errDo
 	}
-	restoreClaudeHTTPResponseToolNames(resp, toolNameSanitization)
+	if errRestore := restoreClaudeHTTPResponseToolNames(resp, toolNameSanitization); errRestore != nil {
+		return nil, errRestore
+	}
 	return resp, nil
 }
 
@@ -269,14 +302,18 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payloadSource); ok {
 		payloadSource = repaired
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, plan.upstreamFormat, baseModel, originalPayloadSource, plan.upstreamStream)
-	body := sdktranslator.TranslateRequest(from, plan.upstreamFormat, baseModel, payloadSource, plan.upstreamStream)
+	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.claude", from, plan.upstreamFormat, baseModel, originalPayloadSource, payloadSource, plan.upstreamStream, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return plan, err
+	}
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(originalTranslated); ok {
 		originalTranslated = repaired
 	}
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
 	}
+	providerConfigStarted := time.Now()
+	providerConfigInput := body
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier())
 	if err != nil {
@@ -300,17 +337,58 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if streamResponse {
 		body = applyMiniMaxStreamingThinkingDefaultForCompat(plan.compatKind, body, true)
 	}
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		claudeProviderConfigTransformStage,
+		providerConfigInput,
+		body,
+		providerConfigStarted,
+		[]string{claudeProviderConfigPolicy},
+		nil,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
+		return plan, err
+	}
+
 	preflight := newClaudeCompatPreflight(body)
 	repairMeta = applyClaudeCompatPreflightStats(repairMeta, preflight)
+	providerCompatibilityStarted := time.Now()
+	providerCompatibilityInput := body
 	if preflight.hasSystemRole && rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
+	forcedToolChoiceInput := body
 	body = disableThinkingIfToolChoiceForced(body)
+	providerCompatibilityDowngrades := make([]string, 0, 1)
+	if !bytes.Equal(forcedToolChoiceInput, body) {
+		providerCompatibilityDowngrades = append(providerCompatibilityDowngrades, claudeForcedToolChoiceThinkingDowngrade)
+	}
 	body = normalizeClaudeTemperatureForThinking(body)
-	body, _, _, err = normalizeThinkingHistoryForModel(body, "claude", baseModel)
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		claudeProviderCompatibilityTransformStage,
+		providerCompatibilityInput,
+		body,
+		providerCompatibilityStarted,
+		[]string{claudeProviderCompatibilityPolicy},
+		providerCompatibilityDowngrades,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
+		return plan, err
+	}
+
+	historyStarted := time.Now()
+	var historyReport thinkingHistoryTransformReport
+	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReport(body, "claude", baseModel)
 	if err != nil {
 		return plan, err
 	}
+	if err = enforceThinkingHistoryTransform(ctx, "claude", historyReport, time.Since(historyStarted)); err != nil {
+		return plan, err
+	}
+
+	toolHistoryStarted := time.Now()
+	toolHistoryInput := body
 	if err = rejectLargeClaudeCompatToolHistory(ctx, body, repairMeta, preflight); err != nil {
 		return plan, err
 	}
@@ -326,8 +404,13 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 			return plan, err
 		}
 	}
+	toolHistoryDowngrades := make([]string, 0, 1)
 	if preflight.hasTools || preflight.hasToolSearch {
+		toolSearchInput := body
 		body = downgradeClaudeToolSearchForCompatKind(plan.compatKind, plan.baseURL, body)
+		if !bytes.Equal(toolSearchInput, body) {
+			toolHistoryDowngrades = append(toolHistoryDowngrades, claudeToolSearchCompatibilityDowngrade)
+		}
 	}
 
 	if streamResponse {
@@ -344,12 +427,30 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 		body = enforceCacheControlLimit(body, 4)
 		body = normalizeCacheControlTTL(body)
 	}
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		claudeToolHistoryTransformStage,
+		toolHistoryInput,
+		body,
+		toolHistoryStarted,
+		[]string{claudeToolHistoryPolicy},
+		toolHistoryDowngrades,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
+		return plan, err
+	}
 
+	finalSanitizeStarted := time.Now()
+	finalSanitizeInput := body
 	if preflight.hasBetas {
 		plan.extraBetas, body = extractAndRemoveBetas(body)
 	}
 	plan.bodyForTranslation = body
 	plan.bodyForUpstream = downgradeClaudeStructuredOutputForCompat(plan.baseURL, body)
+	finalSanitizeDowngrades := make([]string, 0, 1)
+	if !bytes.Equal(body, plan.bodyForUpstream) {
+		finalSanitizeDowngrades = append(finalSanitizeDowngrades, claudeStructuredOutputCompatibilityDowngrade)
+	}
 	plan.oauthToken = isClaudeOAuthToken(plan.apiKey)
 	if preflight.hasTools && plan.oauthToken {
 		plan.bodyForUpstream, plan.oauthToolNamesReverseMap = remapOAuthToolNames(plan.bodyForUpstream)
@@ -360,6 +461,18 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	plan.bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, plan.bodyForUpstream, baseModel)
 	if plan.oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		plan.bodyForUpstream = signAnthropicMessagesBody(plan.bodyForUpstream)
+	}
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		claudeFinalSanitizeTransformStage,
+		finalSanitizeInput,
+		plan.bodyForUpstream,
+		finalSanitizeStarted,
+		[]string{claudeFinalSanitizePolicy},
+		finalSanitizeDowngrades,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
+		return plan, err
 	}
 	return plan, nil
 }
@@ -412,55 +525,22 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return resp, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		if responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg); responseLog != nil {
-			responseLog.AppendChunk(b)
-		}
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return resp, err
-	}
 	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
-	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
+		if responseLog != nil {
+			responseLog.RecordError(err)
 		}
-		return resp, err
-	}
-	defer func() {
-		if errClose := decodedBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-	data, err := io.ReadAll(decodedBody)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	if responseLog != nil {
 		responseLog.AppendChunk(data)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+		return resp, err
 	}
 	if plan.upstreamStream {
 		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
@@ -491,7 +571,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		data,
 		&param,
 	)
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}
 	return resp, nil
 }
 
@@ -514,11 +594,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(plan.bodyForUpstream))
 	if err != nil {
+		cancelRequest()
 		return nil, err
 	}
 	if errHeaders := applyClaudeHeaders(httpReq, auth, plan.apiKey, true, plan.extraBetas, e.cfg); errHeaders != nil {
+		cancelRequest()
 		return nil, errHeaders
 	}
 	var authID, authLabel, authType, authValue string
@@ -539,112 +622,46 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(requestCtx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cancelRequest()
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	responseLog := helps.NewAPIResponseLogRuntime(ctx, e.cfg)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
+		b, readErr := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+		cancelRequest()
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
+			if responseLog != nil {
+				responseLog.RecordError(readErr)
+			}
+			return nil, readErr
 		}
 		if responseLog != nil {
 			responseLog.AppendChunk(b)
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
 		return nil, err
 	}
-	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return nil, err
+	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
+	if errStream != nil {
+		cancelRequest()
+		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
+		return nil, errStream
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "claude executor")
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := decodedBody.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
-			}
-		}()
+		defer closeResponse()
 
-		// If the response target is Claude, directly forward the SSE stream without translation.
-		if plan.responseFormat == plan.upstreamFormat {
-			scanner := bufio.NewScanner(decodedBody)
-			scanner.Buffer(nil, 52_428_800) // 50MB
-			for scanner.Scan() {
-				line := scanner.Bytes()
-				if responseLog != nil {
-					responseLog.AppendChunk(line)
-				}
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
-				line = normalizeClaudeStringMessageSSELine(line)
-				line = restoreClaudeToolNamesFromStreamLine(line, plan.toolNameSanitization)
-				if plan.oauthToken {
-					line = reverseRemapOAuthToolNamesFromStreamLine(line, plan.oauthToolNamesReverseMap)
-				}
-				if progressStartInputTokens > 0 {
-					line = patchClaudeMessageStartUsageForProgress(line, progressStartInputTokens)
-				}
-				// Forward the line as-is to preserve SSE format
-				cloned := make([]byte, len(line)+1)
-				copy(cloned, line)
-				cloned[len(line)] = '\n'
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
-				case <-ctx.Done():
-					return
-				}
-			}
-			if errScan := scanner.Err(); errScan != nil {
-				if responseLog != nil {
-					responseLog.RecordError(errScan)
-				}
-				reporter.PublishFailure(ctx, errScan)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-				case <-ctx.Done():
-				}
-			}
-			return
-		}
-
-		// For other formats, use translation
-		scanner := bufio.NewScanner(decodedBody)
-		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if responseLog != nil {
-				responseLog.AppendChunk(line)
-			}
+		prepareLine := func(line []byte) []byte {
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -653,83 +670,150 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if plan.oauthToken {
 				line = reverseRemapOAuthToolNamesFromStreamLine(line, plan.oauthToolNamesReverseMap)
 			}
-			chunks := sdktranslator.TranslateStream(
-				ctx,
-				plan.upstreamFormat,
-				plan.responseFormat,
-				req.Model,
-				opts.OriginalRequest,
-				plan.bodyForTranslation,
-				bytes.Clone(line),
-				&param,
-			)
-			for i := range chunks {
+			return line
+		}
+
+		// If the response target is Claude, directly forward the SSE stream without translation.
+		if plan.responseFormat == plan.upstreamFormat {
+			for {
+				event, errRead := sseStream.ReadEvent()
+				if errRead != nil {
+					if requestCtx.Err() != nil || errors.Is(errRead, io.EOF) {
+						return
+					}
+					if responseLog != nil {
+						responseLog.RecordError(errRead)
+					}
+					reporter.PublishFailure(ctx, errRead)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+					case <-requestCtx.Done():
+					}
+					return
+				}
+				if responseLog != nil {
+					responseLog.AppendChunk(event)
+				}
+				chunk := rewriteClaudeSSEEvent(event, func(line []byte) []byte {
+					line = prepareLine(line)
+					if progressStartInputTokens > 0 {
+						line = patchClaudeMessageStartUsageForProgress(line, progressStartInputTokens)
+					}
+					return line
+				})
+				payload := terminatedSSEEvent(chunk)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
+				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
+				case <-requestCtx.Done():
 					return
 				}
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil {
-			if responseLog != nil {
-				responseLog.RecordError(errScan)
+
+		// For other formats, use translation
+		var param any
+		for {
+			event, errRead := sseStream.ReadEvent()
+			if errRead != nil {
+				if requestCtx.Err() != nil || errors.Is(errRead, io.EOF) {
+					return
+				}
+				if responseLog != nil {
+					responseLog.RecordError(errRead)
+				}
+				reporter.PublishFailure(ctx, errRead)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case <-requestCtx.Done():
+				}
+				return
 			}
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
+			if responseLog != nil {
+				responseLog.AppendChunk(event)
+			}
+			completed := forEachClaudeSSELine(event, func(line []byte) bool {
+				line = prepareLine(line)
+				chunks := sdktranslator.TranslateStream(
+					requestCtx,
+					plan.upstreamFormat,
+					plan.responseFormat,
+					req.Model,
+					opts.OriginalRequest,
+					plan.bodyForTranslation,
+					internalpayload.CloneBytes(line),
+					&param,
+				)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-requestCtx.Done():
+						return false
+					}
+				}
+				return true
+			})
+			if !completed {
+				return
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
 }
 
 func validateClaudeStreamingResponse(data []byte) error {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(nil, 52_428_800)
+	reader, err := helps.NewBoundedSSEReader(bytes.NewReader(data), 0)
+	if err != nil {
+		return err
+	}
 
 	hasData := false
 	hasMessageStart := false
 	hasMessageDelta := false
 
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
-			continue
+	for {
+		event, errRead := reader.ReadEvent()
+		if errors.Is(errRead, io.EOF) {
+			break
 		}
-		payload := bytes.TrimSpace(line[len("data:"):])
-		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-			continue
+		if errRead != nil {
+			return errRead
 		}
-		hasData = true
-		if !gjson.ValidBytes(payload) {
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned malformed stream data"}
-		}
+		var eventErr error
+		forEachClaudeSSELine(event, func(rawLine []byte) bool {
+			line := bytes.TrimSpace(rawLine)
+			if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+				return true
+			}
+			payload := bytes.TrimSpace(line[len("data:"):])
+			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+				return true
+			}
+			hasData = true
+			if !gjson.ValidBytes(payload) {
+				eventErr = statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned malformed stream data"}
+				return false
+			}
 
-		root := gjson.ParseBytes(payload)
-		switch root.Get("type").String() {
-		case "error":
-			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
+			root := gjson.ParseBytes(payload)
+			switch root.Get("type").String() {
+			case "error":
+				eventErr = newUpstreamStatusErr(http.StatusBadGateway, nil, "text/event-stream", payload)
+				return false
+			case "message_start":
+				message := root.Get("message")
+				if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
+					eventErr = statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream message_start is missing id or model"}
+					return false
+				}
+				hasMessageStart = true
+			case "message_delta":
+				hasMessageDelta = true
 			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
-		case "message_start":
-			message := root.Get("message")
-			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
-				return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream message_start is missing id or model"}
-			}
-			hasMessageStart = true
-		case "message_delta":
-			hasMessageDelta = true
+			return true
+		})
+		if eventErr != nil {
+			return eventErr
 		}
-	}
-	if errScan := scanner.Err(); errScan != nil {
-		return errScan
 	}
 	if !hasData {
 		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned empty stream response"}
@@ -743,7 +827,48 @@ func validateClaudeStreamingResponse(data []byte) error {
 	return nil
 }
 
+func walkClaudeSSELines(event []byte, visit func(line, ending []byte) bool) bool {
+	for start := 0; start < len(event); {
+		end := start
+		for end < len(event) && event[end] != '\r' && event[end] != '\n' {
+			end++
+		}
+		endingEnd := end
+		if endingEnd < len(event) {
+			endingEnd++
+			if event[end] == '\r' && endingEnd < len(event) && event[endingEnd] == '\n' {
+				endingEnd++
+			}
+		}
+		if !visit(event[start:end], event[end:endingEnd]) {
+			return false
+		}
+		start = endingEnd
+	}
+	return true
+}
+
+func forEachClaudeSSELine(event []byte, visit func([]byte) bool) bool {
+	return walkClaudeSSELines(event, func(line, _ []byte) bool {
+		return visit(line)
+	})
+}
+
+func rewriteClaudeSSEEvent(event []byte, rewrite func([]byte) []byte) []byte {
+	out := make([]byte, 0, len(event))
+	walkClaudeSSELines(event, func(line, ending []byte) bool {
+		out = append(out, rewrite(line)...)
+		out = append(out, ending...)
+		return true
+	})
+	return out
+}
+
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return e.countTokens(ctx, auth, req, opts, claudeRequestPlanTransformStage, int64(len(req.Payload)))
+}
+
+func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, transformStage string, transformInputBytes int64) (cliproxyexecutor.Response, error) {
 	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -757,7 +882,10 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	to := sdktranslator.FromString("claude")
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	body, err := helps.TranslateRequestGuarded(ctx, "legacy.translate.claude.count", from, to, baseModel, req.Payload, stream, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
 	}
@@ -799,6 +927,14 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, errValidate
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
+	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       transformStage,
+		InputBytes:  transformInputBytes,
+		OutputBytes: int64(len(body)),
+		Duration:    time.Since(started),
+	}, internalpayload.AmplificationOverride{}); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -833,53 +969,19 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Decompress error responses — pass the Content-Encoding value (may be empty)
-		// and let decodeResponseBody handle both header-declared and magic-byte-detected
-		// compression.  This keeps error-path behaviour consistent with the success path.
-		errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
-		if decErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
-			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg}
-		}
-		b, readErr := io.ReadAll(errBody)
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
-			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		if errClose := errBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
-	}
-	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-		return cliproxyexecutor.Response{}, err
-	}
-	defer func() {
-		if errClose := decodedBody.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-	}()
-	data, err := io.ReadAll(decodedBody)
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return cliproxyexecutor.Response{}, newUpstreamStatusErr(resp.StatusCode, resp.Header, resp.Header.Get("Content-Type"), data)
+	}
 	count := gjson.GetBytes(data, "input_tokens").Int()
 	logCountTokensSummary(ctx, newCountTokensSummaryLogMeta(opts, helps.PayloadRequestedModel(opts, req.Model), baseModel, e.Identifier(), "ClaudeExecutor", body), count, time.Since(started))
 	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
-	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(resp.Header)}, nil
 }
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -1060,135 +1162,6 @@ func claudeSystemBlockFromText(text string) []any {
 		"type": "text",
 		"text": text,
 	}}
-}
-
-type compositeReadCloser struct {
-	io.Reader
-	closers []func() error
-}
-
-func (c *compositeReadCloser) Close() error {
-	var firstErr error
-	for i := range c.closers {
-		if c.closers[i] == nil {
-			continue
-		}
-		if err := c.closers[i](); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// peekableBody wraps a bufio.Reader around the original ReadCloser so that
-// magic bytes can be inspected without consuming them from the stream.
-type peekableBody struct {
-	*bufio.Reader
-	closer io.Closer
-}
-
-func (p *peekableBody) Close() error {
-	return p.closer.Close()
-}
-
-func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadCloser, error) {
-	if body == nil {
-		return nil, fmt.Errorf("response body is nil")
-	}
-	if contentEncoding == "" {
-		// No Content-Encoding header.  Attempt best-effort magic-byte detection to
-		// handle misbehaving upstreams that compress without setting the header.
-		// Only gzip (1f 8b) and zstd (28 b5 2f fd) have reliable magic sequences;
-		// br and deflate have none and are left as-is.
-		// The bufio wrapper preserves unread bytes so callers always see the full
-		// stream regardless of whether decompression was applied.
-		pb := &peekableBody{Reader: bufio.NewReader(body), closer: body}
-		magic, peekErr := pb.Peek(4)
-		if peekErr == nil || (peekErr == io.EOF && len(magic) >= 2) {
-			switch {
-			case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
-				gzipReader, gzErr := gzip.NewReader(pb)
-				if gzErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte gzip: failed to create reader: %w", gzErr)
-				}
-				return &compositeReadCloser{
-					Reader: gzipReader,
-					closers: []func() error{
-						gzipReader.Close,
-						pb.Close,
-					},
-				}, nil
-			case len(magic) >= 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-				decoder, zdErr := zstd.NewReader(pb)
-				if zdErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte zstd: failed to create reader: %w", zdErr)
-				}
-				return &compositeReadCloser{
-					Reader: decoder,
-					closers: []func() error{
-						func() error { decoder.Close(); return nil },
-						pb.Close,
-					},
-				}, nil
-			}
-		}
-		return pb, nil
-	}
-	encodings := strings.Split(contentEncoding, ",")
-	for _, raw := range encodings {
-		encoding := strings.TrimSpace(strings.ToLower(raw))
-		switch encoding {
-		case "", "identity":
-			continue
-		case "gzip":
-			gzipReader, err := gzip.NewReader(body)
-			if err != nil {
-				_ = body.Close()
-				return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-			}
-			return &compositeReadCloser{
-				Reader: gzipReader,
-				closers: []func() error{
-					gzipReader.Close,
-					func() error { return body.Close() },
-				},
-			}, nil
-		case "deflate":
-			deflateReader := flate.NewReader(body)
-			return &compositeReadCloser{
-				Reader: deflateReader,
-				closers: []func() error{
-					deflateReader.Close,
-					func() error { return body.Close() },
-				},
-			}, nil
-		case "br":
-			return &compositeReadCloser{
-				Reader: brotli.NewReader(body),
-				closers: []func() error{
-					func() error { return body.Close() },
-				},
-			}, nil
-		case "zstd":
-			decoder, err := zstd.NewReader(body)
-			if err != nil {
-				_ = body.Close()
-				return nil, fmt.Errorf("failed to create zstd reader: %w", err)
-			}
-			return &compositeReadCloser{
-				Reader: decoder,
-				closers: []func() error{
-					func() error { decoder.Close(); return nil },
-					func() error { return body.Close() },
-				},
-			}, nil
-		default:
-			continue
-		}
-	}
-	return body, nil
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) error {
@@ -1476,17 +1449,16 @@ func scrubDoubaoClaudeDeepSeekThinkingForCompat(body []byte, model string, compa
 		return body
 	}
 	effort, disabled := doubaoDeepSeekReasoningIntent(body, model)
-	for _, path := range []string{
-		"reasoning",
-		"reasoning_effort",
-		"thinking.reasoning_effort",
-		"thinking_budget",
-		"output_config.effort",
-	} {
+	deletePath := func(path string) {
 		if updated, err := sjson.DeleteBytes(body, path); err == nil {
 			body = updated
 		}
 	}
+	deletePath("reasoning")
+	deletePath("reasoning_effort")
+	deletePath("thinking.reasoning_effort")
+	deletePath("thinking_budget")
+	deletePath("output_config.effort")
 	if disabled {
 		if updated, err := sjson.DeleteBytes(body, "thinking"); err == nil {
 			body = updated
@@ -2177,29 +2149,54 @@ func normalizeClaudeEmptyToolResults(body []byte) ([]byte, int, error) {
 	}
 
 	placeholder := []byte(`[{"type":"text","text":"No output."}]`)
-	out := body
+	messageItems := messages.Array()
+	updatedMessages := make([]string, 0, len(messageItems))
 	repairs := 0
-	for msgIdx, msg := range messages.Array() {
+	for _, msg := range messageItems {
 		content := msg.Get("content")
 		if !content.Exists() || !content.IsArray() {
+			updatedMessages = append(updatedMessages, msg.Raw)
 			continue
 		}
-		for partIdx, part := range content.Array() {
+		contentItems := content.Array()
+		updatedContent := make([]string, 0, len(contentItems))
+		messageChanged := false
+		for _, part := range contentItems {
+			partRaw := []byte(part.Raw)
 			if strings.TrimSpace(part.Get("type").String()) != "tool_result" {
+				updatedContent = append(updatedContent, part.Raw)
 				continue
 			}
 			toolContent := part.Get("content")
 			needsRepair := claudeToolResultContentIsEmpty(toolContent)
 			if !needsRepair {
+				updatedContent = append(updatedContent, part.Raw)
 				continue
 			}
-			var err error
-			out, err = sjson.SetRawBytes(out, fmt.Sprintf("messages.%d.content.%d.content", msgIdx, partIdx), placeholder)
+			updatedPart, err := sjson.SetRawBytes(partRaw, "content", placeholder)
 			if err != nil {
 				return body, repairs, fmt.Errorf("failed to normalize empty Claude tool_result content: %w", err)
 			}
+			updatedContent = append(updatedContent, string(updatedPart))
+			messageChanged = true
 			repairs++
 		}
+		if !messageChanged {
+			updatedMessages = append(updatedMessages, msg.Raw)
+			continue
+		}
+		updatedMessage, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(updatedContent))
+		if err != nil {
+			return body, repairs, fmt.Errorf("failed to normalize empty Claude tool_result content: %w", err)
+		}
+		updatedMessages = append(updatedMessages, string(updatedMessage))
+	}
+	if repairs == 0 {
+		return body, 0, nil
+	}
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(updatedMessages))
+	if err != nil {
+		return body, repairs, fmt.Errorf("failed to normalize empty Claude tool_result content: %w", err)
 	}
 	return out, repairs, nil
 }
@@ -2707,7 +2704,7 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	outMessages := []byte(`[]`)
+	outMessages := make([]string, 0, len(messages.Array())+1)
 	pending := map[string]bool{}
 	changed := false
 	repairs := 0
@@ -2727,7 +2724,7 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 				repairs++
 			}
 			pending = claudeToolUseIDsInMessage(gjson.ParseBytes(msgRaw))
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
+			outMessages = append(outMessages, string(msgRaw))
 			continue
 		}
 
@@ -2735,18 +2732,18 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 			if role != "user" {
 				pending = map[string]bool{}
 			}
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
+			outMessages = append(outMessages, string(msgRaw))
 			continue
 		}
 
 		toolResultParts, otherParts := splitPendingClaudeToolResultParts(msg, pending)
 		if len(toolResultParts) == 0 {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
+			outMessages = append(outMessages, string(msgRaw))
 			pending = map[string]bool{}
 			continue
 		}
 		if len(otherParts) == 0 {
-			outMessages, _ = sjson.SetRawBytes(outMessages, "-1", msgRaw)
+			outMessages = append(outMessages, string(msgRaw))
 			continue
 		}
 
@@ -2758,8 +2755,7 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 		if err != nil {
 			return body, 0, err
 		}
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", toolResultMsg)
-		outMessages, _ = sjson.SetRawBytes(outMessages, "-1", otherMsg)
+		outMessages = append(outMessages, string(toolResultMsg), string(otherMsg))
 		pending = map[string]bool{}
 		changed = true
 		repairs++
@@ -2769,7 +2765,7 @@ func repairMiniMaxToolResultAdjacency(body []byte) ([]byte, int, error) {
 		return body, 0, nil
 	}
 
-	out, err := sjson.SetRawBytes(body, "messages", outMessages)
+	out, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(outMessages))
 	if err != nil {
 		return body, 0, fmt.Errorf("failed to update MiniMax Claude tool_result adjacency: %w", err)
 	}
@@ -2801,14 +2797,14 @@ func moveClaudeToolUseBlocksToEnd(msg gjson.Result) ([]byte, bool, error) {
 		return []byte(msg.Raw), false, nil
 	}
 
-	newContent := []byte(`[]`)
+	newContent := make([]string, 0, len(regularParts)+len(toolUseParts))
 	for _, part := range regularParts {
-		newContent, _ = sjson.SetRawBytes(newContent, "-1", []byte(part.Raw))
+		newContent = append(newContent, part.Raw)
 	}
 	for _, part := range toolUseParts {
-		newContent, _ = sjson.SetRawBytes(newContent, "-1", []byte(part.Raw))
+		newContent = append(newContent, part.Raw)
 	}
-	msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", newContent)
+	msgOut, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(newContent))
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to move MiniMax Claude tool_use blocks: %w", err)
 	}
@@ -2838,11 +2834,11 @@ func splitPendingClaudeToolResultParts(msg gjson.Result, pending map[string]bool
 }
 
 func setClaudeMessageContent(msg gjson.Result, parts []gjson.Result) ([]byte, error) {
-	content := []byte(`[]`)
+	content := make([]string, 0, len(parts))
 	for _, part := range parts {
-		content, _ = sjson.SetRawBytes(content, "-1", []byte(part.Raw))
+		content = append(content, part.Raw)
 	}
-	out, err := sjson.SetRawBytes([]byte(msg.Raw), "content", content)
+	out, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(content))
 	if err != nil {
 		return nil, fmt.Errorf("failed to update Claude message content: %w", err)
 	}
@@ -2926,6 +2922,118 @@ func validateMiniMaxToolResultAdjacency(body []byte) error {
 	return nil
 }
 
+type claudeToolNameReplacer func(string) (string, bool)
+
+func rewriteClaudeToolNameField(raw []byte, field string, replace claudeToolNameReplacer, onRewrite func(string, string)) ([]byte, bool) {
+	name := gjson.GetBytes(raw, field).String()
+	newName, ok := replace(name)
+	if !ok || newName == name {
+		return raw, false
+	}
+	updated, err := sjson.SetBytes(raw, field, newName)
+	if err != nil {
+		return raw, false
+	}
+	if onRewrite != nil {
+		onRewrite(name, newName)
+	}
+	return updated, true
+}
+
+func rewriteClaudeCustomToolDefinitions(tools gjson.Result, replace claudeToolNameReplacer, onRewrite func(string, string)) ([]byte, bool) {
+	toolItems := tools.Array()
+	updatedTools := make([]string, 0, len(toolItems))
+	changed := false
+	for _, tool := range toolItems {
+		toolRaw := []byte(tool.Raw)
+		if tool.Get("type").String() == "" {
+			if updatedTool, rewritten := rewriteClaudeToolNameField(toolRaw, "name", replace, onRewrite); rewritten {
+				toolRaw = updatedTool
+				changed = true
+			}
+		}
+		updatedTools = append(updatedTools, string(toolRaw))
+	}
+	if !changed {
+		return nil, false
+	}
+	return internalpayload.BuildRaw(updatedTools), true
+}
+
+func rewriteClaudeContentToolNames(content gjson.Result, replace claudeToolNameReplacer, onRewrite func(string, string)) ([]byte, bool) {
+	contentItems := content.Array()
+	updatedContent := make([]string, 0, len(contentItems))
+	changed := false
+	for _, part := range contentItems {
+		partRaw := []byte(part.Raw)
+		partChanged := false
+		switch part.Get("type").String() {
+		case "tool_use":
+			partRaw, partChanged = rewriteClaudeToolNameField(partRaw, "name", replace, onRewrite)
+		case "tool_reference":
+			partRaw, partChanged = rewriteClaudeToolNameField(partRaw, "tool_name", replace, onRewrite)
+		case "tool_result":
+			nestedContent := part.Get("content")
+			if nestedContent.Exists() && nestedContent.IsArray() {
+				nestedItems := nestedContent.Array()
+				updatedNested := make([]string, 0, len(nestedItems))
+				nestedChanged := false
+				for _, nestedPart := range nestedItems {
+					nestedRaw := []byte(nestedPart.Raw)
+					if nestedPart.Get("type").String() == "tool_reference" {
+						if updatedPart, rewritten := rewriteClaudeToolNameField(nestedRaw, "tool_name", replace, onRewrite); rewritten {
+							nestedRaw = updatedPart
+							nestedChanged = true
+						}
+					}
+					updatedNested = append(updatedNested, string(nestedRaw))
+				}
+				if nestedChanged {
+					if updatedPart, err := sjson.SetRawBytes(partRaw, "content", internalpayload.BuildRaw(updatedNested)); err == nil {
+						partRaw = updatedPart
+						partChanged = true
+					}
+				}
+			}
+		}
+		updatedContent = append(updatedContent, string(partRaw))
+		changed = changed || partChanged
+	}
+	if !changed {
+		return nil, false
+	}
+	return internalpayload.BuildRaw(updatedContent), true
+}
+
+func rewriteClaudeMessageToolNames(messages gjson.Result, replace claudeToolNameReplacer, onRewrite func(string, string)) ([]byte, bool) {
+	messageItems := messages.Array()
+	updatedMessages := make([]string, 0, len(messageItems))
+	changed := false
+	for _, message := range messageItems {
+		content := message.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			updatedMessages = append(updatedMessages, message.Raw)
+			continue
+		}
+		updatedContent, contentChanged := rewriteClaudeContentToolNames(content, replace, onRewrite)
+		if !contentChanged {
+			updatedMessages = append(updatedMessages, message.Raw)
+			continue
+		}
+		updatedMessage, err := sjson.SetRawBytes([]byte(message.Raw), "content", updatedContent)
+		if err != nil {
+			updatedMessages = append(updatedMessages, message.Raw)
+			continue
+		}
+		updatedMessages = append(updatedMessages, string(updatedMessage))
+		changed = true
+	}
+	if !changed {
+		return nil, false
+	}
+	return internalpayload.BuildRaw(updatedMessages), true
+}
+
 // remapOAuthToolNames renames third-party tool names to Claude Code equivalents
 // to prevent Anthropic from fingerprinting the request as a third-party client.
 //
@@ -2949,107 +3057,37 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 			reverseMap[renamed] = original
 		}
 	}
+	replaceOAuthName := func(name string) (string, bool) {
+		newName, ok := oauthToolRenameMap[name]
+		return newName, ok && newName != name
+	}
 
-	// 1. Rewrite tools array in a single pass (if present).
-	// IMPORTANT: do not mutate names first and then rebuild from an older gjson
-	// snapshot. gjson results are snapshots of the original bytes; rebuilding from a
-	// stale snapshot will overwrite renamed names back to their original lowercase values.
+	// 1. Rewrite tools locally, then replace the array once.
 	tools := gjson.GetBytes(body, "tools")
 	if tools.Exists() && tools.IsArray() {
-
-		var toolsJSON strings.Builder
-		toolsJSON.WriteByte('[')
-		toolCount := 0
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Keep Anthropic built-in tools (web_search, code_execution, etc.) unchanged.
-			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
-				if toolCount > 0 {
-					toolsJSON.WriteByte(',')
-				}
-				toolsJSON.WriteString(tool.Raw)
-				toolCount++
-				return true
+		if updatedTools, changed := rewriteClaudeCustomToolDefinitions(tools, replaceOAuthName, recordRename); changed {
+			if updated, err := sjson.SetRawBytes(body, "tools", updatedTools); err == nil {
+				body = updated
 			}
-
-			name := tool.Get("name").String()
-			toolJSON := tool.Raw
-			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
-				updatedTool, err := sjson.Set(toolJSON, "name", newName)
-				if err == nil {
-					toolJSON = updatedTool
-					recordRename(name, newName)
-				}
-			}
-
-			if toolCount > 0 {
-				toolsJSON.WriteByte(',')
-			}
-			toolsJSON.WriteString(toolJSON)
-			toolCount++
-			return true
-		})
-		toolsJSON.WriteByte(']')
-		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+		}
 	}
 
 	// 2. Rename tool_choice if it references a known tool
 	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
 	if toolChoiceType == "tool" {
-		tcName := gjson.GetBytes(body, "tool_choice.name").String()
-		if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
-			recordRename(tcName, newName)
+		if updated, changed := rewriteClaudeToolNameField(body, "tool_choice.name", replaceOAuthName, recordRename); changed {
+			body = updated
 		}
 	}
 
-	// 3. Rename tool references in messages
+	// 3. Rewrite message content locally, then replace messages once.
 	messages := gjson.GetBytes(body, "messages")
 	if messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
+		if updatedMessages, changed := rewriteClaudeMessageToolNames(messages, replaceOAuthName, recordRename); changed {
+			if updated, err := sjson.SetRawBytes(body, "messages", updatedMessages); err == nil {
+				body = updated
 			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				partType := part.Get("type").String()
-				switch partType {
-				case "tool_use":
-					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
-						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(name, newName)
-					}
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
-						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(toolName, newName)
-					}
-				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
-					toolID := part.Get("tool_use_id").String()
-					_ = toolID // tool_use_id stays as-is
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() == "tool_reference" {
-								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
-									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, newName)
-									recordRename(nestedToolName, newName)
-								}
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
-			return true
-		})
+		}
 	}
 
 	return body, reverseMap
@@ -3066,25 +3104,39 @@ func reverseRemapOAuthToolNames(body []byte, reverseMap map[string]string) []byt
 	if !content.Exists() || !content.IsArray() {
 		return body
 	}
-	content.ForEach(func(index, part gjson.Result) bool {
-		partType := part.Get("type").String()
-		switch partType {
+	contentItems := content.Array()
+	updatedContent := make([]string, 0, len(contentItems))
+	changed := false
+	for _, part := range contentItems {
+		partRaw := []byte(part.Raw)
+		switch part.Get("type").String() {
 		case "tool_use":
 			name := part.Get("name").String()
 			if origName, ok := reverseMap[name]; ok {
-				path := fmt.Sprintf("content.%d.name", index.Int())
-				body, _ = sjson.SetBytes(body, path, origName)
+				if updatedPart, err := sjson.SetBytes(partRaw, "name", origName); err == nil {
+					partRaw = updatedPart
+					changed = true
+				}
 			}
 		case "tool_reference":
 			toolName := part.Get("tool_name").String()
 			if origName, ok := reverseMap[toolName]; ok {
-				path := fmt.Sprintf("content.%d.tool_name", index.Int())
-				body, _ = sjson.SetBytes(body, path, origName)
+				if updatedPart, err := sjson.SetBytes(partRaw, "tool_name", origName); err == nil {
+					partRaw = updatedPart
+					changed = true
+				}
 			}
 		}
-		return true
-	})
-	return body
+		updatedContent = append(updatedContent, string(partRaw))
+	}
+	if !changed {
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "content", internalpayload.BuildRaw(updatedContent))
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 // reverseRemapOAuthToolNamesFromStreamLine reverses the tool name mapping for SSE
@@ -3162,12 +3214,9 @@ func sanitizeClaudeHTTPRequestToolNames(req *http.Request) (*claudeToolNameSanit
 	if req == nil || req.Body == nil || req.Body == http.NoBody {
 		return nil, nil
 	}
-	body, errRead := io.ReadAll(req.Body)
+	body, errRead := readAndCloseExecutorHTTPRequestBody(req, "claude executor")
 	if errRead != nil {
 		return nil, errRead
-	}
-	if errClose := req.Body.Close(); errClose != nil {
-		log.Errorf("request body close error: %v", errClose)
 	}
 	compatKind := ""
 	if req.URL != nil {
@@ -3199,79 +3248,70 @@ func requestURLString(req *http.Request) string {
 	return req.URL.String()
 }
 
-func restoreClaudeHTTPResponseToolNames(resp *http.Response, mapping *claudeToolNameSanitization) {
+func restoreClaudeHTTPResponseToolNames(resp *http.Response, mapping *claudeToolNameSanitization) error {
 	if resp == nil || resp.Body == nil || mapping == nil || len(mapping.upstreamToOriginal) == 0 {
-		return
+		return nil
 	}
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if strings.Contains(contentType, "text/event-stream") {
-		resp.Body = newClaudeToolNameRestoringStream(resp.Body, mapping)
+		stream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(resp, 0)
+		if errStream != nil {
+			return errStream
+		}
+		resp.Body = newClaudeToolNameRestoringStream(stream, mapping)
 		resp.ContentLength = -1
-		resp.Header.Del("Content-Length")
-		return
+		resp.Header = decodedResponseHeaders(resp.Header)
+		return nil
 	}
-	if strings.TrimSpace(resp.Header.Get("Content-Encoding")) != "" {
-		return
-	}
-	data, errRead := io.ReadAll(resp.Body)
+	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{})
 	if errRead != nil {
-		log.Errorf("response body read error: %v", errRead)
-		return
-	}
-	if errClose := resp.Body.Close(); errClose != nil {
-		log.Errorf("response body close error: %v", errClose)
+		return errRead
 	}
 	data = restoreClaudeToolNamesFromResponse(data, mapping)
 	resp.Body = io.NopCloser(bytes.NewReader(data))
 	resp.ContentLength = int64(len(data))
+	resp.Header = decodedResponseHeaders(resp.Header)
 	resp.Header.Set("Content-Length", strconv.Itoa(len(data)))
+	return nil
 }
 
 type claudeToolNameRestoringStream struct {
-	*io.PipeReader
-	upstream io.Closer
+	upstream *helps.BoundedUpstreamSSEStream
+	mapping  *claudeToolNameSanitization
+	pending  []byte
 }
 
-func newClaudeToolNameRestoringStream(upstream io.ReadCloser, mapping *claudeToolNameSanitization) io.ReadCloser {
-	reader, writer := io.Pipe()
-	go func() {
-		defer func() {
-			if errClose := upstream.Close(); errClose != nil {
-				log.Errorf("response body close error: %v", errClose)
-			}
-		}()
-		scanner := bufio.NewScanner(upstream)
-		scanner.Buffer(nil, 52_428_800)
-		for scanner.Scan() {
-			line := restoreClaudeToolNamesFromStreamLine(scanner.Bytes(), mapping)
-			if _, errWrite := writer.Write(line); errWrite != nil {
-				_ = writer.CloseWithError(errWrite)
-				return
-			}
-			if _, errWrite := writer.Write([]byte("\n")); errWrite != nil {
-				_ = writer.CloseWithError(errWrite)
-				return
-			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			_ = writer.CloseWithError(errScan)
-			return
-		}
-		_ = writer.Close()
-	}()
-	return &claudeToolNameRestoringStream{PipeReader: reader, upstream: upstream}
+func newClaudeToolNameRestoringStream(upstream *helps.BoundedUpstreamSSEStream, mapping *claudeToolNameSanitization) io.ReadCloser {
+	return &claudeToolNameRestoringStream{upstream: upstream, mapping: mapping}
 }
 
-func (s *claudeToolNameRestoringStream) Close() error {
-	errReader := s.PipeReader.Close()
-	if s.upstream == nil {
-		return errReader
+func (stream *claudeToolNameRestoringStream) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
 	}
-	errUpstream := s.upstream.Close()
-	if errReader != nil {
-		return errReader
+	if stream == nil || stream.upstream == nil {
+		return 0, io.ErrClosedPipe
 	}
-	return errUpstream
+	for len(stream.pending) == 0 {
+		event, errRead := stream.upstream.ReadEvent()
+		if errRead != nil {
+			return 0, errRead
+		}
+		rewritten := rewriteClaudeSSEEvent(event, func(line []byte) []byte {
+			return restoreClaudeToolNamesFromStreamLine(line, stream.mapping)
+		})
+		stream.pending = terminatedSSEEvent(rewritten)
+	}
+	read := copy(buffer, stream.pending)
+	stream.pending = stream.pending[read:]
+	return read, nil
+}
+
+func (stream *claudeToolNameRestoringStream) Close() error {
+	if stream == nil || stream.upstream == nil {
+		return nil
+	}
+	return stream.upstream.Close()
 }
 
 func collectClaudeCustomToolNames(body []byte) map[string]bool {
@@ -3371,67 +3411,30 @@ func rewriteClaudeRequestToolNames(body []byte, replace func(string) string) []b
 	if replace == nil {
 		return body
 	}
+	replaceName := func(name string) (string, bool) {
+		newName := replace(name)
+		return newName, newName != name
+	}
 	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
-		tools.ForEach(func(index, tool gjson.Result) bool {
-			if tool.Get("type").String() != "" {
-				return true
+		if updatedTools, changed := rewriteClaudeCustomToolDefinitions(tools, replaceName, nil); changed {
+			if updated, err := sjson.SetRawBytes(body, "tools", updatedTools); err == nil {
+				body = updated
 			}
-			name := tool.Get("name").String()
-			if newName := replace(name); newName != name {
-				path := fmt.Sprintf("tools.%d.name", index.Int())
-				body, _ = sjson.SetBytes(body, path, newName)
-			}
-			return true
-		})
+		}
 	}
 
 	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
-		name := gjson.GetBytes(body, "tool_choice.name").String()
-		if newName := replace(name); newName != name {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
+		if updated, changed := rewriteClaudeToolNameField(body, "tool_choice.name", replaceName, nil); changed {
+			body = updated
 		}
 	}
 
 	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
+		if updatedMessages, changed := rewriteClaudeMessageToolNames(messages, replaceName, nil); changed {
+			if updated, err := sjson.SetRawBytes(body, "messages", updatedMessages); err == nil {
+				body = updated
 			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				switch part.Get("type").String() {
-				case "tool_use":
-					name := part.Get("name").String()
-					if newName := replace(name); newName != name {
-						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-					}
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if newName := replace(toolName); newName != toolName {
-						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-					}
-				case "tool_result":
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() != "tool_reference" {
-								return true
-							}
-							nestedToolName := nestedPart.Get("tool_name").String()
-							if newName := replace(nestedToolName); newName != nestedToolName {
-								nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-								body, _ = sjson.SetBytes(body, nestedPath, newName)
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
-			return true
-		})
+		}
 	}
 	return body
 }
@@ -3444,39 +3447,19 @@ func restoreClaudeToolNamesFromResponse(body []byte, mapping *claudeToolNameSani
 	if !content.Exists() || !content.IsArray() {
 		return body
 	}
-	content.ForEach(func(index, part gjson.Result) bool {
-		switch part.Get("type").String() {
-		case "tool_use":
-			name := part.Get("name").String()
-			if original, ok := mapping.upstreamToOriginal[name]; ok {
-				path := fmt.Sprintf("content.%d.name", index.Int())
-				body, _ = sjson.SetBytes(body, path, original)
-			}
-		case "tool_reference":
-			toolName := part.Get("tool_name").String()
-			if original, ok := mapping.upstreamToOriginal[toolName]; ok {
-				path := fmt.Sprintf("content.%d.tool_name", index.Int())
-				body, _ = sjson.SetBytes(body, path, original)
-			}
-		case "tool_result":
-			nestedContent := part.Get("content")
-			if nestedContent.Exists() && nestedContent.IsArray() {
-				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-					if nestedPart.Get("type").String() != "tool_reference" {
-						return true
-					}
-					nestedToolName := nestedPart.Get("tool_name").String()
-					if original, ok := mapping.upstreamToOriginal[nestedToolName]; ok {
-						nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
-						body, _ = sjson.SetBytes(body, nestedPath, original)
-					}
-					return true
-				})
-			}
-		}
-		return true
-	})
-	return body
+	restoreName := func(name string) (string, bool) {
+		original, ok := mapping.upstreamToOriginal[name]
+		return original, ok
+	}
+	updatedContent, changed := rewriteClaudeContentToolNames(content, restoreName, nil)
+	if !changed {
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "content", updatedContent)
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func restoreClaudeToolNamesFromStreamLine(line []byte, mapping *claudeToolNameSanitization) []byte {
@@ -4110,12 +4093,11 @@ func countCacheControls(payload []byte) int {
 //	body = enforceCacheControlLimit(body, maxBlocks)
 //	body = normalizeCacheControlTTL(body)
 //
-// Only the read side is merged: a one-pass model drives the common path
-// (payload already within the limit) so normalization runs without re-walking
-// the document. Writes stay pointwise via sjson. The rarer paths (injection
-// needed, or block count over the limit) defer to the legacy functions, which
-// reshape the body and are re-scanned freshly. When doInject is false the
-// injection phase is skipped entirely (CountTokens path).
+// A one-pass model drives the common path (payload already within the limit).
+// Normalization rebuilds only affected arrays and writes each root section once.
+// The rarer paths (injection needed, or block count over the limit) reshape the
+// body and are re-scanned freshly. When doInject is false the injection phase is
+// skipped entirely (CountTokens path).
 func applyCacheControlPipeline(payload []byte, maxBlocks int, doInject bool) []byte {
 	model := collectCacheControlModel(payload)
 
@@ -4207,13 +4189,10 @@ func collectCacheControlModel(payload []byte) cacheControlModel {
 	return model
 }
 
-// normalizeFromModel applies the TTL ordering normalization using the prebuilt
-// model, equivalent to normalizeCacheControlTTL but without re-walking the
-// document. Anthropic evaluates blocks in order tools → system → messages; once
-// a 5m (default) block is seen, every later 1h block must drop its ttl. The
-// model's blocks are already in evaluation order, so a non-object cache_control
-// or a non-"1h" ttl marks a 5m block. Bytes are returned unchanged when no
-// deletion occurs, preserving the no-op identity guarantee.
+// normalizeFromModel uses the prebuilt model to select every TTL deletion before
+// rebuilding affected arrays once. Anthropic evaluates blocks in order tools →
+// system → messages; once a 5m (default) block is seen, every later 1h block
+// must drop its ttl. Bytes are returned unchanged when no deletion occurs.
 func normalizeFromModel(payload []byte, model cacheControlModel) []byte {
 	// Match the guard in normalizeCacheControlTTL/enforceCacheControlLimit so the
 	// common path stays byte-identical to the legacy sequence on empty or invalid
@@ -4222,6 +4201,7 @@ func normalizeFromModel(payload []byte, model cacheControlModel) []byte {
 		return payload
 	}
 	seen5m := false
+	deleteTTL := make(map[string]bool)
 	for _, b := range model.blocks {
 		if !b.ccIsObject || !b.ttlIs1h {
 			seen5m = true
@@ -4230,11 +4210,99 @@ func normalizeFromModel(payload []byte, model cacheControlModel) []byte {
 		if !seen5m {
 			continue
 		}
-		if updated, errDel := sjson.DeleteBytes(payload, b.path+".cache_control.ttl"); errDel == nil {
-			payload = updated
-		}
+		deleteTTL[b.path] = true
 	}
-	return payload
+	if len(deleteTTL) == 0 {
+		return payload
+	}
+	return deleteCacheControlPaths(payload, deleteTTL, "cache_control.ttl")
+}
+
+func deleteCacheControlPaths(payload []byte, paths map[string]bool, field string) []byte {
+	payload = deleteCacheControlArrayPaths(payload, "tools", paths, field)
+	payload = deleteCacheControlArrayPaths(payload, "system", paths, field)
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+	messageItems := messages.Array()
+	updatedMessages := make([]string, 0, len(messageItems))
+	messagesChanged := false
+	for msgIdx, msg := range messageItems {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			updatedMessages = append(updatedMessages, msg.Raw)
+			continue
+		}
+		contentItems := content.Array()
+		updatedContent := make([]string, 0, len(contentItems))
+		contentChanged := false
+		for itemIdx, item := range contentItems {
+			path := fmt.Sprintf("messages.%d.content.%d", msgIdx, itemIdx)
+			if !paths[path] {
+				updatedContent = append(updatedContent, item.Raw)
+				continue
+			}
+			updatedItem, err := sjson.DeleteBytes([]byte(item.Raw), field)
+			if err != nil {
+				updatedContent = append(updatedContent, item.Raw)
+				continue
+			}
+			updatedContent = append(updatedContent, string(updatedItem))
+			contentChanged = true
+		}
+		if !contentChanged {
+			updatedMessages = append(updatedMessages, msg.Raw)
+			continue
+		}
+		updatedMessage, err := sjson.SetRawBytes([]byte(msg.Raw), "content", internalpayload.BuildRaw(updatedContent))
+		if err != nil {
+			updatedMessages = append(updatedMessages, msg.Raw)
+			continue
+		}
+		updatedMessages = append(updatedMessages, string(updatedMessage))
+		messagesChanged = true
+	}
+	if !messagesChanged {
+		return payload
+	}
+	updated, err := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(updatedMessages))
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func deleteCacheControlArrayPaths(payload []byte, root string, paths map[string]bool, field string) []byte {
+	array := gjson.GetBytes(payload, root)
+	if !array.IsArray() {
+		return payload
+	}
+	items := array.Array()
+	updatedItems := make([]string, 0, len(items))
+	changed := false
+	for index, item := range items {
+		if !paths[fmt.Sprintf("%s.%d", root, index)] {
+			updatedItems = append(updatedItems, item.Raw)
+			continue
+		}
+		updatedItem, err := sjson.DeleteBytes([]byte(item.Raw), field)
+		if err != nil {
+			updatedItems = append(updatedItems, item.Raw)
+			continue
+		}
+		updatedItems = append(updatedItems, string(updatedItem))
+		changed = true
+	}
+	if !changed {
+		return payload
+	}
+	updated, err := sjson.SetRawBytes(payload, root, internalpayload.BuildRaw(updatedItems))
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 // normalizeCacheControlTTL ensures cache_control TTL values don't violate the
@@ -4252,72 +4320,7 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-
-	original := payload
-	seen5m := false
-	modified := false
-
-	processBlock := func(path string, obj gjson.Result) {
-		cc := obj.Get("cache_control")
-		if !cc.Exists() {
-			return
-		}
-		if !cc.IsObject() {
-			seen5m = true
-			return
-		}
-		ttl := cc.Get("ttl")
-		if ttl.Type != gjson.String || ttl.String() != "1h" {
-			seen5m = true
-			return
-		}
-		if !seen5m {
-			return
-		}
-		ttlPath := path + ".cache_control.ttl"
-		updated, errDel := sjson.DeleteBytes(payload, ttlPath)
-		if errDel != nil {
-			return
-		}
-		payload = updated
-		modified = true
-	}
-
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("tools.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("system.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				processBlock(fmt.Sprintf("messages.%d.content.%d", int(msgIdx.Int()), int(itemIdx.Int())), item)
-				return true
-			})
-			return true
-		})
-	}
-
-	if !modified {
-		return original
-	}
-	return payload
+	return normalizeFromModel(payload, collectCacheControlModel(payload))
 }
 
 // enforceCacheControlLimit removes excess cache_control blocks from a payload
@@ -4341,162 +4344,48 @@ func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
 		return payload
 	}
 
-	total := countCacheControls(payload)
-	if total <= maxBlocks {
+	model := collectCacheControlModel(payload)
+	if model.total <= maxBlocks {
 		return payload
 	}
-
-	excess := total - maxBlocks
-
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		lastIdx := -1
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			system.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("system.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
+	toolPaths := make([]string, 0)
+	systemPaths := make([]string, 0)
+	messagePaths := make([]string, 0)
+	for _, block := range model.blocks {
+		switch {
+		case strings.HasPrefix(block.path, "tools."):
+			toolPaths = append(toolPaths, block.path)
+		case strings.HasPrefix(block.path, "system."):
+			systemPaths = append(systemPaths, block.path)
+		case strings.HasPrefix(block.path, "messages."):
+			messagePaths = append(messagePaths, block.path)
 		}
 	}
-	if excess <= 0 {
-		return payload
+
+	priority := make([]string, 0, model.total)
+	if len(systemPaths) > 1 {
+		priority = append(priority, systemPaths[:len(systemPaths)-1]...)
+	}
+	if len(toolPaths) > 1 {
+		priority = append(priority, toolPaths[:len(toolPaths)-1]...)
+	}
+	priority = append(priority, messagePaths...)
+	if len(systemPaths) > 0 {
+		priority = append(priority, systemPaths[len(systemPaths)-1])
+	}
+	if len(toolPaths) > 0 {
+		priority = append(priority, toolPaths[len(toolPaths)-1])
 	}
 
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		lastIdx := -1
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			tools.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("tools.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-		}
+	excess := model.total - maxBlocks
+	if excess > len(priority) {
+		excess = len(priority)
 	}
-	if excess <= 0 {
-		return payload
+	deletePaths := make(map[string]bool, excess)
+	for _, path := range priority[:excess] {
+		deletePaths[path] = true
 	}
-
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-			return true
-		})
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	system = gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("system.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	tools = gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("tools.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
-	}
-
-	return payload
+	return deleteCacheControlPaths(payload, deletePaths, "cache_control")
 }
 
 // injectMessagesCacheControl adds cache_control to the second-to-last user turn for multi-turn caching.
@@ -4693,16 +4582,23 @@ func ensureModelMaxTokens(body []byte, modelID string) []byte {
 		return body
 	}
 
+	isClaude := false
 	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.TrimSpace(modelID)) {
 		if strings.EqualFold(provider, "claude") {
-			maxTokens := defaultModelMaxTokens
-			if info := registry.GetGlobalRegistry().GetModelInfo(strings.TrimSpace(modelID), "claude"); info != nil && info.MaxCompletionTokens > 0 {
-				maxTokens = info.MaxCompletionTokens
-			}
-			body, _ = sjson.SetBytes(body, "max_tokens", maxTokens)
-			return body
+			isClaude = true
+			break
 		}
 	}
-
-	return body
+	if !isClaude {
+		return body
+	}
+	maxTokens := defaultModelMaxTokens
+	if info := registry.GetGlobalRegistry().GetModelInfo(strings.TrimSpace(modelID), "claude"); info != nil && info.MaxCompletionTokens > 0 {
+		maxTokens = info.MaxCompletionTokens
+	}
+	updated, err := sjson.SetBytes(body, "max_tokens", maxTokens)
+	if err != nil {
+		return body
+	}
+	return updated
 }

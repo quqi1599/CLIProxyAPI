@@ -52,7 +52,7 @@ func (h *Host) callCommandLineRegistrar(ctx context.Context, record capabilityRe
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "CommandLinePlugin.RegisterCommandLine", recovered)
 			resp = pluginapi.CommandLineRegistrationResponse{}
-			err = fmt.Errorf("command-line registrar panic: %v", recovered)
+			err = fmt.Errorf("command-line registrar panic")
 		}
 	}()
 	return plugin.RegisterCommandLine(ctx, pluginapi.CommandLineRegistrationRequest{Plugin: record.meta})
@@ -356,7 +356,7 @@ func (h *Host) callCommandLineExecutor(ctx context.Context, record capabilityRec
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "CommandLinePlugin.ExecuteCommandLine", recovered)
 			resp = pluginapi.CommandLineExecutionResponse{}
-			err = fmt.Errorf("command-line execution panic: %v", recovered)
+			err = fmt.Errorf("command-line execution panic")
 		}
 	}()
 	return plugin.ExecuteCommandLine(ctx, req)

@@ -5,16 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -64,6 +64,15 @@ func (e *OpenAICompatExecutor) executeMiniMaxImageGeneration(ctx context.Context
 		upstreamModel = strings.TrimSpace(req.Model)
 	}
 	payload, _ = sjson.SetBytes(payload, "model", upstreamModel)
+	if errGuard := internalpayload.EnforceRequestTransform(
+		ctx,
+		openAICompatRequestPlanTransformStage,
+		int64(len(req.Payload)),
+		int64(len(payload)),
+		internalpayload.AmplificationOverride{},
+	); errGuard != nil {
+		return cliproxyexecutor.Response{}, errGuard
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/image_generation"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
@@ -100,13 +109,8 @@ func (e *OpenAICompatExecutor) executeMiniMaxImageGeneration(ctx context.Context
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("openai compat executor: close minimax image response body error: %v", errClose)
-		}
-	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	body, err := io.ReadAll(httpResp.Body)
+	body, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
@@ -124,7 +128,7 @@ func (e *OpenAICompatExecutor) executeMiniMaxImageGeneration(ctx context.Context
 	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(out))
 	reporter.EnsurePublished(ctx)
-	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	return cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}, nil
 }
 
 func buildOpenAIImagesResponseFromMiniMax(body []byte) ([]byte, error) {
@@ -132,20 +136,11 @@ func buildOpenAIImagesResponseFromMiniMax(body []byte) ([]byte, error) {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "minimax image_generation: invalid JSON response", errorCode: "minimax_invalid_json"}
 	}
 	if baseResp := gjson.GetBytes(body, "base_resp.status_code"); baseResp.Exists() && baseResp.Int() != 0 {
-		message := firstNonEmptyJSONValue(body, "base_resp.status_msg", "base_resp.message", "base_resp.msg", "message", "msg")
-		if message == "" {
-			message = "minimax image_generation returned a logical error"
-		}
-		return nil, statusErr{
-			code:               http.StatusBadGateway,
-			providerStatusCode: http.StatusOK,
-			msg:                message,
-			errorCode:          "minimax_" + strings.TrimSpace(baseResp.String()),
-		}
+		status := newUpstreamStatusErr(http.StatusBadGateway, nil, "application/json", body)
+		status.providerStatusCode = http.StatusOK
+		status.errorCode = "minimax_" + strconv.FormatInt(baseResp.Int(), 10)
+		return nil, status
 	}
-
-	out := []byte(`{"created":0,"data":[]}`)
-	out, _ = sjson.SetBytes(out, "created", time.Now().Unix())
 
 	b64Images := collectMiniMaxImageStrings(body,
 		"data.image_base64",
@@ -162,26 +157,28 @@ func buildOpenAIImagesResponseFromMiniMax(body []byte) ([]byte, error) {
 		"data.images.#.image_url",
 		"image_urls",
 	)
-
+	revisedPrompt := firstNonEmptyJSONValue(body, "data.revised_prompt", "revised_prompt")
+	type imageData struct {
+		B64JSON       string `json:"b64_json,omitempty"`
+		URL           string `json:"url,omitempty"`
+		RevisedPrompt string `json:"revised_prompt,omitempty"`
+	}
+	data := make([]imageData, 0, len(b64Images)+len(urlImages))
 	for _, b64 := range b64Images {
-		item := []byte(`{}`)
-		item, _ = sjson.SetBytes(item, "b64_json", b64)
-		out, _ = sjson.SetRawBytes(out, "data.-1", item)
+		data = append(data, imageData{B64JSON: b64, RevisedPrompt: revisedPrompt})
 	}
 	for _, imageURL := range urlImages {
-		item := []byte(`{}`)
-		item, _ = sjson.SetBytes(item, "url", imageURL)
-		out, _ = sjson.SetRawBytes(out, "data.-1", item)
+		data = append(data, imageData{URL: imageURL, RevisedPrompt: revisedPrompt})
 	}
-	if revisedPrompt := firstNonEmptyJSONValue(body, "data.revised_prompt", "revised_prompt"); revisedPrompt != "" {
-		data := gjson.GetBytes(out, "data")
-		for idx := range data.Array() {
-			path := fmt.Sprintf("data.%d.revised_prompt", idx)
-			out, _ = sjson.SetBytes(out, path, revisedPrompt)
-		}
-	}
-	if gjson.GetBytes(out, "data").Array() == nil || len(gjson.GetBytes(out, "data").Array()) == 0 {
+	if len(data) == 0 {
 		return nil, statusErr{code: http.StatusBadGateway, msg: "minimax image_generation: upstream did not return image output", errorCode: "minimax_empty_output"}
+	}
+	out, errMarshal := json.Marshal(struct {
+		Created int64       `json:"created"`
+		Data    []imageData `json:"data"`
+	}{Created: time.Now().Unix(), Data: data})
+	if errMarshal != nil {
+		return nil, fmt.Errorf("minimax image_generation: encode response: %w", errMarshal)
 	}
 	return out, nil
 }

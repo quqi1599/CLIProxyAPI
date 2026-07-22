@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -201,6 +202,29 @@ func applyOpenAICompatDefaultHeaders(req *http.Request, profile openAICompatProf
 	}
 }
 
+func mutateOpenAICompatJSON(payload []byte, deletes []string, sets map[string]any) []byte {
+	if len(payload) == 0 || len(deletes) == 0 && len(sets) == 0 {
+		return payload
+	}
+	modelRules := []config.PayloadModelRule{{Name: "*"}}
+	cfg := &config.Config{}
+	if len(sets) > 0 {
+		paths := make([]string, 0, len(sets))
+		for path := range sets {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		cfg.Payload.Override = make([]config.PayloadRule, 0, len(paths))
+		for _, path := range paths {
+			cfg.Payload.Override = append(cfg.Payload.Override, config.PayloadRule{Models: modelRules, Params: map[string]any{path: sets[path]}})
+		}
+	}
+	if len(deletes) > 0 {
+		cfg.Payload.Filter = []config.PayloadFilterRule{{Models: modelRules, Params: deletes}}
+	}
+	return helps.ApplyPayloadConfigWithRoot(cfg, "payload", "", "", payload, nil, "", "")
+}
+
 func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byte {
 	if len(payload) == 0 {
 		return payload
@@ -208,39 +232,30 @@ func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byt
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
 		payload = repaired
 	}
+	deletePaths := make([]string, 0, 6)
 	if !profile.SupportsStore {
-		if updated, err := sjson.DeleteBytes(payload, "store"); err == nil {
-			payload = updated
-		}
+		deletePaths = append(deletePaths, "store")
 	}
 	if !profile.SupportsMetadata {
-		if updated, err := sjson.DeleteBytes(payload, "metadata"); err == nil {
-			payload = updated
-		}
+		deletePaths = append(deletePaths, "metadata")
 	}
 	if !profile.SupportsParallelToolCall {
-		if updated, err := sjson.DeleteBytes(payload, "parallel_tool_calls"); err == nil {
-			payload = updated
-		}
+		deletePaths = append(deletePaths, "parallel_tool_calls")
 	}
 	if !profile.SupportsStreamUsage {
-		if updated, err := sjson.DeleteBytes(payload, "stream_options"); err == nil {
-			payload = updated
-		}
+		deletePaths = append(deletePaths, "stream_options")
 	}
 	if !profile.SupportsReasoning {
 		if !profile.SupportsNativeThinking {
-			for _, path := range []string{"reasoning", "reasoning_effort"} {
-				if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-					payload = updated
-				}
-			}
+			deletePaths = append(deletePaths, "reasoning", "reasoning_effort")
 		}
+		payload = mutateOpenAICompatJSON(payload, deletePaths, nil)
 		if !profile.PreserveReasoningContent {
 			payload = deleteMessageReasoningContent(payload)
 		}
+		return payload
 	}
-	return payload
+	return mutateOpenAICompatJSON(payload, deletePaths, nil)
 }
 
 func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
@@ -272,11 +287,7 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if compatKind == "minimax" {
 		payload = normalizeMiniMaxSystemMessages(payload)
 		payload = normalizeMiniMaxM3Thinking(payload, model)
-		for _, path := range []string{"frequency_penalty", "presence_penalty"} {
-			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-				payload = updated
-			}
-		}
+		payload = mutateOpenAICompatJSON(payload, []string{"frequency_penalty", "presence_penalty"}, nil)
 		payload = normalizeOpenAICompatToolCallArguments(payload)
 	}
 	if compatKind == "qwen" {
@@ -371,7 +382,7 @@ func requiresKimiK3PayloadCompatibility(payload []byte, model string) bool {
 }
 
 func normalizeKimiK3Payload(payload []byte) []byte {
-	for _, path := range []string{
+	payload = mutateOpenAICompatJSON(payload, []string{
 		"thinking",
 		"reasoning",
 		"thinking_budget",
@@ -380,14 +391,7 @@ func normalizeKimiK3Payload(payload []byte) []byte {
 		"n",
 		"presence_penalty",
 		"frequency_penalty",
-	} {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
-		}
-	}
-	if updated, err := sjson.SetBytes(payload, "reasoning_effort", "max"); err == nil {
-		payload = updated
-	}
+	}, map[string]any{"reasoning_effort": "max"})
 	return normalizeKimiK3ToolChoice(payload)
 }
 
@@ -461,48 +465,28 @@ func normalizeKimiThinkingConfig(payload []byte, model string) []byte {
 	if thinkingType == "" {
 		thinkingType = kimiThinkingTypeFromReasoning(payload)
 	}
+	sets := make(map[string]any, 1)
 	switch thinkingType {
 	case "none", "off", "false", "disabled", "disable":
-		if updated, err := sjson.SetBytes(payload, "thinking.type", "disabled"); err == nil {
-			payload = updated
-		}
+		sets["thinking.type"] = "disabled"
 	case "", "low", "medium", "high", "max", "auto", "adaptive", "true", "enabled", "enable":
 		if thinkingType != "" {
-			if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
-				payload = updated
-			}
+			sets["thinking.type"] = "enabled"
 		}
 	default:
-		if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
-			payload = updated
-		}
+		sets["thinking.type"] = "enabled"
 	}
-	for _, path := range []string{
+	if sets["thinking.type"] != "disabled" && kimiPayloadHasReasoningContent(payload) {
+		sets["thinking.type"] = "enabled"
+	}
+	return mutateOpenAICompatJSON(payload, []string{
 		"reasoning",
 		"reasoning_effort",
 		"thinking.reasoning_effort",
 		"thinking.budget_tokens",
 		"thinking_budget",
-	} {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
-		}
-	}
-	if !kimiThinkingEnabled(payload) {
-		if updated, err := sjson.DeleteBytes(payload, "thinking.keep"); err == nil {
-			payload = updated
-		}
-		return payload
-	}
-	if kimiPayloadHasReasoningContent(payload) {
-		if updated, err := sjson.SetBytes(payload, "thinking.type", "enabled"); err == nil {
-			payload = updated
-		}
-	}
-	if updated, err := sjson.DeleteBytes(payload, "thinking.keep"); err == nil {
-		payload = updated
-	}
-	return payload
+		"thinking.keep",
+	}, sets)
 }
 
 func kimiThinkingTypeFromReasoning(payload []byte) string {
@@ -549,21 +533,21 @@ func normalizeKimiFixedSamplingParams(payload []byte) []byte {
 	if !kimiThinkingEnabled(payload) {
 		temperature = kimiInstantTemperature
 	}
-	for path, value := range map[string]any{
+	desired := map[string]any{
 		"temperature":       temperature,
 		"top_p":             kimiTopP,
 		"n":                 1,
 		"presence_penalty":  0.0,
 		"frequency_penalty": 0.0,
-	} {
+	}
+	sets := make(map[string]any, len(desired))
+	for path, value := range desired {
 		if !gjson.GetBytes(payload, path).Exists() {
 			continue
 		}
-		if updated, err := sjson.SetBytes(payload, path, value); err == nil {
-			payload = updated
-		}
+		sets[path] = value
 	}
-	return payload
+	return mutateOpenAICompatJSON(payload, nil, sets)
 }
 
 func normalizeKimiForCodingTemperature(payload []byte) []byte {
@@ -677,6 +661,8 @@ func normalizeXiaomiMimo25TokenFields(payload []byte, model string) []byte {
 	if !requiresXiaomiMimo25TokenClamp(model) {
 		return payload
 	}
+	deletePaths := make([]string, 0, 3)
+	sets := make(map[string]any, 3)
 	for _, path := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		value := gjson.GetBytes(payload, path)
 		if !value.Exists() {
@@ -684,9 +670,7 @@ func normalizeXiaomiMimo25TokenFields(payload []byte, model string) []byte {
 		}
 		tokens, ok := xiaomiTokenLimitValue(value)
 		if !ok {
-			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-				payload = updated
-			}
+			deletePaths = append(deletePaths, path)
 			continue
 		}
 		if tokens < 1 {
@@ -694,11 +678,9 @@ func normalizeXiaomiMimo25TokenFields(payload []byte, model string) []byte {
 		} else if tokens > xiaomiMimo25MaxTokens {
 			tokens = xiaomiMimo25MaxTokens
 		}
-		if updated, err := sjson.SetBytes(payload, path, tokens); err == nil {
-			payload = updated
-		}
+		sets[path] = tokens
 	}
-	return payload
+	return mutateOpenAICompatJSON(payload, deletePaths, sets)
 }
 
 func requiresXiaomiMimo25TokenClamp(model string) bool {
@@ -729,24 +711,20 @@ func normalizeXiaomiThinkingConfig(payload []byte) []byte {
 	if thinkingType == "" {
 		thinkingType = xiaomiThinkingTypeFromReasoning(payload)
 	}
+	sets := make(map[string]any, 1)
 	switch thinkingType {
 	case "none", "off", "false", "disabled", "disable":
-		payload, _ = sjson.SetBytes(payload, "thinking.type", "disabled")
+		sets["thinking.type"] = "disabled"
 	case "low", "medium", "high", "max", "auto", "adaptive", "true", "enabled", "enable":
-		payload, _ = sjson.SetBytes(payload, "thinking.type", "enabled")
+		sets["thinking.type"] = "enabled"
 	}
-	for _, path := range []string{
+	return mutateOpenAICompatJSON(payload, []string{
 		"reasoning",
 		"reasoning_effort",
 		"thinking.reasoning_effort",
 		"thinking.budget_tokens",
 		"thinking_budget",
-	} {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
-		}
-	}
-	return payload
+	}, sets)
 }
 
 func xiaomiThinkingTypeFromReasoning(payload []byte) string {
@@ -801,16 +779,13 @@ func scrubDoubaoUnsupportedOpenAIFields(payload []byte, model string) []byte {
 	if !isDoubaoDeepSeekReasoningModel(model) {
 		unsupportedPaths = append(unsupportedPaths, "reasoning")
 	}
-	for _, path := range unsupportedPaths {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
+	if outputConfig := gjson.GetBytes(payload, "output_config"); outputConfig.Exists() && outputConfig.IsObject() {
+		fields := outputConfig.Map()
+		if len(fields) == 0 || len(fields) == 1 && outputConfig.Get("effort").Exists() {
+			unsupportedPaths = append(unsupportedPaths, "output_config")
 		}
 	}
-	if oc := gjson.GetBytes(payload, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-		if updated, err := sjson.DeleteBytes(payload, "output_config"); err == nil {
-			payload = updated
-		}
-	}
+	payload = mutateOpenAICompatJSON(payload, unsupportedPaths, nil)
 	payload = deleteMessageReasoningContent(payload)
 	return payload
 }
@@ -856,23 +831,20 @@ func applyDoubaoDeepSeekReasoningIntent(payload []byte, model, effort string, di
 		return payload
 	}
 	if disabled {
-		for _, path := range []string{
+		deletePaths := []string{
 			"reasoning",
 			"reasoning_effort",
 			"thinking",
 			"thinking_budget",
 			"output_config.effort",
-		} {
-			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-				payload = updated
+		}
+		if outputConfig := gjson.GetBytes(payload, "output_config"); outputConfig.Exists() && outputConfig.IsObject() {
+			fields := outputConfig.Map()
+			if len(fields) == 0 || len(fields) == 1 && outputConfig.Get("effort").Exists() {
+				deletePaths = append(deletePaths, "output_config")
 			}
 		}
-		if oc := gjson.GetBytes(payload, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			if updated, err := sjson.DeleteBytes(payload, "output_config"); err == nil {
-				payload = updated
-			}
-		}
-		return payload
+		return mutateOpenAICompatJSON(payload, deletePaths, nil)
 	}
 	effort, disabled = normalizeDoubaoDeepSeekReasoningEffort(effort)
 	if disabled || effort == "" {
@@ -935,28 +907,14 @@ func normalizeDoubaoSeed20Temperature(payload []byte) []byte {
 func normalizeDoubaoSeed20TokenFields(payload []byte) []byte {
 	token, ok := firstOpenAICompatIntegerValue(payload, "max_completion_tokens", "max_tokens", "max_output_tokens")
 	if !ok {
-		for _, path := range []string{"max_completion_tokens", "max_tokens", "max_output_tokens"} {
-			if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-				payload = updated
-			}
-		}
-		return payload
+		return mutateOpenAICompatJSON(payload, []string{"max_completion_tokens", "max_tokens", "max_output_tokens"}, nil)
 	}
 	if token < 1 {
 		token = 1
 	} else if token > doubaoSeed20MaxCompletionTokens {
 		token = doubaoSeed20MaxCompletionTokens
 	}
-	updated, err := sjson.SetBytes(payload, "max_completion_tokens", token)
-	if err == nil {
-		payload = updated
-	}
-	for _, path := range []string{"max_tokens", "max_output_tokens"} {
-		if updated, errDelete := sjson.DeleteBytes(payload, path); errDelete == nil {
-			payload = updated
-		}
-	}
-	return payload
+	return mutateOpenAICompatJSON(payload, []string{"max_tokens", "max_output_tokens"}, map[string]any{"max_completion_tokens": token})
 }
 
 func firstOpenAICompatIntegerValue(payload []byte, paths ...string) (int64, bool) {
@@ -1717,32 +1675,20 @@ func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
 		hasBudget = false
 	}
 
-	for _, path := range []string{
-		"enable_thinking",
-		"reasoning_effort",
-		"reasoning",
-		"thinking",
-		"thinking_budget",
-	} {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
-		}
-	}
-	if updated, err := sjson.SetBytes(payload, "enable_thinking", true); err == nil {
-		payload = updated
-	}
+	deletePaths := []string{"reasoning", "thinking"}
+	sets := map[string]any{"enable_thinking": true}
 	if hasEffort && effort != "" {
-		if updated, err := sjson.SetBytes(payload, "reasoning_effort", effort); err == nil {
-			payload = updated
-		}
-		return payload
+		sets["reasoning_effort"] = effort
+		deletePaths = append(deletePaths, "thinking_budget")
+		return mutateOpenAICompatJSON(payload, deletePaths, sets)
 	}
+	deletePaths = append(deletePaths, "reasoning_effort")
 	if hasBudget && budget > 0 {
-		if updated, err := sjson.SetBytes(payload, "thinking_budget", budget); err == nil {
-			payload = updated
-		}
+		sets["thinking_budget"] = budget
+	} else {
+		deletePaths = append(deletePaths, "thinking_budget")
 	}
-	return payload
+	return mutateOpenAICompatJSON(payload, deletePaths, sets)
 }
 
 func requiresQwen38MaxThinking(payload []byte, model string) bool {
@@ -1915,12 +1861,7 @@ func requiresDeepSeekThinkingBudgetCompatibility(model string, baseURL string, c
 }
 
 func deleteDeepSeekThinkingBudgetPaths(payload []byte) []byte {
-	for _, path := range []string{"thinking_budget", "thinking.budget_tokens"} {
-		if updated, err := sjson.DeleteBytes(payload, path); err == nil {
-			payload = updated
-		}
-	}
-	return payload
+	return mutateOpenAICompatJSON(payload, []string{"thinking_budget", "thinking.budget_tokens"}, nil)
 }
 
 func normalizeDeepSeekThinkingBudgetPath(payload []byte, path string) []byte {
@@ -3174,20 +3115,30 @@ func deleteMessageReasoningContent(payload []byte) []byte {
 	if !messages.Exists() || !messages.IsArray() {
 		return payload
 	}
-	messages.ForEach(func(key, value gjson.Result) bool {
+	messageItems := messages.Array()
+	updatedMessages := make([]string, 0, len(messageItems))
+	changed := false
+	for _, value := range messageItems {
 		if !value.Get("reasoning_content").Exists() {
-			return true
+			updatedMessages = append(updatedMessages, value.Raw)
+			continue
 		}
-		updated := value.Raw
-		if next, err := sjson.Delete(updated, "reasoning_content"); err == nil {
-			updated = next
+		updated, err := sjson.Delete(value.Raw, "reasoning_content")
+		if err != nil {
+			updatedMessages = append(updatedMessages, value.Raw)
+			continue
 		}
-		if nextPayload, err := sjson.SetRawBytes(payload, fmt.Sprintf("messages.%s", key.String()), []byte(updated)); err == nil {
-			payload = nextPayload
-		}
-		return true
-	})
-	return payload
+		updatedMessages = append(updatedMessages, updated)
+		changed = true
+	}
+	if !changed {
+		return payload
+	}
+	updated, err := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(updatedMessages))
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func summarizeOpenAICompatError(body []byte) string {
@@ -3544,19 +3495,28 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 	retryAfter := openAICompatRetryAfter(headers, body)
 	logOpenAICompatUpstreamError(profile, auth, routeModel, statusCode, retryAfter, contentType, body)
 	jsonBody := openAICompatJSONErrorBody(body)
-	message := summarizeOpenAICompatError(body)
-	errorCode := firstNonEmptyJSONValue(jsonBody, "error.code", "code", "error.type", "type", "error.err_code")
-	if errorCode == "" && strings.TrimSpace(string(body)) == "" {
+	classificationMessage := summarizeOpenAICompatError(body)
+	classificationCode := firstNonEmptyJSONValue(jsonBody, "error.code", "code", "error.type", "type", "error.err_code")
+	errorCode, errorType, _ := safeUpstreamIdentifiers(body)
+	if errorCode == "" {
+		errorCode = errorType
+	}
+	if strings.TrimSpace(string(body)) == "" {
 		errorCode = openAICompatEmptyUpstreamResponseCode
 	}
-	normalizedStatus := normalizeOpenAICompatStatus(statusCode, message)
+	normalizedStatus := normalizeOpenAICompatStatus(statusCode, classificationMessage)
+	message, _ := safeUpstreamFailureMessage(contentType, body)
+	failure := classifyOpenAICompatFailure(normalizedStatus, statusCode, classificationMessage, classificationCode, retryAfter)
+	failure.ProviderCode = errorCode
+	failure.PublicMessage = message
 	return statusErr{
 		code:               normalizedStatus,
 		providerStatusCode: statusCode,
 		msg:                message,
 		errorCode:          errorCode,
 		retryAfter:         retryAfter,
-		failure:            classifyOpenAICompatFailure(normalizedStatus, statusCode, message, errorCode, retryAfter),
+		headers:            headers.Clone(),
+		failure:            failure,
 	}
 }
 

@@ -4,9 +4,9 @@
 package gemini
 
 import (
-	"fmt"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -28,35 +28,17 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 		return common.AttachDefaultSafetySettings(rawJSON, "safetySettings")
 	}
 
-	toolsResult := gjson.GetBytes(rawJSON, "tools")
-	if toolsResult.Exists() && toolsResult.IsArray() {
-		toolResults := toolsResult.Array()
-		for i := 0; i < len(toolResults); i++ {
-			if gjson.GetBytes(rawJSON, fmt.Sprintf("tools.%d.functionDeclarations", i)).Exists() {
-				strJson, _ := util.RenameKey(string(rawJSON), fmt.Sprintf("tools.%d.functionDeclarations", i), fmt.Sprintf("tools.%d.function_declarations", i))
-				rawJSON = []byte(strJson)
-			}
-
-			functionDeclarationsResult := gjson.GetBytes(rawJSON, fmt.Sprintf("tools.%d.function_declarations", i))
-			if functionDeclarationsResult.Exists() && functionDeclarationsResult.IsArray() {
-				functionDeclarationsResults := functionDeclarationsResult.Array()
-				for j := 0; j < len(functionDeclarationsResults); j++ {
-					parametersResult := gjson.GetBytes(rawJSON, fmt.Sprintf("tools.%d.function_declarations.%d.parameters", i, j))
-					if parametersResult.Exists() {
-						strJson, _ := util.RenameKey(string(rawJSON), fmt.Sprintf("tools.%d.function_declarations.%d.parameters", i, j), fmt.Sprintf("tools.%d.function_declarations.%d.parametersJsonSchema", i, j))
-						rawJSON = []byte(strJson)
-					}
-				}
-			}
-		}
-	}
+	rawJSON = normalizeGeminiRequestTools(rawJSON)
+	contents = gjson.GetBytes(rawJSON, "contents")
 
 	// Walk contents and fix roles
 	out := rawJSON
 	prevRole := ""
-	idx := 0
+	var normalizedContents [][]byte
+	rolesChanged := false
 	contents.ForEach(func(_ gjson.Result, value gjson.Result) bool {
 		role := value.Get("role").String()
+		content := []byte(value.Raw)
 
 		// Only user/model are valid for Gemini v1beta requests
 		valid := role == "user" || role == "model"
@@ -69,15 +51,18 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 			} else {
 				newRole = "user"
 			}
-			path := fmt.Sprintf("contents.%d.role", idx)
-			out, _ = sjson.SetBytes(out, path, newRole)
+			content, _ = sjson.SetBytes(content, "role", newRole)
 			role = newRole
+			rolesChanged = true
 		}
 
 		prevRole = role
-		idx++
+		normalizedContents = append(normalizedContents, content)
 		return true
 	})
+	if rolesChanged {
+		out, _ = sjson.SetRawBytes(out, "contents", internalpayload.BuildRaw(normalizedContents))
+	}
 
 	out = signature.SanitizeGeminiRequestThoughtSignatures(out, "contents")
 
@@ -94,6 +79,57 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 	return out
 }
 
+func normalizeGeminiRequestTools(data []byte) []byte {
+	tools := gjson.GetBytes(data, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return data
+	}
+
+	var normalizedTools [][]byte
+	toolsChanged := false
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		toolJSON := []byte(tool.Raw)
+		toolChanged := false
+		if tool.Get("functionDeclarations").Exists() {
+			if renamed, err := util.RenameKey(string(toolJSON), "functionDeclarations", "function_declarations"); err == nil {
+				toolJSON = []byte(renamed)
+				toolChanged = true
+			}
+		}
+
+		declarations := gjson.GetBytes(toolJSON, "function_declarations")
+		if declarations.Exists() && declarations.IsArray() {
+			var normalizedDeclarations [][]byte
+			declarationsChanged := false
+			declarations.ForEach(func(_, declaration gjson.Result) bool {
+				declarationJSON := []byte(declaration.Raw)
+				if declaration.Get("parameters").Exists() {
+					if renamed, err := util.RenameKey(string(declarationJSON), "parameters", "parametersJsonSchema"); err == nil {
+						declarationJSON = []byte(renamed)
+						declarationsChanged = true
+					}
+				}
+				normalizedDeclarations = append(normalizedDeclarations, declarationJSON)
+				return true
+			})
+			if declarationsChanged {
+				toolJSON, _ = sjson.SetRawBytes(toolJSON, "function_declarations", internalpayload.BuildRaw(normalizedDeclarations))
+				toolChanged = true
+			}
+		}
+
+		normalizedTools = append(normalizedTools, toolJSON)
+		toolsChanged = toolsChanged || toolChanged
+		return true
+	})
+	if !toolsChanged {
+		return data
+	}
+
+	out, _ := sjson.SetRawBytes(data, "tools", internalpayload.BuildRaw(normalizedTools))
+	return out
+}
+
 // backfillEmptyFunctionResponseNames walks the contents array and for each
 // model turn containing functionCall parts, records the call names in order.
 // For the immediately following user/function turn containing functionResponse
@@ -104,11 +140,13 @@ func backfillEmptyFunctionResponseNames(data []byte) []byte {
 		return data
 	}
 
-	out := data
+	var normalizedContents [][]byte
+	contentsChanged := false
 	var pendingCallNames []string
 
 	contents.ForEach(func(contentIdx, content gjson.Result) bool {
 		role := content.Get("role").String()
+		contentJSON := []byte(content.Raw)
 
 		// Collect functionCall names from model turns
 		if role == "model" {
@@ -124,33 +162,47 @@ func backfillEmptyFunctionResponseNames(data []byte) []byte {
 			} else {
 				pendingCallNames = nil
 			}
+			normalizedContents = append(normalizedContents, contentJSON)
 			return true
 		}
 
 		// Backfill empty functionResponse names from pending call names
 		if len(pendingCallNames) > 0 {
 			ri := 0
-			content.Get("parts").ForEach(func(partIdx, part gjson.Result) bool {
+			var normalizedParts [][]byte
+			partsChanged := false
+			content.Get("parts").ForEach(func(_, part gjson.Result) bool {
+				partJSON := []byte(part.Raw)
 				if part.Get("functionResponse").Exists() {
 					name := part.Get("functionResponse.name").String()
 					if strings.TrimSpace(name) == "" {
 						if ri < len(pendingCallNames) {
-							out, _ = sjson.SetBytes(out,
-								fmt.Sprintf("contents.%d.parts.%d.functionResponse.name", contentIdx.Int(), partIdx.Int()),
-								pendingCallNames[ri])
+							partJSON, _ = sjson.SetBytes(partJSON, "functionResponse.name", pendingCallNames[ri])
+							partsChanged = true
 						} else {
 							log.Debugf("more function responses than calls at contents[%d], skipping name backfill", contentIdx.Int())
 						}
 					}
 					ri++
 				}
+				normalizedParts = append(normalizedParts, partJSON)
 				return true
 			})
+			if partsChanged {
+				contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts", internalpayload.BuildRaw(normalizedParts))
+				contentsChanged = true
+			}
 			pendingCallNames = nil
 		}
 
+		normalizedContents = append(normalizedContents, contentJSON)
 		return true
 	})
 
+	if !contentsChanged {
+		return data
+	}
+
+	out, _ := sjson.SetRawBytes(data, "contents", internalpayload.BuildRaw(normalizedContents))
 	return out
 }

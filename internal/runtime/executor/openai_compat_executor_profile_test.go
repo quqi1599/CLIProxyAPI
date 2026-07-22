@@ -1,20 +1,89 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestOpenAICompatExecutorBoundsAndDecodesNonStreamResponse(t *testing.T) {
+	responseBody := []byte(`{"id":"chatcmpl-bounded","object":"chat.completion","created":1,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	var upstreamBody []byte
+	var encoded bytes.Buffer
+	writer := brotli.NewWriter(&encoded)
+	if _, err := writer.Write(responseBody); err != nil {
+		t.Fatalf("brotli write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("brotli close: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "br")
+		w.Header().Set("Content-Length", fmt.Sprint(encoded.Len()))
+		w.Header().Set("Content-MD5", "stale-md5")
+		w.Header().Set("Digest", "sha-256=stale")
+		w.Header().Set("ETag", `"stale"`)
+		_, _ = w.Write(encoded.Bytes())
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	requestBody := []byte(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(requestBody))
+	resp, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "test-model",
+		Payload: requestBody,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("response content = %q; payload=%s", got, resp.Payload)
+	}
+	if resp.Headers.Get("Content-Encoding") != "" || resp.Headers.Get("Content-Length") != "" || resp.Headers.Get("Content-MD5") != "" || resp.Headers.Get("Digest") != "" || resp.Headers.Get("ETag") != "" {
+		t.Fatalf("stale response framing headers = %#v", resp.Headers)
+	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, openAICompatFinalSanitizeTransformStage, len(upstreamBody))
+}
+
+func TestOpenAICompatExecutorRejectsOversizedErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), int(helps.DefaultUpstreamErrorBodyBytes+1)))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "test-model",
+		Payload: []byte(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.UpstreamProtocolError || typed.Scope != failurecontract.ScopeProvider || typed.ProviderCode != "upstream_error_body_too_large" {
+		t.Fatalf("failure = %#v", typed)
+	}
+}
 
 func TestOpenAICompatExecutorCompactFallsBackToChatCompletionsForProfile(t *testing.T) {
 	var gotPath string
@@ -200,17 +269,19 @@ func TestOpenAICompatExecutorStreamScrubsUnsupportedFieldsForProfile(t *testing.
 		"compat_kind": "newapi",
 	}}
 
-	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
-		Model: "kimi-k2",
-		Payload: []byte(`{
-			"model":"kimi-k2",
-			"messages":[{"role":"assistant","content":"thinking","reasoning_content":"hidden"}],
-			"stream":true,
-			"parallel_tool_calls":true,
-			"reasoning":{"effort":"high"},
-			"metadata":{"tenant":"demo"},
-			"store":true
-		}`),
+	payload := []byte(`{
+		"model":"kimi-k2",
+		"messages":[{"role":"assistant","content":"thinking","reasoning_content":"hidden"}],
+		"stream":true,
+		"parallel_tool_calls":true,
+		"reasoning":{"effort":"high"},
+		"metadata":{"tenant":"demo"},
+		"store":true
+	}`)
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+	stream, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2",
+		Payload: payload,
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai"),
 		Stream:       true,
@@ -223,6 +294,7 @@ func TestOpenAICompatExecutorStreamScrubsUnsupportedFieldsForProfile(t *testing.
 			t.Fatalf("unexpected stream error: %v", chunk.Err)
 		}
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, openAICompatFinalSanitizeTransformStage, len(gotBody))
 
 	for _, path := range []string{
 		"stream_options",
@@ -235,6 +307,50 @@ func TestOpenAICompatExecutorStreamScrubsUnsupportedFieldsForProfile(t *testing.
 		if gjson.GetBytes(gotBody, path).Exists() {
 			t.Fatalf("unexpected field %s in payload: %s", path, string(gotBody))
 		}
+	}
+}
+
+func TestOpenAICompatExecutorStreamDecodesBrotliSSE(t *testing.T) {
+	streamBody := []byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\r\rdata: [DONE]\r\r")
+	var encoded bytes.Buffer
+	writer := brotli.NewWriter(&encoded)
+	if _, err := writer.Write(streamBody); err != nil {
+		t.Fatalf("brotli write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("brotli close: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "br")
+		w.Header().Set("Content-Length", fmt.Sprint(encoded.Len()))
+		w.Header().Set("ETag", `"stale"`)
+		_, _ = w.Write(encoded.Bytes())
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if stream.Headers.Get("Content-Encoding") != "" || stream.Headers.Get("Content-Length") != "" || stream.Headers.Get("ETag") != "" {
+		t.Fatalf("stale stream headers = %#v", stream.Headers)
+	}
+	chunks := 0
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		chunks++
+	}
+	if chunks == 0 {
+		t.Fatal("decoded stream produced no chunks")
 	}
 }
 
@@ -1959,6 +2075,63 @@ func TestOpenAICompatPayloadDeepSeekKeepsStrictOnBetaAndNormalizesSchema(t *test
 		!requiredContains(out, "tools.0.function.parameters.required", "limit") {
 		t.Fatalf("strict schema should require all object properties: %s", string(out))
 	}
+}
+
+func TestDeleteMessageReasoningContentLargePreservesOrderAndUnknownFields(t *testing.T) {
+	for _, messageCount := range []int{16, 64, 256, 1024} {
+		t.Run(strconv.Itoa(messageCount), func(t *testing.T) {
+			input := buildOpenAICompatReasoningContentPayload(messageCount)
+			original := bytes.Clone(input)
+
+			out := deleteMessageReasoningContent(input)
+
+			if !bytes.Equal(input, original) {
+				t.Fatal("deleteMessageReasoningContent mutated its input")
+			}
+			messages := gjson.GetBytes(out, "messages").Array()
+			if len(messages) != messageCount {
+				t.Fatalf("messages length = %d, want %d", len(messages), messageCount)
+			}
+			for _, index := range []int{0, messageCount / 2, messageCount - 1} {
+				if messages[index].Get("reasoning_content").Exists() {
+					t.Fatalf("messages[%d] retained reasoning_content: %s", index, messages[index].Raw)
+				}
+				if got := messages[index].Get("marker").Int(); got != int64(index) {
+					t.Fatalf("messages[%d].marker = %d, want %d", index, got, index)
+				}
+				if !messages[index].Get("unknown.keep").Bool() {
+					t.Fatalf("messages[%d] lost unknown field: %s", index, messages[index].Raw)
+				}
+			}
+			outText := string(out)
+			if before, messagesKey, after := strings.Index(outText, `"before"`), strings.Index(outText, `"messages"`), strings.Index(outText, `"after"`); !(before < messagesKey && messagesKey < after) {
+				t.Fatalf("root field order changed: %s", out)
+			}
+			first := messages[0].Raw
+			if marker, content, unknown := strings.Index(first, `"marker"`), strings.Index(first, `"content"`), strings.Index(first, `"unknown"`); !(marker < content && content < unknown) {
+				t.Fatalf("message field order changed: %s", first)
+			}
+		})
+	}
+}
+
+func buildOpenAICompatReasoningContentPayload(messageCount int) []byte {
+	var payload strings.Builder
+	payload.Grow(messageCount * 128)
+	payload.WriteString(`{"before":1,"messages":[`)
+	for index := 0; index < messageCount; index++ {
+		if index > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"role":"assistant","marker":`)
+		payload.WriteString(strconv.Itoa(index))
+		if index%2 == 0 {
+			payload.WriteString(`,"reasoning_content":"hidden"`)
+		}
+		payload.WriteString(`,"content":"visible","unknown":{"keep":true}}`)
+	}
+	payload.WriteString(`],"after":2}`)
+	return []byte(payload.String())
 }
 
 func requiredContains(payload []byte, path string, want string) bool {

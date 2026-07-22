@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -477,7 +479,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		}
 
 		// Build response.output from aggregated state
-		outputsWrapper := []byte(`{"arr":[]}`)
+		outputItems := make([]json.RawMessage, 0, 2+len(st.FuncArgsBuf))
 		// reasoning item (if any)
 		if st.ReasoningBuf.Len() > 0 || st.ReasoningPartAdded || st.ReasoningSignature != "" {
 			item := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`)
@@ -488,7 +490,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				summary, _ = sjson.SetBytes(summary, "text", st.ReasoningBuf.String())
 				item, _ = sjson.SetRawBytes(item, "summary.-1", summary)
 			}
-			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+			outputItems = append(outputItems, item)
 		}
 		// assistant message item (if any text)
 		if st.TextBuf.Len() > 0 || st.InTextBlock || st.CurrentMsgID != "" {
@@ -498,7 +500,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			if len(st.MessageAnnotations) > 0 {
 				item, _ = sjson.SetBytes(item, "content.0.annotations", st.MessageAnnotations)
 			}
-			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+			outputItems = append(outputItems, item)
 		}
 		// function_call items (in ascending index order for determinism)
 		if len(st.FuncArgsBuf) > 0 {
@@ -507,14 +509,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			for idx := range st.FuncArgsBuf {
 				idxs = append(idxs, idx)
 			}
-			// simple sort (small N), avoid adding new imports
-			for i := 0; i < len(idxs); i++ {
-				for j := i + 1; j < len(idxs); j++ {
-					if idxs[j] < idxs[i] {
-						idxs[i], idxs[j] = idxs[j], idxs[i]
-					}
-				}
-			}
+			sort.Ints(idxs)
 			for _, idx := range idxs {
 				args := ""
 				if b := st.FuncArgsBuf[idx]; b != nil {
@@ -530,11 +525,12 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				item, _ = sjson.SetBytes(item, "arguments", args)
 				item, _ = sjson.SetBytes(item, "call_id", callID)
 				item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "")
-				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+				outputItems = append(outputItems, item)
 			}
 		}
-		if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-			completed, _ = sjson.SetRawBytes(completed, "response.output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+		if len(outputItems) > 0 {
+			outputJSON, _ := json.Marshal(outputItems)
+			completed, _ = sjson.SetRawBytes(completed, "response.output", outputJSON)
 		}
 
 		reasoningTokens := int64(0)
@@ -767,7 +763,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	// Build output array
-	outputsWrapper := []byte(`{"arr":[]}`)
+	outputItems := make([]json.RawMessage, 0, 2+len(toolCalls))
 	if reasoningBuf.Len() > 0 || reasoningSig != "" {
 		item := []byte(`{"id":"","type":"reasoning","encrypted_content":"","summary":[]}`)
 		item, _ = sjson.SetBytes(item, "id", reasoningItemID)
@@ -777,7 +773,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			summary, _ = sjson.SetBytes(summary, "text", reasoningBuf.String())
 			item, _ = sjson.SetRawBytes(item, "summary.-1", summary)
 		}
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+		outputItems = append(outputItems, item)
 	}
 	if currentMsgID != "" || textBuf.Len() > 0 {
 		item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
@@ -786,7 +782,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		if len(annotations) > 0 {
 			item, _ = sjson.SetBytes(item, "content.0.annotations", annotations)
 		}
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+		outputItems = append(outputItems, item)
 	}
 	if len(toolCalls) > 0 {
 		// Preserve index order
@@ -794,13 +790,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		for i := range toolCalls {
 			idxs = append(idxs, i)
 		}
-		for i := 0; i < len(idxs); i++ {
-			for j := i + 1; j < len(idxs); j++ {
-				if idxs[j] < idxs[i] {
-					idxs[i], idxs[j] = idxs[j], idxs[i]
-				}
-			}
-		}
+		sort.Ints(idxs)
 		for _, i := range idxs {
 			st := toolCalls[i]
 			args := st.args.String()
@@ -812,11 +802,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			item, _ = sjson.SetBytes(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", st.id)
 			item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, st.name, "")
-			outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+			outputItems = append(outputItems, item)
 		}
 	}
-	if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-		out, _ = sjson.SetRawBytes(out, "output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+	if len(outputItems) > 0 {
+		outputJSON, _ := json.Marshal(outputItems)
+		out, _ = sjson.SetRawBytes(out, "output", outputJSON)
 	}
 
 	// Usage

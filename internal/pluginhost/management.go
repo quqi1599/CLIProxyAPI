@@ -3,6 +3,7 @@ package pluginhost
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,10 +14,13 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var errPluginManagementBodyTooLarge = errors.New("plugin management request body exceeds the allowed size")
+
 const (
 	managementBasePath      = "/v0/management"
 	resourcePluginBasePath  = "/v0/resource/plugins"
 	legacyPluginRoutePrefix = "/plugins"
+	maxPluginManagementBody = 8 << 20
 )
 
 type managementRouteRecord struct {
@@ -98,7 +102,7 @@ func (h *Host) callManagementRegistrar(ctx context.Context, record capabilityRec
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "ManagementAPI.RegisterManagement", recovered)
 			resp = pluginapi.ManagementRegistrationResponse{}
-			err = fmt.Errorf("management registrar panic: %v", recovered)
+			err = fmt.Errorf("management registrar panic")
 		}
 	}()
 	return plugin.RegisterManagement(ctx, pluginapi.ManagementRegistrationRequest{
@@ -232,14 +236,15 @@ func (h *Host) ServeManagementHTTP(w http.ResponseWriter, r *http.Request) bool 
 
 	var body []byte
 	if r.Body != nil {
+		requestBody := r.Body
 		var errRead error
-		body, errRead = io.ReadAll(r.Body)
-		if errRead != nil {
-			http.Error(w, "failed to read plugin management request body", http.StatusBadRequest)
-			return true
-		}
-		if errClose := r.Body.Close(); errClose != nil {
+		body, errRead = readPluginManagementBody(r)
+		if errClose := requestBody.Close(); errClose != nil {
 			log.Warnf("pluginhost: failed to close plugin management request body: %v", errClose)
+		}
+		if errRead != nil {
+			writePluginManagementBodyError(w, errRead)
+			return true
 		}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
@@ -249,7 +254,7 @@ func (h *Host) ServeManagementHTTP(w http.ResponseWriter, r *http.Request) bool 
 		Path:    r.URL.Path,
 		Headers: cloneHeader(r.Header),
 		Query:   cloneValues(r.URL.Query()),
-		Body:    bytes.Clone(body),
+		Body:    body,
 	})
 	if errHandle != nil {
 		log.Warnf("pluginhost: management handler %s failed: %v", record.pluginID, errHandle)
@@ -272,6 +277,35 @@ func (h *Host) ServeManagementHTTP(w http.ResponseWriter, r *http.Request) bool 
 		log.Warnf("pluginhost: failed to write plugin management response: %v", errWrite)
 	}
 	return true
+}
+
+func readPluginManagementBody(r *http.Request) ([]byte, error) {
+	if r == nil || r.Body == nil {
+		return nil, nil
+	}
+	if r.ContentLength > maxPluginManagementBody {
+		return nil, errPluginManagementBodyTooLarge
+	}
+	body, errRead := io.ReadAll(io.LimitReader(r.Body, maxPluginManagementBody+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if int64(len(body)) > maxPluginManagementBody {
+		return nil, errPluginManagementBodyTooLarge
+	}
+	return body, nil
+}
+
+func writePluginManagementBodyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errPluginManagementBodyTooLarge) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		if _, errWrite := io.WriteString(w, "{\"error\":\"request_too_large\",\"message\":\"request body exceeds the allowed size\"}\n"); errWrite != nil {
+			log.Warnf("pluginhost: failed to write plugin management body error: %v", errWrite)
+		}
+		return
+	}
+	http.Error(w, "failed to read plugin management request body", http.StatusBadRequest)
 }
 
 // ServeResourceHTTP dispatches an unauthenticated browser-navigable resource request to a plugin route.
@@ -326,7 +360,7 @@ func (h *Host) callManagementHandler(ctx context.Context, record managementRoute
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.pluginID, "ManagementHandler.HandleManagement", recovered)
 			resp = pluginapi.ManagementResponse{}
-			err = fmt.Errorf("management handler panic: %v", recovered)
+			err = fmt.Errorf("management handler panic")
 		}
 	}()
 	return record.route.Handler.HandleManagement(ctx, req)
@@ -348,7 +382,7 @@ func (h *Host) callResourceHandler(ctx context.Context, record resourceRouteReco
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.pluginID, "ResourceHandler.HandleManagement", recovered)
 			resp = pluginapi.ManagementResponse{}
-			err = fmt.Errorf("resource handler panic: %v", recovered)
+			err = fmt.Errorf("resource handler panic")
 		}
 	}()
 	return record.route.Handler.HandleManagement(ctx, req)

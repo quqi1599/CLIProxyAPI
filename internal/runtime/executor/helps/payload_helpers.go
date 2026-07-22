@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
@@ -40,143 +41,112 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 
 	rules := cfg.Payload
 	hasPayloadRules := len(rules.Default) != 0 || len(rules.DefaultRaw) != 0 || len(rules.Override) != 0 || len(rules.OverrideRaw) != 0 || len(rules.Filter) != 0
-	if hasPayloadRules {
-		model = strings.TrimSpace(model)
-		requestedModel = strings.TrimSpace(requestedModel)
-		if model != "" || requestedModel != "" {
-			candidates := payloadModelCandidates(model, requestedModel)
-			source := original
-			if len(source) == 0 {
-				source = payload
-			}
-			appliedDefaults := make(map[string]struct{})
-			// Apply default rules: first write wins per field across all matching rules.
-			for i := range rules.Default {
-				rule := &rules.Default[i]
-				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
+	model = strings.TrimSpace(model)
+	requestedModel = strings.TrimSpace(requestedModel)
+	if !hasPayloadRules || model == "" && requestedModel == "" {
+		return out
+	}
+
+	document, ok := newPayloadJSONDocument(out)
+	if !ok {
+		return out
+	}
+	source := original
+	if len(source) == 0 {
+		source = payload
+	}
+	sourceDocument, _ := newPayloadJSONDocument(source)
+	candidates := payloadModelCandidates(model, requestedModel)
+	appliedDefaults := make(map[string]struct{})
+
+	// Defaults are first-write-wins and check the unmodified source payload.
+	for i := range rules.Default {
+		rule := &rules.Default[i]
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, document, root, candidates) {
+			continue
+		}
+		for path, value := range rule.Params {
+			fullPath := buildPayloadPath(root, path)
+			for _, resolvedPath := range resolvePayloadRulePaths(document, fullPath) {
+				if sourceDocument.valueAtPath(resolvedPath) != nil {
 					continue
 				}
-				for path, value := range rule.Params {
-					fullPath := buildPayloadPath(root, path)
-					if fullPath == "" {
-						continue
-					}
-					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						if gjson.GetBytes(source, resolvedPath).Exists() {
-							continue
-						}
-						if _, ok := appliedDefaults[resolvedPath]; ok {
-							continue
-						}
-						updated, errSet := sjson.SetBytes(out, resolvedPath, value)
-						if errSet != nil {
-							continue
-						}
-						out = updated
-						appliedDefaults[resolvedPath] = struct{}{}
-					}
-				}
-			}
-			// Apply default raw rules: first write wins per field across all matching rules.
-			for i := range rules.DefaultRaw {
-				rule := &rules.DefaultRaw[i]
-				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
+				if _, exists := appliedDefaults[resolvedPath]; exists {
 					continue
 				}
-				for path, value := range rule.Params {
-					fullPath := buildPayloadPath(root, path)
-					if fullPath == "" {
-						continue
-					}
-					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						if gjson.GetBytes(source, resolvedPath).Exists() {
-							continue
-						}
-						if _, ok := appliedDefaults[resolvedPath]; ok {
-							continue
-						}
-						rawValue, ok := payloadRawValue(value)
-						if !ok {
-							continue
-						}
-						updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
-						if errSet != nil {
-							continue
-						}
-						out = updated
-						appliedDefaults[resolvedPath] = struct{}{}
-					}
-				}
-			}
-			// Apply override rules: last write wins per field across all matching rules.
-			for i := range rules.Override {
-				rule := &rules.Override[i]
-				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
-					continue
-				}
-				for path, value := range rule.Params {
-					fullPath := buildPayloadPath(root, path)
-					if fullPath == "" {
-						continue
-					}
-					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						updated, errSet := sjson.SetBytes(out, resolvedPath, value)
-						if errSet != nil {
-							continue
-						}
-						out = updated
-					}
-				}
-			}
-			// Apply override raw rules: last write wins per field across all matching rules.
-			for i := range rules.OverrideRaw {
-				rule := &rules.OverrideRaw[i]
-				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
-					continue
-				}
-				for path, value := range rule.Params {
-					fullPath := buildPayloadPath(root, path)
-					if fullPath == "" {
-						continue
-					}
-					rawValue, ok := payloadRawValue(value)
-					if !ok {
-						continue
-					}
-					for _, resolvedPath := range resolvePayloadRulePaths(out, fullPath) {
-						updated, errSet := sjson.SetRawBytes(out, resolvedPath, rawValue)
-						if errSet != nil {
-							continue
-						}
-						out = updated
-					}
-				}
-			}
-			// Apply filter rules: remove matching paths from payload.
-			for i := range rules.Filter {
-				rule := &rules.Filter[i]
-				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
-					continue
-				}
-				for _, path := range rule.Params {
-					fullPath := buildPayloadPath(root, path)
-					if fullPath == "" {
-						continue
-					}
-					resolvedPaths := resolvePayloadRulePaths(out, fullPath)
-					for i := len(resolvedPaths) - 1; i >= 0; i-- {
-						resolvedPath := resolvedPaths[i]
-						updated, errDel := sjson.DeleteBytes(out, resolvedPath)
-						if errDel != nil {
-							continue
-						}
-						out = updated
-					}
+				rawValue, errMarshal := json.Marshal(value)
+				if errMarshal == nil && document.setRaw(resolvedPath, rawValue) {
+					appliedDefaults[resolvedPath] = struct{}{}
 				}
 			}
 		}
 	}
-	return out
+	for i := range rules.DefaultRaw {
+		rule := &rules.DefaultRaw[i]
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, document, root, candidates) {
+			continue
+		}
+		for path, value := range rule.Params {
+			fullPath := buildPayloadPath(root, path)
+			for _, resolvedPath := range resolvePayloadRulePaths(document, fullPath) {
+				if sourceDocument.valueAtPath(resolvedPath) != nil {
+					continue
+				}
+				if _, exists := appliedDefaults[resolvedPath]; exists {
+					continue
+				}
+				rawValue, valid := payloadRawValue(value)
+				if valid && document.setRaw(resolvedPath, rawValue) {
+					appliedDefaults[resolvedPath] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// Overrides are last-write-wins.
+	for i := range rules.Override {
+		rule := &rules.Override[i]
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, document, root, candidates) {
+			continue
+		}
+		for path, value := range rule.Params {
+			rawValue, errMarshal := json.Marshal(value)
+			if errMarshal != nil {
+				continue
+			}
+			for _, resolvedPath := range resolvePayloadRulePaths(document, buildPayloadPath(root, path)) {
+				document.setRaw(resolvedPath, rawValue)
+			}
+		}
+	}
+	for i := range rules.OverrideRaw {
+		rule := &rules.OverrideRaw[i]
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, document, root, candidates) {
+			continue
+		}
+		for path, value := range rule.Params {
+			rawValue, valid := payloadRawValue(value)
+			if !valid {
+				continue
+			}
+			for _, resolvedPath := range resolvePayloadRulePaths(document, buildPayloadPath(root, path)) {
+				document.setRaw(resolvedPath, rawValue)
+			}
+		}
+	}
+
+	// Filters resolve all matching array indexes before deleting them in reverse.
+	for i := range rules.Filter {
+		rule := &rules.Filter[i]
+		if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, document, root, candidates) {
+			continue
+		}
+		for _, path := range rule.Params {
+			resolvedPaths := resolvePayloadRulePaths(document, buildPayloadPath(root, path))
+			document.deleteAll(resolvedPaths)
+		}
+	}
+	return document.bytes()
 }
 
 func isImagesEndpointRequestPath(path string) bool {
@@ -214,7 +184,7 @@ func shouldStripImageGeneration(mode config.DisableImageGenerationMode, requestP
 	}
 }
 
-func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, fromProtocol string, headers http.Header, payload []byte, root string, models []string) bool {
+func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, fromProtocol string, headers http.Header, payload *payloadJSONDocument, root string, models []string) bool {
 	if len(rules) == 0 || len(models) == 0 {
 		return false
 	}
@@ -244,7 +214,7 @@ func payloadModelRulesMatch(rules []config.PayloadModelRule, protocol string, fr
 	return false
 }
 
-func payloadModelRuleConditionsMatch(payload []byte, root string, rule config.PayloadModelRule) bool {
+func payloadModelRuleConditionsMatch(payload *payloadJSONDocument, root string, rule config.PayloadModelRule) bool {
 	if !payloadMatchConditionsMatch(payload, root, rule.Match) {
 		return false
 	}
@@ -260,7 +230,7 @@ func payloadModelRuleConditionsMatch(payload []byte, root string, rule config.Pa
 	return true
 }
 
-func payloadMatchConditionsMatch(payload []byte, root string, conditions []map[string]any) bool {
+func payloadMatchConditionsMatch(payload *payloadJSONDocument, root string, conditions []map[string]any) bool {
 	for _, condition := range conditions {
 		for path, value := range condition {
 			if strings.TrimSpace(path) == "" {
@@ -274,7 +244,7 @@ func payloadMatchConditionsMatch(payload []byte, root string, conditions []map[s
 	return true
 }
 
-func payloadNotMatchConditionsMatch(payload []byte, root string, conditions []map[string]any) bool {
+func payloadNotMatchConditionsMatch(payload *payloadJSONDocument, root string, conditions []map[string]any) bool {
 	for _, condition := range conditions {
 		for path, value := range condition {
 			if strings.TrimSpace(path) == "" {
@@ -288,7 +258,7 @@ func payloadNotMatchConditionsMatch(payload []byte, root string, conditions []ma
 	return true
 }
 
-func payloadExistConditionsMatch(payload []byte, root string, paths []string) bool {
+func payloadExistConditionsMatch(payload *payloadJSONDocument, root string, paths []string) bool {
 	for _, path := range paths {
 		if strings.TrimSpace(path) == "" {
 			continue
@@ -300,7 +270,7 @@ func payloadExistConditionsMatch(payload []byte, root string, paths []string) bo
 	return true
 }
 
-func payloadNotExistConditionsMatch(payload []byte, root string, paths []string) bool {
+func payloadNotExistConditionsMatch(payload *payloadJSONDocument, root string, paths []string) bool {
 	for _, path := range paths {
 		if strings.TrimSpace(path) == "" {
 			continue
@@ -312,10 +282,10 @@ func payloadNotExistConditionsMatch(payload []byte, root string, paths []string)
 	return true
 }
 
-func payloadPathMatchesValue(payload []byte, path string, value any) bool {
+func payloadPathMatchesValue(payload *payloadJSONDocument, path string, value any) bool {
 	for _, resolvedPath := range resolvePayloadRulePaths(payload, path) {
-		result := gjson.GetBytes(payload, resolvedPath)
-		if !result.Exists() {
+		result := payload.valueAtPath(resolvedPath)
+		if result == nil {
 			continue
 		}
 		if payloadResultEquals(result, value) {
@@ -325,18 +295,18 @@ func payloadPathMatchesValue(payload []byte, path string, value any) bool {
 	return false
 }
 
-func payloadPathExists(payload []byte, path string) bool {
+func payloadPathExists(payload *payloadJSONDocument, path string) bool {
 	for _, resolvedPath := range resolvePayloadRulePaths(payload, path) {
-		result := gjson.GetBytes(payload, resolvedPath)
-		if result.Exists() && result.Type != gjson.Null {
+		result := payload.valueAtPath(resolvedPath)
+		if result != nil && !result.isNull() {
 			return true
 		}
 	}
 	return false
 }
 
-func payloadResultEquals(result gjson.Result, value any) bool {
-	actual, ok := normalizedPayloadResult(result)
+func payloadResultEquals(result *payloadJSONValue, value any) bool {
+	actual, ok := normalizedPayloadJSON(result.appendJSON(nil))
 	if !ok {
 		return false
 	}
@@ -345,21 +315,6 @@ func payloadResultEquals(result gjson.Result, value any) bool {
 		return false
 	}
 	return reflect.DeepEqual(actual, expected)
-}
-
-func normalizedPayloadResult(result gjson.Result) (any, bool) {
-	if !result.Exists() {
-		return nil, false
-	}
-	raw := strings.TrimSpace(result.Raw)
-	if raw == "" {
-		encoded, errMarshal := json.Marshal(result.Value())
-		if errMarshal != nil {
-			return nil, false
-		}
-		raw = string(encoded)
-	}
-	return normalizedPayloadJSON([]byte(raw))
 }
 
 func normalizedPayloadValue(value any) (any, bool) {
@@ -497,7 +452,453 @@ func buildPayloadPath(root, path string) string {
 	return r + "." + p
 }
 
-func resolvePayloadRulePaths(payload []byte, path string) []string {
+// payloadJSONDocument keeps object field order while payload rules mutate a parsed tree.
+// It avoids serializing the full request after every configured field update.
+type payloadJSONDocument struct {
+	root     *payloadJSONValue
+	capacity int
+	original []byte
+	changed  bool
+}
+
+type payloadJSONValue struct {
+	kind        byte
+	raw         []byte
+	object      []payloadJSONField
+	objectIndex map[string]int
+	array       []*payloadJSONValue
+}
+
+type payloadJSONField struct {
+	name    string
+	rawName []byte
+	value   *payloadJSONValue
+}
+
+type payloadJSONPathPart struct {
+	name    string
+	index   int
+	numeric bool
+	append  bool
+}
+
+type payloadJSONDeleteTarget struct {
+	parent   *payloadJSONValue
+	position int
+	object   bool
+}
+
+func newPayloadJSONDocument(data []byte) (*payloadJSONDocument, bool) {
+	if !gjson.ValidBytes(data) {
+		return nil, false
+	}
+	return &payloadJSONDocument{
+		root:     newPayloadJSONValue(gjson.ParseBytes(data)),
+		capacity: len(data),
+		original: data,
+	}, true
+}
+
+func newPayloadJSONValue(result gjson.Result) *payloadJSONValue {
+	raw := []byte(strings.TrimSpace(result.Raw))
+	if result.Type != gjson.JSON || len(raw) == 0 {
+		return &payloadJSONValue{raw: raw}
+	}
+	value := &payloadJSONValue{kind: raw[0]}
+	switch value.kind {
+	case '{':
+		value.objectIndex = make(map[string]int)
+		result.ForEach(func(key, child gjson.Result) bool {
+			rawName := []byte(key.Raw)
+			if len(rawName) == 0 {
+				rawName, _ = json.Marshal(key.String())
+			}
+			field := payloadJSONField{name: key.String(), rawName: rawName, value: newPayloadJSONValue(child)}
+			if _, exists := value.objectIndex[field.name]; !exists {
+				value.objectIndex[field.name] = len(value.object)
+			}
+			value.object = append(value.object, field)
+			return true
+		})
+	case '[':
+		items := result.Array()
+		value.array = make([]*payloadJSONValue, 0, len(items))
+		for _, item := range items {
+			value.array = append(value.array, newPayloadJSONValue(item))
+		}
+	default:
+		value.kind = 0
+		value.raw = raw
+	}
+	return value
+}
+
+func newPayloadJSONRawValue(raw []byte) *payloadJSONValue {
+	if gjson.ValidBytes(raw) {
+		return newPayloadJSONValue(gjson.ParseBytes(raw))
+	}
+	return &payloadJSONValue{raw: raw}
+}
+
+func (document *payloadJSONDocument) bytes() []byte {
+	if document == nil || document.root == nil {
+		return nil
+	}
+	if !document.changed {
+		return document.original
+	}
+	return document.root.appendJSON(make([]byte, 0, document.capacity))
+}
+
+func (value *payloadJSONValue) appendJSON(out []byte) []byte {
+	if value == nil {
+		return append(out, "null"...)
+	}
+	switch value.kind {
+	case '{':
+		out = append(out, '{')
+		written := false
+		for _, field := range value.object {
+			if field.value == nil {
+				continue
+			}
+			if written {
+				out = append(out, ',')
+			}
+			written = true
+			out = append(out, field.rawName...)
+			out = append(out, ':')
+			out = field.value.appendJSON(out)
+		}
+		return append(out, '}')
+	case '[':
+		out = append(out, '[')
+		written := false
+		for _, item := range value.array {
+			if item == nil {
+				continue
+			}
+			if written {
+				out = append(out, ',')
+			}
+			written = true
+			out = item.appendJSON(out)
+		}
+		return append(out, ']')
+	default:
+		return append(out, value.raw...)
+	}
+}
+
+func (value *payloadJSONValue) isNull() bool {
+	return value != nil && value.kind == 0 && strings.TrimSpace(string(value.raw)) == "null"
+}
+
+func (document *payloadJSONDocument) valueAtPath(path string) *payloadJSONValue {
+	if document == nil || document.root == nil {
+		return nil
+	}
+	if path == "" {
+		return document.root
+	}
+	parts, ok := parsePayloadJSONPath(path)
+	if !ok {
+		return nil
+	}
+	value := document.root
+	for _, part := range parts {
+		switch value.kind {
+		case '{':
+			position, exists := value.objectIndex[part.name]
+			if !exists || position >= len(value.object) || value.object[position].value == nil {
+				return nil
+			}
+			value = value.object[position].value
+		case '[':
+			if !part.numeric {
+				return nil
+			}
+			position, exists := value.arrayPosition(part.index)
+			if !exists {
+				return nil
+			}
+			value = value.array[position]
+		default:
+			return nil
+		}
+	}
+	return value
+}
+
+func (document *payloadJSONDocument) setRaw(path string, raw []byte) bool {
+	parts, ok := parsePayloadJSONPath(path)
+	if !ok || len(parts) == 0 || document == nil || document.root == nil {
+		return false
+	}
+	if !document.root.set(parts, newPayloadJSONRawValue(raw)) {
+		return false
+	}
+	document.changed = true
+	return true
+}
+
+func (value *payloadJSONValue) set(parts []payloadJSONPathPart, replacement *payloadJSONValue) bool {
+	part := parts[0]
+	if value.kind != '{' && value.kind != '[' {
+		if part.numeric || part.append {
+			value.reset('[')
+		} else {
+			value.reset('{')
+		}
+	}
+	if value.kind == '{' {
+		position, exists := value.objectIndex[part.name]
+		if len(parts) == 1 {
+			if exists && value.object[position].value != nil {
+				value.object[position].value = replacement
+				return true
+			}
+			value.appendObjectField(part.name, replacement)
+			return true
+		}
+		if !exists || value.object[position].value == nil {
+			child := &payloadJSONValue{}
+			value.appendObjectField(part.name, child)
+			return child.set(parts[1:], replacement)
+		}
+		return value.object[position].value.set(parts[1:], replacement)
+	}
+	if !part.numeric && !part.append {
+		return false
+	}
+	if part.append {
+		if len(parts) == 1 {
+			value.array = append(value.array, replacement)
+			return true
+		}
+		child := &payloadJSONValue{}
+		value.array = append(value.array, child)
+		return child.set(parts[1:], replacement)
+	}
+	position, exists := value.arrayPosition(part.index)
+	if !exists {
+		for value.arrayLength() < part.index {
+			value.array = append(value.array, &payloadJSONValue{raw: []byte("null")})
+		}
+		child := replacement
+		if len(parts) > 1 {
+			child = &payloadJSONValue{}
+		}
+		value.array = append(value.array, child)
+		if len(parts) == 1 {
+			return true
+		}
+		return child.set(parts[1:], replacement)
+	}
+	if len(parts) == 1 {
+		value.array[position] = replacement
+		return true
+	}
+	return value.array[position].set(parts[1:], replacement)
+}
+
+func (document *payloadJSONDocument) deleteAll(paths []string) {
+	if document == nil || document.root == nil || len(paths) == 0 {
+		return
+	}
+	targets := make([]payloadJSONDeleteTarget, 0, len(paths))
+	for _, path := range paths {
+		if target, ok := document.deleteTarget(path); ok {
+			targets = append(targets, target)
+		}
+	}
+	touched := make(map[*payloadJSONValue]struct{})
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := targets[i]
+		if target.object {
+			if target.position >= len(target.parent.object) || target.parent.object[target.position].value == nil {
+				continue
+			}
+			target.parent.object[target.position].value = nil
+		} else {
+			if target.position >= len(target.parent.array) || target.parent.array[target.position] == nil {
+				continue
+			}
+			target.parent.array[target.position] = nil
+		}
+		document.changed = true
+		touched[target.parent] = struct{}{}
+	}
+	for parent := range touched {
+		parent.compact()
+	}
+}
+
+func (document *payloadJSONDocument) deleteTarget(path string) (payloadJSONDeleteTarget, bool) {
+	parts, ok := parsePayloadJSONPath(path)
+	if !ok || len(parts) == 0 {
+		return payloadJSONDeleteTarget{}, false
+	}
+	parent := document.root
+	for _, part := range parts[:len(parts)-1] {
+		switch parent.kind {
+		case '{':
+			position, exists := parent.objectIndex[part.name]
+			if !exists || parent.object[position].value == nil {
+				return payloadJSONDeleteTarget{}, false
+			}
+			parent = parent.object[position].value
+		case '[':
+			if !part.numeric {
+				return payloadJSONDeleteTarget{}, false
+			}
+			position, exists := parent.arrayPosition(part.index)
+			if !exists {
+				return payloadJSONDeleteTarget{}, false
+			}
+			parent = parent.array[position]
+		default:
+			return payloadJSONDeleteTarget{}, false
+		}
+	}
+	part := parts[len(parts)-1]
+	if parent.kind == '{' {
+		position, exists := parent.objectIndex[part.name]
+		return payloadJSONDeleteTarget{parent: parent, position: position, object: true}, exists && parent.object[position].value != nil
+	}
+	if parent.kind != '[' {
+		return payloadJSONDeleteTarget{}, false
+	}
+	if part.append {
+		part.index = parent.arrayLength() - 1
+		part.numeric = true
+	}
+	if !part.numeric {
+		return payloadJSONDeleteTarget{}, false
+	}
+	position, exists := parent.arrayPosition(part.index)
+	return payloadJSONDeleteTarget{parent: parent, position: position}, exists
+}
+
+func (value *payloadJSONValue) compact() {
+	if value.kind == '[' {
+		kept := value.array[:0]
+		for _, item := range value.array {
+			if item != nil {
+				kept = append(kept, item)
+			}
+		}
+		value.array = kept
+		return
+	}
+	kept := value.object[:0]
+	value.objectIndex = make(map[string]int, len(value.object))
+	for _, field := range value.object {
+		if field.value == nil {
+			continue
+		}
+		if _, exists := value.objectIndex[field.name]; !exists {
+			value.objectIndex[field.name] = len(kept)
+		}
+		kept = append(kept, field)
+	}
+	value.object = kept
+}
+
+func (value *payloadJSONValue) reset(kind byte) {
+	*value = payloadJSONValue{kind: kind}
+	if kind == '{' {
+		value.objectIndex = make(map[string]int)
+	}
+}
+
+func (value *payloadJSONValue) appendObjectField(name string, child *payloadJSONValue) {
+	rawName, _ := json.Marshal(name)
+	value.objectIndex[name] = len(value.object)
+	value.object = append(value.object, payloadJSONField{name: name, rawName: rawName, value: child})
+}
+
+func (value *payloadJSONValue) arrayLength() int {
+	length := 0
+	for _, item := range value.array {
+		if item != nil {
+			length++
+		}
+	}
+	return length
+}
+
+func (value *payloadJSONValue) arrayPosition(index int) (int, bool) {
+	if index < 0 {
+		return 0, false
+	}
+	if index < len(value.array) && value.array[index] != nil {
+		return index, true
+	}
+	logical := 0
+	for position, item := range value.array {
+		if item == nil {
+			continue
+		}
+		if logical == index {
+			return position, true
+		}
+		logical++
+	}
+	return 0, false
+}
+
+func parsePayloadJSONPath(path string) ([]payloadJSONPathPart, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, false
+	}
+	rawParts := splitPayloadRulePath(path)
+	parts := make([]payloadJSONPathPart, 0, len(rawParts))
+	for _, rawPart := range rawParts {
+		forceString := strings.HasPrefix(rawPart, ":")
+		if forceString {
+			rawPart = rawPart[1:]
+		}
+		var name strings.Builder
+		for i := 0; i < len(rawPart); i++ {
+			if rawPart[i] == '\\' {
+				i++
+				if i >= len(rawPart) {
+					return nil, false
+				}
+				name.WriteByte(rawPart[i])
+				continue
+			}
+			switch rawPart[i] {
+			case '|', '#', '@', '*', '?':
+				return nil, false
+			default:
+				name.WriteByte(rawPart[i])
+			}
+		}
+		part := payloadJSONPathPart{name: name.String()}
+		if !forceString && part.name == "-1" {
+			part.append = true
+		} else if !forceString && part.name != "" {
+			part.index, part.numeric = parsePayloadArrayIndex(part.name)
+		}
+		parts = append(parts, part)
+	}
+	return parts, true
+}
+
+func parsePayloadArrayIndex(value string) (int, bool) {
+	for i := range value {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+	}
+	index, errAtoi := strconv.Atoi(value)
+	return index, errAtoi == nil
+}
+
+func resolvePayloadRulePaths(payload *payloadJSONDocument, path string) []string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil
@@ -520,15 +921,21 @@ func resolvePayloadRulePaths(payload []byte, path string) []string {
 		}
 		nextPaths := make([]string, 0, len(paths))
 		for _, basePath := range paths {
-			array := payloadValueAtPath(payload, basePath)
-			if !array.Exists() || !array.IsArray() {
+			array := payload.valueAtPath(basePath)
+			if array == nil || array.kind != '[' {
 				continue
 			}
-			for index, item := range array.Array() {
+			index := 0
+			for _, item := range array.array {
+				if item == nil {
+					continue
+				}
 				if !payloadQueryMatches(item, query) {
+					index++
 					continue
 				}
 				nextPaths = append(nextPaths, appendPayloadPathPart(basePath, strconv.Itoa(index)))
+				index++
 				if !allMatches {
 					break
 				}
@@ -650,14 +1057,7 @@ func appendPayloadPathPart(path, part string) string {
 	return path + "." + part
 }
 
-func payloadValueAtPath(payload []byte, path string) gjson.Result {
-	if path == "" {
-		return gjson.ParseBytes(payload)
-	}
-	return gjson.GetBytes(payload, path)
-}
-
-func payloadQueryMatches(item gjson.Result, query string) bool {
+func payloadQueryMatches(item *payloadJSONValue, query string) bool {
 	for _, orPart := range splitPayloadLogical(query, "||") {
 		if payloadQueryAndMatches(item, orPart) {
 			return true
@@ -666,7 +1066,7 @@ func payloadQueryMatches(item gjson.Result, query string) bool {
 	return false
 }
 
-func payloadQueryAndMatches(item gjson.Result, query string) bool {
+func payloadQueryAndMatches(item *payloadJSONValue, query string) bool {
 	parts := splitPayloadLogical(query, "&&")
 	if len(parts) == 0 {
 		return false
@@ -714,14 +1114,15 @@ func splitPayloadLogical(query, operator string) []string {
 	return parts
 }
 
-func payloadQueryTermMatches(item gjson.Result, term string) bool {
+func payloadQueryTermMatches(item *payloadJSONValue, term string) bool {
 	term = strings.TrimSpace(term)
-	if term == "" || item.Raw == "" {
+	if term == "" || item == nil {
 		return false
 	}
-	wrapped := make([]byte, 0, len(item.Raw)+2)
+	raw := item.appendJSON(nil)
+	wrapped := make([]byte, 0, len(raw)+2)
 	wrapped = append(wrapped, '[')
-	wrapped = append(wrapped, item.Raw...)
+	wrapped = append(wrapped, raw...)
 	wrapped = append(wrapped, ']')
 	return gjson.GetBytes(wrapped, "#("+term+")").Exists()
 }
@@ -793,22 +1194,18 @@ func removeToolTypeFromToolsArray(payload []byte, toolsPath string, toolType str
 		return payload
 	}
 	removed := false
-	filtered := []byte(`[]`)
+	filtered := make([]json.RawMessage, 0, len(tools.Array()))
 	for _, tool := range tools.Array() {
 		if tool.Get("type").String() == toolType {
 			removed = true
 			continue
 		}
-		updated, errSet := sjson.SetRawBytes(filtered, "-1", []byte(tool.Raw))
-		if errSet != nil {
-			continue
-		}
-		filtered = updated
+		filtered = append(filtered, json.RawMessage(tool.Raw))
 	}
 	if !removed {
 		return payload
 	}
-	updated, errSet := sjson.SetRawBytes(payload, toolsPath, filtered)
+	updated, errSet := sjson.SetRawBytes(payload, toolsPath, internalpayload.BuildRaw(filtered))
 	if errSet != nil {
 		return payload
 	}

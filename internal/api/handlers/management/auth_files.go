@@ -33,6 +33,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -742,7 +743,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
+		writeManagementRequestBodyError(c, errMultipart)
 		return
 	}
 	if len(fileHeaders) == 1 {
@@ -801,9 +802,9 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "name must end with .json"})
 		return
 	}
-	data, err := io.ReadAll(c.Request.Body)
+	data, err := sdkhandlers.ReadRequestBodyWithLimits(c, maxManagementAuthUploadBodyBytes, maxManagementAuthUploadBodyBytes)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
@@ -856,6 +857,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 
 	names, errNames := requestedAuthFileNamesForDelete(c)
 	if errNames != nil {
+		if sdkhandlers.IsRequestBodyTooLarge(errNames) {
+			writeManagementRequestBodyError(c, errNames)
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
 		return
 	}
@@ -898,7 +903,7 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	if h == nil || c == nil || c.ContentType() != "multipart/form-data" {
 		return nil, nil
 	}
-	form, err := c.MultipartForm()
+	form, err := sdkhandlers.ParseMultipartFormWithLimits(c, maxManagementAuthUploadBodyBytes, 8<<20, 8<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +936,11 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to open uploaded file: %w", err)
 	}
-	defer src.Close()
+	defer func() {
+		if errClose := src.Close(); errClose != nil {
+			log.Errorf("management: close auth file upload: %v", errClose)
+		}
+	}()
 
 	data, err := io.ReadAll(src)
 	if err != nil {
@@ -972,8 +981,11 @@ func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
 		return names, nil
 	}
 
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readManagementRequestBody(c, maxManagementJSONBodyBytes)
 	if err != nil {
+		if sdkhandlers.IsRequestBodyTooLarge(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to read body")
 	}
 	body = bytes.TrimSpace(body)
@@ -1251,8 +1263,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		Name     string `json:"name"`
 		Disabled *bool  `json:"disabled"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &req); err != nil {
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 
@@ -1368,9 +1380,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req map[string]json.RawMessage
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &req); err != nil {
+		if sdkhandlers.IsRequestBodyTooLarge(err) {
+			writeManagementRequestBodyError(c, err)
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}

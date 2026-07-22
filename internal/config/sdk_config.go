@@ -60,7 +60,7 @@ type SDKConfig struct {
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
 
-	// RequestGuards configures opt-in request shaping and admission guards.
+	// RequestGuards configures request shaping and admission guards.
 	RequestGuards RequestGuardsConfig `yaml:"request-guards" json:"request-guards"`
 }
 
@@ -82,16 +82,36 @@ type StreamingConfig struct {
 
 // RequestGuardsConfig holds optional traffic safety guards.
 type RequestGuardsConfig struct {
+	Amplification             AmplificationGuardConfig             `yaml:"amplification" json:"amplification"`
 	MiniMaxHighspeedNarrative MiniMaxHighspeedNarrativeGuardConfig `yaml:"minimax-m27-highspeed-narrative,omitempty" json:"minimax-m27-highspeed-narrative,omitempty"`
-	GlobalAdmission           GlobalAdmissionConfig                `yaml:"global-admission,omitempty" json:"global-admission,omitempty"`
+	GlobalAdmission           GlobalAdmissionConfig                `yaml:"global-admission" json:"global-admission"`
+	PayloadBodyLimit          PayloadBodyLimitConfig               `yaml:"payload-body-limit" json:"payload-body-limit"`
+}
+
+// AmplificationGuardConfig controls request-transform expansion enforcement.
+// File-based configuration defaults to observe mode so operators can measure
+// compatibility impact before switching to enforce.
+type AmplificationGuardConfig struct {
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+}
+
+// PayloadBodyLimitConfig controls the staged request-body safety policy for
+// public API routes. File-based configuration defaults to observe mode so an
+// operator can measure impact before switching to enforce.
+type PayloadBodyLimitConfig struct {
+	Mode           string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	JSONBytes      int64  `yaml:"json-bytes,omitempty" json:"json-bytes,omitempty"`
+	MultipartBytes int64  `yaml:"multipart-bytes,omitempty" json:"multipart-bytes,omitempty"`
+	WebsocketBytes int64  `yaml:"websocket-bytes,omitempty" json:"websocket-bytes,omitempty"`
 }
 
 // GlobalAdmissionConfig bounds aggregate request complexity before upstream execution.
-// It is disabled by default for backward compatibility.
+// File-based server configuration enables it by default; set enabled=false to opt out.
 type GlobalAdmissionConfig struct {
-	Enabled                bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Enabled                bool `yaml:"enabled" json:"enabled"`
 	Capacity               int  `yaml:"capacity,omitempty" json:"capacity,omitempty"`
 	MaxQueue               int  `yaml:"max-queue,omitempty" json:"max-queue,omitempty"`
+	MaxWaitSeconds         int  `yaml:"max-wait-seconds,omitempty" json:"max-wait-seconds,omitempty"`
 	SaturationGraceSeconds int  `yaml:"saturation-grace-seconds,omitempty" json:"saturation-grace-seconds,omitempty"`
 }
 

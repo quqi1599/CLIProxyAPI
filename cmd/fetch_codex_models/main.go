@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +30,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -46,6 +46,7 @@ const (
 	defaultCodexUserAgent    = "codex_cli_rs/0.133.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 	defaultCodexOriginator   = "codex_cli_rs"
 	accessTokenRefreshLeeway = 30 * time.Second
+	maxCodexModelsBytes      = 4 << 20
 )
 
 func init() {
@@ -269,16 +270,13 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVe
 		return nil, 0, errDo
 	}
 
-	bodyBytes, errRead := io.ReadAll(httpResp.Body)
-	if errClose := httpResp.Body.Close(); errClose != nil && errRead == nil {
-		errRead = errClose
-	}
+	bodyBytes, errRead := httpfetch.ReadResponseBytes(httpResp, maxCodexModelsBytes)
 	if errRead != nil {
 		return nil, 0, errRead
 	}
 
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-		return nil, 0, fmt.Errorf("models request failed with status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return nil, 0, codexModelsStatusError(httpResp.StatusCode, httpResp.Header.Get("Content-Type"), bodyBytes)
 	}
 
 	count, errCount := countModels(bodyBytes)
@@ -286,6 +284,10 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVe
 		return nil, 0, errCount
 	}
 	return bodyBytes, count, nil
+}
+
+func codexModelsStatusError(statusCode int, contentType string, body []byte) error {
+	return fmt.Errorf("models request failed with status %d: %s", statusCode, httpfetch.ErrorBodyMetadata(contentType, body))
 }
 
 func codexModelsURL(clientVersion string) (string, error) {

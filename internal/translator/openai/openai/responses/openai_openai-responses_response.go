@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -138,7 +139,6 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 		}
 	}
 
-	outputsWrapper := []byte(`{"arr":[]}`)
 	type completedOutputItem struct {
 		index int
 		raw   []byte
@@ -190,11 +190,12 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 		}
 	}
 	sort.Slice(outputItems, func(i, j int) bool { return outputItems[i].index < outputItems[j].index })
-	for _, item := range outputItems {
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item.raw)
-	}
-	if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-		completed, _ = sjson.SetRawBytes(completed, "response.output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+	if len(outputItems) > 0 {
+		outputs := make([][]byte, len(outputItems))
+		for i := range outputItems {
+			outputs[i] = outputItems[i].raw
+		}
+		completed, _ = sjson.SetRawBytes(completed, "response.output", internalpayload.BuildRaw(outputs))
 	}
 	if st.UsageSeen {
 		completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens", st.PromptTokens)
@@ -794,7 +795,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	}
 
 	// Build output list from choices[...]
-	outputsWrapper := []byte(`{"arr":[]}`)
+	var outputs [][]byte
 	// Detect and capture reasoning content if present
 	rcText := gjson.GetBytes(rawJSON, "choices.0.message.reasoning_content").String()
 	includeReasoning := rcText != ""
@@ -813,7 +814,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 			reasoningItem, _ = sjson.SetBytes(reasoningItem, "summary.0.type", "summary_text")
 			reasoningItem, _ = sjson.SetBytes(reasoningItem, "summary.0.text", rcText)
 		}
-		outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", reasoningItem)
+		outputs = append(outputs, reasoningItem)
 	}
 
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
@@ -825,7 +826,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 					item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
 					item, _ = sjson.SetBytes(item, "content.0.text", c.String())
-					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+					outputs = append(outputs, item)
 				}
 
 				// Function/tool calls
@@ -846,7 +847,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 							item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))
 							item, _ = sjson.SetBytes(item, "call_id", callID)
 							item, _ = sjson.SetBytes(item, "name", name)
-							outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+							outputs = append(outputs, item)
 							return true
 						}
 						item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
@@ -854,7 +855,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						item, _ = sjson.SetBytes(item, "arguments", args)
 						item, _ = sjson.SetBytes(item, "call_id", callID)
 						item = applyResponsesFunctionCallNamespaceFields(item, requestForNamespace, name, "")
-						outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+						outputs = append(outputs, item)
 						return true
 					})
 				}
@@ -862,8 +863,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 			return true
 		})
 	}
-	if gjson.GetBytes(outputsWrapper, "arr.#").Int() > 0 {
-		resp, _ = sjson.SetRawBytes(resp, "output", []byte(gjson.GetBytes(outputsWrapper, "arr").Raw))
+	if len(outputs) > 0 {
+		resp, _ = sjson.SetRawBytes(resp, "output", internalpayload.BuildRaw(outputs))
 	}
 
 	// usage mapping

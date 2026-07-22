@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime"
 	"net"
 	"net/http"
@@ -14,25 +13,42 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 const (
-	miniMaxM3ImageInlineMaxBytes  = 5 << 20
-	miniMaxM3ImageInlineMaxImages = 4
+	miniMaxM3ImageInlineMaxBytes     = 5 << 20
+	miniMaxM3ImageInlineMaxWireBytes = 8 << 20
+	miniMaxM3ImageInlineMaxImages    = 4
+	// Four 5 MiB images expand to at most about 26.7 MiB after base64 encoding.
+	miniMaxM3ImageInlineMaxExpansionBytes int64 = 28 << 20
 )
+
+func miniMaxM3InlineAmplificationOverride(applied bool) internalpayload.AmplificationOverride {
+	if !applied {
+		return internalpayload.AmplificationOverride{}
+	}
+	return internalpayload.AmplificationOverride{
+		PolicyID:          "openai_compat.minimax_m3_image_inline",
+		MaxExpansionBytes: miniMaxM3ImageInlineMaxExpansionBytes,
+	}
+}
 
 var (
 	fetchMiniMaxM3ImageURL = fetchMiniMaxM3ImageURLDefault
 
 	miniMaxM3ImageHTTPClient = &http.Client{
-		Transport: &http.Transport{
-			Proxy:             nil,
-			DialContext:       miniMaxM3ImageDialContext,
-			ForceAttemptHTTP2: true,
-		},
+		Transport: proxyutil.ApplyHTTPTransportLimits(&http.Transport{
+			Proxy:              nil,
+			DialContext:        miniMaxM3ImageDialContext,
+			ForceAttemptHTTP2:  true,
+			DisableCompression: true,
+		}),
 		CheckRedirect: miniMaxM3ImageCheckRedirect,
 	}
 
@@ -51,7 +67,7 @@ var (
 
 type miniMaxM3ImageInlineState struct {
 	ctx       context.Context
-	converted int
+	attempted int
 }
 
 func inlineMiniMaxM3RemoteImageURLs(ctx context.Context, payload []byte, profile openAICompatProfile, model string) ([]byte, bool) {
@@ -144,17 +160,17 @@ func (s *miniMaxM3ImageInlineState) inlineOpenAIImageURLPart(part map[string]any
 
 func (s *miniMaxM3ImageInlineState) inlineURL(rawURL string) (string, bool) {
 	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" || s.converted >= miniMaxM3ImageInlineMaxImages {
+	if rawURL == "" || s.attempted >= miniMaxM3ImageInlineMaxImages {
 		return "", false
 	}
 	if strings.HasPrefix(strings.ToLower(rawURL), "data:") {
 		return "", false
 	}
+	s.attempted++
 	mediaType, data, ok := fetchMiniMaxM3ImageURL(s.ctx, rawURL)
 	if !ok {
 		return "", false
 	}
-	s.converted++
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), true
 }
 
@@ -177,20 +193,18 @@ func fetchMiniMaxM3ImageURLDefault(ctx context.Context, rawURL string) (string, 
 	if err != nil {
 		return "", nil, false
 	}
-	defer func() {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close minimax m3 image fetch body error: %v", errClose)
 		}
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", nil, false
-	}
-	if resp.ContentLength > miniMaxM3ImageInlineMaxBytes {
 		return "", nil, false
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, miniMaxM3ImageInlineMaxBytes+1))
-	if err != nil || len(data) == 0 || len(data) > miniMaxM3ImageInlineMaxBytes {
+	data, err := helps.ReadBoundedUpstreamHTTPResponse(resp, helps.UpstreamBodyLimits{
+		SuccessBytes:     miniMaxM3ImageInlineMaxBytes,
+		SuccessWireBytes: miniMaxM3ImageInlineMaxWireBytes,
+	})
+	if err != nil || len(data) == 0 {
 		return "", nil, false
 	}
 	mediaType := miniMaxM3AllowedImageMediaType(resp.Header.Get("Content-Type"), data)

@@ -271,10 +271,7 @@ func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 // Additionally, remote access requires allow-remote-management=true.
 func (h *Handler) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("X-CPA-VERSION", buildinfo.Version)
-		c.Header("X-CPA-COMMIT", buildinfo.Commit)
-		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
-		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
+		c.Header("Cache-Control", "no-store")
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
@@ -298,6 +295,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
 		}
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
+		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 		c.Next()
 	}
 }
@@ -651,7 +652,11 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 	var body struct {
 		Value *bool `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
@@ -663,7 +668,11 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 	var body struct {
 		Value *int `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
@@ -675,7 +684,11 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 	var body struct {
 		Value *string `json:"value"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &body); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if body.Value == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}

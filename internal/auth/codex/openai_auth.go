@@ -7,14 +7,15 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
@@ -26,6 +27,8 @@ const (
 	TokenURL    = "https://auth.openai.com/oauth/token"
 	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RedirectURI = "http://localhost:1455/auth/callback"
+
+	maxCodexTokenResponseBytes = 1 << 20
 )
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
@@ -36,6 +39,51 @@ type CodexAuth struct {
 }
 
 var codexRefreshGroup singleflight.Group
+
+type codexTokenHTTPError struct {
+	operation    string
+	status       int
+	metadata     string
+	nonRetryable bool
+}
+
+func (e *codexTokenHTTPError) Error() string {
+	if e == nil {
+		return "token request failed"
+	}
+	reason := ""
+	if e.nonRetryable {
+		reason = " reason=refresh_token_reused"
+	}
+	return fmt.Sprintf("%s failed with status %d:%s %s", e.operation, e.status, reason, e.metadata)
+}
+
+func newCodexTokenHTTPError(operation string, status int, contentType string, body []byte) error {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	code := strings.TrimSpace(envelope.Code)
+	if len(envelope.Error) > 0 {
+		var errorCode string
+		if json.Unmarshal(envelope.Error, &errorCode) == nil && code == "" {
+			code = strings.TrimSpace(errorCode)
+		}
+		var nested struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(envelope.Error, &nested) == nil && code == "" {
+			code = strings.TrimSpace(nested.Code)
+		}
+	}
+	return &codexTokenHTTPError{
+		operation:    operation,
+		status:       status,
+		metadata:     httpfetch.ErrorBodyMetadata(contentType, body),
+		nonRetryable: strings.EqualFold(code, "refresh_token_reused"),
+	}
+}
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
@@ -124,18 +172,12 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	if err != nil {
 		return nil, fmt.Errorf("token exchange request failed: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpfetch.ReadResponseBytes(resp, maxCodexTokenResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
-	// log.Debugf("Token response: %s", string(body))
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, newCodexTokenHTTPError("token exchange", resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	}
 
 	// Parse token response
@@ -227,19 +269,13 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 	if errDo != nil {
 		return nil, fmt.Errorf("token refresh request failed: %w", errDo)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("token refresh response body close error: %v", errClose)
-		}
-	}()
-
-	body, errRead := io.ReadAll(resp.Body)
+	body, errRead := httpfetch.ReadResponseBytes(resp, maxCodexTokenResponseBytes)
 	if errRead != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", errRead)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, newCodexTokenHTTPError("token refresh", resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	}
 
 	var tokenResp struct {
@@ -335,11 +371,8 @@ func refreshLogSourceLabel(sourceLabel string) string {
 }
 
 func isNonRetryableRefreshErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	var tokenErr *codexTokenHTTPError
+	return errors.As(err, &tokenErr) && tokenErr.nonRetryable
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.

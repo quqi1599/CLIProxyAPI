@@ -1,10 +1,15 @@
 package openai
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -261,6 +266,36 @@ func TestBuildXAIVideosCreateRequestAllowsCustomSeconds(t *testing.T) {
 	}
 }
 
+func TestBuildXAIVideosCreateRequestBuildsBoundedReferenceArray(t *testing.T) {
+	refs := make([]string, maxXAIVideoReferences)
+	for idx := range refs {
+		refs[idx] = fmt.Sprintf("https://example.com/%d.png", idx)
+	}
+	encoded, errMarshal := json.Marshal(refs)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	rawJSON := []byte(fmt.Sprintf(`{"prompt":"animate","reference_image_urls":%s}`, encoded))
+
+	req, _, err := buildXAIVideosCreateRequest(rawJSON, defaultXAIVideosModel)
+	if err != nil {
+		t.Fatalf("buildXAIVideosCreateRequest() error = %v", err)
+	}
+	if got := len(gjson.GetBytes(req, "reference_images").Array()); got != maxXAIVideoReferences {
+		t.Fatalf("reference images = %d, want %d", got, maxXAIVideoReferences)
+	}
+
+	refs = append(refs, "https://example.com/overflow.png")
+	encoded, errMarshal = json.Marshal(refs)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	rawJSON = []byte(fmt.Sprintf(`{"prompt":"animate","reference_image_urls":%s}`, encoded))
+	if _, _, err = buildXAIVideosCreateRequest(rawJSON, defaultXAIVideosModel); err == nil || !strings.Contains(err.Error(), "at most 7") {
+		t.Fatalf("overflow error = %v, want reference limit", err)
+	}
+}
+
 func TestBuildXAIVideosCreateRequestRejectsFileIDReference(t *testing.T) {
 	rawJSON := []byte(`{"prompt":"animate","input_reference":{"file_id":"file_123"}}`)
 
@@ -334,6 +369,24 @@ func TestBuildVideosRetrieveAPIResponseFromXAI(t *testing.T) {
 	}
 }
 
+func TestBuildVideosRetrieveAPIResponseFromXAIPreservesSelectedFieldOrder(t *testing.T) {
+	payload := []byte(`{"size":"1280x720","prompt":"animate","expires_at":30,"created_at":10,"completed_at":20,"remixed_from_video_id":"source","status":"completed"}`)
+
+	out, err := buildVideosRetrieveAPIResponseFromXAI("video_123", payload, defaultOpenAIVideosModel)
+	if err != nil {
+		t.Fatalf("buildVideosRetrieveAPIResponseFromXAI() error = %v", err)
+	}
+	ordered := []string{`"object"`, `"id"`, `"model"`, `"created_at"`, `"completed_at"`, `"expires_at"`, `"prompt"`, `"remixed_from_video_id"`, `"size"`, `"status"`}
+	previous := -1
+	for _, field := range ordered {
+		index := strings.Index(string(out), field)
+		if index <= previous {
+			t.Fatalf("field order changed at %s: %s", field, out)
+		}
+		previous = index
+	}
+}
+
 func TestBuildVideosRetrieveAPIResponseFromXAINormalizesTopLevelError(t *testing.T) {
 	payload := []byte(`{"code":"invalid-argument","error":"1080p video resolution is not available for your team."}`)
 
@@ -388,7 +441,10 @@ func TestXAIVideoContentURLFromPayload(t *testing.T) {
 }
 
 func TestWriteVideoContentFromURL(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Errorf("Accept-Encoding = %q, want identity", got)
+		}
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Header().Set("Content-Disposition", `attachment; filename="video.mp4"`)
 		_, _ = w.Write([]byte("video-bytes"))
@@ -417,6 +473,55 @@ func TestWriteVideoContentFromURL(t *testing.T) {
 	}
 	if got := resp.Body.String(); got != "video-bytes" {
 		t.Fatalf("body = %q, want video-bytes", got)
+	}
+}
+
+func TestWriteVideoContentFromURLRejectsEncodedMedia(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("compressed-video"))
+	}))
+	defer upstream.Close()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/openai/v1/videos/video_123/content", nil)
+	handler := NewOpenAIAPIHandler(apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	if err := handler.writeVideoContentFromURL(ctx, upstream.URL+"/video.mp4"); err == nil {
+		t.Fatal("writeVideoContentFromURL() succeeded for encoded media")
+	}
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+}
+
+func TestWriteVideoContentFromURLErrorDoesNotExposeBody(t *testing.T) {
+	const secret = "video-upstream-secret-marker"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"` + secret + `"}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/openai/v1/videos/video_123/content", nil)
+	handler := NewOpenAIAPIHandler(apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	err := handler.writeVideoContentFromURL(ctx, upstream.URL+"/video.mp4")
+	if err == nil {
+		t.Fatal("writeVideoContentFromURL() error = nil")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(recorder.Body.String(), secret) {
+		t.Fatalf("raw upstream error leaked: error=%v body=%s", err, recorder.Body.String())
+	}
+	if !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("missing safe error metadata: %v", err)
 	}
 }
 
@@ -761,6 +866,111 @@ func TestVideosCreateFormRequest(t *testing.T) {
 	if got := gjson.GetBytes(rawJSON, "input_reference.image_url").String(); got != "https://example.com/a.png" {
 		t.Fatalf("input_reference.image_url = %q", got)
 	}
+}
+
+func TestVideosCreateFormRejectsReferenceOverflowWithoutSplittingWholeValue(t *testing.T) {
+	refs := strings.Repeat(",", 100_000)
+	body := "model=grok-imagine-video&prompt=video&reference_image_urls=" + url.QueryEscape(refs)
+	if _, err := videosCreateRequestFromFormContext(body); err == nil || !strings.Contains(err.Error(), "at most 7") {
+		t.Fatalf("error = %v, want reference limit", err)
+	}
+}
+
+func TestVideosCreateFormBuildsOrderedJSONOnce(t *testing.T) {
+	values := url.Values{
+		"model":                      {defaultXAIVideosModel},
+		"prompt":                     {"animate"},
+		"seconds":                    {"6"},
+		"size":                       {"1280x720"},
+		"aspect_ratio":               {"16:9"},
+		"resolution":                 {"720p"},
+		"input_reference[image_url]": {"https://example.com/a.png"},
+		"reference_image_urls":       {"https://example.com/b.png, https://example.com/c.png"},
+	}
+	rawJSON, err := videosCreateRequestFromFormContext(values.Encode())
+	if err != nil {
+		t.Fatalf("videosCreateRequestFromForm() error = %v", err)
+	}
+	if got := gjson.GetBytes(rawJSON, "reference_image_urls.#").Int(); got != 2 {
+		t.Fatalf("reference_image_urls length = %d; body=%s", got, rawJSON)
+	}
+	ordered := []string{`"model"`, `"prompt"`, `"seconds"`, `"size"`, `"aspect_ratio"`, `"resolution"`, `"input_reference"`, `"reference_image_urls"`}
+	previous := -1
+	for _, field := range ordered {
+		index := strings.Index(string(rawJSON), field)
+		if index <= previous {
+			t.Fatalf("field order changed at %s: %s", field, rawJSON)
+		}
+		previous = index
+	}
+}
+
+func TestVideosCreateMultipartRequestBoundaries(t *testing.T) {
+	newContext := func(t *testing.T, addFile bool) (*gin.Context, int) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		if err := writer.WriteField("model", defaultXAIVideosModel); err != nil {
+			t.Fatalf("write model: %v", err)
+		}
+		if err := writer.WriteField("prompt", "make a video"); err != nil {
+			t.Fatalf("write prompt: %v", err)
+		}
+		if addFile {
+			part, err := writer.CreateFormFile("image", "input.png")
+			if err != nil {
+				t.Fatalf("create file: %v", err)
+			}
+			if _, err = part.Write([]byte("image")); err != nil {
+				t.Fatalf("write file: %v", err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, videosPath, bytes.NewReader(body.Bytes()))
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		return c, body.Len()
+	}
+
+	t.Run("text fields", func(t *testing.T) {
+		c, _ := newContext(t, false)
+		rawJSON, err := videosCreateRequestFromForm(c)
+		if err != nil {
+			t.Fatalf("videosCreateRequestFromForm() error = %v", err)
+		}
+		if got := gjson.GetBytes(rawJSON, "prompt").String(); got != "make a video" {
+			t.Fatalf("prompt = %q", got)
+		}
+	})
+
+	t.Run("file rejected", func(t *testing.T) {
+		c, _ := newContext(t, true)
+		_, err := videosCreateRequestFromForm(c)
+		if err == nil || !strings.Contains(err.Error(), "file uploads are not supported") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("known length overflow", func(t *testing.T) {
+		c, _ := newContext(t, false)
+		c.Request.ContentLength = maxVideosFormBodyBytes + 1
+		_, err := videosCreateRequestFromForm(c)
+		if !apihandlers.IsRequestBodyTooLarge(err) {
+			t.Fatalf("error = %v, want request-too-large", err)
+		}
+	})
+
+	t.Run("compressed multipart rejected", func(t *testing.T) {
+		c, _ := newContext(t, false)
+		c.Request.Header.Set("Content-Encoding", "gzip")
+		_, err := videosCreateRequestFromForm(c)
+		if err == nil || !strings.Contains(err.Error(), "do not support Content-Encoding") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 }
 
 func videosCreateRequestFromFormContext(body string) ([]byte, error) {

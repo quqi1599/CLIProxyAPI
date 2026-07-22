@@ -9,8 +9,11 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -28,7 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 )
 
 var requestLogID atomic.Uint64
@@ -50,12 +53,278 @@ var currentHomeRequestLogClient = func() homeRequestLogClient {
 	return home.Current()
 }
 
+const (
+	homeRequestLogMaxBytes          = 16 << 20
+	homeRequestBodyMaxBytes         = 2 << 20
+	homeAPISectionMaxBytes          = 4 << 20
+	homeStreamingResponseMaxBytes   = 8 << 20
+	homeStreamingChunkMaxBytes      = 64 << 10
+	homeStreamingChunkQueueCapacity = 32
+	decompressedLogResponseMaxBytes = 16 << 20
+	fileBodySourceMaxBytes          = 16 << 20
+	fileBodySourceMaxParts          = 256
+	streamingLogChunkMaxBytes       = 64 << 10
+	streamingLogQueueMaxBytes       = 2 << 20
+
+	homeRequestLogTruncationMarker        = "\n[TRUNCATED HOME REQUEST LOG: size limit reached]\n"
+	homeRequestBodyTruncationMarker       = "\n[TRUNCATED REQUEST BODY: size limit reached]\n"
+	homeAPIRequestTruncationMarker        = "\n[TRUNCATED API REQUEST: size limit reached]\n"
+	homeAPIResponseTruncationMarker       = "\n[TRUNCATED API RESPONSE: size limit reached]\n"
+	homeWebsocketTruncationMarker         = "\n[TRUNCATED WEBSOCKET TIMELINE: size limit reached]\n"
+	homeAPIWebsocketTruncationMarker      = "\n[TRUNCATED API WEBSOCKET TIMELINE: size limit reached]\n"
+	homeStreamingResponseTruncationMarker = "\n[TRUNCATED STREAMING RESPONSE: size limit reached]\n"
+	decompressedResponseTruncationMarker  = "\n[TRUNCATED DECOMPRESSED RESPONSE: size limit reached]\n"
+	fileBodySourceTruncationMarker        = "\n[TRUNCATED FILE-BACKED LOG SOURCE: size limit reached]\n"
+	streamingLogChunkTruncationMarker     = "\n[TRUNCATED STREAM CHUNK: size limit reached]\n"
+	streamingLogQueueTruncationMarker     = "\n[TRUNCATED STREAM LOG QUEUE: byte limit reached]\n"
+)
+
+const (
+	// RedactedHeaderValue is deliberately fixed so logs never retain a token prefix or suffix.
+	RedactedHeaderValue = "[REDACTED]"
+	bodyMetadataPrefix  = "[BODY METADATA v1] "
+)
+
+// BodyLogMetadata is the only body representation accepted by request logs.
+type BodyLogMetadata struct {
+	Bytes       int64  `json:"bytes"`
+	SHA256      string `json:"sha256"`
+	Chunks      int64  `json:"chunks,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Truncated   bool   `json:"truncated"`
+}
+
+// EncodeBodyLogMetadata renders a small, validated metadata envelope without raw body bytes.
+func EncodeBodyLogMetadata(metadata BodyLogMetadata) []byte {
+	if metadata.Bytes < 0 {
+		metadata.Bytes = 0
+	}
+	if metadata.Chunks < 0 {
+		metadata.Chunks = 0
+	}
+	metadata.ContentType = sanitizeLogMetadataValue(metadata.ContentType, 128)
+	if _, errDecode := hex.DecodeString(metadata.SHA256); errDecode != nil || len(metadata.SHA256) != sha256.Size*2 {
+		metadata.SHA256 = hex.EncodeToString(sha256.New().Sum(nil))
+	}
+	raw, _ := json.Marshal(metadata)
+	return append([]byte(bodyMetadataPrefix), raw...)
+}
+
+// SummarizeBodyForLog replaces raw body bytes with deterministic metadata.
+func SummarizeBodyForLog(payload []byte, contentType string) []byte {
+	digest := sha256.Sum256(payload)
+	return EncodeBodyLogMetadata(BodyLogMetadata{
+		Bytes:       int64(len(payload)),
+		SHA256:      hex.EncodeToString(digest[:]),
+		ContentType: contentType,
+	})
+}
+
+func normalizeBodyLogMetadata(payload []byte, contentType string) []byte {
+	if len(payload) <= 4096 && bytes.HasPrefix(payload, []byte(bodyMetadataPrefix)) {
+		var metadata BodyLogMetadata
+		decoder := json.NewDecoder(bytes.NewReader(payload[len(bodyMetadataPrefix):]))
+		decoder.DisallowUnknownFields()
+		if errDecode := decoder.Decode(&metadata); errDecode == nil {
+			var extra any
+			if errExtra := decoder.Decode(&extra); errExtra == io.EOF {
+				if decoded, errDigest := hex.DecodeString(metadata.SHA256); errDigest == nil && len(decoded) == sha256.Size && metadata.Bytes >= 0 && metadata.Chunks >= 0 {
+					return EncodeBodyLogMetadata(metadata)
+				}
+			}
+		}
+	}
+	return SummarizeBodyForLog(payload, contentType)
+}
+
+func sanitizeLogMetadataValue(value string, maxBytes int) string {
+	value = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(value))
+	if len(value) > maxBytes {
+		value = value[:maxBytes]
+	}
+	return value
+}
+
+// RedactHeaderValue applies the single fail-safe header policy shared by every log sink.
+func RedactHeaderValue(key, value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if normalized == "authorization" || normalized == "proxy-authorization" || normalized == "cookie" || normalized == "set-cookie" ||
+		strings.Contains(normalized, "token") || strings.Contains(normalized, "key") || strings.Contains(normalized, "secret") {
+		return RedactedHeaderValue
+	}
+	return value
+}
+
+func headerValue(headers map[string][]string, target string) string {
+	for key, values := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), target) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
+}
+
+// boundedLogBuffer consumes every write while retaining at most limit bytes.
+// Once truncated, it emits exactly one marker and discards later writes.
+type boundedLogBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	marker    string
+	truncated bool
+}
+
+func newBoundedLogBuffer(limit int, marker string) *boundedLogBuffer {
+	return &boundedLogBuffer{limit: limit, marker: marker}
+}
+
+func (b *boundedLogBuffer) Write(payload []byte) (int, error) {
+	originalLen := len(payload)
+	if originalLen == 0 || b == nil || b.truncated {
+		return originalLen, nil
+	}
+
+	dataLimit := b.limit - len(b.marker)
+	if dataLimit < 0 {
+		dataLimit = 0
+	}
+	remaining := dataLimit - b.buf.Len()
+	if remaining > 0 {
+		writeLen := min(remaining, originalLen)
+		_, _ = b.buf.Write(payload[:writeLen])
+		payload = payload[writeLen:]
+	}
+	if len(payload) > 0 {
+		b.markTruncated()
+	}
+	return originalLen, nil
+}
+
+func (b *boundedLogBuffer) markTruncated() {
+	if b == nil || b.truncated {
+		return
+	}
+	dataLimit := b.limit - len(b.marker)
+	if dataLimit < 0 {
+		dataLimit = 0
+	}
+	if b.buf.Len() > dataLimit {
+		b.buf.Truncate(dataLimit)
+	}
+	marker := b.marker
+	if len(marker) > b.limit {
+		marker = marker[:b.limit]
+	}
+	_, _ = b.buf.WriteString(marker)
+	b.truncated = true
+}
+
+func (b *boundedLogBuffer) Bytes() []byte {
+	if b == nil {
+		return nil
+	}
+	return b.buf.Bytes()
+}
+
+func (b *boundedLogBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	return b.buf.String()
+}
+
+func truncateLogSection(payload []byte, limit int, marker string) []byte {
+	if len(payload) <= limit {
+		return payload
+	}
+	dataLimit := limit - len(marker)
+	if dataLimit < 0 {
+		dataLimit = 0
+	}
+	truncated := make([]byte, 0, limit)
+	truncated = append(truncated, payload[:dataLimit]...)
+	if len(marker) > limit {
+		marker = marker[:limit]
+	}
+	return append(truncated, marker...)
+}
+
+func cloneBoundedLogSection(payload []byte, limit int, marker string) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	if len(payload) <= limit {
+		return internalpayload.CloneBytes(payload)
+	}
+	dataLimit := limit - len(marker)
+	if dataLimit < 0 {
+		dataLimit = 0
+	}
+	truncated := make([]byte, 0, limit)
+	truncated = append(truncated, payload[:dataLimit]...)
+	if len(marker) > limit {
+		marker = marker[:limit]
+	}
+	return append(truncated, marker...)
+}
+
 // FileBodySource stores large log sections as ordered temp-file parts.
 type FileBodySource struct {
-	mu      sync.Mutex
-	dir     string
-	paths   []string
-	cleaned bool
+	mu           sync.Mutex
+	dir          string
+	paths        []string
+	writtenBytes int64
+	truncated    bool
+	cleaned      bool
+}
+
+// FileBodyPart is an ordered, source-budgeted log part.
+type FileBodyPart struct {
+	mu     sync.Mutex
+	source *FileBodySource
+	file   *os.File
+}
+
+func (p *FileBodyPart) Name() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.file == nil {
+		return ""
+	}
+	return p.file.Name()
+}
+
+func (p *FileBodyPart) Write(payload []byte) (int, error) {
+	if p == nil || len(payload) == 0 {
+		return len(payload), nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.source == nil || p.file == nil {
+		return len(payload), nil
+	}
+	p.source.mu.Lock()
+	defer p.source.mu.Unlock()
+	if p.source.cleaned {
+		return 0, fmt.Errorf("file body source has been cleaned")
+	}
+	return p.source.writeBoundedLocked(p.file, payload)
+}
+
+func (p *FileBodyPart) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.file == nil {
+		return nil
+	}
+	errClose := p.file.Close()
+	p.file = nil
+	return errClose
 }
 
 // NewFileBodySourceInDir creates a temp-backed source under baseDir.
@@ -103,7 +372,7 @@ func sanitizeTempPrefix(prefix string) string {
 }
 
 // CreatePart creates one ordered detail log part.
-func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
+func (s *FileBodySource) CreatePart(prefix string) (*FileBodyPart, error) {
 	if s == nil {
 		return nil, fmt.Errorf("file body source is nil")
 	}
@@ -111,6 +380,14 @@ func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
 	defer s.mu.Unlock()
 	if s.cleaned {
 		return nil, fmt.Errorf("file body source has been cleaned")
+	}
+	if s.truncated || len(s.paths) >= fileBodySourceMaxParts {
+		if !s.truncated {
+			if errMark := s.markTruncatedLocked(); errMark != nil {
+				return nil, errMark
+			}
+		}
+		return &FileBodyPart{source: s}, nil
 	}
 	prefix = sanitizeTempPrefix(prefix)
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
@@ -121,7 +398,7 @@ func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
 		return nil, errCreate
 	}
 	s.paths = append(s.paths, file.Name())
-	return file, nil
+	return &FileBodyPart{source: s, file: file}, nil
 }
 
 // AppendPart appends one complete ordered part to the source.
@@ -156,6 +433,9 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 	if s.cleaned {
 		return fmt.Errorf("file body source has been cleaned")
 	}
+	if s.truncated {
+		return nil
+	}
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
 		return errMkdir
 	}
@@ -174,13 +454,95 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 		return errOpen
 	}
 
-	_, writeErr := file.Write(data)
+	_, writeErr := s.writeBoundedLocked(file, data)
 	if errClose := file.Close(); errClose != nil {
 		if writeErr == nil {
 			writeErr = errClose
 		}
 	}
 	return writeErr
+}
+
+func (s *FileBodySource) writeBoundedLocked(file *os.File, payload []byte) (int, error) {
+	originalLen := len(payload)
+	if originalLen == 0 || s.truncated {
+		return originalLen, nil
+	}
+	dataLimit := int64(fileBodySourceMaxBytes - len(fileBodySourceTruncationMarker))
+	remaining := dataLimit - s.writtenBytes
+	if remaining < 0 {
+		remaining = 0
+	}
+	writeLen := min(originalLen, int(remaining))
+	if writeLen > 0 {
+		written, errWrite := file.Write(payload[:writeLen])
+		s.writtenBytes += int64(written)
+		if errWrite != nil {
+			return written, errWrite
+		}
+		if written != writeLen {
+			return written, io.ErrShortWrite
+		}
+	}
+	if writeLen < originalLen {
+		if errMark := s.writeTruncationMarkerLocked(file); errMark != nil {
+			return writeLen, errMark
+		}
+	}
+	return originalLen, nil
+}
+
+func (s *FileBodySource) markTruncatedLocked() error {
+	if s.truncated {
+		return nil
+	}
+	if len(s.paths) == 0 {
+		if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
+			return errMkdir
+		}
+		file, errCreate := os.CreateTemp(s.dir, "truncated-*.tmp")
+		if errCreate != nil {
+			return errCreate
+		}
+		s.paths = append(s.paths, file.Name())
+		errMark := s.writeTruncationMarkerLocked(file)
+		if errClose := file.Close(); errClose != nil && errMark == nil {
+			errMark = errClose
+		}
+		return errMark
+	}
+	file, errOpen := os.OpenFile(s.paths[len(s.paths)-1], os.O_WRONLY|os.O_APPEND, 0644)
+	if errOpen != nil {
+		return errOpen
+	}
+	errMark := s.writeTruncationMarkerLocked(file)
+	if errClose := file.Close(); errClose != nil && errMark == nil {
+		errMark = errClose
+	}
+	return errMark
+}
+
+func (s *FileBodySource) writeTruncationMarkerLocked(file *os.File) error {
+	if s.truncated {
+		return nil
+	}
+	marker := []byte(fileBodySourceTruncationMarker)
+	remaining := int64(fileBodySourceMaxBytes) - s.writtenBytes
+	if remaining < int64(len(marker)) {
+		marker = marker[:max(0, int(remaining))]
+	}
+	if len(marker) > 0 {
+		written, errWrite := file.Write(marker)
+		s.writtenBytes += int64(written)
+		if errWrite != nil {
+			return errWrite
+		}
+		if written != len(marker) {
+			return io.ErrShortWrite
+		}
+	}
+	s.truncated = true
+	return nil
 }
 
 // HasPayload reports whether any detail parts were recorded.
@@ -207,10 +569,68 @@ func (s *FileBodySource) Paths() []string {
 
 // CopyTo merges all ordered parts into w.
 func (s *FileBodySource) CopyTo(w io.Writer) error {
+	return s.CopyToBounded(w, fileBodySourceMaxBytes, fileBodySourceTruncationMarker)
+}
+
+var errLogOutputLimit = fmt.Errorf("log output byte limit reached")
+
+type boundedLogStreamWriter struct {
+	writer    io.Writer
+	limit     int
+	marker    string
+	written   int
+	truncated bool
+}
+
+func (w *boundedLogStreamWriter) Write(payload []byte) (int, error) {
+	originalLen := len(payload)
+	if originalLen == 0 {
+		return 0, nil
+	}
+	if w.truncated {
+		return originalLen, errLogOutputLimit
+	}
+	dataLimit := max(0, w.limit-len(w.marker))
+	remaining := max(0, dataLimit-w.written)
+	writeLen := min(originalLen, remaining)
+	if writeLen > 0 {
+		written, errWrite := w.writer.Write(payload[:writeLen])
+		w.written += written
+		if errWrite != nil {
+			return written, errWrite
+		}
+		if written != writeLen {
+			return written, io.ErrShortWrite
+		}
+	}
+	if writeLen < originalLen {
+		marker := w.marker
+		if len(marker) > w.limit-w.written {
+			marker = marker[:max(0, w.limit-w.written)]
+		}
+		if marker != "" {
+			written, errWrite := io.WriteString(w.writer, marker)
+			w.written += written
+			if errWrite != nil {
+				return writeLen, errWrite
+			}
+		}
+		w.truncated = true
+		return originalLen, errLogOutputLimit
+	}
+	return originalLen, nil
+}
+
+// CopyToBounded streams ordered parts into w without materializing them in memory.
+func (s *FileBodySource) CopyToBounded(w io.Writer, limit int, marker string) error {
 	if s == nil || w == nil {
 		return nil
 	}
+	if limit <= 0 {
+		return nil
+	}
 	paths := s.Paths()
+	bounded := &boundedLogStreamWriter{writer: w, limit: limit, marker: marker}
 	wrote := false
 	for _, path := range paths {
 		file, errOpen := os.Open(path)
@@ -221,19 +641,25 @@ func (s *FileBodySource) CopyTo(w io.Writer) error {
 			return errOpen
 		}
 		if wrote {
-			if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+			if _, errWrite := io.WriteString(bounded, "\n"); errWrite != nil {
 				if errClose := file.Close(); errClose != nil {
 					log.WithError(errClose).Warn("failed to close log part file")
+				}
+				if errWrite == errLogOutputLimit {
+					return nil
 				}
 				return errWrite
 			}
 		}
-		_, errCopy := io.Copy(w, file)
+		_, errCopy := io.Copy(bounded, file)
 		if errClose := file.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close log part file")
 			if errCopy == nil {
 				errCopy = errClose
 			}
+		}
+		if errCopy == errLogOutputLimit {
+			return nil
 		}
 		if errCopy != nil {
 			return errCopy
@@ -241,6 +667,35 @@ func (s *FileBodySource) CopyTo(w io.Writer) error {
 		wrote = true
 	}
 	return nil
+}
+
+// Metadata streams the source through SHA-256 and returns no raw content.
+func (s *FileBodySource) Metadata(contentType string) ([]byte, error) {
+	digest := sha256.New()
+	counter := &countingWriter{writer: digest}
+	if errCopy := s.CopyTo(counter); errCopy != nil {
+		return nil, errCopy
+	}
+	s.mu.Lock()
+	truncated := s.truncated
+	s.mu.Unlock()
+	return EncodeBodyLogMetadata(BodyLogMetadata{
+		Bytes:       counter.written,
+		SHA256:      hex.EncodeToString(digest.Sum(nil)),
+		ContentType: contentType,
+		Truncated:   truncated,
+	}), nil
+}
+
+type countingWriter struct {
+	writer  hash.Hash
+	written int64
+}
+
+func (w *countingWriter) Write(payload []byte) (int, error) {
+	written, errWrite := w.writer.Write(payload)
+	w.written += int64(written)
+	return written, errWrite
 }
 
 // Bytes merges all ordered parts into memory.
@@ -437,7 +892,9 @@ func cloneHeaders(headers map[string][]string) map[string][]string {
 			continue
 		}
 		copied := make([]string, len(values))
-		copy(copied, values)
+		for index, value := range values {
+			copied[index] = RedactHeaderValue(key, value)
+		}
 		out[key] = copied
 	}
 	if len(out) == 0 {
@@ -453,6 +910,10 @@ func (l *FileRequestLogger) forwardRequestLogToHome(ctx context.Context, headers
 	client := currentHomeRequestLogClient()
 	if client == nil || !client.HeartbeatOK() {
 		return nil
+	}
+	if len(logText) > homeRequestLogMaxBytes {
+		dataLimit := homeRequestLogMaxBytes - len(homeRequestLogTruncationMarker)
+		logText = logText[:dataLimit] + homeRequestLogTruncationMarker
 	}
 	payload := homeRequestLogPayload{
 		Headers:    cloneHeaders(headers),
@@ -593,14 +1054,20 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 			responseToWrite = response
 		}
 
-		var buf bytes.Buffer
+		body = truncateLogSection(body, homeRequestBodyMaxBytes, homeRequestBodyTruncationMarker)
+		websocketTimeline = truncateLogSection(websocketTimeline, homeAPISectionMaxBytes, homeWebsocketTruncationMarker)
+		apiRequest = truncateLogSection(apiRequest, homeAPISectionMaxBytes, homeAPIRequestTruncationMarker)
+		apiResponse = truncateLogSection(apiResponse, homeAPISectionMaxBytes, homeAPIResponseTruncationMarker)
+		apiWebsocketTimeline = truncateLogSection(apiWebsocketTimeline, homeAPISectionMaxBytes, homeAPIWebsocketTruncationMarker)
+		responseToWrite = truncateLogSection(responseToWrite, homeStreamingResponseMaxBytes, homeStreamingResponseTruncationMarker)
+
+		buf := newBoundedLogBuffer(homeRequestLogMaxBytes, homeRequestLogTruncationMarker)
 		writeErr := l.writeNonStreamingLog(
-			&buf,
+			buf,
 			url,
 			method,
 			requestHeaders,
 			body,
-			"",
 			websocketTimeline,
 			websocketTimelineSource,
 			apiRequest,
@@ -635,24 +1102,6 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 	}
 	filePath := filepath.Join(l.logsDir, filename)
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
-	if errTemp != nil {
-		log.WithError(errTemp).Warn("failed to create request body temp file, falling back to direct write")
-	}
-	if requestBodyPath != "" {
-		defer func() {
-			if errRemove := os.Remove(requestBodyPath); errRemove != nil {
-				log.WithError(errRemove).Warn("failed to remove request body temp file")
-			}
-		}()
-	}
-
-	responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
-	if decompressErr != nil {
-		// If decompression fails, continue with original response and annotate the log output.
-		responseToWrite = response
-	}
-
 	logFile, errOpen := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if errOpen != nil {
 		return fmt.Errorf("failed to create log file: %w", errOpen)
@@ -664,7 +1113,6 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		method,
 		requestHeaders,
 		body,
-		requestBodyPath,
 		websocketTimeline,
 		websocketTimelineSource,
 		apiRequest,
@@ -676,8 +1124,8 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		apiResponseErrors,
 		statusCode,
 		responseHeaders,
-		responseToWrite,
-		decompressErr,
+		response,
+		nil,
 		requestTimestamp,
 		apiResponseTimestamp,
 	)
@@ -734,38 +1182,21 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 	filename := l.generateFilename(url, requestID)
 	filePath := filepath.Join(l.logsDir, filename)
 
-	requestHeaders := make(map[string][]string, len(headers))
-	for key, values := range headers {
-		headerValues := make([]string, len(values))
-		copy(headerValues, values)
-		requestHeaders[key] = headerValues
-	}
-
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
-	if errTemp != nil {
-		return nil, fmt.Errorf("failed to create request body temp file: %w", errTemp)
-	}
-
-	responseBodyFile, errCreate := os.CreateTemp(l.logsDir, "response-body-*.tmp")
-	if errCreate != nil {
-		_ = os.Remove(requestBodyPath)
-		return nil, fmt.Errorf("failed to create response body temp file: %w", errCreate)
-	}
-	responseBodyPath := responseBodyFile.Name()
+	requestHeaders := cloneHeaders(headers)
 
 	// Create streaming writer
 	writer := &FileStreamingLogWriter{
-		logFilePath:      filePath,
-		url:              url,
-		method:           method,
-		timestamp:        time.Now(),
-		requestHeaders:   requestHeaders,
-		requestBodyPath:  requestBodyPath,
-		responseBodyPath: responseBodyPath,
-		responseBodyFile: responseBodyFile,
-		chunkChan:        make(chan []byte, 100), // Buffered channel for async writes
-		closeChan:        make(chan struct{}),
-		errorChan:        make(chan error, 1),
+		logFilePath:    filePath,
+		url:            url,
+		method:         method,
+		timestamp:      time.Now(),
+		requestHeaders: requestHeaders,
+		requestBody:    normalizeBodyLogMetadata(body, headerValue(headers, "Content-Type")),
+		chunkChan:      make(chan []byte, 100), // Buffered channel for async writes
+		closeChan:      make(chan struct{}),
+		errorChan:      make(chan error, 1),
+		closeResult:    make(chan struct{}),
+		responseDigest: sha256.New(),
 	}
 
 	// Start async writer goroutine
@@ -913,31 +1344,11 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	return nil
 }
 
-func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error) {
-	tmpFile, errCreate := os.CreateTemp(l.logsDir, "request-body-*.tmp")
-	if errCreate != nil {
-		return "", errCreate
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, errCopy := io.Copy(tmpFile, bytes.NewReader(body)); errCopy != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		return "", errCopy
-	}
-	if errClose := tmpFile.Close(); errClose != nil {
-		_ = os.Remove(tmpPath)
-		return "", errClose
-	}
-	return tmpPath, nil
-}
-
 func (l *FileRequestLogger) writeNonStreamingLog(
 	w io.Writer,
 	url, method string,
 	requestHeaders map[string][]string,
 	requestBody []byte,
-	requestBodyPath string,
 	websocketTimeline []byte,
 	websocketTimelineSource *FileBodySource,
 	apiRequest []byte,
@@ -960,7 +1371,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	isWebsocketTranscript := hasSectionPayload(websocketTimeline) || hasFileBodySourcePayload(websocketTimelineSource)
 	downstreamTransport := inferDownstreamTransport(requestHeaders, websocketTimeline, websocketTimelineSource)
 	upstreamTransport := inferUpstreamTransport(apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors)
-	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISectionWithSource(w, "=== WEBSOCKET TIMELINE ===\n", "=== WEBSOCKET TIMELINE", websocketTimeline, websocketTimelineSource, time.Time{}); errWrite != nil {
@@ -984,7 +1395,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 		// and appending a one-off upgrade response snapshot would dilute that transcript.
 		return nil
 	}
-	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
+	return writeResponseSection(w, statusCode, true, responseHeaders, response, decompressErr, true)
 }
 
 func writeRequestInfoWithBody(
@@ -992,7 +1403,6 @@ func writeRequestInfoWithBody(
 	url, method string,
 	headers map[string][]string,
 	body []byte,
-	bodyPath string,
 	timestamp time.Time,
 	downstreamTransport string,
 	upstreamTransport string,
@@ -1032,7 +1442,7 @@ func writeRequestInfoWithBody(
 	}
 	for key, values := range headers {
 		for _, value := range values {
-			masked := util.MaskSensitiveHeaderValue(key, value)
+			masked := RedactHeaderValue(key, value)
 			if _, errWrite := io.WriteString(w, fmt.Sprintf("%s: %s\n", key, masked)); errWrite != nil {
 				return errWrite
 			}
@@ -1050,30 +1460,11 @@ func writeRequestInfoWithBody(
 		return errWrite
 	}
 
-	bodyTrailingNewlines := 1
-	if bodyPath != "" {
-		bodyFile, errOpen := os.Open(bodyPath)
-		if errOpen != nil {
-			return errOpen
-		}
-		tracker := &trailingNewlineTrackingWriter{writer: w}
-		written, errCopy := io.Copy(tracker, bodyFile)
-		if errCopy != nil {
-			_ = bodyFile.Close()
-			return errCopy
-		}
-		if written > 0 {
-			bodyTrailingNewlines = tracker.trailingNewlines
-		}
-		if errClose := bodyFile.Close(); errClose != nil {
-			log.WithError(errClose).Warn("failed to close request body temp file")
-		}
-	} else if _, errWrite := w.Write(body); errWrite != nil {
+	bodyMetadata := normalizeBodyLogMetadata(body, headerValue(headers, "Content-Type"))
+	if _, errWrite := w.Write(bodyMetadata); errWrite != nil {
 		return errWrite
-	} else if len(body) > 0 {
-		bodyTrailingNewlines = countTrailingNewlinesBytes(body)
 	}
-	if errWrite := writeSectionSpacing(w, bodyTrailingNewlines); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, countTrailingNewlinesBytes(bodyMetadata)); errWrite != nil {
 		return errWrite
 	}
 	return nil
@@ -1182,25 +1573,21 @@ func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, pa
 		return nil
 	}
 
-	if bytes.HasPrefix(payload, []byte(sectionPrefix)) {
-		if _, errWrite := w.Write(payload); errWrite != nil {
-			return errWrite
-		}
-	} else {
-		if _, errWrite := io.WriteString(w, sectionHeader); errWrite != nil {
-			return errWrite
-		}
-		if !timestamp.IsZero() {
-			if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
-				return errWrite
-			}
-		}
-		if _, errWrite := w.Write(payload); errWrite != nil {
+	_ = sectionPrefix
+	if _, errWrite := io.WriteString(w, sectionHeader); errWrite != nil {
+		return errWrite
+	}
+	if !timestamp.IsZero() {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
 			return errWrite
 		}
 	}
+	metadata := normalizeBodyLogMetadata(payload, "text/plain")
+	if _, errWrite := w.Write(metadata); errWrite != nil {
+		return errWrite
+	}
 
-	if errWrite := writeSectionSpacing(w, countTrailingNewlinesBytes(payload)); errWrite != nil {
+	if errWrite := writeSectionSpacing(w, countTrailingNewlinesBytes(metadata)); errWrite != nil {
 		return errWrite
 	}
 	return nil
@@ -1210,11 +1597,6 @@ func writeAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix 
 	if !hasFileBodySourcePayload(source) {
 		return writeAPISection(w, sectionHeader, sectionPrefix, payload, timestamp)
 	}
-	if len(payload) > 0 {
-		if errWrite := writeAPISection(w, sectionHeader, sectionPrefix, payload, timestamp); errWrite != nil {
-			return errWrite
-		}
-	}
 	if _, errWrite := io.WriteString(w, sectionHeader); errWrite != nil {
 		return errWrite
 	}
@@ -1223,33 +1605,35 @@ func writeAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix 
 			return errWrite
 		}
 	}
-	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.CopyTo(tracker); errWrite != nil {
+	if len(payload) > 0 {
+		if _, errWrite := io.WriteString(w, "Memory: "); errWrite != nil {
+			return errWrite
+		}
+		if _, errWrite := w.Write(normalizeBodyLogMetadata(payload, "text/plain")); errWrite != nil {
+			return errWrite
+		}
+		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+			return errWrite
+		}
+	}
+	metadata, errMetadata := source.Metadata("text/plain")
+	if errMetadata != nil {
+		return errMetadata
+	}
+	if _, errWrite := io.WriteString(w, "Source: "); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {
+	if _, errWrite := w.Write(metadata); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := writeSectionSpacing(w, countTrailingNewlinesBytes(metadata)); errWrite != nil {
 		return errWrite
 	}
 	return nil
 }
 
 func writePreformattedAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix string, payload []byte, source *FileBodySource, timestamp time.Time) error {
-	if !hasFileBodySourcePayload(source) {
-		return writeAPISection(w, sectionHeader, sectionPrefix, payload, timestamp)
-	}
-	if len(payload) > 0 {
-		if errWrite := writeAPISection(w, sectionHeader, sectionPrefix, payload, timestamp); errWrite != nil {
-			return errWrite
-		}
-	}
-	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.CopyTo(tracker); errWrite != nil {
-		return errWrite
-	}
-	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {
-		return errWrite
-	}
-	return nil
+	return writeAPISectionWithSource(w, sectionHeader, sectionPrefix, payload, source, timestamp)
 }
 
 func writeAPIErrorResponses(w io.Writer, apiResponseErrors []*interfaces.ErrorMessage) error {
@@ -1265,7 +1649,7 @@ func writeAPIErrorResponses(w io.Writer, apiResponseErrors []*interfaces.ErrorMe
 		}
 		trailingNewlines := 1
 		if apiResponseErrors[i].Error != nil {
-			errText := apiResponseErrors[i].Error.Error()
+			errText := "upstream request failed"
 			if _, errWrite := io.WriteString(w, errText); errWrite != nil {
 				return errWrite
 			}
@@ -1280,7 +1664,7 @@ func writeAPIErrorResponses(w io.Writer, apiResponseErrors []*interfaces.ErrorMe
 	return nil
 }
 
-func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, responseHeaders map[string][]string, responseReader io.Reader, decompressErr error, trailingNewline bool) error {
+func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, responseHeaders map[string][]string, response []byte, decompressErr error, trailingNewline bool) error {
 	if _, errWrite := io.WriteString(w, "=== RESPONSE ===\n"); errWrite != nil {
 		return errWrite
 	}
@@ -1293,30 +1677,22 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 	if responseHeaders != nil {
 		for key, values := range responseHeaders {
 			for _, value := range values {
-				if _, errWrite := io.WriteString(w, fmt.Sprintf("%s: %s\n", key, value)); errWrite != nil {
+				if _, errWrite := io.WriteString(w, fmt.Sprintf("%s: %s\n", key, RedactHeaderValue(key, value))); errWrite != nil {
 					return errWrite
 				}
 			}
 		}
 	}
 
-	var bufferedReader *bufio.Reader
-	if responseReader != nil {
-		bufferedReader = bufio.NewReader(responseReader)
+	if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+		return errWrite
 	}
-	if !responseBodyStartsWithLeadingNewline(bufferedReader) {
-		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-			return errWrite
-		}
-	}
-
-	if bufferedReader != nil {
-		if _, errCopy := io.Copy(w, bufferedReader); errCopy != nil {
-			return errCopy
-		}
+	metadata := normalizeBodyLogMetadata(response, headerValue(responseHeaders, "Content-Type"))
+	if _, errWrite := w.Write(metadata); errWrite != nil {
+		return errWrite
 	}
 	if decompressErr != nil {
-		if _, errWrite := io.WriteString(w, fmt.Sprintf("\n[DECOMPRESSION ERROR: %v]", decompressErr)); errWrite != nil {
+		if _, errWrite := io.WriteString(w, "\ndecompression_failed=true"); errWrite != nil {
 			return errWrite
 		}
 	}
@@ -1399,7 +1775,7 @@ func (l *FileRequestLogger) decompressGzip(data []byte) ([]byte, error) {
 		}
 	}()
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedLogResponse(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress gzip data: %w", err)
 	}
@@ -1423,7 +1799,7 @@ func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
 		}
 	}()
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedLogResponse(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress deflate data: %w", err)
 	}
@@ -1442,7 +1818,7 @@ func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
 func (l *FileRequestLogger) decompressBrotli(data []byte) ([]byte, error) {
 	reader := brotli.NewReader(bytes.NewReader(data))
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedLogResponse(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress brotli data: %w", err)
 	}
@@ -1465,12 +1841,20 @@ func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
 	}
 	defer decoder.Close()
 
-	decompressed, err := io.ReadAll(decoder)
+	decompressed, err := readDecompressedLogResponse(decoder)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress zstd data: %w", err)
 	}
 
 	return decompressed, nil
+}
+
+func readDecompressedLogResponse(reader io.Reader) ([]byte, error) {
+	decompressed, errRead := io.ReadAll(io.LimitReader(reader, decompressedLogResponseMaxBytes+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	return truncateLogSection(decompressed, decompressedLogResponseMaxBytes, decompressedResponseTruncationMarker), nil
 }
 
 // FileStreamingLogWriter implements StreamingLogWriter for file-based streaming logs.
@@ -1492,23 +1876,29 @@ type FileStreamingLogWriter struct {
 	// requestHeaders stores the request headers.
 	requestHeaders map[string][]string
 
-	// requestBodyPath is a temporary file path holding the request body.
-	requestBodyPath string
-
-	// responseBodyPath is a temporary file path holding the streaming response body.
-	responseBodyPath string
-
-	// responseBodyFile is the temp file where chunks are appended by the async writer.
-	responseBodyFile *os.File
+	// requestBody stores only the validated metadata envelope.
+	requestBody []byte
 
 	// chunkChan is a channel for receiving response chunks to spool.
-	chunkChan chan []byte
+	chunkChan   chan []byte
+	chunkMu     sync.Mutex
+	queuedBytes int
+	closed      bool
+	closeOnce   sync.Once
+	closeResult chan struct{}
+	closeErr    error
 
 	// closeChan is a channel for signaling when the writer is closed.
 	closeChan chan struct{}
 
 	// errorChan is a channel for reporting errors during writing.
 	errorChan chan error
+
+	responseDigest        hash.Hash
+	responseObservedBytes atomic.Int64
+	responseCapturedBytes int64
+	responseChunks        int64
+	responseTruncated     atomic.Bool
 
 	// responseStatus stores the HTTP status code.
 	responseStatus int
@@ -1520,19 +1910,23 @@ type FileStreamingLogWriter struct {
 	responseHeaders map[string][]string
 
 	// apiRequest stores the upstream API request data.
-	apiRequest []byte
+	apiRequest        []byte
+	apiRequestRelease func()
 
 	// apiRequestSource stores file-backed upstream API request data.
 	apiRequestSource *FileBodySource
 
 	// apiResponse stores the upstream API response data.
-	apiResponse []byte
+	apiResponse        []byte
+	apiResponseRelease func()
 
 	// apiResponseSource stores file-backed upstream API response data.
 	apiResponseSource *FileBodySource
 
 	// apiWebsocketTimeline stores the upstream websocket event timeline.
-	apiWebsocketTimeline []byte
+	apiWebsocketTimeline        []byte
+	apiWebsocketTimelineRelease func()
+	apiWebsocketTimelineSource  *FileBodySource
 
 	// apiResponseTimestamp captures when the API response was received.
 	apiResponseTimestamp time.Time
@@ -1543,20 +1937,35 @@ type FileStreamingLogWriter struct {
 // Parameters:
 //   - chunk: The response chunk to write
 func (w *FileStreamingLogWriter) WriteChunkAsync(chunk []byte) {
-	if w.chunkChan == nil {
+	if len(chunk) == 0 {
 		return
 	}
 
-	// Make a copy of the chunk to avoid data races
-	chunkCopy := make([]byte, len(chunk))
-	copy(chunkCopy, chunk)
-
-	// Non-blocking send
-	select {
-	case w.chunkChan <- chunkCopy:
-	default:
-		// Channel is full, skip this chunk to avoid blocking
+	w.responseObservedBytes.Add(int64(len(chunk)))
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	chunkLen := min(len(chunk), streamingLogChunkMaxBytes)
+	if len(chunk) > streamingLogChunkMaxBytes {
+		chunkLen = streamingLogChunkMaxBytes
+		w.responseTruncated.Store(true)
 	}
+	if w.closed || w.chunkChan == nil || len(w.chunkChan) >= cap(w.chunkChan) || w.queuedBytes+chunkLen > streamingLogQueueMaxBytes {
+		w.responseTruncated.Store(true)
+		return
+	}
+	queued := cloneBoundedStreamingChunk(chunk)
+	w.queuedBytes += len(queued)
+	w.chunkChan <- queued
+}
+
+func cloneBoundedStreamingChunk(chunk []byte) []byte {
+	if len(chunk) <= streamingLogChunkMaxBytes {
+		return internalpayload.CloneBytes(chunk)
+	}
+	dataLimit := max(0, streamingLogChunkMaxBytes-len(streamingLogChunkTruncationMarker))
+	cloned := make([]byte, 0, streamingLogChunkMaxBytes)
+	cloned = append(cloned, chunk[:dataLimit]...)
+	return append(cloned, streamingLogChunkTruncationMarker...)
 }
 
 // WriteStatus buffers the response status and headers for later writing.
@@ -1572,15 +1981,13 @@ func (w *FileStreamingLogWriter) WriteStatus(status int, headers map[string][]st
 		return nil
 	}
 
-	w.responseStatus = status
-	if headers != nil {
-		w.responseHeaders = make(map[string][]string, len(headers))
-		for key, values := range headers {
-			headerValues := make([]string, len(values))
-			copy(headerValues, values)
-			w.responseHeaders[key] = headerValues
-		}
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if w.closed {
+		return nil
 	}
+	w.responseStatus = status
+	w.responseHeaders = cloneHeaders(headers)
 	w.statusWritten = true
 	return nil
 }
@@ -1596,7 +2003,12 @@ func (w *FileStreamingLogWriter) WriteAPIRequest(apiRequest []byte) error {
 	if len(apiRequest) == 0 {
 		return nil
 	}
-	w.apiRequest = bytes.Clone(apiRequest)
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.replaceScopedClone(&w.apiRequest, &w.apiRequestRelease, normalizeBodyLogMetadata(apiRequest, "text/plain"), "logging.file.api_request")
 	return nil
 }
 
@@ -1605,7 +2017,11 @@ func (w *FileStreamingLogWriter) WriteAPIRequestSource(apiRequestSource *FileBod
 	if apiRequestSource == nil || !apiRequestSource.HasPayload() {
 		return nil
 	}
-	w.apiRequestSource = apiRequestSource
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if !w.closed {
+		w.apiRequestSource = apiRequestSource
+	}
 	return nil
 }
 
@@ -1620,7 +2036,12 @@ func (w *FileStreamingLogWriter) WriteAPIResponse(apiResponse []byte) error {
 	if len(apiResponse) == 0 {
 		return nil
 	}
-	w.apiResponse = bytes.Clone(apiResponse)
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.replaceScopedClone(&w.apiResponse, &w.apiResponseRelease, normalizeBodyLogMetadata(apiResponse, "text/plain"), "logging.file.api_response")
 	return nil
 }
 
@@ -1629,7 +2050,11 @@ func (w *FileStreamingLogWriter) WriteAPIResponseSource(apiResponseSource *FileB
 	if apiResponseSource == nil || !apiResponseSource.HasPayload() {
 		return nil
 	}
-	w.apiResponseSource = apiResponseSource
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if !w.closed {
+		w.apiResponseSource = apiResponseSource
+	}
 	return nil
 }
 
@@ -1644,12 +2069,57 @@ func (w *FileStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline 
 	if len(apiWebsocketTimeline) == 0 {
 		return nil
 	}
-	w.apiWebsocketTimeline = bytes.Clone(apiWebsocketTimeline)
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.replaceScopedClone(&w.apiWebsocketTimeline, &w.apiWebsocketTimelineRelease, normalizeBodyLogMetadata(apiWebsocketTimeline, "text/plain"), "logging.file.websocket_timeline")
 	return nil
+}
+
+func (w *FileStreamingLogWriter) WriteAPIWebsocketTimelineSource(source *FileBodySource) error {
+	if source == nil || !source.HasPayload() {
+		return nil
+	}
+	w.chunkMu.Lock()
+	defer w.chunkMu.Unlock()
+	if !w.closed {
+		w.apiWebsocketTimelineSource = source
+	}
+	return nil
+}
+
+func (w *FileStreamingLogWriter) replaceScopedClone(destination *[]byte, release *func(), source []byte, hotspot string) {
+	if release != nil && *release != nil {
+		(*release)()
+	}
+	cloned, releaseClone := internalpayload.CloneBytesScoped(source, hotspot)
+	*destination = cloned
+	*release = releaseClone
+}
+
+func (w *FileStreamingLogWriter) releaseScopedClones() {
+	for _, release := range []func(){w.apiRequestRelease, w.apiResponseRelease, w.apiWebsocketTimelineRelease} {
+		if release != nil {
+			release()
+		}
+	}
+	w.apiRequestRelease = nil
+	w.apiResponseRelease = nil
+	w.apiWebsocketTimelineRelease = nil
+	w.apiRequest = nil
+	w.apiResponse = nil
+	w.apiWebsocketTimeline = nil
 }
 
 func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 	if !timestamp.IsZero() {
+		w.chunkMu.Lock()
+		defer w.chunkMu.Unlock()
+		if w.closed {
+			return
+		}
 		w.apiResponseTimestamp = timestamp
 	}
 }
@@ -1661,15 +2131,45 @@ func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 // Returns:
 //   - error: An error if closing fails, nil otherwise
 func (w *FileStreamingLogWriter) Close() error {
-	if w.chunkChan != nil {
+	if w == nil {
+		return nil
+	}
+	w.chunkMu.Lock()
+	if w.closeResult == nil {
+		w.closeResult = make(chan struct{})
+	}
+	closeResult := w.closeResult
+	w.chunkMu.Unlock()
+	w.closeOnce.Do(func() {
+		w.closeErr = w.close()
+		close(closeResult)
+	})
+	<-closeResult
+	return w.closeErr
+}
+
+func (w *FileStreamingLogWriter) close() error {
+	defer w.releaseScopedClones()
+	w.chunkMu.Lock()
+	if !w.closed && w.chunkChan != nil {
+		w.closed = true
 		close(w.chunkChan)
 	}
+	closeChan := w.closeChan
+	chunkChan := w.chunkChan
+	w.chunkMu.Unlock()
 
 	// Wait for async writer to finish spooling chunks
-	if w.closeChan != nil {
-		<-w.closeChan
-		w.chunkChan = nil
+	if closeChan != nil {
+		<-closeChan
+	} else if chunkChan != nil {
+		for chunk := range chunkChan {
+			w.releaseQueuedChunk(len(chunk))
+		}
 	}
+	w.chunkMu.Lock()
+	w.chunkChan = nil
+	w.chunkMu.Unlock()
 
 	select {
 	case errWrite := <-w.errorChan:
@@ -1707,41 +2207,30 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 	defer close(w.closeChan)
 
 	for chunk := range w.chunkChan {
-		if w.responseBodyFile == nil {
-			continue
+		w.releaseQueuedChunk(len(chunk))
+		if w.responseDigest == nil {
+			w.responseDigest = sha256.New()
 		}
-		if _, errWrite := w.responseBodyFile.Write(chunk); errWrite != nil {
-			select {
-			case w.errorChan <- errWrite:
-			default:
-			}
-			if errClose := w.responseBodyFile.Close(); errClose != nil {
-				select {
-				case w.errorChan <- errClose:
-				default:
-				}
-			}
-			w.responseBodyFile = nil
-		}
+		_, _ = w.responseDigest.Write(chunk)
+		w.responseCapturedBytes += int64(len(chunk))
+		w.responseChunks++
 	}
+}
 
-	if w.responseBodyFile == nil {
-		return
+func (w *FileStreamingLogWriter) releaseQueuedChunk(size int) {
+	w.chunkMu.Lock()
+	w.queuedBytes -= size
+	if w.queuedBytes < 0 {
+		w.queuedBytes = 0
 	}
-	if errClose := w.responseBodyFile.Close(); errClose != nil {
-		select {
-		case w.errorChan <- errClose:
-		default:
-		}
-	}
-	w.responseBodyFile = nil
+	w.chunkMu.Unlock()
 }
 
 func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
-	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, w.requestBody, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, nil), true); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeAPISection(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, time.Time{}); errWrite != nil {
+	if errWrite := writeAPISectionWithSource(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, time.Time{}); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writePreformattedAPISectionWithSource(logFile, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, w.apiRequestSource, time.Time{}); errWrite != nil {
@@ -1751,33 +2240,26 @@ func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
 		return errWrite
 	}
 
-	responseBodyFile, errOpen := os.Open(w.responseBodyPath)
-	if errOpen != nil {
-		return errOpen
+	digest := sha256.New()
+	if w.responseDigest != nil {
+		digest = w.responseDigest
 	}
-	defer func() {
-		if errClose := responseBodyFile.Close(); errClose != nil {
-			log.WithError(errClose).Warn("failed to close response body temp file")
-		}
-	}()
-
-	return writeResponseSection(logFile, w.responseStatus, w.statusWritten, w.responseHeaders, responseBodyFile, nil, false)
+	metadata := EncodeBodyLogMetadata(BodyLogMetadata{
+		Bytes:       w.responseObservedBytes.Load(),
+		SHA256:      hex.EncodeToString(digest.Sum(nil)),
+		Chunks:      w.responseChunks,
+		ContentType: headerValue(w.responseHeaders, "Content-Type"),
+		Truncated:   w.responseTruncated.Load() || w.responseCapturedBytes != w.responseObservedBytes.Load(),
+	})
+	return writeResponseSection(logFile, w.responseStatus, w.statusWritten, w.responseHeaders, metadata, nil, false)
 }
 
 func (w *FileStreamingLogWriter) cleanupTempFiles() {
-	if w.requestBodyPath != "" {
-		if errRemove := os.Remove(w.requestBodyPath); errRemove != nil {
-			log.WithError(errRemove).Warn("failed to remove request body temp file")
-		}
-		w.requestBodyPath = ""
-	}
-
-	if w.responseBodyPath != "" {
-		if errRemove := os.Remove(w.responseBodyPath); errRemove != nil {
-			log.WithError(errRemove).Warn("failed to remove response body temp file")
-		}
-		w.responseBodyPath = ""
-	}
+	cleanupFileBodySources(w.apiRequestSource, w.apiResponseSource, w.apiWebsocketTimelineSource)
+	w.apiRequestSource = nil
+	w.apiResponseSource = nil
+	w.apiWebsocketTimelineSource = nil
+	w.requestBody = nil
 }
 
 // NoOpStreamingLogWriter is a no-operation implementation for when logging is disabled.
@@ -1851,13 +2333,23 @@ type homeStreamingLogWriter struct {
 	requestHeaders map[string][]string
 	requestBody    []byte
 
-	chunkChan chan []byte
-	doneChan  chan struct{}
+	mu                sync.Mutex
+	chunkChan         chan []byte
+	doneChan          chan struct{}
+	closeResult       chan struct{}
+	closeOnce         sync.Once
+	closed            bool
+	closeErr          error
+	responseTruncated atomic.Bool
+	queuedBytes       int
 
 	responseStatus   int
 	statusWritten    bool
 	responseHeaders  map[string][]string
-	responseBody     bytes.Buffer
+	responseDigest   hash.Hash
+	responseObserved atomic.Int64
+	responseCaptured int64
+	responseChunks   int64
 	apiRequest       []byte
 	apiResponse      []byte
 	apiWebsocketTime []byte
@@ -1867,22 +2359,17 @@ type homeStreamingLogWriter struct {
 }
 
 func newHomeStreamingLogWriter(url, method string, headers map[string][]string, body []byte, requestID string) *homeStreamingLogWriter {
-	requestHeaders := make(map[string][]string, len(headers))
-	for key, values := range headers {
-		headerValues := make([]string, len(values))
-		copy(headerValues, values)
-		requestHeaders[key] = headerValues
-	}
-
 	writer := &homeStreamingLogWriter{
 		url:            url,
 		method:         method,
 		timestamp:      time.Now(),
-		requestHeaders: requestHeaders,
-		requestBody:    append([]byte(nil), body...),
+		requestHeaders: cloneHeaders(headers),
+		requestBody:    normalizeBodyLogMetadata(body, headerValue(headers, "Content-Type")),
 		requestID:      strings.TrimSpace(requestID),
-		chunkChan:      make(chan []byte, 100),
+		chunkChan:      make(chan []byte, homeStreamingChunkQueueCapacity),
 		doneChan:       make(chan struct{}),
+		closeResult:    make(chan struct{}),
+		responseDigest: sha256.New(),
 	}
 
 	go writer.asyncWriter()
@@ -1892,37 +2379,57 @@ func newHomeStreamingLogWriter(url, method string, headers map[string][]string, 
 func (w *homeStreamingLogWriter) asyncWriter() {
 	defer close(w.doneChan)
 	for chunk := range w.chunkChan {
+		w.mu.Lock()
+		w.queuedBytes -= len(chunk)
+		if w.queuedBytes < 0 {
+			w.queuedBytes = 0
+		}
+		w.mu.Unlock()
 		if len(chunk) == 0 {
 			continue
 		}
-		_, _ = w.responseBody.Write(chunk)
+		_, _ = w.responseDigest.Write(chunk)
+		w.responseCaptured += int64(len(chunk))
+		w.responseChunks++
 	}
 }
 
 func (w *homeStreamingLogWriter) WriteChunkAsync(chunk []byte) {
-	if w == nil || w.chunkChan == nil || len(chunk) == 0 {
+	if w == nil || len(chunk) == 0 {
 		return
 	}
-	select {
-	case w.chunkChan <- append([]byte(nil), chunk...):
-	default:
+	w.responseObserved.Add(int64(len(chunk)))
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.chunkChan == nil || w.responseTruncated.Load() {
+		return
 	}
+	chunkLen := min(len(chunk), homeStreamingChunkMaxBytes)
+	if len(w.chunkChan) >= cap(w.chunkChan) || w.queuedBytes+chunkLen > streamingLogQueueMaxBytes {
+		w.responseTruncated.Store(true)
+		return
+	}
+	if len(chunk) > homeStreamingChunkMaxBytes {
+		w.responseTruncated.Store(true)
+	}
+	queued := cloneBoundedStreamingChunk(chunk)
+	w.queuedBytes += len(queued)
+	w.chunkChan <- queued
 }
 
 func (w *homeStreamingLogWriter) WriteStatus(status int, headers map[string][]string) error {
 	if w == nil || status == 0 {
 		return nil
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
 	w.responseStatus = status
 	w.statusWritten = true
-	if headers != nil {
-		w.responseHeaders = make(map[string][]string, len(headers))
-		for key, values := range headers {
-			copied := make([]string, len(values))
-			copy(copied, values)
-			w.responseHeaders[key] = copied
-		}
-	}
+	w.responseHeaders = cloneHeaders(headers)
 	return nil
 }
 
@@ -1930,7 +2437,12 @@ func (w *homeStreamingLogWriter) WriteAPIRequest(apiRequest []byte) error {
 	if w == nil || len(apiRequest) == 0 {
 		return nil
 	}
-	w.apiRequest = bytes.Clone(apiRequest)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.apiRequest = normalizeBodyLogMetadata(apiRequest, "text/plain")
 	return nil
 }
 
@@ -1938,7 +2450,12 @@ func (w *homeStreamingLogWriter) WriteAPIResponse(apiResponse []byte) error {
 	if w == nil || len(apiResponse) == 0 {
 		return nil
 	}
-	w.apiResponse = bytes.Clone(apiResponse)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.apiResponse = normalizeBodyLogMetadata(apiResponse, "text/plain")
 	return nil
 }
 
@@ -1946,8 +2463,59 @@ func (w *homeStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline 
 	if w == nil || len(apiWebsocketTimeline) == 0 {
 		return nil
 	}
-	w.apiWebsocketTime = bytes.Clone(apiWebsocketTimeline)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.apiWebsocketTime = normalizeBodyLogMetadata(apiWebsocketTimeline, "text/plain")
 	return nil
+}
+
+func boundedSourceMetadata(source *FileBodySource, limit int, _ string) ([]byte, error) {
+	if source == nil {
+		return nil, nil
+	}
+	defer cleanupFileBodySources(source)
+	metadata, errMetadata := source.Metadata("text/plain")
+	if errMetadata != nil {
+		return nil, errMetadata
+	}
+	if limit <= 0 || !bytes.HasPrefix(metadata, []byte(bodyMetadataPrefix)) {
+		return metadata, nil
+	}
+	var decoded BodyLogMetadata
+	if errDecode := json.Unmarshal(metadata[len(bodyMetadataPrefix):], &decoded); errDecode != nil {
+		return metadata, nil
+	}
+	if decoded.Bytes > int64(limit) {
+		decoded.Truncated = true
+	}
+	return EncodeBodyLogMetadata(decoded), nil
+}
+
+func (w *homeStreamingLogWriter) WriteAPIRequestSource(source *FileBodySource) error {
+	metadata, errMetadata := boundedSourceMetadata(source, homeAPISectionMaxBytes, homeAPIRequestTruncationMarker)
+	if errMetadata != nil || len(metadata) == 0 {
+		return errMetadata
+	}
+	return w.WriteAPIRequest(metadata)
+}
+
+func (w *homeStreamingLogWriter) WriteAPIResponseSource(source *FileBodySource) error {
+	metadata, errMetadata := boundedSourceMetadata(source, homeAPISectionMaxBytes, homeAPIResponseTruncationMarker)
+	if errMetadata != nil || len(metadata) == 0 {
+		return errMetadata
+	}
+	return w.WriteAPIResponse(metadata)
+}
+
+func (w *homeStreamingLogWriter) WriteAPIWebsocketTimelineSource(source *FileBodySource) error {
+	metadata, errMetadata := boundedSourceMetadata(source, homeAPISectionMaxBytes, homeAPIWebsocketTruncationMarker)
+	if errMetadata != nil || len(metadata) == 0 {
+		return errMetadata
+	}
+	return w.WriteAPIWebsocketTimeline(metadata)
 }
 
 func (w *homeStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
@@ -1955,6 +2523,11 @@ func (w *homeStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 		return
 	}
 	if !timestamp.IsZero() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.closed {
+			return
+		}
 		w.firstChunkTS = timestamp
 		w.apiResponseTS = timestamp
 	}
@@ -1964,35 +2537,59 @@ func (w *homeStreamingLogWriter) Close() error {
 	if w == nil {
 		return nil
 	}
+	w.closeOnce.Do(func() {
+		w.closeErr = w.close()
+		close(w.closeResult)
+	})
+	<-w.closeResult
+	return w.closeErr
+}
+
+func (w *homeStreamingLogWriter) close() error {
+	w.mu.Lock()
+	w.closed = true
+	if w.chunkChan != nil {
+		close(w.chunkChan)
+	}
+	w.mu.Unlock()
+	<-w.doneChan
+	defer func() {
+		w.mu.Lock()
+		w.chunkChan = nil
+		w.requestBody = nil
+		w.apiRequest = nil
+		w.apiResponse = nil
+		w.apiWebsocketTime = nil
+		w.mu.Unlock()
+	}()
 
 	client := currentHomeRequestLogClient()
 	if client == nil || !client.HeartbeatOK() {
 		return nil
 	}
 
-	if w.chunkChan != nil {
-		close(w.chunkChan)
-		<-w.doneChan
-		w.chunkChan = nil
-	}
-
-	responsePayload := w.responseBody.Bytes()
-
-	var buf bytes.Buffer
+	buf := newBoundedLogBuffer(homeRequestLogMaxBytes, homeRequestLogTruncationMarker)
 	upstreamTransport := inferUpstreamTransport(w.apiRequest, nil, w.apiResponse, nil, w.apiWebsocketTime, nil, nil)
-	if errWrite := writeRequestInfoWithBody(&buf, w.url, w.method, w.requestHeaders, w.requestBody, "", w.timestamp, "http", upstreamTransport, true); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(buf, w.url, w.method, w.requestHeaders, w.requestBody, w.timestamp, "http", upstreamTransport, true); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeAPISection(&buf, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTime, time.Time{}); errWrite != nil {
+	if errWrite := writeAPISection(buf, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTime, time.Time{}); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeAPISection(&buf, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, time.Time{}); errWrite != nil {
+	if errWrite := writeAPISection(buf, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, time.Time{}); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeAPISection(&buf, "=== API RESPONSE ===\n", "=== API RESPONSE", w.apiResponse, w.apiResponseTS); errWrite != nil {
+	if errWrite := writeAPISection(buf, "=== API RESPONSE ===\n", "=== API RESPONSE", w.apiResponse, w.apiResponseTS); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeResponseSection(&buf, w.responseStatus, w.statusWritten, w.responseHeaders, bytes.NewReader(responsePayload), nil, false); errWrite != nil {
+	metadata := EncodeBodyLogMetadata(BodyLogMetadata{
+		Bytes:       w.responseObserved.Load(),
+		SHA256:      hex.EncodeToString(w.responseDigest.Sum(nil)),
+		Chunks:      w.responseChunks,
+		ContentType: headerValue(w.responseHeaders, "Content-Type"),
+		Truncated:   w.responseTruncated.Load() || w.responseCaptured != w.responseObserved.Load(),
+	})
+	if errWrite := writeResponseSection(buf, w.responseStatus, w.statusWritten, w.responseHeaders, metadata, nil, false); errWrite != nil {
 		return errWrite
 	}
 

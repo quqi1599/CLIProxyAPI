@@ -1,9 +1,10 @@
 package signature
 
 import (
-	"fmt"
+	"encoding/json"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -38,56 +39,188 @@ func SanitizeGeminiRequestThoughtSignatures(payload []byte, contentsPath string)
 		return payload
 	}
 
-	contents.ForEach(func(contentIdx, content gjson.Result) bool {
+	contentResults := contents.Array()
+	updatedContents := make([]string, len(contentResults))
+	contentsChanged := false
+	for contentIdx, content := range contentResults {
+		updatedContents[contentIdx] = content.Raw
 		isModelTurn := content.Get("role").String() == "model"
 		parts := content.Get("parts")
 		if !parts.IsArray() {
-			return true
+			continue
 		}
 
-		parts.ForEach(func(partIdx, part gjson.Result) bool {
-			partPath := fmt.Sprintf("%s.%d.parts.%d", contentsPath, contentIdx.Int(), partIdx.Int())
+		partResults := parts.Array()
+		updatedParts := make([]string, len(partResults))
+		partsChanged := false
+		for partIdx, part := range partResults {
+			updatedParts[partIdx] = part.Raw
 			if part.Get("functionResponse").Exists() {
 				_, hadSignature := geminiPartThoughtSignature(part)
-				payload = deleteGeminiPartThoughtSignatureFields(payload, partPath)
+				if updatedPart, changed := rewriteGeminiPartThoughtSignatures(part, "", false); changed {
+					updatedParts[partIdx] = updatedPart
+					partsChanged = true
+				}
 				if hadSignature {
-					logGeminiThoughtSignatureSanitize(contentsPath, int(contentIdx.Int()), int(partIdx.Int()), SignatureCompatibilityDecision{
+					logGeminiThoughtSignatureSanitize(contentsPath, contentIdx, partIdx, SignatureCompatibilityDecision{
 						TargetProvider: SignatureProviderGemini,
 						BlockKind:      SignatureBlockKindGeminiModelPart,
 						Action:         SignatureActionDropSignature,
 						Reason:         "user-turn functionResponse parts cannot replay thought signatures",
 					}, "", true)
 				}
-				return true
+				continue
 			}
 			if !isModelTurn {
-				return true
+				continue
 			}
 
 			hasFunctionCall := part.Get("functionCall").Exists()
 			hasThought := part.Get("thought").Exists()
 			rawSignature, hasSignature := geminiPartThoughtSignature(part)
 			if !hasFunctionCall && !hasThought && !hasSignature {
-				return true
+				continue
 			}
 
 			blockKind := SignatureBlockKindGeminiModelPart
 			if hasFunctionCall {
 				blockKind = SignatureBlockKindGeminiFunctionCall
 			}
-			payload = deleteGeminiPartThoughtSignatureFields(payload, partPath)
 			decision := DecideSignatureCompatibility(SignatureProviderGemini, rawSignature, blockKind)
 			replaySignature := GeminiReplaySignatureOrBypass(rawSignature, blockKind)
-			payload, _ = sjson.SetBytes(payload, partPath+".thoughtSignature", replaySignature)
-			if decision.Action != SignatureActionPreserve {
-				logGeminiThoughtSignatureSanitize(contentsPath, int(contentIdx.Int()), int(partIdx.Int()), decision, rawSignature, hasSignature)
+			if updatedPart, changed := rewriteGeminiPartThoughtSignatures(part, replaySignature, true); changed {
+				updatedParts[partIdx] = updatedPart
+				partsChanged = true
 			}
-			return true
+			if decision.Action != SignatureActionPreserve {
+				logGeminiThoughtSignatureSanitize(contentsPath, contentIdx, partIdx, decision, rawSignature, hasSignature)
+			}
+		}
+
+		if !partsChanged {
+			continue
+		}
+		partsJSON := string(internalpayload.BuildRaw(updatedParts))
+		updatedContent, changed, _ := rewriteSignatureJSONObject(content.Raw, func(key string, _ gjson.Result) (signatureJSONFieldEdit, bool) {
+			if key != "parts" {
+				return signatureJSONFieldEdit{}, false
+			}
+			return signatureJSONFieldEdit{replacement: partsJSON}, true
 		})
+		if changed {
+			updatedContents[contentIdx] = updatedContent
+			contentsChanged = true
+		}
+	}
+
+	if !contentsChanged {
+		return payload
+	}
+	updatedPayload, err := sjson.SetRawBytes(payload, contentsPath, internalpayload.BuildRaw(updatedContents))
+	if err != nil {
+		return payload
+	}
+	return updatedPayload
+}
+func rewriteGeminiPartThoughtSignatures(part gjson.Result, replacement string, addReplacement bool) (string, bool) {
+	object := gjson.Parse(part.Raw)
+	if !object.IsObject() {
+		return part.Raw, false
+	}
+	encodedReplacement, _ := json.Marshal(replacement)
+	canonicalWritten := false
+	changed := false
+	fields := 0
+	var builder strings.Builder
+	builder.Grow(len(part.Raw) + len(encodedReplacement) + 24)
+	builder.WriteByte('{')
+	object.ForEach(func(key, value gjson.Result) bool {
+		fieldName := key.String()
+		fieldRaw := value.Raw
+		keep := true
+		switch fieldName {
+		case "thoughtSignature":
+			if addReplacement {
+				canonicalWritten = true
+				if fieldRaw != string(encodedReplacement) {
+					fieldRaw = string(encodedReplacement)
+					changed = true
+				}
+			} else {
+				keep = false
+				changed = true
+			}
+		case "thought_signature":
+			keep = false
+			changed = true
+		case "functionCall", "functionResponse":
+			if value.IsObject() {
+				updated, nestedChanged, _ := rewriteSignatureJSONObject(value.Raw, dropGeminiThoughtSignatureField)
+				if nestedChanged {
+					fieldRaw = updated
+					changed = true
+				}
+			}
+		case "extra_content":
+			if value.IsObject() {
+				updated, nestedChanged := rewriteGeminiExtraContent(value.Raw)
+				if nestedChanged {
+					fieldRaw = updated
+					changed = true
+				}
+			}
+		}
+		if !keep {
+			return true
+		}
+		if fields > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(key.Raw)
+		builder.WriteByte(':')
+		builder.WriteString(fieldRaw)
+		fields++
 		return true
 	})
+	if addReplacement && !canonicalWritten {
+		if fields > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`"thoughtSignature":`)
+		builder.Write(encodedReplacement)
+		changed = true
+	}
+	builder.WriteByte('}')
+	if !changed {
+		return part.Raw, false
+	}
+	return builder.String(), true
+}
 
-	return payload
+func dropGeminiThoughtSignatureField(key string, _ gjson.Result) (signatureJSONFieldEdit, bool) {
+	if key != "thoughtSignature" && key != "thought_signature" {
+		return signatureJSONFieldEdit{}, false
+	}
+	return signatureJSONFieldEdit{remove: true}, true
+}
+
+func rewriteGeminiExtraContent(raw string) (string, bool) {
+	updated, changed, _ := rewriteSignatureJSONObject(raw, func(key string, value gjson.Result) (signatureJSONFieldEdit, bool) {
+		if key != "google" || !value.IsObject() {
+			return signatureJSONFieldEdit{}, false
+		}
+		google, googleChanged, _ := rewriteSignatureJSONObject(value.Raw, func(googleKey string, _ gjson.Result) (signatureJSONFieldEdit, bool) {
+			if googleKey != "thought_signature" {
+				return signatureJSONFieldEdit{}, false
+			}
+			return signatureJSONFieldEdit{remove: true}, true
+		})
+		if !googleChanged {
+			return signatureJSONFieldEdit{}, false
+		}
+		return signatureJSONFieldEdit{replacement: google}, true
+	})
+	return updated, changed
 }
 
 func logGeminiThoughtSignatureSanitize(contentsPath string, contentIndex, partIndex int, decision SignatureCompatibilityDecision, rawSignature string, hasSignature bool) {
@@ -122,19 +255,4 @@ func geminiPartThoughtSignature(part gjson.Result) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func deleteGeminiPartThoughtSignatureFields(payload []byte, partPath string) []byte {
-	for _, path := range []string{
-		"thoughtSignature",
-		"thought_signature",
-		"functionCall.thoughtSignature",
-		"functionCall.thought_signature",
-		"functionResponse.thoughtSignature",
-		"functionResponse.thought_signature",
-		"extra_content.google.thought_signature",
-	} {
-		payload, _ = sjson.DeleteBytes(payload, partPath+"."+path)
-	}
-	return payload
 }

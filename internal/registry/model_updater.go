@@ -5,18 +5,19 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
 	modelsFetchTimeout    = 30 * time.Second
 	modelsRefreshInterval = 3 * time.Hour
+	maxModelsCatalogBytes = 4 << 20
 )
 
 var modelsURLs = []string{
@@ -158,19 +159,15 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			continue
 		}
 
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			cancel()
-			log.Debugf("models fetch returned %d from %s", resp.StatusCode, url)
-			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		data, err := httpfetch.ReadResponseBytes(resp, maxModelsCatalogBytes)
 		cancel()
 
 		if err != nil {
 			log.Debugf("models fetch read error from %s: %v", url, err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Debugf("models fetch returned %d from %s", resp.StatusCode, url)
 			continue
 		}
 

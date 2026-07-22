@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
@@ -24,7 +25,7 @@ var (
 )
 
 // ConvertOpenAIResponsesRequestToClaude transforms an OpenAI Responses API request
-// into a Claude Messages API request using only gjson/sjson for JSON handling.
+// into a Claude Messages API request.
 // It supports:
 // - instructions -> system message
 // - input[].type==message with input_text/output_text -> user/assistant messages
@@ -52,6 +53,10 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	// Base Claude message payload
 	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
+	messageItems := make([]json.RawMessage, 0)
+	appendMessage := func(msg []byte) {
+		messageItems = append(messageItems, msg)
+	}
 
 	root := gjson.ParseBytes(rawJSON)
 
@@ -189,16 +194,14 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					textPart := gjson.Parse(partsJSON[0])
 					msg, _ = sjson.SetBytes(msg, "content", textPart.Get("text").String())
 				} else {
-					for _, partJSON := range partsJSON {
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(partJSON))
-					}
+					msg, _ = sjson.SetRawBytes(msg, "content", marshalRawStrings(partsJSON))
 				}
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				appendMessage(msg)
 			} else if textAggregate.Len() > 0 || role == "system" {
 				msg := []byte(`{"role":"","content":""}`)
 				msg, _ = sjson.SetBytes(msg, "role", role)
 				msg, _ = sjson.SetBytes(msg, "content", textAggregate.String())
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				appendMessage(msg)
 			}
 
 		case "function_call":
@@ -221,7 +224,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 			asst := []byte(`{"role":"assistant","content":[]}`)
 			asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
-			out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
+			appendMessage(asst)
 
 		case "function_call_output":
 			callID := strings.TrimSpace(item.Get("call_id").String())
@@ -238,7 +241,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 			usr := []byte(`{"role":"user","content":[]}`)
 			usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
-			out, _ = sjson.SetRawBytes(out, "messages.-1", usr)
+			appendMessage(usr)
 		}
 	}
 
@@ -250,7 +253,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		if instructionsText != "" {
 			sysMsg := []byte(`{"role":"user","content":""}`)
 			sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-			out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
+			appendMessage(sysMsg)
 		}
 	}
 
@@ -276,7 +279,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					if instructionsText != "" {
 						sysMsg := []byte(`{"role":"user","content":""}`)
 						sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-						out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
+						appendMessage(sysMsg)
 						extractedFromSystem = true
 					}
 				}
@@ -292,17 +295,12 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		raw    []byte
 	}
 	var pendingToolUseMessages []pendingToolUseMessage
-	appendMessage := func(msg []byte) {
-		out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
-	}
 	flushPendingReasoning := func() {
 		if len(pendingReasoningParts) == 0 {
 			return
 		}
 		asst := []byte(`{"role":"assistant","content":[]}`)
-		for _, partJSON := range pendingReasoningParts {
-			asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(partJSON))
-		}
+		asst, _ = sjson.SetRawBytes(asst, "content", marshalRawStrings(pendingReasoningParts))
 		appendMessage(asst)
 		pendingReasoningParts = nil
 	}
@@ -465,9 +463,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						textPart := gjson.Parse(partsJSON[0])
 						msg, _ = sjson.SetBytes(msg, "content", textPart.Get("text").String())
 					} else {
-						for _, partJSON := range partsJSON {
-							msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(partJSON))
-						}
+						msg, _ = sjson.SetRawBytes(msg, "content", marshalRawStrings(partsJSON))
 					}
 					appendMessage(msg)
 				} else if textAggregate.Len() > 0 || role == "system" {
@@ -503,11 +499,10 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				}
 
 				asst := []byte(`{"role":"assistant","content":[]}`)
-				for _, partJSON := range pendingReasoningParts {
-					asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(partJSON))
-				}
+				parts := append([]string(nil), pendingReasoningParts...)
 				pendingReasoningParts = nil
-				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
+				parts = append(parts, string(toolUse))
+				asst, _ = sjson.SetRawBytes(asst, "content", marshalRawStrings(parts))
 				pendingToolUseMessages = append(pendingToolUseMessages, pendingToolUseMessage{
 					callID: callID,
 					raw:    asst,
@@ -537,17 +532,19 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	} else if input.Type == gjson.String {
 		msg := []byte(`{"role":"user","content":""}`)
 		msg, _ = sjson.SetBytes(msg, "content", input.String())
-		out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+		appendMessage(msg)
 	}
 	flushPendingReasoning()
 	flushPendingToolUses()
+	messagesJSON, _ := json.Marshal(messageItems)
+	out, _ = sjson.SetRawBytes(out, "messages", messagesJSON)
 
 	includedToolNames := map[string]struct{}{}
 	toolNameMap := map[string]string{}
 
 	// tools mapping: parameters -> input_schema
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		toolsJSON := []byte("[]")
+		toolItems := make([]json.RawMessage, 0)
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			convertedTools := convertResponsesToolToClaudeTools(tool, toolNameMap)
 			for _, tJSON := range convertedTools {
@@ -555,11 +552,12 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				if toolName != "" {
 					includedToolNames[toolName] = struct{}{}
 				}
-				toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", tJSON)
+				toolItems = append(toolItems, tJSON)
 			}
 			return true
 		})
-		if parsedTools := gjson.ParseBytes(toolsJSON); parsedTools.IsArray() && len(parsedTools.Array()) > 0 {
+		if len(toolItems) > 0 {
+			toolsJSON, _ := json.Marshal(toolItems)
 			out, _ = sjson.SetRawBytes(out, "tools", toolsJSON)
 		}
 	}
@@ -601,6 +599,15 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
+	return out
+}
+
+func marshalRawStrings(items []string) []byte {
+	raw := make([]json.RawMessage, len(items))
+	for i := range items {
+		raw[i] = json.RawMessage(items[i])
+	}
+	out, _ := json.Marshal(raw)
 	return out
 }
 
@@ -724,12 +731,8 @@ func applyResponsesToolResultContent(toolResult []byte, output gjson.Result) []b
 				return toolResult
 			}
 		}
-		contentJSON := []byte("[]")
-		for _, partJSON := range partsJSON {
-			contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", []byte(partJSON))
-		}
 		toolResult, _ = sjson.DeleteBytes(toolResult, "content")
-		toolResult, _ = sjson.SetRawBytes(toolResult, "content", contentJSON)
+		toolResult, _ = sjson.SetRawBytes(toolResult, "content", marshalRawStrings(partsJSON))
 		return toolResult
 	}
 	toolResult, _ = sjson.SetBytes(toolResult, "content", output.String())

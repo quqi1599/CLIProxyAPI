@@ -11,17 +11,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
-const providerKey = "echo"
+const (
+	providerKey             = "echo"
+	maxExampleResponseBytes = 4 << 20
+)
 
 // EchoExecutor is a minimal provider implementation for demonstration purposes.
 type EchoExecutor struct{}
@@ -103,14 +106,9 @@ func main() {
 	if errDoPrepared != nil {
 		panic(errDoPrepared)
 	}
-	defer func() {
-		if errClose := respPrepared.Body.Close(); errClose != nil {
-			log.Errorf("close response body error: %v", errClose)
-		}
-	}()
-	bodyPrepared, errReadPrepared := io.ReadAll(respPrepared.Body)
+	bodyPrepared, errReadPrepared := httpfetch.ReadResponseBytes(respPrepared, maxExampleResponseBytes)
 	if errReadPrepared != nil {
-		panic(errReadPrepared)
+		panic(fmt.Errorf("read prepared response: %w", errReadPrepared))
 	}
 	fmt.Printf("Prepared request status: %d\n%s\n\n", respPrepared.StatusCode, bodyPrepared)
 
@@ -127,14 +125,9 @@ func main() {
 	if errDoExec != nil {
 		panic(errDoExec)
 	}
-	defer func() {
-		if errClose := respExec.Body.Close(); errClose != nil {
-			log.Errorf("close response body error: %v", errClose)
-		}
-	}()
-	bodyExec, errReadExec := io.ReadAll(respExec.Body)
+	bodyExec, errReadExec := httpfetch.ReadResponseBytes(respExec, maxExampleResponseBytes)
 	if errReadExec != nil {
-		panic(errReadExec)
+		panic(fmt.Errorf("read manager response: %w", errReadExec))
 	}
 	fmt.Printf("Manager HttpRequest status: %d\n%s\n", respExec.StatusCode, bodyExec)
 }

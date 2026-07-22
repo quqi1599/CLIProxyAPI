@@ -51,11 +51,13 @@ func newPendingRequest(id string) *pendingRequest {
 
 func (pr *pendingRequest) enqueue(msg Message) bool {
 	if pr == nil {
+		msg.Release()
 		return false
 	}
 	pr.stateMutex.Lock()
 	defer pr.stateMutex.Unlock()
 	if pr.terminated {
+		msg.Release()
 		return false
 	}
 	if isTerminalMessage(msg.Type) {
@@ -67,6 +69,7 @@ func (pr *pendingRequest) enqueue(msg Message) bool {
 	case pr.mailbox <- msg:
 		return false
 	default:
+		msg.Release()
 		pr.terminated = true
 		pr.terminal <- requestErrorMessage(pr.id, errMailboxOverflow)
 		return true
@@ -75,11 +78,13 @@ func (pr *pendingRequest) enqueue(msg Message) bool {
 
 func (pr *pendingRequest) terminate(msg Message) {
 	if pr == nil {
+		msg.Release()
 		return
 	}
 	pr.stateMutex.Lock()
 	defer pr.stateMutex.Unlock()
 	if pr.terminated {
+		msg.Release()
 		return
 	}
 	pr.terminated = true
@@ -98,6 +103,7 @@ func (pr *pendingRequest) abandon() {
 func (pr *pendingRequest) drain() {
 	defer close(pr.done)
 	defer close(pr.ch)
+	defer pr.releaseQueued()
 	for {
 		select {
 		case <-pr.abort:
@@ -110,9 +116,11 @@ func (pr *pendingRequest) drain() {
 			for {
 				select {
 				case <-pr.abort:
+					terminal.Release()
 					return
 				case msg := <-pr.mailbox:
 					if !pr.deliver(msg) {
+						terminal.Release()
 						return
 					}
 				default:
@@ -127,9 +135,30 @@ func (pr *pendingRequest) drain() {
 func (pr *pendingRequest) deliver(msg Message) bool {
 	select {
 	case <-pr.abort:
+		msg.Release()
 		return false
 	case pr.ch <- msg:
+		// Ownership transfers to the channel consumer. The message must stay
+		// charged while that consumer reads or copies Payload.
 		return true
+	}
+}
+
+func (pr *pendingRequest) releaseQueued() {
+	for {
+		select {
+		case msg := <-pr.mailbox:
+			msg.Release()
+		default:
+			goto terminal
+		}
+	}
+
+terminal:
+	select {
+	case msg := <-pr.terminal:
+		msg.Release()
+	default:
 	}
 }
 
@@ -139,18 +168,25 @@ type session struct {
 	provider   string
 	id         string
 	closed     chan struct{}
+	readCtx    context.Context
+	cancelRead context.CancelFunc
 	closeOnce  sync.Once
 	writeMutex sync.Mutex
 	pending    sync.Map // map[string]*pendingRequest
+	lease      *connectionLease
 }
 
-func newSession(conn *websocket.Conn, mgr *Manager, id string) *session {
+func newSession(conn *websocket.Conn, mgr *Manager, id string, lease *connectionLease) *session {
+	readCtx, cancelRead := context.WithCancel(context.Background())
 	s := &session{
-		conn:     conn,
-		manager:  mgr,
-		provider: "",
-		id:       id,
-		closed:   make(chan struct{}),
+		conn:       conn,
+		manager:    mgr,
+		provider:   "",
+		id:         id,
+		closed:     make(chan struct{}),
+		readCtx:    readCtx,
+		cancelRead: cancelRead,
+		lease:      lease,
 	}
 	conn.SetReadLimit(maxInboundMessageLen)
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
@@ -187,10 +223,32 @@ func (s *session) startHeartbeat() {
 }
 
 func (s *session) run(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		s.cleanup(ctx.Err())
+	})
+	defer stopCancel()
 	defer s.cleanup(errClosed)
+	readCtx := s.readCtx
+	if readCtx == nil {
+		readCtx = ctx
+	}
 	for {
-		var msg Message
-		if err := s.conn.ReadJSON(&msg); err != nil {
+		// NextReader handles control frames internally. Text and binary data
+		// frames intentionally share the same single-JSON-value contract.
+		messageType, reader, err := s.conn.NextReader()
+		if err != nil {
+			s.cleanup(err)
+			return
+		}
+		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+			s.cleanup(errors.New("wsrelay: unsupported websocket data frame"))
+			return
+		}
+		msg, err := decodeInboundMessage(readCtx, s.manager.inbound, reader)
+		if err != nil {
 			s.cleanup(err)
 			return
 		}
@@ -200,6 +258,7 @@ func (s *session) run(ctx context.Context) {
 
 func (s *session) dispatch(msg Message) {
 	if msg.Type == MessageTypePing {
+		msg.Release()
 		_ = s.send(context.Background(), Message{ID: msg.ID, Type: MessageTypePong})
 		return
 	}
@@ -213,6 +272,7 @@ func (s *session) dispatch(msg Message) {
 	if isTerminalMessage(msg.Type) && s.manager != nil {
 		s.manager.logDebugf("wsrelay: received terminal message for unknown id %s (provider=%s)", msg.ID, s.provider)
 	}
+	msg.Release()
 }
 
 func (s *session) send(ctx context.Context, msg Message) error {
@@ -277,6 +337,9 @@ func (s *session) cleanup(cause error) {
 		if cause == nil {
 			cause = errClosed
 		}
+		if s.cancelRead != nil {
+			s.cancelRead()
+		}
 		close(s.closed)
 		s.pending.Range(func(key, _ any) bool {
 			if value, loaded := s.pending.LoadAndDelete(key); loaded {
@@ -288,6 +351,7 @@ func (s *session) cleanup(cause error) {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
+		s.lease.release()
 		if s.manager != nil {
 			s.manager.handleSessionClosed(s, cause)
 		}

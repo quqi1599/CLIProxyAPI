@@ -2,10 +2,46 @@ package gemini
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertCodexResponseToGemini_NonStreamLargePartsPreserveOrder(t *testing.T) {
+	const itemCount = 512
+	var raw strings.Builder
+	raw.WriteString(`{"type":"response.completed","response":{"id":"resp-large","created_at":1700000000,"usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"reasoning","content":"thinking"},{"type":"message","content":[{"type":"output_text","text":"answer"}]}`)
+	for i := 0; i < itemCount; i++ {
+		raw.WriteString(`,{"type":"function_call","call_id":"call-`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`","name":"tool_`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`","arguments":"{}"},{"type":"image_generation_call","output_format":"png","result":"aW1hZ2U`)
+		raw.WriteString(strconv.Itoa(i))
+		raw.WriteString(`="}`)
+	}
+	raw.WriteString(`]}}`)
+
+	out := ConvertCodexResponseToGeminiNonStream(context.Background(), "gemini-2.5-pro", []byte(`{"tools":[]}`), nil, []byte(raw.String()), nil)
+	parts := gjson.GetBytes(out, "candidates.0.content.parts").Array()
+	if len(parts) != 2+itemCount*2 {
+		t.Fatalf("part count = %d, want %d", len(parts), 2+itemCount*2)
+	}
+	if got := parts[0].Get("text").String(); got != "thinking" || !parts[0].Get("thought").Bool() {
+		t.Fatalf("reasoning part = %s", parts[0].Raw)
+	}
+	if got := parts[1].Get("text").String(); got != "answer" {
+		t.Fatalf("message part = %q", got)
+	}
+	if got := parts[len(parts)-2].Get("functionCall.id").String(); got != "call-511" {
+		t.Fatalf("last function call id = %q", got)
+	}
+	if got := parts[len(parts)-1].Get("inlineData.data").String(); got != "aW1hZ2U511=" {
+		t.Fatalf("last image data = %q", got)
+	}
+}
 
 func TestConvertCodexResponseToGemini_StreamEmptyOutputUsesOutputItemDoneMessageFallback(t *testing.T) {
 	ctx := context.Background()

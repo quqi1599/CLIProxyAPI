@@ -1,6 +1,7 @@
 package signature
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -119,4 +120,58 @@ func TestSanitizeGeminiRequestThoughtSignaturesRemovesFunctionResponseSignature(
 	if gjson.GetBytes(out, "contents.0.parts.0.functionResponse.thoughtSignature").Exists() {
 		t.Fatalf("functionResponse nested thoughtSignature should be removed. Output: %s", string(out))
 	}
+}
+
+func TestSanitizeGeminiRequestThoughtSignaturesLargeHistoryIsLinearAndImmutable(t *testing.T) {
+	input := largeGeminiSignatureHistory(1024)
+	original := bytes.Clone(input)
+
+	out := SanitizeGeminiRequestThoughtSignatures(input, "contents")
+
+	if !bytes.Equal(input, original) {
+		t.Fatal("sanitizer mutated caller input")
+	}
+	parts := gjson.GetBytes(out, "contents.0.parts").Array()
+	if len(parts) != 1024 {
+		t.Fatalf("parts = %d, want 1024", len(parts))
+	}
+	for _, index := range []int{0, len(parts) - 1} {
+		part := parts[index]
+		if got := part.Get("thoughtSignature").String(); got != GeminiSkipThoughtSignatureValidator {
+			t.Fatalf("parts.%d thoughtSignature = %q", index, got)
+		}
+		if part.Get("functionCall.thought_signature").Exists() {
+			t.Fatalf("parts.%d retained nested thought signature", index)
+		}
+		if strings.Index(part.Raw, `"before"`) > strings.Index(part.Raw, `"functionCall"`) || strings.Index(part.Raw, `"functionCall"`) > strings.Index(part.Raw, `"after"`) {
+			t.Fatalf("parts.%d field order changed: %s", index, part.Raw)
+		}
+	}
+	if got := gjson.GetBytes(out, "tail.keep").Bool(); !got {
+		t.Fatal("unknown top-level field was not preserved")
+	}
+}
+
+func BenchmarkSanitizeGeminiRequestThoughtSignaturesLargeHistory(b *testing.B) {
+	input := largeGeminiSignatureHistory(1024)
+	b.ReportAllocs()
+	for b.Loop() {
+		if out := SanitizeGeminiRequestThoughtSignatures(input, "contents"); len(out) == 0 {
+			b.Fatal("empty output")
+		}
+	}
+}
+
+func largeGeminiSignatureHistory(parts int) []byte {
+	var builder strings.Builder
+	builder.Grow(parts * 128)
+	builder.WriteString(`{"contents":[{"role":"model","parts":[`)
+	for index := 0; index < parts; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"before":1,"functionCall":{"name":"f","args":{},"thought_signature":"bad"},"after":2}`)
+	}
+	builder.WriteString(`]}],"tail":{"keep":true}}`)
+	return []byte(builder.String())
 }

@@ -44,7 +44,8 @@ api-keys:
 # Enable debug logging
 debug: false
 
-# Enable pprof HTTP debug server (host:port). Keep it bound to localhost for safety.
+# Enable pprof HTTP debug server only for a bounded diagnostic session.
+# The address must be localhost or a loopback IP; the listener stops automatically after 30 minutes.
 pprof:
   enable: false
   addr: "127.0.0.1:8316"
@@ -205,6 +206,11 @@ codex:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
+# Concurrent /v1/ws relay connection limits. Values <= 0 use the safe defaults shown below.
+# Limits apply before the WebSocket upgrade; the per-IP limit uses the TCP peer address.
+# ws-max-connections: 128
+# ws-max-connections-per-ip: 16
+
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
@@ -213,14 +219,24 @@ nonstream-keepalive-interval: 0
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 #   flush-interval-ms: 25   # Default: 0 (disabled). Coalesces chunk flushes up to this delay.
 
-# Optional traffic safety guards. Global admission is disabled by default;
-# calibrate it against production traffic before enabling it.
+# Traffic safety guards. Global admission is enabled by default; calibrate the
+# capacity for production traffic or set enabled: false only as an emergency rollback.
 # request-guards:
+#   amplification:
+#     mode: observe                   # Default for file config. Switch to enforce after checking exceeded transform metrics.
+#                                      # Default bound: input + max(256 KiB, ceil(input * 25%)).
+#   payload-body-limit:
+#     mode: observe                   # Default for file config: observe. Switch to enforce after checking health metrics.
+#     json-bytes: 67108864            # Soft wire/decoded limit for JSON requests (64 MiB).
+#     multipart-bytes: 134217728      # Soft total limit for multipart requests (128 MiB).
+#     websocket-bytes: 67108864       # Soft per-frame limit for downstream WebSocket requests (64 MiB).
+#                                      # A fixed 256 MiB emergency ceiling always applies and is not configurable.
 #   global-admission:
-#     enabled: true                  # Default: false. Opt in after calibrating limits for this deployment.
+#     enabled: true                  # Default: true. Set false only to opt out explicitly.
 #     capacity: 128                  # Total weighted in-flight request capacity. <= 0 uses 128.
 #     max-queue: 64                  # Maximum local waiters. <= 0 uses 64.
-#     saturation-grace-seconds: 5   # Sustained full-queue time before /readyz returns 503. <= 0 uses 5.
+#     max-wait-seconds: 30           # Pre-upstream queue wait only. <= 0 uses 30; it never limits an established upstream request.
+#     saturation-grace-seconds: 5   # Sustained capacity pressure or queued work before /readyz returns 503. <= 0 uses 5.
 #   minimax-m27-highspeed-narrative:
 #     enabled: true
 #     max-concurrent: 4      # Matching requests above this wait before upstream execution.

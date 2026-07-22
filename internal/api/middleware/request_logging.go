@@ -4,19 +4,19 @@
 package middleware
 
 import (
-	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"hash"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
-
-const maxCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
@@ -42,8 +42,8 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 
 		loggerEnabled := logger.IsEnabled()
 
-		// Capture request information
-		requestInfo, err := captureRequestInfo(c, shouldCaptureRequestBody(loggerEnabled, c.Request))
+		// Capture request metadata without retaining raw body bytes.
+		requestInfo, err := captureRequestInfo(c)
 		if err != nil {
 			// Log error but continue processing
 			// In a real implementation, you might want to use a proper logger here
@@ -59,14 +59,14 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 		c.Writer = wrapper
 		attachRequestLogSources(c, logger, loggerEnabled)
 
-		// Process the request
+		defer func() {
+			if panicValue := recover(); panicValue != nil {
+				_ = wrapper.Abort(c)
+				panic(panicValue)
+			}
+			_ = wrapper.Finalize(c)
+		}()
 		c.Next()
-
-		// Finalize logging after request processing
-		if err = wrapper.Finalize(c); err != nil {
-			// Log error but don't interrupt the response
-			// In a real implementation, you might want to use a proper logger here
-		}
 	}
 }
 
@@ -119,27 +119,9 @@ func isResponsesWebsocketUpgrade(req *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(req.Header.Get("Upgrade")), "websocket")
 }
 
-func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
-	if loggerEnabled {
-		return true
-	}
-	if req == nil || req.Body == nil {
-		return false
-	}
-	contentType := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Type")))
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return false
-	}
-	if req.ContentLength <= 0 {
-		return false
-	}
-	return req.ContentLength <= maxCapturedRequestBodyBytes
-}
-
 // captureRequestInfo extracts relevant information from the incoming HTTP request.
-// It captures the URL, method, headers, and body. The request body is read and then
-// restored so that it can be processed by subsequent handlers.
-func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) {
+// The request body is wrapped with a streaming digest and is never buffered for logs.
+func captureRequestInfo(c *gin.Context) (*RequestInfo, error) {
 	// Capture URL with sensitive query parameters masked
 	maskedQuery := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
 	url := c.Request.URL.Path
@@ -151,50 +133,78 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	method := c.Request.Method
 
 	// Capture headers
-	headers := make(map[string][]string)
+	headers := make(map[string][]string, len(c.Request.Header))
 	for key, values := range c.Request.Header {
-		headers[key] = values
+		headers[key] = append([]string(nil), values...)
 	}
 
-	// Capture request body
-	var body []byte
-	if captureBody && c.Request.Body != nil {
-		originalBody := c.Request.Body
-		bodyBytes, err := io.ReadAll(io.LimitReader(originalBody, maxCapturedRequestBodyBytes+1))
-		if err != nil {
-			return nil, err
+	var bodyCapture *requestBodyMetadataCapture
+	if c.Request.Body != nil {
+		bodyCapture = &requestBodyMetadataCapture{
+			body:          c.Request.Body,
+			digest:        sha256.New(),
+			contentLength: c.Request.ContentLength,
+			contentType:   c.Request.Header.Get("Content-Type"),
 		}
-
-		// Replay the captured prefix and leave the unread tail for the handler.
-		c.Request.Body = struct {
-			io.Reader
-			io.Closer
-		}{Reader: io.MultiReader(bytes.NewReader(bodyBytes), originalBody), Closer: originalBody}
-		if int64(len(bodyBytes)) <= maxCapturedRequestBodyBytes {
-			body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
-		}
+		c.Request.Body = bodyCapture
 	}
 
 	return &RequestInfo{
-		URL:       url,
-		Method:    method,
-		Headers:   headers,
-		Body:      body,
-		RequestID: logging.GetGinRequestID(c),
-		Timestamp: time.Now(),
+		URL:         url,
+		Method:      method,
+		Headers:     headers,
+		bodyCapture: bodyCapture,
+		RequestID:   logging.GetGinRequestID(c),
+		Timestamp:   time.Now(),
 	}, nil
 }
 
-func decodeCapturedRequestBodyForLog(raw []byte, encoding string) []byte {
-	if len(raw) == 0 {
-		return raw
-	}
+type requestBodyMetadataCapture struct {
+	mu            sync.Mutex
+	body          io.ReadCloser
+	digest        hash.Hash
+	bytesRead     int64
+	contentLength int64
+	contentType   string
+	complete      bool
+}
 
-	decoded, errDecode := sdkhandlers.DecodeRequestBodyWithLimit(raw, encoding, maxCapturedRequestBodyBytes)
-	if errDecode != nil {
+func (c *requestBodyMetadataCapture) Read(payload []byte) (int, error) {
+	if c == nil || c.body == nil {
+		return 0, io.EOF
+	}
+	n, errRead := c.body.Read(payload)
+	c.mu.Lock()
+	if n > 0 {
+		_, _ = c.digest.Write(payload[:n])
+		c.bytesRead += int64(n)
+	}
+	if errRead == io.EOF || (c.contentLength >= 0 && c.bytesRead >= c.contentLength) {
+		c.complete = true
+	}
+	c.mu.Unlock()
+	return n, errRead
+}
+
+func (c *requestBodyMetadataCapture) Close() error {
+	if c == nil || c.body == nil {
 		return nil
 	}
-	return decoded
+	return c.body.Close()
+}
+
+func (c *requestBodyMetadataCapture) metadata() []byte {
+	if c == nil {
+		return logging.SummarizeBodyForLog(nil, "")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return logging.EncodeBodyLogMetadata(logging.BodyLogMetadata{
+		Bytes:       c.bytesRead,
+		SHA256:      hex.EncodeToString(c.digest.Sum(nil)),
+		ContentType: c.contentType,
+		Truncated:   !c.complete && (c.bytesRead > 0 || c.contentLength > 0),
+	})
 }
 
 // shouldLogRequest determines whether the request should be logged.

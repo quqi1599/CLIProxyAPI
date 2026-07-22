@@ -99,3 +99,31 @@ func TestForwardStreamTerminalErrorFlushesImmediatelyWhenCoalescing(t *testing.T
 		t.Fatalf("flush count = %d, want immediate terminal-error flush", got)
 	}
 }
+
+func TestForwardStreamNeverWritesDoneWhenTerminalErrorRacesDataClose(t *testing.T) {
+	const iterations = 1000
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+
+	for i := 0; i < iterations; i++ {
+		c := newForwardStreamTestContext()
+		flusher := &countingFlusher{}
+		data := make(chan []byte)
+		close(data)
+		errs := make(chan *interfaces.ErrorMessage, 1)
+		terminalErr := errors.New("upstream protocol error")
+		errs <- &interfaces.ErrorMessage{Error: terminalErr}
+		close(errs)
+
+		wroteError := false
+		wroteDone := false
+		var cancelErr error
+		handler.ForwardStream(c, flusher, func(err error) { cancelErr = err }, data, errs, StreamForwardOptions{
+			WriteTerminalError: func(StreamBodyWriter, *interfaces.ErrorMessage) { wroteError = true },
+			WriteDone:          func(StreamBodyWriter) { wroteDone = true },
+		})
+
+		if !wroteError || wroteDone || !errors.Is(cancelErr, terminalErr) {
+			t.Fatalf("iteration %d: wroteError=%v wroteDone=%v cancelErr=%v", i, wroteError, wroteDone, cancelErr)
+		}
+	}
+}

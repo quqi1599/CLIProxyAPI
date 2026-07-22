@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -169,7 +170,10 @@ func TestCollectXAIImagesFromJSONNormalizesLooseImageReferences(t *testing.T) {
 		]
 	}`)
 
-	images := collectXAIImagesFromJSON(raw)
+	images, err := collectXAIImagesFromJSON(raw)
+	if err != nil {
+		t.Fatalf("collectXAIImagesFromJSON() error = %v", err)
+	}
 
 	want := []string{
 		"data:image/png;base64,iVBORw0KGgo=",
@@ -184,6 +188,26 @@ func TestCollectXAIImagesFromJSONNormalizesLooseImageReferences(t *testing.T) {
 		if images[i] != want[i] {
 			t.Fatalf("images[%d] = %q, want %q; all=%#v", i, images[i], want[i], images)
 		}
+	}
+}
+
+func TestCollectXAIImagesFromJSONRejectsTooManyReferences(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"images":[`)
+	for idx := 0; idx < maxImagesEditReferences+1; idx++ {
+		if idx > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`"https://example.com/image.png"`)
+	}
+	body.WriteString(`]}`)
+
+	images, err := collectXAIImagesFromJSON([]byte(body.String()))
+	if err == nil {
+		t.Fatalf("images = %d, want reference-limit error", len(images))
+	}
+	if !strings.Contains(err.Error(), "at most 16") {
+		t.Fatalf("error = %q, want stable reference limit", err)
 	}
 }
 
@@ -301,6 +325,41 @@ func TestBuildOpenAICompatImagesJSONRequestDropsToolControlFields(t *testing.T) 
 	for _, field := range openAICompatImagesToolControlFields {
 		if gjson.GetBytes(req, field).Exists() {
 			t.Fatalf("%s should be removed from images request: %s", field, string(req))
+		}
+	}
+}
+
+func TestBuildOpenAICompatImagesJSONRequestPreservesUnknownFieldOrder(t *testing.T) {
+	raw := []byte(`{"before":{"nested":[1,2]},"model":"old","prompt":"draw","tools":[{"type":"image_generation"}],"middle":7,"stream":false,"after":"keep"}`)
+	req := buildOpenAICompatImagesJSONRequest(raw, "upstream-image", true)
+
+	if got := gjson.GetBytes(req, "before.nested.1").Int(); got != 2 {
+		t.Fatalf("unknown nested field lost: %s", req)
+	}
+	if got := gjson.GetBytes(req, "after").String(); got != "keep" {
+		t.Fatalf("unknown trailing field lost: %s", req)
+	}
+	if gjson.GetBytes(req, "tools").Exists() {
+		t.Fatalf("tools field was not removed: %s", req)
+	}
+	ordered := []string{`"before"`, `"model"`, `"prompt"`, `"middle"`, `"stream"`, `"after"`}
+	previous := -1
+	for _, field := range ordered {
+		index := strings.Index(string(req), field)
+		if index <= previous {
+			t.Fatalf("field order changed at %s: %s", field, req)
+		}
+		previous = index
+	}
+}
+
+func BenchmarkPayloadGrowthOpenAICompatImagesRequest(b *testing.B) {
+	raw := []byte(`{"before":{"nested":"` + strings.Repeat("x", 1<<20) + `"},"model":"old","prompt":"draw","tools":[],"parallel_tool_calls":true,"stream":false,"after":"keep"}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for idx := 0; idx < b.N; idx++ {
+		if out := buildOpenAICompatImagesJSONRequest(raw, "upstream-image", true); len(out) == 0 {
+			b.Fatal("empty output")
 		}
 	}
 }
@@ -503,26 +562,25 @@ func TestShouldStreamImagesRequestRequiresSSEAccept(t *testing.T) {
 	}
 }
 
-func TestImageEmptyOutputMessageUsesUpstreamReason(t *testing.T) {
-	payload := []byte(`{"type":"response.completed","response":{"status":"failed","error":{"message":"The content you provided is blocked."},"output":[]}}`)
+func TestImageEmptyOutputMessageSummarizesUpstreamReason(t *testing.T) {
+	const secret = "image-upstream-error-sentinel"
+	payload := []byte("{\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"" + secret + "\"},\"output\":[]}}")
 
 	got := imageEmptyOutputMessage(payload)
 
-	if !strings.Contains(got, "content you provided is blocked") {
-		t.Fatalf("message = %q, want upstream reason", got)
-	}
-	if strings.Contains(got, "upstream did not return image output") {
-		t.Fatalf("message should not use generic empty output fallback: %q", got)
+	if strings.Contains(got, secret) || !strings.Contains(got, "upstream image generation failed: status=failed") || !strings.Contains(got, "sha256") {
+		t.Fatalf("message = %q, want safe failure classification and metadata", got)
 	}
 }
 
-func TestImageEmptyOutputMessageUsesToolCallStatus(t *testing.T) {
-	payload := []byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"image_generation_call","status":"failed","error":{"message":"image tool unavailable"}}]}}`)
+func TestImageEmptyOutputMessageSummarizesToolCallStatus(t *testing.T) {
+	const secret = "image-tool-error-sentinel"
+	payload := []byte("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"image_generation_call\",\"status\":\"failed\",\"error\":{\"message\":\"" + secret + "\"}}]}}")
 
 	got := imageEmptyOutputMessage(payload)
 
-	if !strings.Contains(got, "image tool unavailable") {
-		t.Fatalf("message = %q, want tool call reason", got)
+	if strings.Contains(got, secret) || !strings.Contains(got, "upstream image generation call failed: status=failed") || !strings.Contains(got, "sha256") {
+		t.Fatalf("message = %q, want safe tool failure classification and metadata", got)
 	}
 }
 
@@ -583,6 +641,98 @@ func TestImagesEditsMultipartRejectsUnsupportedModel(t *testing.T) {
 	resp := performImagesEndpointRequest(t, imagesEditsPath, writer.FormDataContentType(), &body, handler.ImagesEdits)
 
 	assertUnsupportedImagesModelResponse(t, resp, "gpt-5.4-mini")
+}
+
+func TestImagesEditsMultipartRejectsTooManyFilesBeforeReadingThem(t *testing.T) {
+	handler := &OpenAIAPIHandler{}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("model", defaultXAIImagesModel); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+	if err := writer.WriteField("prompt", "edit"); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	for idx := 0; idx < maxImagesEditReferences+1; idx++ {
+		part, errCreate := writer.CreateFormFile("image[]", fmt.Sprintf("image-%d.png", idx))
+		if errCreate != nil {
+			t.Fatalf("create image %d: %v", idx, errCreate)
+		}
+		if _, errWrite := part.Write([]byte("x")); errWrite != nil {
+			t.Fatalf("write image %d: %v", idx, errWrite)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	resp := performImagesEndpointRequest(t, imagesEditsPath, writer.FormDataContentType(), &body, handler.ImagesEdits)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if message := gjson.GetBytes(resp.Body.Bytes(), "error.message").String(); !strings.Contains(message, "at most 16 images") {
+		t.Fatalf("message = %q, want image-count limit", message)
+	}
+}
+
+func TestImagesEditsMultipartUsesStableTooLargeResponse(t *testing.T) {
+	handler := &OpenAIAPIHandler{}
+
+	t.Run("total body", func(t *testing.T) {
+		previousLimit := openAICompatImagesMaxMultipartBodyBytes
+		openAICompatImagesMaxMultipartBodyBytes = 4
+		defer func() { openAICompatImagesMaxMultipartBodyBytes = previousLimit }()
+
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		if err := writer.WriteField("model", "gpt-image-2"); err != nil {
+			t.Fatalf("write model: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+
+		resp := performImagesEndpointRequest(t, imagesEditsPath, writer.FormDataContentType(), &body, handler.ImagesEdits)
+		if resp.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusRequestEntityTooLarge, resp.Body.String())
+		}
+		if got := gjson.GetBytes(resp.Body.Bytes(), "error.code").String(); got != "request_too_large" {
+			t.Fatalf("error.code = %q", got)
+		}
+	})
+
+	t.Run("unused file", func(t *testing.T) {
+		previousLimit := openAICompatImagesMaxUploadFileBytes
+		openAICompatImagesMaxUploadFileBytes = 4
+		defer func() { openAICompatImagesMaxUploadFileBytes = previousLimit }()
+
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		if err := writer.WriteField("model", "gpt-image-2"); err != nil {
+			t.Fatalf("write model: %v", err)
+		}
+		if err := writer.WriteField("prompt", "edit this"); err != nil {
+			t.Fatalf("write prompt: %v", err)
+		}
+		part, err := writer.CreateFormFile("unused", "unused.bin")
+		if err != nil {
+			t.Fatalf("create file: %v", err)
+		}
+		if _, err = part.Write([]byte("12345")); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		if err = writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+
+		resp := performImagesEndpointRequest(t, imagesEditsPath, writer.FormDataContentType(), &body, handler.ImagesEdits)
+		if resp.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusRequestEntityTooLarge, resp.Body.String())
+		}
+		if got := gjson.GetBytes(resp.Body.Bytes(), "error.code").String(); got != "request_too_large" {
+			t.Fatalf("error.code = %q", got)
+		}
+	})
 }
 
 func TestImagesGenerationsMissingPromptReturnsActionableMessage(t *testing.T) {

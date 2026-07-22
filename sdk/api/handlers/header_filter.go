@@ -103,3 +103,37 @@ func WriteUpstreamHeaders(dst http.Header, src http.Header) {
 		}
 	}
 }
+
+// FilterErrorAddonHeaders keeps Retry-After for retryable failures and only
+// keeps other safe upstream headers when passthrough is explicitly enabled.
+func FilterErrorAddonHeaders(addon http.Header, passthrough bool) http.Header {
+	filtered := FilterUpstreamHeaders(addon)
+	if passthrough || len(filtered) == 0 {
+		return filtered
+	}
+	for key := range filtered {
+		if !strings.EqualFold(key, "Retry-After") {
+			delete(filtered, key)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+// WriteErrorAddonHeaders writes the filtered error headers to dst.
+func WriteErrorAddonHeaders(dst, addon http.Header, passthrough bool) {
+	if dst == nil {
+		return
+	}
+	for key, values := range FilterErrorAddonHeaders(addon, passthrough) {
+		if len(values) == 0 {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}

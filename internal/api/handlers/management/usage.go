@@ -76,9 +76,9 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		return
 	}
 
-	data, err := c.GetRawData()
+	data, err := readManagementRequestBody(c, maxManagementJSONBodyBytes)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		writeManagementRequestBodyError(c, err)
 		return
 	}
 

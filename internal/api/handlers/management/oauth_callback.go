@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -25,7 +26,11 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 	}
 
 	var req oauthCallbackRequest
-	if errBindJSON := c.ShouldBindJSON(&req); errBindJSON != nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &req); errBindJSON != nil {
+		if sdkhandlers.IsRequestBodyTooLarge(errBindJSON) {
+			writeManagementRequestBodyError(c, errBindJSON)
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid body"})
 		return
 	}

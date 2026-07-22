@@ -3,6 +3,7 @@ package util
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1088,4 +1089,69 @@ func TestCleanJSONSchemaForAntigravity_UniqueItemsStripped(t *testing.T) {
 	if !strings.Contains(result, "uniqueItems: true") {
 		t.Errorf("uniqueItems hint missing in description")
 	}
+}
+
+func TestCleanJSONSchemaForGemini_LargeSchemaPreservesUnknownFieldsAndInput(t *testing.T) {
+	const propertyCount = 2048
+	input := buildLargeGeminiSchema(propertyCount)
+	original := input
+
+	result := CleanJSONSchemaForGemini(input)
+
+	if input != original {
+		t.Fatal("schema cleanup mutated its input")
+	}
+	properties := gjson.Get(result, "properties")
+	if !properties.IsObject() || len(properties.Map()) != propertyCount {
+		t.Fatalf("property count = %d, want %d", len(properties.Map()), propertyCount)
+	}
+	if got := properties.Get("field_2047.vendor.trace").String(); got != "keep-2047" {
+		t.Fatalf("unknown field = %q, want %q", got, "keep-2047")
+	}
+	if properties.Get("field_2047.minLength").Exists() {
+		t.Fatal("unsupported constraint was not removed")
+	}
+	if got := properties.Get("field_2047.enum.0").String(); got != "2047" {
+		t.Fatalf("enum value = %q, want %q", got, "2047")
+	}
+}
+
+func BenchmarkCleanJSONSchemaForGemini_LargeSchema(b *testing.B) {
+	for _, propertyCount := range []int{256, 1024, 4096} {
+		b.Run(strconv.Itoa(propertyCount), func(b *testing.B) {
+			input := buildLargeGeminiSchema(propertyCount)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				_ = CleanJSONSchemaForGemini(input)
+			}
+		})
+	}
+}
+
+func buildLargeGeminiSchema(propertyCount int) string {
+	properties := make(map[string]any, propertyCount)
+	required := make([]string, propertyCount)
+	for i := 0; i < propertyCount; i++ {
+		name := "field_" + strconv.Itoa(i)
+		required[i] = name
+		properties[name] = map[string]any{
+			"type":      "integer",
+			"enum":      []int{i, i + 1},
+			"minLength": 1,
+			"vendor": map[string]any{
+				"trace": "keep-" + strconv.Itoa(i),
+			},
+		}
+	}
+	raw, err := json.Marshal(map[string]any{
+		"type":       "object",
+		"properties": properties,
+		"required":   required,
+		"vendorRoot": map[string]any{"preserve": true},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
 }

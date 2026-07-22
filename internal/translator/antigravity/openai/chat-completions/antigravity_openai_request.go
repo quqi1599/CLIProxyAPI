@@ -3,10 +3,10 @@
 package chat_completions
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -110,249 +110,154 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	messages := gjson.GetBytes(rawJSON, "messages")
 	if messages.IsArray() {
 		arr := messages.Array()
-		// First pass: assistant tool_calls id->name map
-		tcID2Name := map[string]string{}
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			if m.Get("role").String() == "assistant" {
-				tcs := m.Get("tool_calls")
-				if tcs.IsArray() {
-					for _, tc := range tcs.Array() {
-						if tc.Get("type").String() == "function" {
-							id := tc.Get("id").String()
-							name := tc.Get("function.name").String()
-							if id != "" && name != "" {
-								tcID2Name[id] = name
-							}
-						}
+		tcID2Name := make(map[string]string)
+		toolResponses := make(map[string]string)
+		for _, message := range arr {
+			if message.Get("role").String() == "assistant" {
+				for _, toolCall := range message.Get("tool_calls").Array() {
+					if toolCall.Get("type").String() != "function" {
+						continue
+					}
+					id := toolCall.Get("id").String()
+					name := toolCall.Get("function.name").String()
+					if id != "" && name != "" {
+						tcID2Name[id] = name
 					}
 				}
 			}
-		}
-
-		// Second pass build systemInstruction/tool responses cache
-		toolResponses := map[string]string{} // tool_call_id -> response text
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			role := m.Get("role").String()
-			if role == "tool" {
-				toolCallID := m.Get("tool_call_id").String()
-				if toolCallID != "" {
-					c := m.Get("content")
-					toolResponses[toolCallID] = c.Raw
+			if message.Get("role").String() == "tool" {
+				if id := message.Get("tool_call_id").String(); id != "" {
+					toolResponses[id] = message.Get("content").Raw
 				}
 			}
 		}
 
-		systemPartIndex := 0
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			role := m.Get("role").String()
-			content := m.Get("content")
-
+		systemParts := make([][]byte, 0)
+		requestContents := make([][]byte, 0, len(arr))
+		for _, message := range arr {
+			role := message.Get("role").String()
+			content := message.Get("content")
 			if (role == "system" || role == "developer") && len(arr) > 1 {
-				// system -> request.systemInstruction as a user message style
-				if content.Type == gjson.String {
-					out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("request.systemInstruction.parts.%d.text", systemPartIndex), content.String())
-					systemPartIndex++
-				} else if content.IsObject() && content.Get("type").String() == "text" {
-					out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("request.systemInstruction.parts.%d.text", systemPartIndex), content.Get("text").String())
-					systemPartIndex++
-				} else if content.IsArray() {
-					contents := content.Array()
-					if len(contents) > 0 {
-						out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
-						for j := 0; j < len(contents); j++ {
-							out, _ = sjson.SetBytes(out, fmt.Sprintf("request.systemInstruction.parts.%d.text", systemPartIndex), contents[j].Get("text").String())
-							systemPartIndex++
-						}
-					}
-				}
-			} else if role == "user" || ((role == "system" || role == "developer") && len(arr) == 1) {
-				// Build single user content node to avoid splitting into multiple contents
-				node := []byte(`{"role":"user","parts":[]}`)
-				if content.Type == gjson.String {
-					node, _ = sjson.SetBytes(node, "parts.0.text", content.String())
-				} else if content.IsArray() {
-					items := content.Array()
-					p := 0
-					for _, item := range items {
-						switch item.Get("type").String() {
-						case "text":
-							text := item.Get("text").String()
-							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
-							}
-						case "image_url":
-							imageURL := item.Get("image_url.url").String()
-							if len(imageURL) > 5 {
-								pieces := strings.SplitN(imageURL[5:], ";", 2)
-								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									mime := pieces[0]
-									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mimeType", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", antigravityFunctionThoughtSignature)
-									p++
-								}
-							}
-						case "file":
-							filename := item.Get("file.filename").String()
-							fileData := item.Get("file.file_data").String()
-							ext := ""
-							if sp := strings.Split(filename, "."); len(sp) > 1 {
-								ext = sp[len(sp)-1]
-							}
-							if mimeType, ok := misc.MimeTypes[ext]; ok {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mimeType", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", fileData)
-								p++
-							} else {
-								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
-							}
-						case "input_audio":
-							audioData := item.Get("input_audio.data").String()
-							audioFormat := item.Get("input_audio.format").String()
-							if audioData != "" {
-								audioMimeMap := map[string]string{
-									"mp3":       "audio/mpeg",
-									"wav":       "audio/wav",
-									"ogg":       "audio/ogg",
-									"flac":      "audio/flac",
-									"aac":       "audio/aac",
-									"webm":      "audio/webm",
-									"pcm16":     "audio/pcm",
-									"g711_ulaw": "audio/basic",
-									"g711_alaw": "audio/basic",
-								}
-								mimeType := "audio/wav"
-								if audioFormat != "" {
-									if mapped, ok := audioMimeMap[audioFormat]; ok {
-										mimeType = mapped
-									} else {
-										mimeType = "audio/" + audioFormat
-									}
-								}
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", audioData)
-								p++
-							}
-						}
-					}
-				}
-				out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
-			} else if role == "assistant" {
-				node := []byte(`{"role":"model","parts":[]}`)
-				p := 0
-				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == gjson.String && reasoningContent.String() != "" {
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", reasoningContent.String())
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thought", true)
-					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", antigravityFunctionThoughtSignature)
-					p++
-				}
-				if content.Type == gjson.String && content.String() != "" {
-					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
-					p++
-				} else if content.IsArray() {
-					// Assistant multimodal content (e.g. text + image) -> single model content with parts
+				switch {
+				case content.Type == gjson.String:
+					systemParts = append(systemParts, textPart(content.String()))
+				case content.IsObject() && content.Get("type").String() == "text":
+					systemParts = append(systemParts, textPart(content.Get("text").String()))
+				case content.IsArray():
 					for _, item := range content.Array() {
-						switch item.Get("type").String() {
-						case "text":
-							text := item.Get("text").String()
-							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
-							}
-						case "image_url":
-							// If the assistant returned an inline data URL, preserve it for history fidelity.
-							imageURL := item.Get("image_url.url").String()
-							if len(imageURL) > 5 { // expect data:...
-								pieces := strings.SplitN(imageURL[5:], ";", 2)
-								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									mime := pieces[0]
-									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mimeType", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", antigravityFunctionThoughtSignature)
-									p++
-								}
-							}
+						systemParts = append(systemParts, textPart(item.Get("text").String()))
+					}
+				}
+				continue
+			}
+
+			if role == "user" || ((role == "system" || role == "developer") && len(arr) == 1) {
+				parts := make([][]byte, 0)
+				if content.Type == gjson.String {
+					parts = append(parts, textPart(content.String()))
+				} else if content.IsArray() {
+					for _, item := range content.Array() {
+						if part := openAIContentPart(item, false); part != nil {
+							parts = append(parts, part)
 						}
 					}
 				}
+				requestContents = append(requestContents, contentNode("user", parts))
+				continue
+			}
 
-				// Tool calls -> single model content with functionCall parts
-				tcs := m.Get("tool_calls")
-				if tcs.IsArray() {
-					fIDs := make([]string, 0)
-					for _, tc := range tcs.Array() {
-						if tc.Get("type").String() != "function" {
-							continue
-						}
-						fid := tc.Get("id").String()
-						fname := util.SanitizeFunctionName(tc.Get("function.name").String())
-						if fname == "" {
-							continue
-						}
-						fargs := tc.Get("function.arguments").String()
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
-						if gjson.Valid(fargs) {
-							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
-						} else {
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.args.params", []byte(fargs))
-						}
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", antigravityFunctionThoughtSignature)
-						p++
-						if fid != "" {
-							fIDs = append(fIDs, fid)
-						}
+			if role != "assistant" {
+				continue
+			}
+			parts := make([][]byte, 0)
+			if reasoning := message.Get("reasoning_content"); reasoning.Type == gjson.String && reasoning.String() != "" {
+				part := textPart(reasoning.String())
+				part, _ = sjson.SetBytes(part, "thought", true)
+				part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
+				parts = append(parts, part)
+			}
+			if content.Type == gjson.String && content.String() != "" {
+				parts = append(parts, textPart(content.String()))
+			} else if content.IsArray() {
+				for _, item := range content.Array() {
+					if part := openAIContentPart(item, true); part != nil {
+						parts = append(parts, part)
 					}
-					if p > 0 {
-						out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
-					}
-
-					// Append a single tool content combining name + response per function
-					toolNode := []byte(`{"role":"user","parts":[]}`)
-					pp := 0
-					for _, fid := range fIDs {
-						if name, ok := tcID2Name[fid]; ok {
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", util.SanitizeFunctionName(name))
-							resp := toolResponses[fid]
-							if resp == "" {
-								resp = "{}"
-							}
-							// Handle non-JSON output gracefully (matches dev branch approach)
-							if resp != "null" {
-								parsed := gjson.Parse(resp)
-								if parsed.Type == gjson.JSON {
-									toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
-								} else {
-									toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
-								}
-							}
-							pp++
-						}
-					}
-					if pp > 0 {
-						out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
-					}
-				} else if p > 0 {
-					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 				}
 			}
+
+			toolCalls := message.Get("tool_calls")
+			if !toolCalls.IsArray() {
+				if len(parts) > 0 {
+					requestContents = append(requestContents, contentNode("model", parts))
+				}
+				continue
+			}
+			functionIDs := make([]string, 0)
+			for _, toolCall := range toolCalls.Array() {
+				if toolCall.Get("type").String() != "function" {
+					continue
+				}
+				name := util.SanitizeFunctionName(toolCall.Get("function.name").String())
+				if name == "" {
+					continue
+				}
+				id := toolCall.Get("id").String()
+				arguments := toolCall.Get("function.arguments").String()
+				part := []byte(`{"functionCall":{"id":"","name":""},"thoughtSignature":"skip_thought_signature_validator"}`)
+				part, _ = sjson.SetBytes(part, "functionCall.id", id)
+				part, _ = sjson.SetBytes(part, "functionCall.name", name)
+				if gjson.Valid(arguments) {
+					part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(arguments))
+				} else {
+					part, _ = sjson.SetBytes(part, "functionCall.args.params", []byte(arguments))
+				}
+				parts = append(parts, part)
+				if id != "" {
+					functionIDs = append(functionIDs, id)
+				}
+			}
+			if len(parts) > 0 {
+				requestContents = append(requestContents, contentNode("model", parts))
+			}
+
+			responseParts := make([][]byte, 0, len(functionIDs))
+			for _, id := range functionIDs {
+				name, ok := tcID2Name[id]
+				if !ok {
+					continue
+				}
+				response := toolResponses[id]
+				if response == "" {
+					response = "{}"
+				}
+				part := []byte(`{"functionResponse":{"id":"","name":"","response":{}}}`)
+				part, _ = sjson.SetBytes(part, "functionResponse.id", id)
+				part, _ = sjson.SetBytes(part, "functionResponse.name", util.SanitizeFunctionName(name))
+				if response != "null" {
+					parsed := gjson.Parse(response)
+					if parsed.Type == gjson.JSON {
+						part, _ = sjson.SetRawBytes(part, "functionResponse.response.result", []byte(parsed.Raw))
+					} else {
+						part, _ = sjson.SetBytes(part, "functionResponse.response.result", response)
+					}
+				}
+				responseParts = append(responseParts, part)
+			}
+			if len(responseParts) > 0 {
+				requestContents = append(requestContents, contentNode("user", responseParts))
+			}
 		}
+		if len(systemParts) > 0 {
+			out, _ = sjson.SetRawBytes(out, "request.systemInstruction", contentNode("user", systemParts))
+		}
+		out, _ = sjson.SetRawBytes(out, "request.contents", internalpayload.BuildRaw(requestContents))
 	}
 
 	// tools -> request.tools[].functionDeclarations + request.tools[].googleSearch/codeExecution/urlContext passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
-		functionToolNode := []byte(`{}`)
-		hasFunction := false
+		functionDeclarations := make([][]byte, 0)
 		googleSearchNodes := make([][]byte, 0)
 		codeExecutionNodes := make([][]byte, 0)
 		urlContextNodes := make([][]byte, 0)
@@ -399,34 +304,17 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					fnRawBytes := []byte(fnRaw)
 					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
 					fnRaw, _ = sjson.Delete(string(fnRawBytes), "strict")
-					if !hasFunction {
-						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
-					}
-					tmp, errSet := sjson.SetRawBytes(functionToolNode, "functionDeclarations.-1", []byte(fnRaw))
-					if errSet != nil {
-						log.Warnf("Failed to append tool declaration for '%s': %v", fn.Get("name").String(), errSet)
-						continue
-					}
-					functionToolNode = tmp
-					hasFunction = true
+					functionDeclarations = append(functionDeclarations, []byte(fnRaw))
 				}
 			}
 			if t.Get("type").String() == "web_search" {
 				hasWebSearchTool = true
-				googleToolNode := []byte(`{}`)
-				var errSet error
-				googleToolNode, errSet = sjson.SetRawBytes(googleToolNode, "googleSearch", []byte(`{}`))
-				if errSet != nil {
-					log.Warnf("Failed to set googleSearch tool for web_search: %v", errSet)
-					continue
-				}
-				googleSearchNodes = append(googleSearchNodes, googleToolNode)
+				googleSearchNodes = append(googleSearchNodes, []byte(`{"googleSearch":{}}`))
 			}
 			if gs := t.Get("google_search"); gs.Exists() {
 				hasWebSearchTool = true
 				googleToolNode := []byte(`{}`)
-				var errSet error
-				googleToolNode, errSet = sjson.SetRawBytes(googleToolNode, "googleSearch", []byte(gs.Raw))
+				googleToolNode, errSet := sjson.SetRawBytes(googleToolNode, "googleSearch", []byte(gs.Raw))
 				if errSet != nil {
 					log.Warnf("Failed to set googleSearch tool: %v", errSet)
 					continue
@@ -435,8 +323,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 			if ce := t.Get("code_execution"); ce.Exists() {
 				codeToolNode := []byte(`{}`)
-				var errSet error
-				codeToolNode, errSet = sjson.SetRawBytes(codeToolNode, "codeExecution", []byte(ce.Raw))
+				codeToolNode, errSet := sjson.SetRawBytes(codeToolNode, "codeExecution", []byte(ce.Raw))
 				if errSet != nil {
 					log.Warnf("Failed to set codeExecution tool: %v", errSet)
 					continue
@@ -445,8 +332,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 			if uc := t.Get("url_context"); uc.Exists() {
 				urlToolNode := []byte(`{}`)
-				var errSet error
-				urlToolNode, errSet = sjson.SetRawBytes(urlToolNode, "urlContext", []byte(uc.Raw))
+				urlToolNode, errSet := sjson.SetRawBytes(urlToolNode, "urlContext", []byte(uc.Raw))
 				if errSet != nil {
 					log.Warnf("Failed to set urlContext tool: %v", errSet)
 					continue
@@ -454,21 +340,17 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
-		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
-			toolsNode := []byte("[]")
-			if hasFunction {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolNode)
-			}
-			for _, googleNode := range googleSearchNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleNode)
-			}
-			for _, codeNode := range codeExecutionNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", codeNode)
-			}
-			for _, urlNode := range urlContextNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", urlNode)
-			}
-			out, _ = sjson.SetRawBytes(out, "request.tools", toolsNode)
+		toolNodes := make([][]byte, 0, 1+len(googleSearchNodes)+len(codeExecutionNodes)+len(urlContextNodes))
+		if len(functionDeclarations) > 0 {
+			functionToolNode := []byte(`{"functionDeclarations":[]}`)
+			functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", internalpayload.BuildRaw(functionDeclarations))
+			toolNodes = append(toolNodes, functionToolNode)
+		}
+		toolNodes = append(toolNodes, googleSearchNodes...)
+		toolNodes = append(toolNodes, codeExecutionNodes...)
+		toolNodes = append(toolNodes, urlContextNodes...)
+		if len(toolNodes) > 0 {
+			out, _ = sjson.SetRawBytes(out, "request.tools", internalpayload.BuildRaw(toolNodes))
 		}
 	}
 
@@ -481,5 +363,96 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
 }
 
-// itoa converts int to string without strconv import for few usages.
-func itoa(i int) string { return fmt.Sprintf("%d", i) }
+func textPart(text string) []byte {
+	part := []byte(`{"text":""}`)
+	part, _ = sjson.SetBytes(part, "text", text)
+	return part
+}
+
+func contentNode(role string, parts [][]byte) []byte {
+	node := []byte(`{"role":"","parts":[]}`)
+	node, _ = sjson.SetBytes(node, "role", role)
+	node, _ = sjson.SetRawBytes(node, "parts", internalpayload.BuildRaw(parts))
+	return node
+}
+
+func openAIContentPart(item gjson.Result, assistant bool) []byte {
+	switch item.Get("type").String() {
+	case "text":
+		if text := item.Get("text").String(); text != "" {
+			return textPart(text)
+		}
+	case "image_url":
+		imageURL := item.Get("image_url.url").String()
+		if len(imageURL) <= 5 {
+			return nil
+		}
+		pieces := strings.SplitN(imageURL[5:], ";", 2)
+		if len(pieces) != 2 || len(pieces[1]) <= 7 {
+			return nil
+		}
+		part := []byte(`{"inlineData":{"mimeType":"","data":""},"thoughtSignature":"skip_thought_signature_validator"}`)
+		part, _ = sjson.SetBytes(part, "inlineData.mimeType", pieces[0])
+		part, _ = sjson.SetBytes(part, "inlineData.data", pieces[1][7:])
+		return part
+	case "file":
+		if assistant {
+			return nil
+		}
+		filename := item.Get("file.filename").String()
+		fileData := item.Get("file.file_data").String()
+		extension := ""
+		if pieces := strings.Split(filename, "."); len(pieces) > 1 {
+			extension = pieces[len(pieces)-1]
+		}
+		mimeType, ok := misc.MimeTypes[extension]
+		if !ok {
+			log.Warnf("Unknown file name extension '%s' in user message, skip", extension)
+			return nil
+		}
+		part := []byte(`{"inlineData":{"mimeType":"","data":""}}`)
+		part, _ = sjson.SetBytes(part, "inlineData.mimeType", mimeType)
+		part, _ = sjson.SetBytes(part, "inlineData.data", fileData)
+		return part
+	case "input_audio":
+		if assistant {
+			return nil
+		}
+		audioData := item.Get("input_audio.data").String()
+		if audioData == "" {
+			return nil
+		}
+		audioFormat := item.Get("input_audio.format").String()
+		mimeType := audioMIMEType(audioFormat)
+		part := []byte(`{"inlineData":{"mime_type":"","data":""}}`)
+		part, _ = sjson.SetBytes(part, "inlineData.mime_type", mimeType)
+		part, _ = sjson.SetBytes(part, "inlineData.data", audioData)
+		return part
+	}
+	return nil
+}
+
+func audioMIMEType(format string) string {
+	switch format {
+	case "":
+		return "audio/wav"
+	case "mp3":
+		return "audio/mpeg"
+	case "wav":
+		return "audio/wav"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "webm":
+		return "audio/webm"
+	case "pcm16":
+		return "audio/pcm"
+	case "g711_ulaw", "g711_alaw":
+		return "audio/basic"
+	default:
+		return "audio/" + format
+	}
+}

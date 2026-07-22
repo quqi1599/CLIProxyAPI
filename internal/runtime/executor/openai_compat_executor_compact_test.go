@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -41,7 +42,8 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 		"api_key":  "test",
 	}}
 	payload := []byte(`{"model":"gpt-5.1-codex-max","input":[{"role":"user","content":"hi"}]}`)
-	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
+	resp, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.1-codex-max",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
@@ -64,6 +66,7 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
 		t.Fatalf("payload = %s", string(resp.Payload))
 	}
+	assertExecutorRequestTransformReport(t, ctx, releaseReport, openAICompatFinalSanitizeTransformStage, len(gotBody))
 }
 
 func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {
@@ -222,6 +225,83 @@ func TestOpenAICompatExecutorImagesGenerationsStreamsUpstream(t *testing.T) {
 	}
 	if !strings.Contains(streamed.String(), "event: image_generation.partial") || !strings.Contains(streamed.String(), "data: [DONE]") {
 		t.Fatalf("streamed body = %q", streamed.String())
+	}
+}
+
+func TestOpenAICompatExecutorImagesRawStreamNormalizesReadFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		connection, _, errHijack := w.(http.Hijacker).Hijack()
+		if errHijack != nil {
+			t.Errorf("Hijack() error = %v", errHijack)
+			return
+		}
+		_, _ = io.WriteString(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\npartial")
+		_ = connection.Close()
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	streamResult, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "upstream-image",
+		Payload: []byte(`{"model":"upstream-image","prompt":"draw","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-image"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/images/generations",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var sawPayload bool
+	var streamErr error
+	for chunk := range streamResult.Chunks {
+		if len(chunk.Payload) > 0 {
+			sawPayload = true
+		}
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if !sawPayload {
+		t.Fatal("partial raw response payload was not forwarded")
+	}
+	typed, ok := failurecontract.As(streamErr)
+	if !ok || typed.Kind != failurecontract.TransportError || typed.Scope != failurecontract.ScopeProvider || typed.HTTPStatus != http.StatusBadGateway || !typed.Retryable {
+		t.Fatalf("stream error = %#v, want retryable transport/provider 502", typed)
+	}
+}
+
+func TestOpenAICompatExecutorPreservesHTTPStatusWhenErrorBodyIsTruncated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		connection, _, errHijack := w.(http.Hijacker).Hijack()
+		if errHijack != nil {
+			t.Errorf("Hijack() error = %v", errHijack)
+			return
+		}
+		_, _ = io.WriteString(connection, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 128\r\nRetry-After: 7\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"rate limited\"}}")
+		_ = connection.Close()
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "test-model",
+		Payload: []byte(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want upstream status error")
+	}
+	statusProvider, ok := err.(interface{ StatusCode() int })
+	if !ok || statusProvider.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want status 429", err, err)
+	}
+	headerProvider, ok := err.(interface{ Headers() http.Header })
+	if !ok || headerProvider.Headers().Get("Retry-After") != "7" {
+		t.Fatalf("Retry-After was not preserved: %T %v", err, err)
 	}
 }
 
@@ -460,11 +540,18 @@ func TestOpenAICompatExecutorStreamRejectsPlainJSONAfterBlankLines(t *testing.T)
 	if gotErr == nil {
 		t.Fatalf("expected plain JSON stream error")
 	}
-	if status, ok := gotErr.(interface{ StatusCode() int }); !ok || status.StatusCode() != http.StatusBadGateway {
-		t.Fatalf("stream error status = %v, want %d", gotErr, http.StatusBadGateway)
+	typed, ok := failurecontract.As(gotErr)
+	if !ok {
+		t.Fatalf("stream error type = %T, want typed failure", gotErr)
 	}
-	if !strings.Contains(gotErr.Error(), "upstream failed") {
-		t.Fatalf("stream error = %v", gotErr)
+	if typed.Kind != failurecontract.UpstreamProtocolError || typed.Scope != failurecontract.ScopeProvider || typed.HTTPStatus != http.StatusBadGateway || typed.ProviderCode != openAICompatMalformedSSEEventCode {
+		t.Fatalf("stream error classification = %+v", typed)
+	}
+	if strings.Contains(gotErr.Error(), "upstream failed") {
+		t.Fatal("stream error exposed raw upstream body")
+	}
+	if !strings.Contains(gotErr.Error(), "category=malformed_sse_event") || !strings.Contains(gotErr.Error(), "sha256=") {
+		t.Fatalf("stream error lacks safe metadata: %v", gotErr)
 	}
 }
 

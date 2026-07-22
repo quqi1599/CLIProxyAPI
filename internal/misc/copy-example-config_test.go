@@ -1,6 +1,8 @@
 package misc
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,5 +58,21 @@ func TestCopyConfigTemplateUsesRemoteTemplateWhenLocalTemplateMissing(t *testing
 	}
 	if string(got) != remoteConfig {
 		t.Fatalf("copied config = %q, want %q", string(got), remoteConfig)
+	}
+}
+
+func TestCopyConfigTemplateRejectsOversizedSourceBeforeCreatingDestination(t *testing.T) {
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "config.example.yaml")
+	dst := filepath.Join(tmpDir, "config", "config.yaml")
+	if errWrite := os.WriteFile(src, bytes.Repeat([]byte{'x'}, maxConfigTemplateBytes+1), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+
+	if errCopy := CopyConfigTemplate(src, dst); errCopy == nil || !strings.Contains(errCopy.Error(), "maximum allowed size") {
+		t.Fatalf("CopyConfigTemplate() error = %v, want size limit error", errCopy)
+	}
+	if _, errStat := os.Stat(dst); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("destination stat error = %v, want not-exist", errStat)
 	}
 }

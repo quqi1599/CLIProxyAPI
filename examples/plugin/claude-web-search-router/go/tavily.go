@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 )
 
-const tavilySearchURL = "https://api.tavily.com/search"
+const (
+	tavilySearchURL        = "https://api.tavily.com/search"
+	maxTavilyResponseBytes = 4 << 20
+)
 
 type tavilyClient struct {
 	keys    []string
@@ -113,13 +117,12 @@ func (c *tavilyClient) search(ctx context.Context, query string, maxResults int)
 	if errDo != nil {
 		return nil, "", errDo
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, errRead := io.ReadAll(resp.Body)
+	body, errRead := httpfetch.ReadResponseBytes(resp, maxTavilyResponseBytes)
 	if errRead != nil {
 		return nil, "", errRead
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("tavily http %d: %s", resp.StatusCode, truncate(string(body), 512))
+		return nil, "", fmt.Errorf("tavily http %d: %s", resp.StatusCode, httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), body))
 	}
 	var parsed tavilySearchResponse
 	if errDecode := json.Unmarshal(body, &parsed); errDecode != nil {

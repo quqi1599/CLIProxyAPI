@@ -32,7 +32,8 @@ const (
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
-	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	maxReleaseMetadataSize       = 2 << 20
+	maxAssetDownloadSize         = 50 << 20 // 50 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -355,7 +356,7 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 		headers["Authorization"] = "Bearer " + tok
 	}
 
-	data, err := httpfetch.GetBytes(ctx, client, releaseURL, headers, 0)
+	data, err := httpfetch.GetBytes(ctx, client, releaseURL, headers, maxReleaseMetadataSize)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch release: %w", err)
 	}

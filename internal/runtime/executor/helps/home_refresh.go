@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -79,7 +80,7 @@ func RefreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxya
 
 	raw, err := client.GetRefreshAuth(ctx, authIndex)
 	if err != nil {
-		return nil, true, homeStatusErr{code: http.StatusBadGateway, msg: err.Error()}
+		return nil, true, homeStatusErr{code: http.StatusBadGateway, msg: "home refresh request failed"}
 	}
 
 	var env homeErrorEnvelope
@@ -88,10 +89,7 @@ func RefreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxya
 		if code == "" {
 			code = strings.TrimSpace(env.Error.Code)
 		}
-		msg := strings.TrimSpace(env.Error.Message)
-		if msg == "" {
-			msg = "home returned error"
-		}
+		msg := "home returned error: " + internalpayload.SummarizeBodyMetadata(raw, "application/json")
 		return nil, true, homeStatusErr{code: statusFromHomeErrorCode(code), msg: msg}
 	}
 

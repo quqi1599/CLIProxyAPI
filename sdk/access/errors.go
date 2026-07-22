@@ -14,6 +14,7 @@ const (
 	AuthErrorCodeInvalidCredential AuthErrorCode = "invalid_credential"
 	AuthErrorCodeNotHandled        AuthErrorCode = "not_handled"
 	AuthErrorCodeInternal          AuthErrorCode = "internal_error"
+	AuthErrorCodeRequestTooLarge   AuthErrorCode = "request_too_large"
 )
 
 // AuthError carries authentication failure details and HTTP status.
@@ -80,6 +81,12 @@ func NewInternalAuthError(message string, cause error) *AuthError {
 		normalizedMessage = "Authentication service error"
 	}
 	return newAuthError(AuthErrorCodeInternal, normalizedMessage, http.StatusInternalServerError, cause)
+}
+
+// NewRequestTooLargeAuthError rejects an oversized request before an
+// authentication provider receives or duplicates its body.
+func NewRequestTooLargeAuthError(cause error) *AuthError {
+	return newAuthError(AuthErrorCodeRequestTooLarge, "Request body exceeds the allowed size", http.StatusRequestEntityTooLarge, cause)
 }
 
 func IsAuthErrorCode(authErr *AuthError, code AuthErrorCode) bool {

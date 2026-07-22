@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -22,6 +23,7 @@ const (
 	antigravityCLIPlatform     = "darwin/arm64"
 	antigravityVersionCacheTTL = 6 * time.Hour
 	antigravityFetchTimeout    = 10 * time.Second
+	maxAntigravityGCSListBytes = 1 << 20
 	AntigravityNodeAPIClientUA = "google-api-nodejs-client/10.3.0"
 	AntigravityGoogAPIClientUA = "gl-node/22.21.1"
 )
@@ -278,7 +280,7 @@ func fetchAntigravityCLIUpdaterManifestVersion(ctx context.Context, client *http
 		return "", errors.New("antigravity CLI updater manifest returned empty version")
 	}
 	if _, ok := parseAntigravitySemVersion(version); !ok {
-		return "", fmt.Errorf("antigravity CLI updater manifest returned invalid version %q", version)
+		return "", fmt.Errorf("antigravity CLI updater manifest returned invalid version: %s", httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), raw))
 	}
 	return version, nil
 }
@@ -313,7 +315,7 @@ func fetchAntigravityCLILatestVersion(ctx context.Context, client *http.Client) 
 	}
 	semVersion, ok := parseAntigravitySemVersion(version)
 	if !ok {
-		return "", fmt.Errorf("antigravity CLI latest returned invalid version %q", version)
+		return "", fmt.Errorf("antigravity CLI latest returned invalid version: %s", httpfetch.ErrorBodyMetadata(resp.Header.Get("Content-Type"), raw))
 	}
 	return semVersion.raw, nil
 }
@@ -328,18 +330,17 @@ func fetchAntigravityCLIGCSLatestVersion(ctx context.Context, client *http.Clien
 	if errDo != nil {
 		return "", fmt.Errorf("fetch antigravity CLI GCS list: %w", errDo)
 	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.WithError(errClose).Warn("antigravity CLI GCS response body close error")
-		}
-	}()
+	raw, errRead := httpfetch.ReadResponseBytes(resp, maxAntigravityGCSListBytes)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("antigravity CLI GCS list returned status %d", resp.StatusCode)
 	}
+	if errRead != nil {
+		return "", fmt.Errorf("read antigravity CLI GCS list: %w", errRead)
+	}
 
 	var list antigravityGCSList
-	if errDecode := xml.NewDecoder(resp.Body).Decode(&list); errDecode != nil {
+	if errDecode := xml.Unmarshal(raw, &list); errDecode != nil {
 		return "", fmt.Errorf("decode antigravity CLI GCS list: %w", errDecode)
 	}
 

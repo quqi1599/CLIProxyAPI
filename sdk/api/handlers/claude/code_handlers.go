@@ -8,7 +8,6 @@ package claude
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,12 +19,15 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
+
+const maxClaudeCodeResponseBytes int64 = helps.DefaultUpstreamSuccessBodyBytes
 
 // ClaudeCodeAPIHandler contains the handlers for Claude API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -163,30 +165,39 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 		return
 	}
 
-	// Decompress gzipped responses - Claude API sometimes returns gzip without Content-Encoding header
-	// This fixes title generation and other non-streaming responses that arrive compressed
-	if len(resp) >= 2 && resp[0] == 0x1f && resp[1] == 0x8b {
-		gzReader, errGzip := gzip.NewReader(bytes.NewReader(resp))
-		if errGzip != nil {
-			log.Warnf("failed to decompress gzipped Claude response: %v", errGzip)
-		} else {
-			defer func() {
-				if errClose := gzReader.Close(); errClose != nil {
-					log.Warnf("failed to close Claude gzip reader: %v", errClose)
-				}
-			}()
-			decompressed, errRead := io.ReadAll(gzReader)
-			if errRead != nil {
-				log.Warnf("failed to read decompressed Claude response: %v", errRead)
-			} else {
-				resp = decompressed
-			}
-		}
+	// Claude-compatible upstreams occasionally return gzip bytes without a
+	// Content-Encoding header. Decode that fallback through the same bounded,
+	// single-member reader used by executors.
+	resp, errDecode := decodeClaudeCodeResponse(resp, maxClaudeCodeResponseBytes)
+	if errDecode != nil {
+		log.WithError(errDecode).Warn("failed to decode Claude response")
+		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+			Message: "Upstream response could not be decoded within the allowed size",
+			Type:    "upstream_error",
+			Code:    "upstream_response_decode_failed",
+		}})
+		cliCancel(errDecode)
+		return
 	}
 
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
+}
+
+func decodeClaudeCodeResponse(response []byte, maxDecodedBytes int64) ([]byte, error) {
+	if len(response) < 2 || response[0] != 0x1f || response[1] != 0x8b {
+		return response, nil
+	}
+	return helps.ReadBoundedUpstreamBody(
+		io.NopCloser(bytes.NewReader(response)),
+		"gzip",
+		http.StatusOK,
+		helps.UpstreamBodyLimits{
+			SuccessBytes:     maxDecodedBytes,
+			SuccessWireBytes: int64(len(response)),
+		},
+	)
 }
 
 // handleStreamingResponse streams Claude-compatible responses backed by Gemini.
@@ -373,16 +384,8 @@ func claudeErrorFromStatusText(status int, errText string) claudeErrorResponse {
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status, errText := claudeErrorStatusAndText(msg, helps.MaterializeAPIResponse(c))
-	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
-		for key, values := range msg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
+	if msg != nil && msg.Addon != nil {
+		handlers.WriteErrorAddonHeaders(c.Writer.Header(), msg.Addon, handlers.PassthroughHeadersEnabled(h.Cfg))
 	}
 
 	body, err := json.Marshal(claudeErrorFromStatusText(status, errText))
@@ -473,5 +476,5 @@ func appendClaudeAPIResponse(c *gin.Context, data []byte) {
 		c.Set("API_RESPONSE", combined)
 		return
 	}
-	c.Set("API_RESPONSE", bytes.Clone(data))
+	c.Set("API_RESPONSE", internalpayload.CloneBytes(data))
 }

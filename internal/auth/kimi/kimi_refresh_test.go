@@ -87,3 +87,25 @@ func TestRefreshToken_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T)
 		t.Fatalf("expected both refresh callers to share a single upstream call, got %d", got)
 	}
 }
+
+func TestRefreshTokenErrorDoesNotExposeBody(t *testing.T) {
+	resetKimiRefreshGroupForTest()
+	t.Cleanup(resetKimiRefreshGroupForTest)
+	const secret = "kimi-oauth-secret-marker"
+	client := &DeviceFlowClient{httpClient: &http.Client{Transport: kimiRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"` + secret + `"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Request:    req,
+		}, nil
+	})}}
+
+	_, err := client.RefreshToken(context.Background(), "refresh-token")
+	if err == nil {
+		t.Fatal("RefreshToken() error = nil")
+	}
+	if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"sha256":"`) {
+		t.Fatalf("unsafe refresh error: %v", err)
+	}
+}

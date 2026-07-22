@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
@@ -205,7 +206,11 @@ func (h *Handler) PatchPluginEnabled(c *gin.Context) {
 	var body struct {
 		Enabled *bool `json:"enabled"`
 	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Enabled == nil {
+	if errBindJSON := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &body); errBindJSON != nil {
+		writeManagementRequestBodyError(c, errBindJSON)
+		return
+	}
+	if body.Enabled == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "enabled is required"})
 		return
 	}
@@ -482,10 +487,12 @@ func pluginIDFromRequest(c *gin.Context) (string, bool) {
 }
 
 func readPluginConfigObject(c *gin.Context) (map[string]any, bool) {
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.UseNumber()
 	var body map[string]any
-	if errDecode := decoder.Decode(&body); errDecode != nil {
+	if errDecode := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &body); errDecode != nil {
+		if sdkhandlers.IsRequestBodyTooLarge(errDecode) {
+			writeManagementRequestBodyError(c, errDecode)
+			return nil, false
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errDecode.Error()})
 		return nil, false
 	}

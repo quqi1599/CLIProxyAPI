@@ -1,9 +1,11 @@
 package signature
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -159,8 +161,8 @@ func SanitizeClaudeMessagesSignaturesForTarget(payload []byte, opts ClaudeMessag
 			if len(keptParts) == 0 && opts.DropEmptyMessages {
 				continue
 			}
-			updated, _ := sjson.SetRaw(message.Raw, "content", "["+strings.Join(keptParts, ",")+"]")
-			keptMessages = append(keptMessages, updated)
+			updated, _ := sjson.SetRawBytes([]byte(message.Raw), "content", internalpayload.BuildRaw(keptParts))
+			keptMessages = append(keptMessages, string(updated))
 			continue
 		}
 
@@ -170,34 +172,20 @@ func SanitizeClaudeMessagesSignaturesForTarget(payload []byte, opts ClaudeMessag
 	if !modified {
 		return payload, report
 	}
-	output, _ := sjson.SetRawBytes(payload, "messages", []byte("["+strings.Join(keptMessages, ",")+"]"))
+	output, _ := sjson.SetRawBytes(payload, "messages", internalpayload.BuildRaw(keptMessages))
 	return output, report
 }
 
 func stripClaudeToolUseSignatureFields(part gjson.Result) (string, bool) {
-	updated := part.Raw
-	changed := false
+	edits := make(map[string]signatureJSONFieldEdit, len(claudeToolUseProvenancePaths()))
 	for _, sigPath := range claudeToolUseProvenancePaths() {
-		if !gjson.Get(updated, sigPath).Exists() {
-			continue
-		}
-		updated, _ = sjson.Delete(updated, sigPath)
-		changed = true
+		edits[sigPath] = signatureJSONFieldEdit{remove: true}
 	}
-	if cleaned, ok := deleteEmptyJSONObjectPath(updated, "extra_content.google"); ok {
-		updated = cleaned
-		changed = true
-	}
-	if cleaned, ok := deleteEmptyJSONObjectPath(updated, "extra_content"); ok {
-		updated = cleaned
-		changed = true
-	}
-	return updated, changed
+	return rewriteClaudeToolUsePart(part.Raw, edits)
 }
 
 func sanitizeClaudeToolUseSignature(part gjson.Result, targetProvider SignatureProvider, messageIdx, partIdx int) (string, bool, []SignatureCompatibilityDecision) {
-	updated := part.Raw
-	changed := false
+	edits := make(map[string]signatureJSONFieldEdit, len(claudeToolUseSignaturePaths()))
 	var decisions []SignatureCompatibilityDecision
 
 	for _, sigPath := range claudeToolUseSignaturePaths() {
@@ -219,28 +207,100 @@ func sanitizeClaudeToolUseSignature(part gjson.Result, targetProvider SignatureP
 		switch decision.Action {
 		case SignatureActionPreserve:
 			if decision.NormalizedSignature != "" && decision.NormalizedSignature != sigResult.String() {
-				updated, _ = sjson.Set(updated, sigPath, decision.NormalizedSignature)
-				changed = true
+				encoded, _ := json.Marshal(decision.NormalizedSignature)
+				edits[sigPath] = signatureJSONFieldEdit{replacement: string(encoded)}
 			}
 		case SignatureActionReplaceWithGeminiBypass:
-			updated, _ = sjson.Set(updated, sigPath, decision.ReplacementSignature)
-			changed = true
+			encoded, _ := json.Marshal(decision.ReplacementSignature)
+			edits[sigPath] = signatureJSONFieldEdit{replacement: string(encoded)}
 		default:
-			updated, _ = sjson.Delete(updated, sigPath)
-			changed = true
+			edits[sigPath] = signatureJSONFieldEdit{remove: true}
 		}
 	}
 
-	if cleaned, ok := deleteEmptyJSONObjectPath(updated, "extra_content.google"); ok {
-		updated = cleaned
-		changed = true
-	}
-	if cleaned, ok := deleteEmptyJSONObjectPath(updated, "extra_content"); ok {
-		updated = cleaned
-		changed = true
+	updated, changed := rewriteClaudeToolUsePart(part.Raw, edits)
+	return updated, changed, decisions
+}
+
+type signatureJSONFieldEdit struct {
+	replacement string
+	remove      bool
+}
+
+func rewriteClaudeToolUsePart(raw string, edits map[string]signatureJSONFieldEdit) (string, bool) {
+	updated, changed, _ := rewriteSignatureJSONObject(raw, func(key string, value gjson.Result) (signatureJSONFieldEdit, bool) {
+		if !strings.Contains(key, ".") {
+			if edit, ok := edits[key]; ok {
+				return edit, true
+			}
+		}
+		if key != "extra_content" || !value.IsObject() {
+			return signatureJSONFieldEdit{}, false
+		}
+
+		extraContent, extraChanged, fields := rewriteSignatureJSONObject(value.Raw, func(extraKey string, extraValue gjson.Result) (signatureJSONFieldEdit, bool) {
+			if extraKey != "google" || !extraValue.IsObject() {
+				return signatureJSONFieldEdit{}, false
+			}
+			google, googleChanged, googleFields := rewriteSignatureJSONObject(extraValue.Raw, func(googleKey string, _ gjson.Result) (signatureJSONFieldEdit, bool) {
+				edit, ok := edits["extra_content.google."+googleKey]
+				return edit, ok
+			})
+			if googleFields == 0 {
+				return signatureJSONFieldEdit{remove: true}, true
+			}
+			if googleChanged {
+				return signatureJSONFieldEdit{replacement: google}, true
+			}
+			return signatureJSONFieldEdit{}, false
+		})
+		if fields == 0 {
+			return signatureJSONFieldEdit{remove: true}, true
+		}
+		if extraChanged {
+			return signatureJSONFieldEdit{replacement: extraContent}, true
+		}
+		return signatureJSONFieldEdit{}, false
+	})
+	return updated, changed
+}
+
+func rewriteSignatureJSONObject(raw string, edit func(string, gjson.Result) (signatureJSONFieldEdit, bool)) (string, bool, int) {
+	object := gjson.Parse(raw)
+	if !object.IsObject() {
+		return raw, false, 0
 	}
 
-	return updated, changed, decisions
+	var builder strings.Builder
+	builder.Grow(len(raw))
+	builder.WriteByte('{')
+	changed := false
+	fields := 0
+	object.ForEach(func(key, value gjson.Result) bool {
+		fieldEdit, hasEdit := edit(key.String(), value)
+		if hasEdit && fieldEdit.remove {
+			changed = true
+			return true
+		}
+		replacement := value.Raw
+		if hasEdit && fieldEdit.replacement != value.Raw {
+			replacement = fieldEdit.replacement
+			changed = true
+		}
+		if fields > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(key.Raw)
+		builder.WriteByte(':')
+		builder.WriteString(replacement)
+		fields++
+		return true
+	})
+	builder.WriteByte('}')
+	if !changed {
+		return raw, false, fields
+	}
+	return builder.String(), true, fields
 }
 
 func claudeToolUseSignaturePaths() []string {
@@ -254,16 +314,4 @@ func claudeToolUseSignaturePaths() []string {
 
 func claudeToolUseProvenancePaths() []string {
 	return append(claudeToolUseSignaturePaths(), "model")
-}
-
-func deleteEmptyJSONObjectPath(raw, path string) (string, bool) {
-	result := gjson.Get(raw, path)
-	if !result.Exists() || !result.IsObject() || len(result.Map()) != 0 {
-		return raw, false
-	}
-	updated, err := sjson.Delete(raw, path)
-	if err != nil {
-		return raw, false
-	}
-	return updated, true
 }

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	geminicommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -306,6 +307,7 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	thinkingBuilder := strings.Builder{}
 	toolIDCounter := 0
 	hasToolCall := false
+	contentBlocks := make([][]byte, 0)
 
 	flushText := func() {
 		if textBuilder.Len() == 0 {
@@ -313,7 +315,7 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 		}
 		block := []byte(`{"type":"text","text":""}`)
 		block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-		out, _ = sjson.SetRawBytes(out, "content.-1", block)
+		contentBlocks = append(contentBlocks, block)
 		textBuilder.Reset()
 	}
 
@@ -323,7 +325,7 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 		}
 		block := []byte(`{"type":"thinking","thinking":""}`)
 		block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
-		out, _ = sjson.SetRawBytes(out, "content.-1", block)
+		contentBlocks = append(contentBlocks, block)
 		thinkingBuilder.Reset()
 	}
 
@@ -357,7 +359,7 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 					inputRaw = args.Raw
 				}
 				toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", []byte(inputRaw))
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolBlock)
+				contentBlocks = append(contentBlocks, toolBlock)
 				continue
 			}
 		}
@@ -365,6 +367,7 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 	flushThinking()
 	flushText()
+	out, _ = sjson.SetRawBytes(out, "content", geminicommon.RawJSONArray(contentBlocks))
 
 	stopReason := "end_turn"
 	if hasToolCall {

@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"reflect"
-	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -24,6 +26,13 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator/builtin"
 	log "github.com/sirupsen/logrus"
 )
+
+const (
+	defaultPluginRequestBodyBytes   int64 = 32 << 20
+	imageEditPluginRequestBodyBytes int64 = 128 << 20
+)
+
+var errPluginRequestBodyTooLarge = errors.New("plugin request body exceeds the allowed size")
 
 type registryModelInfo = registry.ModelInfo
 
@@ -465,7 +474,7 @@ func (h *Host) callModelRegistrar(ctx context.Context, record capabilityRecord, 
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "ModelRegistrar.RegisterModels", recovered)
 			resp = pluginapi.ModelRegistrationResponse{}
-			err = fmt.Errorf("model registrar panic: %v", recovered)
+			err = fmt.Errorf("model registrar panic")
 		}
 	}()
 	return registrar.RegisterModels(ctx, pluginapi.ModelRegistrationRequest{Plugin: record.meta})
@@ -479,7 +488,7 @@ func (h *Host) callModelProviderStaticModels(ctx context.Context, record capabil
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "ModelProvider.StaticModels", recovered)
 			resp = pluginapi.ModelResponse{}
-			err = fmt.Errorf("model provider panic: %v", recovered)
+			err = fmt.Errorf("model provider panic")
 		}
 	}()
 	return provider.StaticModels(ctx, pluginapi.StaticModelRequest{
@@ -496,7 +505,7 @@ func (h *Host) callModelsForAuth(ctx context.Context, record capabilityRecord, p
 		if recovered := recover(); recovered != nil {
 			h.fusePlugin(record.id, "ModelProvider.ModelsForAuth", recovered)
 			resp = pluginapi.ModelResponse{}
-			err = fmt.Errorf("model provider per-auth models panic: %v", recovered)
+			err = fmt.Errorf("model provider per-auth models panic")
 		}
 	}()
 	return provider.ModelsForAuth(ctx, pluginapi.AuthModelRequest{
@@ -524,7 +533,7 @@ func (h *Host) callRequestInterceptor(ctx context.Context, pluginID, method stri
 	}()
 	resp, errIntercept := call(ctx, req)
 	if errIntercept != nil {
-		log.Warnf("pluginhost: request interceptor %s failed: %v", pluginID, errIntercept)
+		log.Warnf("pluginhost: request interceptor %s failed error_type=%T", pluginID, errIntercept)
 		return pluginapi.RequestInterceptResponse{}, false
 	}
 	return resp, true
@@ -543,7 +552,7 @@ func (h *Host) callResponseInterceptor(ctx context.Context, pluginID string, int
 	}()
 	resp, errIntercept := interceptor.InterceptResponse(ctx, req)
 	if errIntercept != nil {
-		log.Warnf("pluginhost: response interceptor %s failed: %v", pluginID, errIntercept)
+		log.Warnf("pluginhost: response interceptor %s failed error_type=%T", pluginID, errIntercept)
 		return pluginapi.ResponseInterceptResponse{}, false
 	}
 	return resp, true
@@ -562,7 +571,7 @@ func (h *Host) callStreamChunkInterceptor(ctx context.Context, pluginID string, 
 	}()
 	resp, errIntercept := interceptor.InterceptStreamChunk(ctx, req)
 	if errIntercept != nil {
-		log.Warnf("pluginhost: stream chunk interceptor %s failed: %v", pluginID, errIntercept)
+		log.Warnf("pluginhost: stream chunk interceptor %s failed error_type=%T", pluginID, errIntercept)
 		return pluginapi.StreamChunkInterceptResponse{}, false
 	}
 	return resp, true
@@ -591,7 +600,7 @@ func (h *Host) InterceptRequestAfterAuthExcept(ctx context.Context, req pluginap
 func (h *Host) interceptRequest(ctx context.Context, req pluginapi.RequestInterceptRequest, method string, invoke func(pluginapi.RequestInterceptor, context.Context, pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error), skipPluginID string) pluginapi.RequestInterceptResponse {
 	current := pluginapi.RequestInterceptResponse{
 		Headers: cloneHeader(req.Headers),
-		Body:    bytes.Clone(req.Body),
+		Body:    internalpayload.CloneBytes(req.Body),
 	}
 	skipPluginID = strings.TrimSpace(skipPluginID)
 	for _, record := range h.Snapshot().records {
@@ -601,14 +610,14 @@ func (h *Host) interceptRequest(ctx context.Context, req pluginapi.RequestInterc
 		}
 		nextReq := req
 		nextReq.Headers = cloneHeader(current.Headers)
-		nextReq.Body = bytes.Clone(current.Body)
+		nextReq.Body = internalpayload.CloneBytes(current.Body)
 		nextReq.Metadata = cloneInterceptorMetadata(req.Metadata)
 		if resp, ok := h.callRequestInterceptor(ctx, record.id, method, func(callCtx context.Context, callReq pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
 			return invoke(interceptor, callCtx, callReq)
 		}, nextReq); ok {
 			current.Headers = mergeHeaders(current.Headers, resp.Headers, resp.ClearHeaders)
 			if len(resp.Body) > 0 {
-				current.Body = bytes.Clone(resp.Body)
+				current.Body = internalpayload.CloneBytes(resp.Body)
 			}
 		}
 	}
@@ -622,7 +631,7 @@ func (h *Host) InterceptResponse(ctx context.Context, req pluginapi.ResponseInte
 func (h *Host) InterceptResponseExcept(ctx context.Context, req pluginapi.ResponseInterceptRequest, skipPluginID string) pluginapi.ResponseInterceptResponse {
 	current := pluginapi.ResponseInterceptResponse{
 		Headers: cloneHeader(req.ResponseHeaders),
-		Body:    bytes.Clone(req.Body),
+		Body:    internalpayload.CloneBytes(req.Body),
 	}
 	skipPluginID = strings.TrimSpace(skipPluginID)
 	for _, record := range h.Snapshot().records {
@@ -633,14 +642,14 @@ func (h *Host) InterceptResponseExcept(ctx context.Context, req pluginapi.Respon
 		nextReq := req
 		nextReq.RequestHeaders = cloneHeader(req.RequestHeaders)
 		nextReq.ResponseHeaders = cloneHeader(current.Headers)
-		nextReq.OriginalRequest = bytes.Clone(req.OriginalRequest)
-		nextReq.RequestBody = bytes.Clone(req.RequestBody)
-		nextReq.Body = bytes.Clone(current.Body)
+		nextReq.OriginalRequest = internalpayload.CloneBytes(req.OriginalRequest)
+		nextReq.RequestBody = internalpayload.CloneBytes(req.RequestBody)
+		nextReq.Body = internalpayload.CloneBytes(current.Body)
 		nextReq.Metadata = cloneInterceptorMetadata(req.Metadata)
 		if resp, ok := h.callResponseInterceptor(ctx, record.id, interceptor, nextReq); ok {
 			current.Headers = mergeHeaders(current.Headers, resp.Headers, resp.ClearHeaders)
 			if len(resp.Body) > 0 {
-				current.Body = bytes.Clone(resp.Body)
+				current.Body = internalpayload.CloneBytes(resp.Body)
 			}
 		}
 	}
@@ -654,7 +663,7 @@ func (h *Host) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamChu
 func (h *Host) InterceptStreamChunkExcept(ctx context.Context, req pluginapi.StreamChunkInterceptRequest, skipPluginID string) pluginapi.StreamChunkInterceptResponse {
 	current := pluginapi.StreamChunkInterceptResponse{
 		Headers: cloneHeader(req.ResponseHeaders),
-		Body:    bytes.Clone(req.Body),
+		Body:    internalpayload.CloneBytes(req.Body),
 	}
 	skipPluginID = strings.TrimSpace(skipPluginID)
 	for _, record := range h.Snapshot().records {
@@ -665,15 +674,15 @@ func (h *Host) InterceptStreamChunkExcept(ctx context.Context, req pluginapi.Str
 		nextReq := req
 		nextReq.RequestHeaders = cloneHeader(req.RequestHeaders)
 		nextReq.ResponseHeaders = cloneHeader(current.Headers)
-		nextReq.OriginalRequest = bytes.Clone(req.OriginalRequest)
-		nextReq.RequestBody = bytes.Clone(req.RequestBody)
-		nextReq.Body = bytes.Clone(current.Body)
+		nextReq.OriginalRequest = internalpayload.CloneBytes(req.OriginalRequest)
+		nextReq.RequestBody = internalpayload.CloneBytes(req.RequestBody)
+		nextReq.Body = internalpayload.CloneBytes(current.Body)
 		nextReq.HistoryChunks = cloneByteSlices(req.HistoryChunks)
 		nextReq.Metadata = cloneInterceptorMetadata(req.Metadata)
 		if resp, ok := h.callStreamChunkInterceptor(ctx, record.id, interceptor, nextReq); ok {
 			current.Headers = mergeHeaders(current.Headers, resp.Headers, resp.ClearHeaders)
 			if len(resp.Body) > 0 {
-				current.Body = bytes.Clone(resp.Body)
+				current.Body = internalpayload.CloneBytes(resp.Body)
 			}
 			if resp.DropChunk {
 				current.DropChunk = true
@@ -1228,10 +1237,10 @@ func (h *Host) fusePlugin(id, method string, recovered any) {
 		return
 	}
 	h.mu.Lock()
-	h.fused[id] = fmt.Sprintf("%s panic: %v", method, recovered)
+	h.fused[id] = fmt.Sprintf("%s panic", method)
 	h.mu.Unlock()
 	thinking.UnregisterPluginProviders(id)
-	log.WithField("plugin_id", id).WithField("method", method).Errorf("pluginhost: plugin panic recovered: %v\n%s", recovered, debug.Stack())
+	log.WithField("plugin_id", id).WithField("method", method).WithField("panic_type", fmt.Sprintf("%T", recovered)).Error("pluginhost: plugin panic recovered")
 }
 
 func (h *Host) isPluginFused(id string) bool {
@@ -1282,8 +1291,11 @@ func (a *accessAdapter) Authenticate(ctx context.Context, r *http.Request) (resu
 		}
 	}()
 
-	body, errReadAll := readAndRestoreRequestBody(r)
+	body, errReadAll := readAndRestoreRequestBody(r, frontendAuthRequestBodyLimit(r))
 	if errReadAll != nil {
+		if errors.Is(errReadAll, errPluginRequestBodyTooLarge) {
+			return nil, sdkaccess.NewRequestTooLargeAuthError(errReadAll)
+		}
 		return nil, sdkaccess.NewInternalAuthError("failed to read plugin auth request body", errReadAll)
 	}
 	resp, errAuthenticate := a.provider.Authenticate(ctx, pluginapi.FrontendAuthRequest{
@@ -1291,7 +1303,7 @@ func (a *accessAdapter) Authenticate(ctx context.Context, r *http.Request) (resu
 		Path:    r.URL.Path,
 		Headers: cloneHeader(r.Header),
 		Query:   cloneValues(r.URL.Query()),
-		Body:    bytes.Clone(body),
+		Body:    internalpayload.CloneBytes(body),
 	})
 	if errAuthenticate != nil || !resp.Authenticated {
 		return nil, sdkaccess.NewNotHandledError()
@@ -1332,7 +1344,7 @@ type preparedExecutorCall struct {
 	outputFormat    sdktranslator.Format
 }
 
-func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts coreexecutor.Options) (preparedExecutorCall, error) {
+func (a *executorAdapter) prepareExecutorCall(ctx context.Context, req coreexecutor.Request, opts coreexecutor.Options) (preparedExecutorCall, error) {
 	inputRequested := executorInputFormat(req, opts)
 	requestedFormat := executorRequestedFormat(req, opts)
 	inputFormat, errInput := a.selectExecutorInputFormat(inputRequested)
@@ -1347,7 +1359,17 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	nativeReq := req
 	nativeOpts := opts
 	if inputRequested != "" && inputRequested != inputFormat {
-		nativeReq.Payload = sdktranslator.TranslateRequest(inputRequested, inputFormat, req.Model, req.Payload, opts.Stream)
+		translated := sdktranslator.TranslateRequest(inputRequested, inputFormat, req.Model, req.Payload, opts.Stream)
+		if errGuard := internalpayload.EnforceRequestTransform(
+			ctx,
+			"legacy.translate.plugin_executor",
+			int64(len(req.Payload)),
+			int64(len(translated)),
+			internalpayload.AmplificationOverride{},
+		); errGuard != nil {
+			return preparedExecutorCall{}, errGuard
+		}
+		nativeReq.Payload = translated
 	}
 	nativeReq.Format = outputFormat
 	nativeOpts.SourceFormat = inputFormat
@@ -1457,7 +1479,7 @@ func executorNativeStreamResponseTranslatorExists(from, to sdktranslator.Format)
 
 func (a *executorAdapter) translateExecutorResponse(ctx context.Context, prepared preparedExecutorCall, payload []byte, stream bool, param *any) []byte {
 	if prepared.requestedFormat == "" || prepared.outputFormat == prepared.requestedFormat {
-		return bytes.Clone(payload)
+		return internalpayload.CloneBytes(payload)
 	}
 	originalRequest := prepared.opts.OriginalRequest
 	if len(originalRequest) == 0 {
@@ -1469,7 +1491,7 @@ func (a *executorAdapter) translateExecutorResponse(ctx context.Context, prepare
 			return nil
 		}
 		if len(frames) == 1 {
-			return bytes.Clone(frames[0])
+			return internalpayload.CloneBytes(frames[0])
 		}
 		return bytes.Join(frames, nil)
 	}
@@ -1564,7 +1586,7 @@ func executorStreamDonePayload(format sdktranslator.Format) []byte {
 
 func sendExecutorPluginStreamChunk(ctx context.Context, out chan<- pluginapi.ExecutorStreamChunk, chunk pluginapi.ExecutorStreamChunk) bool {
 	select {
-	case out <- pluginapi.ExecutorStreamChunk{Payload: bytes.Clone(chunk.Payload), Err: chunk.Err}:
+	case out <- chunk:
 		return true
 	case <-ctx.Done():
 		return false
@@ -1579,15 +1601,17 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.Execute", recovered)
 			resp = coreexecutor.Response{}
-			err = fmt.Errorf("plugin executor %s panic: %v", a.Identifier(), recovered)
+			err = fmt.Errorf("plugin executor %s panic", a.Identifier())
 		}
 	}()
 
-	prepared, errPrepare := a.prepareExecutorCall(req, opts)
+	prepared, errPrepare := a.prepareExecutorCall(ctx, req, opts)
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
-	pluginResp, errExecute := a.executor.Execute(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
+	pluginRequest, releasePluginRequest := buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts)
+	defer releasePluginRequest()
+	pluginResp, errExecute := a.executor.Execute(ctx, pluginRequest)
 	if errExecute != nil {
 		return coreexecutor.Response{}, errExecute
 	}
@@ -1606,21 +1630,30 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.ExecuteStream", recovered)
 			result = nil
-			err = fmt.Errorf("plugin executor %s stream panic: %v", a.Identifier(), recovered)
+			err = fmt.Errorf("plugin executor %s stream panic", a.Identifier())
 		}
 	}()
 
-	prepared, errPrepare := a.prepareExecutorCall(req, opts)
+	prepared, errPrepare := a.prepareExecutorCall(ctx, req, opts)
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	pluginResp, errExecuteStream := a.executor.ExecuteStream(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
+	pluginRequest, releasePluginRequest := buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts)
+	releaseTransferred := false
+	defer func() {
+		if !releaseTransferred {
+			releasePluginRequest()
+		}
+	}()
+	pluginResp, errExecuteStream := a.executor.ExecuteStream(ctx, pluginRequest)
 	if errExecuteStream != nil {
 		return nil, errExecuteStream
 	}
+	chunks := mapExecutorStreamChunks(ctx, a.translateExecutorStreamChunks(ctx, prepared, pluginResp.Chunks), releasePluginRequest)
+	releaseTransferred = true
 	return &coreexecutor.StreamResult{
 		Headers: cloneHeader(pluginResp.Headers),
-		Chunks:  mapExecutorStreamChunks(ctx, a.translateExecutorStreamChunks(ctx, prepared, pluginResp.Chunks)),
+		Chunks:  chunks,
 	}, nil
 }
 
@@ -1636,7 +1669,7 @@ func (a *executorAdapter) Refresh(ctx context.Context, auth *coreauth.Auth) (ref
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(record.id, "AuthProvider.RefreshAuth", recovered)
 			refreshed = nil
-			err = fmt.Errorf("plugin executor %s refresh panic: %v", a.Identifier(), recovered)
+			err = fmt.Errorf("plugin executor %s refresh panic", a.Identifier())
 		}
 	}()
 
@@ -1705,15 +1738,17 @@ func (a *executorAdapter) CountTokens(ctx context.Context, auth *coreauth.Auth, 
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.CountTokens", recovered)
 			resp = coreexecutor.Response{}
-			err = fmt.Errorf("plugin executor %s count tokens panic: %v", a.Identifier(), recovered)
+			err = fmt.Errorf("plugin executor %s count tokens panic", a.Identifier())
 		}
 	}()
 
-	prepared, errPrepare := a.prepareExecutorCall(req, opts)
+	prepared, errPrepare := a.prepareExecutorCall(ctx, req, opts)
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
-	pluginResp, errCountTokens := a.executor.CountTokens(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
+	pluginRequest, releasePluginRequest := buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts)
+	defer releasePluginRequest()
+	pluginResp, errCountTokens := a.executor.CountTokens(ctx, pluginRequest)
 	if errCountTokens != nil {
 		return coreexecutor.Response{}, errCountTokens
 	}
@@ -1735,10 +1770,10 @@ func (a *executorAdapter) HttpRequest(ctx context.Context, auth *coreauth.Auth, 
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.HttpRequest", recovered)
 			resp = nil
-			err = fmt.Errorf("plugin executor %s http request panic: %v", a.Identifier(), recovered)
+			err = fmt.Errorf("plugin executor %s http request panic", a.Identifier())
 		}
 	}()
-	body, errReadAll := readAndRestoreRequestBody(req)
+	body, errReadAll := readAndRestoreRequestBody(req, imageEditPluginRequestBodyBytes)
 	if errReadAll != nil {
 		return nil, fmt.Errorf("read plugin http request body: %w", errReadAll)
 	}
@@ -1748,7 +1783,7 @@ func (a *executorAdapter) HttpRequest(ctx context.Context, auth *coreauth.Auth, 
 		Method:       req.Method,
 		URL:          req.URL.String(),
 		Headers:      cloneHeader(req.Header),
-		Body:         bytes.Clone(body),
+		Body:         internalpayload.CloneBytes(body),
 		StorageJSON:  storageJSONFromAuth(auth),
 		Metadata:     cloneAnyMap(authMetadata(auth)),
 		Attributes:   authAttributes(auth),
@@ -1765,10 +1800,54 @@ func (a *executorAdapter) HttpRequest(ctx context.Context, auth *coreauth.Auth, 
 		StatusCode: status,
 		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
 		Header:     cloneHeader(pluginResp.Headers),
-		Body:       io.NopCloser(bytes.NewReader(bytes.Clone(pluginResp.Body))),
+		Body:       newScopedPluginResponseBody(pluginResp.Body, "pluginhost.executor_http.response"),
 		Request:    req,
 	}
 	return resp, nil
+}
+
+type scopedPluginResponseBody struct {
+	mu      sync.Mutex
+	reader  *bytes.Reader
+	release func()
+	closed  bool
+}
+
+func newScopedPluginResponseBody(body []byte, hotspot string) io.ReadCloser {
+	cloned, release := internalpayload.CloneBytesScoped(body, hotspot)
+	return &scopedPluginResponseBody{reader: bytes.NewReader(cloned), release: release}
+}
+
+func (b *scopedPluginResponseBody) Read(payload []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.EOF
+	}
+	n, errRead := b.reader.Read(payload)
+	if errRead == io.EOF {
+		b.releaseLocked()
+	}
+	return n, errRead
+}
+
+func (b *scopedPluginResponseBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.releaseLocked()
+	return nil
+}
+
+func (b *scopedPluginResponseBody) releaseLocked() {
+	if b.closed {
+		return
+	}
+	b.closed = true
+	b.reader.Reset(nil)
+	if b.release != nil {
+		b.release()
+		b.release = nil
+	}
 }
 
 type usageAdapter struct {
@@ -1832,12 +1911,12 @@ func (a *usageAdapter) HandleUsage(ctx context.Context, record coreusage.Record)
 
 func (a *thinkingAdapter) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) (out []byte, err error) {
 	if a == nil || a.applier == nil || a.host == nil || a.host.isPluginFused(a.pluginID) {
-		return bytes.Clone(body), nil
+		return internalpayload.CloneBytes(body), nil
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "ThinkingApplier.ApplyThinking", recovered)
-			out = bytes.Clone(body)
+			out = internalpayload.CloneBytes(body)
 			err = nil
 		}
 	}()
@@ -1849,16 +1928,16 @@ func (a *thinkingAdapter) Apply(body []byte, config thinking.ThinkingConfig, mod
 			Budget: config.Budget,
 			Level:  string(config.Level),
 		},
-		Body: bytes.Clone(body),
+		Body: internalpayload.CloneBytes(body),
 	})
 	if errApply != nil || len(resp.Body) == 0 {
-		return bytes.Clone(body), nil
+		return internalpayload.CloneBytes(body), nil
 	}
-	return bytes.Clone(resp.Body), nil
+	return internalpayload.CloneBytes(resp.Body), nil
 }
 
 func (h *Host) NormalizeRequest(ctx context.Context, from, to sdktranslator.Format, model string, body []byte, stream bool) []byte {
-	current := bytes.Clone(body)
+	current := internalpayload.CloneBytes(body)
 	for _, record := range h.Snapshot().records {
 		if h.isPluginFused(record.id) || record.plugin.Capabilities.RequestNormalizer == nil {
 			continue
@@ -1879,11 +1958,11 @@ func (h *Host) TranslateRequest(ctx context.Context, from, to sdktranslator.Form
 			return translated, true
 		}
 	}
-	return bytes.Clone(body), false
+	return internalpayload.CloneBytes(body), false
 }
 
 func (h *Host) NormalizeResponseBefore(ctx context.Context, from, to sdktranslator.Format, model string, originalRequestRawJSON, requestRawJSON, body []byte, stream bool) []byte {
-	current := bytes.Clone(body)
+	current := internalpayload.CloneBytes(body)
 	for _, record := range h.Snapshot().records {
 		normalizer := record.plugin.Capabilities.ResponseBeforeTranslator
 		if h.isPluginFused(record.id) || normalizer == nil {
@@ -1906,11 +1985,11 @@ func (h *Host) TranslateResponse(ctx context.Context, from, to sdktranslator.For
 			return translated, true
 		}
 	}
-	return bytes.Clone(body), false
+	return internalpayload.CloneBytes(body), false
 }
 
 func (h *Host) NormalizeResponseAfter(ctx context.Context, from, to sdktranslator.Format, model string, originalRequestRawJSON, requestRawJSON, body []byte, stream bool) []byte {
-	current := bytes.Clone(body)
+	current := internalpayload.CloneBytes(body)
 	for _, record := range h.Snapshot().records {
 		normalizer := record.plugin.Capabilities.ResponseAfterTranslator
 		if h.isPluginFused(record.id) || normalizer == nil {
@@ -1936,12 +2015,12 @@ func (h *Host) callRequestNormalizer(ctx context.Context, record capabilityRecor
 		ToFormat:   to.String(),
 		Model:      model,
 		Stream:     stream,
-		Body:       bytes.Clone(body),
+		Body:       internalpayload.CloneBytes(body),
 	})
 	if errNormalizeRequest != nil || len(resp.Body) == 0 {
 		return nil, false
 	}
-	return bytes.Clone(resp.Body), true
+	return internalpayload.CloneBytes(resp.Body), true
 }
 
 func (h *Host) callRequestTranslator(ctx context.Context, record capabilityRecord, from, to sdktranslator.Format, model string, body []byte, stream bool) (out []byte, ok bool) {
@@ -1957,12 +2036,12 @@ func (h *Host) callRequestTranslator(ctx context.Context, record capabilityRecor
 		ToFormat:   to.String(),
 		Model:      model,
 		Stream:     stream,
-		Body:       bytes.Clone(body),
+		Body:       internalpayload.CloneBytes(body),
 	})
 	if errTranslateRequest != nil || len(resp.Body) == 0 {
 		return nil, false
 	}
-	return bytes.Clone(resp.Body), true
+	return internalpayload.CloneBytes(resp.Body), true
 }
 
 func (h *Host) callResponseNormalizer(ctx context.Context, pluginID, method string, normalizer pluginapi.ResponseNormalizer, from, to sdktranslator.Format, model string, originalRequestRawJSON, requestRawJSON, body []byte, stream bool) (out []byte, ok bool) {
@@ -1973,19 +2052,13 @@ func (h *Host) callResponseNormalizer(ctx context.Context, pluginID, method stri
 			ok = false
 		}
 	}()
-	resp, errNormalizeResponse := normalizer.NormalizeResponse(ctx, pluginapi.ResponseTransformRequest{
-		FromFormat:        from.String(),
-		ToFormat:          to.String(),
-		Model:             model,
-		Stream:            stream,
-		OriginalRequest:   bytes.Clone(originalRequestRawJSON),
-		TranslatedRequest: bytes.Clone(requestRawJSON),
-		Body:              bytes.Clone(body),
-	})
+	request, release := scopedResponseTransformRequest(from, to, model, originalRequestRawJSON, requestRawJSON, body, stream)
+	defer release()
+	resp, errNormalizeResponse := normalizer.NormalizeResponse(ctx, request)
 	if errNormalizeResponse != nil || len(resp.Body) == 0 {
 		return nil, false
 	}
-	return bytes.Clone(resp.Body), true
+	return internalpayload.CloneBytes(resp.Body), true
 }
 
 func (h *Host) callResponseTranslator(ctx context.Context, pluginID string, translator pluginapi.ResponseTranslator, from, to sdktranslator.Format, model string, originalRequestRawJSON, requestRawJSON, body []byte, stream bool) (out []byte, ok bool) {
@@ -1996,40 +2069,58 @@ func (h *Host) callResponseTranslator(ctx context.Context, pluginID string, tran
 			ok = false
 		}
 	}()
-	resp, errTranslateResponse := translator.TranslateResponse(ctx, pluginapi.ResponseTransformRequest{
-		FromFormat:        from.String(),
-		ToFormat:          to.String(),
-		Model:             model,
-		Stream:            stream,
-		OriginalRequest:   bytes.Clone(originalRequestRawJSON),
-		TranslatedRequest: bytes.Clone(requestRawJSON),
-		Body:              bytes.Clone(body),
-	})
+	request, release := scopedResponseTransformRequest(from, to, model, originalRequestRawJSON, requestRawJSON, body, stream)
+	defer release()
+	resp, errTranslateResponse := translator.TranslateResponse(ctx, request)
 	if errTranslateResponse != nil || len(resp.Body) == 0 {
 		return nil, false
 	}
-	return bytes.Clone(resp.Body), true
+	return internalpayload.CloneBytes(resp.Body), true
 }
 
-func buildExecutorRequest(host *Host, provider string, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) pluginapi.ExecutorRequest {
+func scopedResponseTransformRequest(from, to sdktranslator.Format, model string, originalRequestRawJSON, requestRawJSON, body []byte, stream bool) (pluginapi.ResponseTransformRequest, func()) {
+	originalRequest, releaseOriginalRequest := internalpayload.CloneBytesScoped(originalRequestRawJSON, "pluginhost.response_transform.original_request")
+	translatedRequest, releaseTranslatedRequest := internalpayload.CloneBytesScoped(requestRawJSON, "pluginhost.response_transform.translated_request")
+	responseBody, releaseResponseBody := internalpayload.CloneBytesScoped(body, "pluginhost.response_transform.body")
+	return pluginapi.ResponseTransformRequest{
+			FromFormat:        from.String(),
+			ToFormat:          to.String(),
+			Model:             model,
+			Stream:            stream,
+			OriginalRequest:   originalRequest,
+			TranslatedRequest: translatedRequest,
+			Body:              responseBody,
+		}, func() {
+			releaseResponseBody()
+			releaseTranslatedRequest()
+			releaseOriginalRequest()
+		}
+}
+
+func buildExecutorRequest(host *Host, provider string, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (pluginapi.ExecutorRequest, func()) {
+	originalRequest, releaseOriginalRequest := internalpayload.CloneBytesScoped(opts.OriginalRequest, "pluginhost.executor.original_request")
+	payload, releasePayload := internalpayload.CloneBytesScoped(req.Payload, "pluginhost.executor.payload")
 	return pluginapi.ExecutorRequest{
-		AuthID:          authID(auth),
-		AuthProvider:    authProvider(auth),
-		Model:           req.Model,
-		Format:          req.Format.String(),
-		Stream:          opts.Stream,
-		Alt:             opts.Alt,
-		Headers:         cloneHeader(opts.Headers),
-		Query:           cloneValues(opts.Query),
-		OriginalRequest: bytes.Clone(opts.OriginalRequest),
-		SourceFormat:    opts.SourceFormat.String(),
-		Payload:         bytes.Clone(req.Payload),
-		Metadata:        mergeExecutorMetadata(req.Metadata, opts.Metadata),
-		StorageJSON:     storageJSONFromAuth(auth),
-		AuthMetadata:    cloneAnyMap(authMetadata(auth)),
-		AuthAttributes:  authAttributes(auth),
-		HTTPClient:      host.newHTTPClient(auth, provider),
-	}
+			AuthID:          authID(auth),
+			AuthProvider:    authProvider(auth),
+			Model:           req.Model,
+			Format:          req.Format.String(),
+			Stream:          opts.Stream,
+			Alt:             opts.Alt,
+			Headers:         cloneHeader(opts.Headers),
+			Query:           cloneValues(opts.Query),
+			OriginalRequest: originalRequest,
+			SourceFormat:    opts.SourceFormat.String(),
+			Payload:         payload,
+			Metadata:        mergeExecutorMetadata(req.Metadata, opts.Metadata),
+			StorageJSON:     storageJSONFromAuth(auth),
+			AuthMetadata:    cloneAnyMap(authMetadata(auth)),
+			AuthAttributes:  authAttributes(auth),
+			HTTPClient:      host.newHTTPClient(auth, provider),
+		}, func() {
+			releasePayload()
+			releaseOriginalRequest()
+		}
 }
 
 func storageJSONFromAuth(auth *coreauth.Auth) []byte {
@@ -2037,7 +2128,7 @@ func storageJSONFromAuth(auth *coreauth.Auth) []byte {
 		return nil
 	}
 	if rawProvider, okRaw := auth.Storage.(interface{ RawJSON() []byte }); okRaw {
-		return bytes.Clone(rawProvider.RawJSON())
+		return internalpayload.CloneBytes(rawProvider.RawJSON())
 	}
 	if len(auth.Metadata) == 0 {
 		return nil
@@ -2070,17 +2161,25 @@ func mergeExecutorMetadata(reqMetadata, optsMetadata map[string]any) map[string]
 	return merged
 }
 
-func mapExecutorStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk) <-chan coreexecutor.StreamChunk {
+func mapExecutorStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, release func()) <-chan coreexecutor.StreamChunk {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	out := make(chan coreexecutor.StreamChunk)
 	if in == nil {
+		if release != nil {
+			release()
+		}
 		close(out)
 		return out
 	}
 	go func() {
-		defer close(out)
+		defer func() {
+			if release != nil {
+				release()
+			}
+			close(out)
+		}()
 		for {
 			var mapped coreexecutor.StreamChunk
 			select {
@@ -2091,7 +2190,7 @@ func mapExecutorStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorSt
 					return
 				}
 				mapped = coreexecutor.StreamChunk{
-					Payload: bytes.Clone(chunk.Payload),
+					Payload: chunk.Payload,
 					Err:     chunk.Err,
 				}
 			}
@@ -2105,16 +2204,38 @@ func mapExecutorStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorSt
 	return out
 }
 
-func readAndRestoreRequestBody(r *http.Request) ([]byte, error) {
+func frontendAuthRequestBodyLimit(r *http.Request) int64 {
+	if r == nil || r.URL == nil {
+		return defaultPluginRequestBodyBytes
+	}
+	if r.URL.Path == "/v1/images/edits" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "multipart/form-data") {
+		return imageEditPluginRequestBodyBytes
+	}
+	return defaultPluginRequestBodyBytes
+}
+
+func readAndRestoreRequestBody(r *http.Request, maxBytes int64) ([]byte, error) {
 	if r == nil || r.Body == nil {
 		return nil, nil
 	}
-	body, errReadAll := io.ReadAll(r.Body)
+	if maxBytes <= 0 || maxBytes > imageEditPluginRequestBodyBytes {
+		maxBytes = imageEditPluginRequestBodyBytes
+	}
+	if r.ContentLength > maxBytes {
+		return nil, fmt.Errorf("%w: limit %d bytes", errPluginRequestBodyTooLarge, maxBytes)
+	}
+	body, errReadAll := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if errClose := r.Body.Close(); errClose != nil && errReadAll == nil {
+		errReadAll = errClose
+	}
 	if errReadAll != nil {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		return nil, errReadAll
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("%w: limit %d bytes", errPluginRequestBodyTooLarge, maxBytes)
+	}
 	return body, nil
 }
 
@@ -2173,7 +2294,7 @@ func cloneByteSlices(in [][]byte) [][]byte {
 	}
 	out := make([][]byte, 0, len(in))
 	for _, item := range in {
-		out = append(out, bytes.Clone(item))
+		out = append(out, internalpayload.CloneBytes(item))
 	}
 	return out
 }
