@@ -1,0 +1,80 @@
+{
+  "policy_id": "openai_compat.minimax.request_quirks",
+  "compat_kind": "minimax",
+  "base_url": "https://api.minimaxi.com/v1",
+  "cases": [
+    {
+      "name": "system reminder thinking and tool arguments",
+      "model": "MiniMax-M3",
+      "input": {
+        "model": "configured-minimax-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "<system-reminder>Be concise.</system-reminder>"
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": {
+                    "query": "status"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "thinking": {
+          "type": "enabled"
+        },
+        "frequency_penalty": 1,
+        "presence_penalty": 1,
+        "top_p": 0.9
+      },
+      "expected": {
+        "model": "configured-minimax-alias",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"query\":\"status\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "thinking": {
+          "type": "adaptive"
+        },
+        "top_p": 0.9
+      },
+      "downgrades": [
+        "openai_compat.minimax.penalties_removed"
+      ]
+    }
+  ]
+}

@@ -155,15 +155,16 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 			downgrades,
 		)
 		appendPolicyReport(&report, phaseIndex, policyReport)
-		if policyReport.Amplification.Exceeded {
+		report.SyntheticBytes += transformed.SyntheticBytes
+		current = transformed.Payload
+		report.OutputBytes = int64(len(current))
+		amplificationMode, amplificationModeConfigured := internalpayload.AmplificationModeFromContext(ctx)
+		if policyReport.Amplification.Exceeded && (!amplificationModeConfigured || amplificationMode == internalpayload.AmplificationModeEnforce) {
 			recordPayloadPhase(ctx, report.Phases[phaseIndex])
 			result.Payload = nil
 			result.Report = report
 			return result, transformFailure(policy.ID, "compat_expansion_exceeded", "compatibility transform exceeded its declared output bound")
 		}
-		report.SyntheticBytes += transformed.SyntheticBytes
-		current = transformed.Payload
-		report.OutputBytes = int64(len(current))
 	}
 
 	if len(report.Phases) > 0 {

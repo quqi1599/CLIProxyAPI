@@ -365,6 +365,18 @@ func TestTransformMetricsPublishFixedCatalogDistributions(t *testing.T) {
 	}
 }
 
+func TestTransformPolicyCatalogIncludesOpenAICompatPolicies(t *testing.T) {
+	for _, policyID := range []string{
+		transformPolicyOpenAICompatKimi,
+		transformPolicyOpenAICompatMiniMax,
+		transformPolicyOpenAICompatQwen38,
+	} {
+		if got := transformPolicyCatalogID(policyID); got != policyID {
+			t.Fatalf("transformPolicyCatalogID(%q) = %q", policyID, got)
+		}
+	}
+}
+
 func TestTransformReportObserversReceiveIndependentSnapshotOnce(t *testing.T) {
 	ctx := WithTransformReportBytes(context.Background(), 8, 10)
 	releaseOuter := RetainTransformReport(ctx)

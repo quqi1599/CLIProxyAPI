@@ -92,20 +92,64 @@ func TestPipelineRejectsPolicyExpansionBeyondCostContract(t *testing.T) {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
 
-	result, err := NewPipeline(registry).Apply(context.Background(), MatchContext{}, []byte("x"))
-	if err == nil {
-		t.Fatal("Apply() unexpectedly accepted an over-limit transform")
+	contexts := map[string]context.Context{
+		"default": context.Background(),
+		"enforce": internalpayload.WithAmplificationMode(context.Background(), internalpayload.AmplificationModeEnforce),
 	}
-	typed, ok := failurecontract.As(err)
-	if !ok || typed.Kind != failurecontract.InternalTransformError || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
-		t.Fatalf("failure = %#v", typed)
+	for name, ctx := range contexts {
+		t.Run(name, func(t *testing.T) {
+			result, err := NewPipeline(registry).Apply(ctx, MatchContext{}, []byte("x"))
+			if err == nil {
+				t.Fatal("Apply() unexpectedly accepted an over-limit transform")
+			}
+			typed, ok := failurecontract.As(err)
+			if !ok || typed.Kind != failurecontract.InternalTransformError || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+				t.Fatalf("failure = %#v", typed)
+			}
+			if typed.ProviderCode != "compat_expansion_exceeded" || result.Payload != nil {
+				t.Fatalf("failure code=%q payload=%q", typed.ProviderCode, result.Payload)
+			}
+			if result.Report.OutputBytes != int64(len("xtoo-large")) {
+				t.Fatalf("report output bytes = %d, want attempted output size", result.Report.OutputBytes)
+			}
+			policyReport := result.Report.Phases[0].Policies[0]
+			if !policyReport.Amplification.Exceeded || policyReport.Amplification.AllowedOutputBytes != 3 {
+				t.Fatalf("amplification report = %#v", policyReport.Amplification)
+			}
+		})
 	}
-	if typed.ProviderCode != "compat_expansion_exceeded" || result.Payload != nil {
-		t.Fatalf("failure code=%q payload=%q", typed.ProviderCode, result.Payload)
+}
+
+func TestPipelineObservesPolicyExpansionBeyondCostContract(t *testing.T) {
+	policy := validPolicy("bounded", ProviderQuirkPatch, 0, "body.large")
+	policy.Cost.MaxExpansionBytes = 2
+	policy.Cost.MaxExpansionRatio = 0
+	policy.Apply = func(_ context.Context, input []byte) (TransformResult, error) {
+		return TransformResult{Payload: append(append([]byte(nil), input...), "too-large"...)}, nil
+	}
+	registry, err := NewRegistry(policy)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	ctx := internalpayload.WithAmplificationMode(
+		internalpayload.WithTransformReport(context.Background(), 1),
+		internalpayload.AmplificationModeObserve,
+	)
+
+	result, err := NewPipeline(registry).Apply(ctx, MatchContext{}, []byte("x"))
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if got, want := string(result.Payload), "xtoo-large"; got != want {
+		t.Fatalf("payload = %q, want %q", got, want)
 	}
 	policyReport := result.Report.Phases[0].Policies[0]
-	if !policyReport.Amplification.Exceeded || policyReport.Amplification.AllowedOutputBytes != 3 {
-		t.Fatalf("amplification report = %#v", policyReport.Amplification)
+	if !policyReport.Amplification.Exceeded || result.Report.OutputBytes != int64(len(result.Payload)) {
+		t.Fatalf("pipeline report = %+v", result.Report)
+	}
+	transformReport, ok := internalpayload.TransformReportFromContext(ctx)
+	if !ok || len(transformReport.Stages) != 1 || len(transformReport.Stages[0].AppliedPolicies) != 1 || transformReport.Stages[0].AppliedPolicies[0] != "bounded" {
+		t.Fatalf("transform report = %+v, ok=%v", transformReport, ok)
 	}
 }
 

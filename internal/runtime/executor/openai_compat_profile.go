@@ -260,6 +260,12 @@ func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byt
 }
 
 func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	payload = scrubOpenAICompatPayloadBeforeProviderQuirks(payload, profile, model, baseURL)
+	payload = scrubOpenAICompatLegacyProviderQuirks(payload, profile, model)
+	return scrubOpenAICompatPayloadAfterProviderQuirks(payload, profile, model, baseURL)
+}
+
+func scrubOpenAICompatPayloadBeforeProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
 		payload = repaired
 	}
@@ -285,6 +291,11 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	payload = scrubOpenAICompatProviderToolPayload(payload, profile)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
 	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	return payload
+}
+
+func scrubOpenAICompatLegacyProviderQuirks(payload []byte, profile openAICompatProfile, model string) []byte {
+	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "minimax" {
 		payload = normalizeMiniMaxSystemMessages(payload)
 		payload = normalizeMiniMaxM3Thinking(payload, model)
@@ -297,6 +308,11 @@ func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfil
 	if compatKind == "kimi" {
 		payload = scrubKimiPayloadForModel(payload, model)
 	}
+	return payload
+}
+
+func scrubOpenAICompatPayloadAfterProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "xiaomi" {
 		payload = scrubXiaomiPayloadForModel(payload, model)
 	}
@@ -344,11 +360,15 @@ func scrubKimiPayloadForModel(payload []byte, model string) []byte {
 }
 
 func normalizedKimiModelName(model string) string {
+	return strings.TrimPrefix(normalizedOpenAICompatPolicyModelName(model), "kimi-")
+}
+
+func normalizedOpenAICompatPolicyModelName(model string) string {
 	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
 	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
 		modelName = modelName[slash+1:]
 	}
-	return strings.TrimPrefix(modelName, "kimi-")
+	return modelName
 }
 
 func requiresKimiK25K26Compatibility(model string) bool {
@@ -1688,10 +1708,7 @@ func requiresQwen38MaxThinking(payload []byte, model string) bool {
 }
 
 func isQwen38MaxThinkingModel(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	if slash := strings.LastIndex(model, "/"); slash >= 0 {
-		model = model[slash+1:]
-	}
+	model = normalizedOpenAICompatPolicyModelName(model)
 	return model == "qwen3.8-max" || model == "qwen3.8-max-preview"
 }
 

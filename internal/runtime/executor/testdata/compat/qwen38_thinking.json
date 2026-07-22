@@ -1,0 +1,102 @@
+{
+  "policy_id": "openai_compat.qwen38.thinking",
+  "compat_kind": "qwen",
+  "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "cases": [
+    {
+      "name": "disabled thinking becomes low",
+      "model": "qwen3.8-max",
+      "input": {
+        "model": "configured-qwen-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": false,
+        "reasoning_effort": "none",
+        "reasoning": {
+          "effort": "none"
+        },
+        "thinking": {
+          "type": "disabled",
+          "budget_tokens": 0
+        },
+        "thinking_budget": 0,
+        "temperature": 0.2
+      },
+      "expected": {
+        "model": "configured-qwen-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": true,
+        "reasoning_effort": "low",
+        "temperature": 0.2
+      },
+      "downgrades": [
+        "openai_compat.qwen38.disabled_to_low"
+      ]
+    },
+    {
+      "name": "xhigh effort wins over budget",
+      "model": "qwen3.8-max",
+      "input": {
+        "model": "configured-qwen-xhigh-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "xhigh",
+        "thinking_budget": 4096
+      },
+      "expected": {
+        "model": "configured-qwen-xhigh-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": true,
+        "reasoning_effort": "xhigh"
+      },
+      "downgrades": []
+    },
+    {
+      "name": "positive nested budget becomes canonical",
+      "model": "qwen3.8-max",
+      "input": {
+        "model": "configured-qwen-budget-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 4096
+        }
+      },
+      "expected": {
+        "model": "configured-qwen-budget-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": true,
+        "thinking_budget": 4096
+      },
+      "downgrades": []
+    }
+  ]
+}

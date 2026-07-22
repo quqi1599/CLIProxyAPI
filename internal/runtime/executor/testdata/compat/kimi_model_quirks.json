@@ -1,0 +1,138 @@
+{
+  "policy_id": "openai_compat.kimi.model_quirks",
+  "compat_kind": "kimi",
+  "base_url": "https://api.moonshot.ai/v1",
+  "cases": [
+    {
+      "name": "k3 named tool choice",
+      "model": "kimi-k3",
+      "input": {
+        "model": "configured-kimi-alias",
+        "messages": [
+          {
+            "role": "system",
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "lookup"
+          }
+        },
+        "thinking": {
+          "type": "disabled",
+          "budget_tokens": 0
+        },
+        "reasoning_effort": "low",
+        "temperature": 0.2,
+        "top_p": 0.4,
+        "n": 2,
+        "presence_penalty": 1,
+        "frequency_penalty": 1
+      },
+      "expected": {
+        "model": "configured-kimi-alias",
+        "messages": [
+          {
+            "role": "system",
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tool_choice": "required",
+        "reasoning_effort": "max"
+      },
+      "downgrades": [
+        "openai_compat.kimi.tool_choice_normalized"
+      ]
+    },
+    {
+      "name": "k2.7 web search thinking and sampling",
+      "model": "kimi-k2.7",
+      "input": {
+        "model": "configured-kimi-k27-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "search"
+          }
+        ],
+        "tools": [
+          {
+            "type": "builtin_function",
+            "function": {
+              "name": "$web_search"
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "thinking": {
+          "type": "enabled",
+          "keep": "all"
+        },
+        "temperature": 0.2,
+        "top_p": 0.4,
+        "n": 2,
+        "presence_penalty": 1,
+        "frequency_penalty": 1
+      },
+      "expected": {
+        "model": "configured-kimi-k27-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "search"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "_web_search",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              },
+              "strict": false
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "thinking": {
+          "type": "disabled"
+        },
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "n": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0
+      },
+      "downgrades": [
+        "openai_compat.kimi.tool_choice_normalized",
+        "openai_compat.kimi.web_search_disables_thinking"
+      ]
+    }
+  ]
+}

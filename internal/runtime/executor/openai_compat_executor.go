@@ -660,9 +660,15 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 
 	providerCompatibilityStarted := time.Now()
 	providerCompatibilityInput := body
-	body = scrubOpenAICompatPayloadForModel(body, profile, baseModel, baseURL)
+	body, err = scrubOpenAICompatPayloadForModelWithPolicies(ctx, body, profile, baseModel, baseURL)
+	if err != nil {
+		return plan, err
+	}
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, plan.requestPath, opts.Headers)
-	body = scrubOpenAICompatPayloadForModel(body, profile, baseModel, baseURL)
+	body, err = scrubOpenAICompatPayloadForModelWithPolicies(ctx, body, profile, baseModel, baseURL)
+	if err != nil {
+		return plan, err
+	}
 	if stream {
 		if profile.SupportsStreamUsage {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
