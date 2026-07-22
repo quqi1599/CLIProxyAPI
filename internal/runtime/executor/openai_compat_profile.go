@@ -233,6 +233,13 @@ func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byt
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
 		payload = repaired
 	}
+	return scrubOpenAICompatCapabilityFields(payload, profile)
+}
+
+func scrubOpenAICompatCapabilityFields(payload []byte, profile openAICompatProfile) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
 	deletePaths := make([]string, 0, 6)
 	if !profile.SupportsStore {
 		deletePaths = append(deletePaths, "store")
@@ -257,6 +264,23 @@ func scrubOpenAICompatPayload(payload []byte, profile openAICompatProfile) []byt
 		return payload
 	}
 	return mutateOpenAICompatJSON(payload, deletePaths, nil)
+}
+
+func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
+	if compatKind == "kimi" {
+		payload = normalizeKimiThinkingConfig(payload, model)
+	}
+	doubaoEffort, doubaoThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
+	payload = scrubOpenAICompatCapabilityFields(payload, profile)
+	if compatKind == "doubao" {
+		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoEffort, doubaoThinkingDisabled)
+	}
+	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
+	payload = scrubOpenAICompatToolChoice(payload, profile)
+	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	payload = scrubOpenAICompatLegacyProviderQuirks(payload, profile, model)
+	return scrubOpenAICompatPayloadAfterProviderQuirks(payload, profile, model, baseURL)
 }
 
 func scrubOpenAICompatPayloadForModel(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {

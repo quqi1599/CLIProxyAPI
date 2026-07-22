@@ -1,0 +1,61 @@
+{
+  "policy_id": "openai_compat.post_config_revalidate",
+  "compat_kind": "kimi",
+  "base_url": "https://api.moonshot.ai/v1",
+  "cases": [
+    {
+      "name": "payload config reintroduces rejected fields",
+      "model": "kimi-k2.7",
+      "input": {
+        "model": "configured-kimi-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "metadata": {
+          "tenant": "reintroduced"
+        },
+        "temperature": 0.2,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup"
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "lookup"
+          }
+        }
+      },
+      "expected": {
+        "model": "configured-kimi-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "temperature": 1,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup"
+            }
+          }
+        ],
+        "tool_choice": "auto"
+      },
+      "downgrades": [
+        "openai_compat.metadata_removed",
+        "openai_compat.kimi.tool_choice_normalized"
+      ]
+    }
+  ]
+}

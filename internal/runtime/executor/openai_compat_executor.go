@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -45,12 +46,14 @@ const (
 	openAICompatProviderResolveTransformStage       = "request_plan.openai_compat.provider_resolve"
 	openAICompatProviderConfigTransformStage        = "request_plan.openai_compat.provider_config"
 	openAICompatToolHistoryTransformStage           = "request_plan.openai_compat.tool_history"
-	openAICompatProviderCompatibilityStage          = "request_plan.openai_compat.provider_compatibility"
+	openAICompatUserPayloadConfigStage              = "compat/" + string(compat.ApplyUserPayloadConfig)
+	openAICompatProviderFinalizationStage           = "request_plan.openai_compat.provider_finalization"
 	openAICompatFinalSanitizeTransformStage         = "request_plan.openai_compat.final_sanitize"
 	openAICompatProviderResolvePolicy               = "openai_compat.provider_resolve"
 	openAICompatProviderConfigPolicy                = "openai_compat.provider_config"
 	openAICompatToolHistoryPolicy                   = "openai_compat.tool_history"
-	openAICompatProviderCompatibilityPolicy         = "openai_compat.provider_compatibility"
+	openAICompatUserPayloadConfigPolicy             = "openai_compat.user_payload_config"
+	openAICompatProviderFinalizationPolicy          = "openai_compat.provider_finalization"
 	openAICompatFinalSanitizePolicy                 = "openai_compat.final_sanitize"
 	openAICompatInlineRemoteImagesPolicy            = "openai_compat.inline_remote_images"
 	openAICompatMetadataRemovedDowngrade            = "openai_compat.metadata_removed"
@@ -175,6 +178,28 @@ func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliprox
 		return sdktranslator.FromString("openai-response"), "/responses"
 	}
 	return to, endpoint
+}
+
+func openAICompatPolicyRequestMatch(from, to sdktranslator.Format, endpoint string, stream bool) compat.MatchContext {
+	mode := compat.ExecutionMode("non-stream")
+	if stream {
+		mode = "stream"
+	}
+	endpointKind := compat.EndpointKind(strings.Trim(endpoint, "/"))
+	switch endpoint {
+	case "/chat/completions":
+		endpointKind = "chat"
+	case "/responses":
+		endpointKind = "responses"
+	case "/responses/compact":
+		endpointKind = "compact"
+	}
+	return compat.MatchContext{
+		Endpoint:     endpointKind,
+		Mode:         mode,
+		SourceFormat: compat.Format(from.String()),
+		TargetFormat: compat.Format(to.String()),
+	}
 }
 
 func applyOpenAICompatRequestCorrelationHeaders(ctx context.Context, req *http.Request, source http.Header) {
@@ -658,17 +683,37 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		return plan, err
 	}
 
-	providerCompatibilityStarted := time.Now()
-	providerCompatibilityInput := body
-	body, err = scrubOpenAICompatPayloadForModelWithPolicies(ctx, body, profile, baseModel, baseURL)
+	policyMatch := openAICompatPolicyRequestMatch(from, plan.upstreamFormat, plan.endpoint, stream)
+	body, err = scrubOpenAICompatPayloadForModelWithPolicies(ctx, body, profile, baseModel, baseURL, policyMatch)
 	if err != nil {
 		return plan, err
 	}
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, plan.requestPath, opts.Headers)
-	body, err = scrubOpenAICompatPayloadForModelWithPolicies(ctx, body, profile, baseModel, baseURL)
-	if err != nil {
+
+	payloadConfigStarted := time.Now()
+	payloadConfigInput := body
+	configuredBody := helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, plan.requestPath, opts.Headers)
+	if err = helps.EnforceSemanticTransformStage(
+		ctx,
+		openAICompatUserPayloadConfigStage,
+		payloadConfigInput,
+		configuredBody,
+		payloadConfigStarted,
+		[]string{openAICompatUserPayloadConfigPolicy},
+		nil,
+		internalpayload.AmplificationOverride{},
+	); err != nil {
 		return plan, err
 	}
+	if bytes.Equal(configuredBody, body) {
+		body = configuredBody
+	} else {
+		body, err = revalidateOpenAICompatPayloadAfterConfig(ctx, configuredBody, profile, baseModel, baseURL, policyMatch)
+		if err != nil {
+			return plan, err
+		}
+	}
+	providerFinalizationStarted := time.Now()
+	providerFinalizationInput := body
 	if stream {
 		if profile.SupportsStreamUsage {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
@@ -684,12 +729,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
-		openAICompatProviderCompatibilityStage,
-		providerCompatibilityInput,
+		openAICompatProviderFinalizationStage,
+		providerFinalizationInput,
 		body,
-		providerCompatibilityStarted,
-		[]string{openAICompatProviderCompatibilityPolicy},
-		openAICompatCompatibilityDowngrades(providerCompatibilityInput, body),
+		providerFinalizationStarted,
+		[]string{openAICompatProviderFinalizationPolicy},
+		openAICompatCompatibilityDowngrades(providerFinalizationInput, body),
 		internalpayload.AmplificationOverride{},
 	); err != nil {
 		return plan, err

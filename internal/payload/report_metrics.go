@@ -16,14 +16,15 @@ const (
 	transformStageRequestPrepare = "request_prepare"
 	transformStageRequest        = "request_transform"
 
-	transformPolicyThinkingBudget      = "thinking_history.synthetic_budget"
-	transformPolicyThinkingPlaceholder = "thinking_history.placeholder"
-	transformPolicyCodexReplay         = "codex.reasoning_replay"
-	transformPolicyAntigravityReplay   = "antigravity.reasoning_replay"
-	transformPolicyMinimaxImage        = "openai_compat.minimax_m3_image_inline"
-	transformPolicyOpenAICompatKimi    = "openai_compat.kimi.model_quirks"
-	transformPolicyOpenAICompatMiniMax = "openai_compat.minimax.request_quirks"
-	transformPolicyOpenAICompatQwen38  = "openai_compat.qwen38.thinking"
+	transformPolicyThinkingBudget         = "thinking_history.synthetic_budget"
+	transformPolicyThinkingPlaceholder    = "thinking_history.placeholder"
+	transformPolicyCodexReplay            = "codex.reasoning_replay"
+	transformPolicyAntigravityReplay      = "antigravity.reasoning_replay"
+	transformPolicyMinimaxImage           = "openai_compat.minimax_m3_image_inline"
+	transformPolicyOpenAICompatKimi       = "openai_compat.kimi.model_quirks"
+	transformPolicyOpenAICompatMiniMax    = "openai_compat.minimax.request_quirks"
+	transformPolicyOpenAICompatQwen38     = "openai_compat.qwen38.thinking"
+	transformPolicyOpenAICompatPostConfig = "openai_compat.post_config_revalidate"
 )
 
 var (
@@ -45,6 +46,7 @@ var (
 		transformPolicyOpenAICompatKimi,
 		transformPolicyOpenAICompatMiniMax,
 		transformPolicyOpenAICompatQwen38,
+		transformPolicyOpenAICompatPostConfig,
 		transformMetricOther,
 	}
 )

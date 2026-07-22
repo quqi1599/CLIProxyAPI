@@ -370,6 +370,7 @@ func TestTransformPolicyCatalogIncludesOpenAICompatPolicies(t *testing.T) {
 		transformPolicyOpenAICompatKimi,
 		transformPolicyOpenAICompatMiniMax,
 		transformPolicyOpenAICompatQwen38,
+		transformPolicyOpenAICompatPostConfig,
 	} {
 		if got := transformPolicyCatalogID(policyID); got != policyID {
 			t.Fatalf("transformPolicyCatalogID(%q) = %q", policyID, got)

@@ -70,7 +70,8 @@ func TestPrepareOpenAICompatRequestReportsThinkingHistoryPolicy(t *testing.T) {
 		{id: openAICompatProviderResolveTransformStage, policy: openAICompatProviderResolvePolicy, reused: &changed},
 		{id: openAICompatProviderConfigTransformStage, policy: openAICompatProviderConfigPolicy, reused: &changed},
 		{id: openAICompatToolHistoryTransformStage, policy: openAICompatToolHistoryPolicy, reused: &reused},
-		{id: openAICompatProviderCompatibilityStage, policy: openAICompatProviderCompatibilityPolicy, downgrade: openAICompatMetadataRemovedDowngrade, reused: &changed},
+		{id: openAICompatProviderPreQuirkStage, policy: openAICompatProviderPreQuirkPolicy, downgrade: openAICompatMetadataRemovedDowngrade, reused: &changed},
+		{id: openAICompatProviderPostQuirkStage, policy: openAICompatProviderPostQuirkPolicy, reused: &reused},
 		{id: openAICompatFinalSanitizeTransformStage, policy: openAICompatFinalSanitizePolicy, reused: &reused},
 	}, openAICompatFinalSanitizeTransformStage, len(plan.body))
 	releaseReport()
