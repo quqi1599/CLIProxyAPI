@@ -13,6 +13,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -59,6 +60,7 @@ type Host struct {
 	httpStreams            *hostHTTPStreamBridge
 	modelStreams           *modelStreamBridge
 	callbackContexts       *callbackContextRegistry
+	translatorRegistry     atomic.Pointer[sdktranslator.Registry]
 	snapshot               atomic.Value
 }
 
@@ -101,6 +103,21 @@ func (h *Host) SetModelExecutor(executor modelExecutor) {
 	h.mu.Lock()
 	h.modelExecutor = executor
 	h.mu.Unlock()
+}
+
+// SetTranslatorRegistry binds plugin routing and execution to one registry.
+func (h *Host) SetTranslatorRegistry(registry *sdktranslator.Registry) {
+	if h == nil {
+		return
+	}
+	h.translatorRegistry.Store(registry)
+}
+
+func (h *Host) translatorContext(ctx context.Context) context.Context {
+	if h == nil {
+		return sdktranslator.ContextWithRegistry(ctx, nil)
+	}
+	return sdktranslator.ContextWithRegistry(ctx, h.translatorRegistry.Load())
 }
 
 func (h *Host) currentModelExecutor() modelExecutor {

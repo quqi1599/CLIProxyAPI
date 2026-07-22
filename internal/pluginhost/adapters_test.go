@@ -82,25 +82,27 @@ func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T)
 func TestExecutorNativeStreamResponseTranslatorExistsRequiresStreamTransform(t *testing.T) {
 	outputFormat := sdktranslator.Format("plugin-output-non-stream-only")
 	requestedFormat := sdktranslator.Format("client-output-non-stream-only")
-	sdktranslator.Register(requestedFormat, outputFormat, nil, sdktranslator.ResponseTransform{
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.Register(requestedFormat, outputFormat, nil, sdktranslator.ResponseTransform{
 		NonStream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
 			return rawJSON
 		},
 	})
 
-	if executorNativeStreamResponseTranslatorExists(outputFormat, requestedFormat) {
+	ctx := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
+	if executorNativeStreamResponseTranslatorExists(ctx, outputFormat, requestedFormat) {
 		t.Fatal("non-stream-only response transformer was accepted for stream executor output")
 	}
 
 	streamOutputFormat := sdktranslator.Format("plugin-output-stream")
 	streamRequestedFormat := sdktranslator.Format("client-output-stream")
-	sdktranslator.Register(streamRequestedFormat, streamOutputFormat, nil, sdktranslator.ResponseTransform{
+	translationRegistry.Register(streamRequestedFormat, streamOutputFormat, nil, sdktranslator.ResponseTransform{
 		Stream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 			return [][]byte{rawJSON}
 		},
 	})
 
-	if !executorNativeStreamResponseTranslatorExists(streamOutputFormat, streamRequestedFormat) {
+	if !executorNativeStreamResponseTranslatorExists(ctx, streamOutputFormat, streamRequestedFormat) {
 		t.Fatal("stream response transformer was not accepted for stream executor output")
 	}
 }
@@ -2946,10 +2948,9 @@ func TestExecutorAdapterSelectsCustomOutputWithHostResponseTranslator(t *testing
 			}),
 		}},
 	})
-	sdktranslator.SetPluginHooks(host)
-	t.Cleanup(func() {
-		sdktranslator.SetPluginHooks(nil)
-	})
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.SetPluginHooks(host)
+	ctx := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
 
 	adapter := &executorAdapter{
 		host:          host,
@@ -2967,7 +2968,7 @@ func TestExecutorAdapterSelectsCustomOutputWithHostResponseTranslator(t *testing
 		},
 	}
 
-	resp, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
+	resp, errExecute := adapter.Execute(ctx, &coreauth.Auth{}, coreexecutor.Request{
 		Model:   "model-1",
 		Format:  sdktranslator.FormatOpenAI,
 		Payload: []byte(`{"model":"model-1"}`),
@@ -3056,10 +3057,9 @@ func TestExecutorAdapterKeepsRawStreamFallbackWithOnlyHostResponseTranslator(t *
 			}),
 		}},
 	})
-	sdktranslator.SetPluginHooks(host)
-	t.Cleanup(func() {
-		sdktranslator.SetPluginHooks(nil)
-	})
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.SetPluginHooks(host)
+	ctx := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
 	adapter := &executorAdapter{
 		host: host,
 	}
@@ -3076,7 +3076,7 @@ func TestExecutorAdapterKeepsRawStreamFallbackWithOnlyHostResponseTranslator(t *
 	}
 	var param any
 
-	frames := adapter.translateExecutorStreamPayload(context.Background(), prepared, payload, &param)
+	frames := adapter.translateExecutorStreamPayload(ctx, prepared, payload, &param)
 	if len(frames) != 1 {
 		t.Fatalf("translated stream frame count = %d, want 1", len(frames))
 	}

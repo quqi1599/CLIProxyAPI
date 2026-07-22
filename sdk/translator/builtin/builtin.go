@@ -12,6 +12,11 @@ func Registry() *sdktranslator.Registry {
 	return sdktranslator.Default()
 }
 
+// NewRegistry returns an isolated registry populated with built-in translators.
+func NewRegistry() *sdktranslator.Registry {
+	return sdktranslator.NewBuiltinRegistry()
+}
+
 // Pipeline returns a pipeline that already contains the built-in translators.
 func Pipeline() *sdktranslator.Pipeline {
 	return sdktranslator.NewPipeline(sdktranslator.Default())

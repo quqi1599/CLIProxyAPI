@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestBuilderUsesSpreadRoutingStrategy(t *testing.T) {
@@ -31,5 +32,22 @@ func TestBuilderUsesSpreadRoutingStrategy(t *testing.T) {
 	selectorType := selector.Elem().Type().String()
 	if !strings.Contains(selectorType, "SpreadSelector") {
 		t.Fatalf("selector type = %s, want SpreadSelector", selectorType)
+	}
+}
+
+func TestBuilderKeepsExplicitTranslatorRegistry(t *testing.T) {
+	t.Parallel()
+
+	translationRegistry := sdktranslator.NewRegistry()
+	service, err := NewBuilder().
+		WithConfig(&config.Config{}).
+		WithConfigPath(filepath.Join(t.TempDir(), "config.yaml")).
+		WithTranslatorRegistry(translationRegistry).
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if service.translatorRegistry != translationRegistry {
+		t.Fatal("builder replaced the explicit translator registry")
 	}
 }

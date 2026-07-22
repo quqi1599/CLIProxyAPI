@@ -351,6 +351,29 @@ func TestTranslateStream_PluginTranslatorUsedWhenNativeStreamMissing(t *testing.
 	}
 }
 
+func TestContextRegistryDoesNotPolluteDefaultFacade(t *testing.T) {
+	ctx := context.Background()
+	from := Format("isolated-context-from")
+	to := Format("isolated-context-to")
+	registry := NewRegistry()
+	registry.Register(from, to, nil, ResponseTransform{
+		NonStream: func(context.Context, string, []byte, []byte, []byte, *any) []byte {
+			return []byte(`{"source":"isolated"}`)
+		},
+	})
+
+	bound := ContextWithRegistry(ctx, registry)
+	got := TranslateNonStream(bound, to, from, "model", nil, nil, []byte(`{"source":"raw"}`), nil)
+	if string(got) != `{"source":"isolated"}` {
+		t.Fatalf("context translation = %s", got)
+	}
+
+	defaultGot := TranslateNonStream(ctx, to, from, "model", nil, nil, []byte(`{"source":"raw"}`), nil)
+	if string(defaultGot) != `{"source":"raw"}` {
+		t.Fatalf("default registry was polluted: %s", defaultGot)
+	}
+}
+
 func TestPluginNormalizersChainAfterNative(t *testing.T) {
 	ctx := context.Background()
 	r := NewRegistry()

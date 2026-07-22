@@ -34,6 +34,7 @@ func (h *Host) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteReq
 	if h == nil {
 		return pluginapi.ModelRouteResponse{}, false
 	}
+	ctx = h.translatorContext(ctx)
 	skipPluginID = strings.TrimSpace(skipPluginID)
 	req.AvailableProviders = h.availableProvidersSnapshot()
 	for _, record := range h.Snapshot().records {
@@ -61,7 +62,7 @@ func (h *Host) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteReq
 			}
 			return resp, true
 		case pluginapi.ModelRouteTargetSelf, pluginapi.ModelRouteTargetExecutor:
-			if !h.executorPluginReady(resp.Target, nextReq) {
+			if !h.executorPluginReady(ctx, resp.Target, nextReq) {
 				log.WithFields(log.Fields{"plugin_id": record.id, "target_plugin_id": resp.Target}).Warn("pluginhost: model router returned unavailable executor plugin")
 				continue
 			}

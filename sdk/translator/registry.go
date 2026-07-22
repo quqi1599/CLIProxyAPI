@@ -17,12 +17,61 @@ type Registry struct {
 	hooks     PluginHooks
 }
 
+type registryContextKey struct{}
+
+type builtinRegistration struct {
+	from     Format
+	to       Format
+	request  RequestTransform
+	response ResponseTransform
+}
+
+var (
+	builtinRegistrationsMu sync.RWMutex
+	builtinRegistrations   []builtinRegistration
+)
+
 // NewRegistry constructs an empty translator registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		requests:  make(map[Format]map[Format]RequestTransform),
 		responses: make(map[Format]map[Format]ResponseTransform),
 	}
+}
+
+// NewBuiltinRegistry constructs an isolated registry populated with the built-in
+// transforms linked into the current binary. Plugin hooks are not copied.
+func NewBuiltinRegistry() *Registry {
+	registry := NewRegistry()
+	builtinRegistrationsMu.RLock()
+	registrations := append([]builtinRegistration(nil), builtinRegistrations...)
+	builtinRegistrationsMu.RUnlock()
+	for _, registration := range registrations {
+		registry.Register(registration.from, registration.to, registration.request, registration.response)
+	}
+	return registry
+}
+
+// ContextWithRegistry binds a registry to one execution context. A nil registry
+// keeps the existing context unchanged.
+func ContextWithRegistry(ctx context.Context, registry *Registry) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if registry == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, registryContextKey{}, registry)
+}
+
+// RegistryFromContext returns the request-scoped registry or the default facade.
+func RegistryFromContext(ctx context.Context) *Registry {
+	if ctx != nil {
+		if registry, ok := ctx.Value(registryContextKey{}).(*Registry); ok && registry != nil {
+			return registry
+		}
+	}
+	return Default()
 }
 
 // Register stores request/response transforms between two formats.
@@ -228,6 +277,17 @@ func Register(from, to Format, request RequestTransform, response ResponseTransf
 	defaultRegistry.Register(from, to, request, response)
 }
 
+// RegisterBuiltin attaches a built-in transform to the default facade and the
+// catalog used by NewBuiltinRegistry. Dynamic callers should use Register.
+func RegisterBuiltin(from, to Format, request RequestTransform, response ResponseTransform) {
+	defaultRegistry.Register(from, to, request, response)
+	builtinRegistrationsMu.Lock()
+	builtinRegistrations = append(builtinRegistrations, builtinRegistration{
+		from: from, to: to, request: request, response: response,
+	})
+	builtinRegistrationsMu.Unlock()
+}
+
 // SetPluginHooks stores plugin hooks on the default registry.
 func SetPluginHooks(hooks PluginHooks) {
 	defaultRegistry.SetPluginHooks(hooks)
@@ -258,19 +318,19 @@ func HasNonStreamResponseTransformer(from, to Format) bool {
 	return defaultRegistry.HasNonStreamResponseTransformer(from, to)
 }
 
-// TranslateStream is a helper on the default registry.
+// TranslateStream uses the request-scoped registry or the default facade.
 func TranslateStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
-	return defaultRegistry.TranslateStream(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
+	return RegistryFromContext(ctx).TranslateStream(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
 }
 
-// TranslateNonStream is a helper on the default registry.
+// TranslateNonStream uses the request-scoped registry or the default facade.
 func TranslateNonStream(ctx context.Context, from, to Format, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
-	return defaultRegistry.TranslateNonStream(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
+	return RegistryFromContext(ctx).TranslateNonStream(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, rawJSON, param)
 }
 
-// TranslateTokenCount is a helper on the default registry.
+// TranslateTokenCount uses the request-scoped registry or the default facade.
 func TranslateTokenCount(ctx context.Context, from, to Format, count int64, rawJSON []byte) []byte {
-	return defaultRegistry.TranslateTokenCount(ctx, from, to, count, rawJSON)
+	return RegistryFromContext(ctx).TranslateTokenCount(ctx, from, to, count, rawJSON)
 }
 
 func hasAnyResponseTransform(fn ResponseTransform) bool {

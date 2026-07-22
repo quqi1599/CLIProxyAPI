@@ -19,7 +19,7 @@ import (
 // Routing pre-checks use this so that targets which would fail at execution are
 // treated as unhandled and fall through to lower-priority routers instead of
 // returning handled then 500ing.
-func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRouteRequest) bool {
+func (h *Host) executorPluginReady(ctx context.Context, pluginID string, routeReq pluginapi.ModelRouteRequest) bool {
 	if h == nil {
 		return false
 	}
@@ -44,6 +44,7 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 		}
 		adapter := newExecutorAdapterRegistration(h, record, provider, executor).adapter
 		return adapter.supportsExecutorFormats(
+			ctx,
 			coreexecutor.Request{Model: routeReq.RequestedModel, Payload: routeReq.Body},
 			coreexecutor.Options{
 				Stream:          routeReq.Stream,
@@ -59,17 +60,17 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 	return false
 }
 
-func (a *executorAdapter) supportsExecutorFormats(req coreexecutor.Request, opts coreexecutor.Options) bool {
+func (a *executorAdapter) supportsExecutorFormats(ctx context.Context, req coreexecutor.Request, opts coreexecutor.Options) bool {
 	if a == nil {
 		return false
 	}
 	inputRequested := executorInputFormat(req, opts)
 	requestedFormat := executorRequestedFormat(req, opts)
-	inputFormat, errInput := a.selectExecutorInputFormat(inputRequested)
+	inputFormat, errInput := a.selectExecutorInputFormat(ctx, inputRequested)
 	if errInput != nil {
 		return false
 	}
-	_, errOutput := a.selectExecutorOutputFormat(requestedFormat, inputFormat)
+	_, errOutput := a.selectExecutorOutputFormat(ctx, requestedFormat, inputFormat)
 	return errOutput == nil
 }
 
@@ -88,7 +89,7 @@ func (h *Host) ExecutePluginExecutor(ctx context.Context, pluginID string, req c
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	return adapter.Execute(ctx, (*coreauth.Auth)(nil), req, opts)
+	return adapter.Execute(h.translatorContext(ctx), (*coreauth.Auth)(nil), req, opts)
 }
 
 // ExecutePluginExecutorStream executes a streaming request with the named plugin executor without changing the requested model.
@@ -97,7 +98,7 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 	if errAdapter != nil {
 		return nil, errAdapter
 	}
-	return adapter.ExecuteStream(ctx, (*coreauth.Auth)(nil), req, opts)
+	return adapter.ExecuteStream(h.translatorContext(ctx), (*coreauth.Auth)(nil), req, opts)
 }
 
 // CountPluginExecutor executes a count-tokens request with the named plugin executor without changing the requested model.
@@ -106,7 +107,7 @@ func (h *Host) CountPluginExecutor(ctx context.Context, pluginID string, req cor
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	return adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
+	return adapter.CountTokens(h.translatorContext(ctx), (*coreauth.Auth)(nil), req, opts)
 }
 
 func (h *Host) executorAdapterForPlugin(pluginID string) (*executorAdapter, error) {

@@ -921,6 +921,7 @@ type Manager struct {
 	maxRetryInterval    atomic.Int64
 	retryQueueDelay     atomic.Int64
 	schedulerHotSyncDue atomic.Int64
+	translatorRegistry  atomic.Pointer[sdktranslator.Registry]
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -1000,6 +1001,22 @@ func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
 	m.mu.Lock()
 	m.pluginScheduler = scheduler
 	m.mu.Unlock()
+}
+
+// SetTranslatorRegistry binds request execution to an explicit translator
+// registry. Passing nil clears the manager-level override.
+func (m *Manager) SetTranslatorRegistry(registry *sdktranslator.Registry) {
+	if m == nil {
+		return
+	}
+	m.translatorRegistry.Store(registry)
+}
+
+func (m *Manager) translatorContext(ctx context.Context) context.Context {
+	if m == nil {
+		return sdktranslator.ContextWithRegistry(ctx, nil)
+	}
+	return sdktranslator.ContextWithRegistry(ctx, m.translatorRegistry.Load())
 }
 
 func (m *Manager) hasPluginScheduler() bool {
@@ -3705,6 +3722,7 @@ func (m *Manager) Load(ctx context.Context) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = m.translatorContext(ctx)
 	ctx, trace := ensureRequestAttemptTrace(ctx)
 	finalSuccess := false
 	var finalErr error
@@ -3765,6 +3783,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = m.translatorContext(ctx)
 	ctx, trace := ensureRequestAttemptTrace(ctx)
 	finalSuccess := false
 	var finalErr error
@@ -3819,6 +3838,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = m.translatorContext(ctx)
 	ctx, trace := ensureRequestAttemptTrace(ctx)
 	finalSuccess := false
 	var finalErr error
@@ -3886,11 +3906,15 @@ type requestToFormatResolver interface {
 	RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
 }
 
+type requestToFormatContextResolver interface {
+	RequestToFormatContext(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
+}
+
 func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	if opts.RequestAfterAuthInterceptor == nil {
 		return req, opts
 	}
-	toFormat := requestToFormat(provider, executor, req, opts)
+	toFormat := requestToFormat(ctx, provider, executor, req, opts)
 	resp := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
 		SourceFormat:   opts.SourceFormat,
 		ToFormat:       toFormat,
@@ -3909,7 +3933,14 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 	return req, opts
 }
 
-func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+func requestToFormat(ctx context.Context, provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+	contextResolver, okContext := executor.(requestToFormatContextResolver)
+	if okContext && contextResolver != nil {
+		formatRequestTo := contextResolver.RequestToFormatContext(ctx, req, opts)
+		if formatRequestTo != "" {
+			return formatRequestTo
+		}
+	}
 	resolver, ok := executor.(requestToFormatResolver)
 	if ok && resolver != nil {
 		formatRequestTo := resolver.RequestToFormat(req, opts)

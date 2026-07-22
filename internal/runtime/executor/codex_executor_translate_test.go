@@ -13,7 +13,8 @@ func TestTranslateCodexRequestPairReusesEqualPayload(t *testing.T) {
 	from := sdktranslator.Format("codex-test-from-equal")
 	to := sdktranslator.Format("codex-test-to-equal")
 	var calls int32
-	sdktranslator.Register(from, to, func(model string, rawJSON []byte, stream bool) []byte {
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.Register(from, to, func(model string, rawJSON []byte, stream bool) []byte {
 		atomic.AddInt32(&calls, 1)
 		if model != "test-model" {
 			t.Errorf("model = %q, want test-model", model)
@@ -25,7 +26,8 @@ func TestTranslateCodexRequestPairReusesEqualPayload(t *testing.T) {
 	}, sdktranslator.ResponseTransform{})
 
 	payload := []byte(`{"model":"test-model","input":[{"role":"user"}]}`)
-	originalTranslated, body, err := translateCodexRequestPair(context.Background(), from, to, "test-model", payload, bytes.Clone(payload), true)
+	ctx := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
+	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, "test-model", payload, bytes.Clone(payload), true)
 	if err != nil {
 		t.Fatalf("translateCodexRequestPair() error = %v", err)
 	}
@@ -42,14 +44,16 @@ func TestTranslateCodexRequestPairTranslatesDifferentPayloads(t *testing.T) {
 	from := sdktranslator.Format("codex-test-from-different")
 	to := sdktranslator.Format("codex-test-to-different")
 	var calls int32
-	sdktranslator.Register(from, to, func(_ string, rawJSON []byte, _ bool) []byte {
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.Register(from, to, func(_ string, rawJSON []byte, _ bool) []byte {
 		atomic.AddInt32(&calls, 1)
 		return append([]byte(nil), rawJSON...)
 	}, sdktranslator.ResponseTransform{})
 
 	originalPayload := []byte(`{"model":"test-model","input":[{"role":"system"}]}`)
 	payload := []byte(`{"model":"test-model","input":[{"role":"user"}]}`)
-	originalTranslated, body, err := translateCodexRequestPair(context.Background(), from, to, "test-model", originalPayload, payload, false)
+	ctx := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
+	originalTranslated, body, err := translateCodexRequestPair(ctx, from, to, "test-model", originalPayload, payload, false)
 	if err != nil {
 		t.Fatalf("translateCodexRequestPair() error = %v", err)
 	}

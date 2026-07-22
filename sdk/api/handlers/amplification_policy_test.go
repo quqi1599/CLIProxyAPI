@@ -15,7 +15,8 @@ import (
 func TestAmplificationPolicyControlsProductionRequestContext(t *testing.T) {
 	from := sdktranslator.Format("handler-amplification-policy-input")
 	to := sdktranslator.Format("handler-amplification-policy-output")
-	sdktranslator.Register(from, to, func(_ string, _ []byte, _ bool) []byte {
+	translationRegistry := sdktranslator.NewRegistry()
+	translationRegistry.Register(from, to, func(_ string, _ []byte, _ bool) []byte {
 		return bytes.Repeat([]byte("x"), 300<<10)
 	}, sdktranslator.ResponseTransform{})
 
@@ -35,7 +36,8 @@ func TestAmplificationPolicyControlsProductionRequestContext(t *testing.T) {
 			if !snapshot.Configured || snapshot.Mode != test.mode {
 				t.Fatalf("amplification snapshot = %+v, want configured %s", snapshot, test.mode)
 			}
-			ctx, release, errAdmission := handler.inspectAndAcquireAdmission(context.Background(), input, nil)
+			requestContext := sdktranslator.ContextWithRegistry(context.Background(), translationRegistry)
+			ctx, release, errAdmission := handler.inspectAndAcquireAdmission(requestContext, input, nil)
 			if errAdmission != nil {
 				t.Fatalf("inspectAndAcquireAdmission() error = %v", errAdmission)
 			}

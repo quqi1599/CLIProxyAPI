@@ -17,6 +17,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 // Builder constructs a Service instance with customizable providers.
@@ -49,6 +50,9 @@ type Builder struct {
 
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
+
+	// translatorRegistry isolates protocol transforms for this service.
+	translatorRegistry *sdktranslator.Registry
 
 	// pluginHost owns dynamic plugin lifecycle and adapters.
 	pluginHost *pluginhost.Host
@@ -145,6 +149,12 @@ func (b *Builder) WithRequestAccessManager(mgr *sdkaccess.Manager) *Builder {
 // WithCoreAuthManager overrides the runtime auth manager responsible for request execution.
 func (b *Builder) WithCoreAuthManager(mgr *coreauth.Manager) *Builder {
 	b.coreManager = mgr
+	return b
+}
+
+// WithTranslatorRegistry overrides the registry used by request execution.
+func (b *Builder) WithTranslatorRegistry(registry *sdktranslator.Registry) *Builder {
+	b.translatorRegistry = registry
 	return b
 }
 
@@ -260,22 +270,29 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
+	translatorRegistry := b.translatorRegistry
+	if translatorRegistry == nil {
+		translatorRegistry = sdktranslator.Default()
+	}
+	coreManager.SetTranslatorRegistry(translatorRegistry)
 	if pluginHost != nil {
 		coreManager.SetPluginScheduler(pluginHost)
+		pluginHost.SetTranslatorRegistry(translatorRegistry)
 	}
 
 	service := &Service{
-		cfg:            b.cfg,
-		configPath:     b.configPath,
-		tokenProvider:  tokenProvider,
-		apiKeyProvider: apiKeyProvider,
-		watcherFactory: watcherFactory,
-		hooks:          b.hooks,
-		authManager:    authManager,
-		accessManager:  accessManager,
-		coreManager:    coreManager,
-		pluginHost:     pluginHost,
-		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
+		cfg:                b.cfg,
+		configPath:         b.configPath,
+		tokenProvider:      tokenProvider,
+		apiKeyProvider:     apiKeyProvider,
+		watcherFactory:     watcherFactory,
+		hooks:              b.hooks,
+		authManager:        authManager,
+		accessManager:      accessManager,
+		coreManager:        coreManager,
+		translatorRegistry: translatorRegistry,
+		pluginHost:         pluginHost,
+		serverOptions:      append([]api.ServerOption(nil), b.serverOptions...),
 	}
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))

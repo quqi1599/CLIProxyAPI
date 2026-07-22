@@ -22,7 +22,7 @@ var registry = sdktranslator.Default()
 //   - request: The request translation function
 //   - response: The response translation function
 func Register(from, to string, request interfaces.TranslateRequestFunc, response interfaces.TranslateResponse) {
-	registry.Register(sdktranslator.FromString(from), sdktranslator.FromString(to), request, response)
+	sdktranslator.RegisterBuiltin(sdktranslator.FromString(from), sdktranslator.FromString(to), request, response)
 }
 
 // Request translates a request from one API format to another.

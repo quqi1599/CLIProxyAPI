@@ -20,7 +20,7 @@ func TranslateRequestGuarded(
 	stream bool,
 	override internalpayload.AmplificationOverride,
 ) ([]byte, error) {
-	translated := sdktranslator.TranslateRequest(from, to, model, body, stream)
+	translated := sdktranslator.RegistryFromContext(ctx).TranslateRequest(from, to, model, body, stream)
 	if err := internalpayload.EnforceRequestTransform(ctx, stage, int64(len(body)), int64(len(translated)), override); err != nil {
 		return nil, err
 	}

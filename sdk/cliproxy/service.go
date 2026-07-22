@@ -99,6 +99,9 @@ type Service struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// translatorRegistry owns request-scoped protocol transforms and plugin hooks.
+	translatorRegistry *sdktranslator.Registry
+
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
@@ -236,6 +239,7 @@ func (s *Service) syncPluginRuntimeConfig(ctx context.Context) bool {
 
 	if s.pluginHost != nil {
 		s.pluginHost.ApplyConfig(ctx, cfg)
+		s.pluginHost.SetTranslatorRegistry(s.translatorRegistryOrDefault())
 	}
 	if s.coreManager != nil {
 		s.coreManager.SetPluginScheduler(s.pluginHost)
@@ -249,7 +253,7 @@ func (s *Service) syncPluginRuntimeConfig(ctx context.Context) bool {
 		s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
 	}
 	s.pluginHost.RegisterUsagePlugins()
-	sdktranslator.SetPluginHooks(s.pluginHost)
+	s.translatorRegistryOrDefault().SetPluginHooks(s.pluginHost)
 	if s.server != nil {
 		s.server.RefreshPluginManagementRoutes()
 	}
@@ -1942,7 +1946,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		if s.pluginHost != nil {
-			sdktranslator.SetPluginHooks(nil)
+			s.translatorRegistryOrDefault().SetPluginHooks(nil)
 			sdkAuth.RegisterPluginAuthParser(nil)
 			if s.watcher != nil {
 				s.watcher.SetPluginAuthParser(nil)
@@ -1962,6 +1966,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+func (s *Service) translatorRegistryOrDefault() *sdktranslator.Registry {
+	if s != nil && s.translatorRegistry != nil {
+		return s.translatorRegistry
+	}
+	return sdktranslator.Default()
 }
 
 func (s *Service) ensureDefaults() error {
@@ -2008,6 +2019,13 @@ func (s *Service) ensureDefaults() error {
 	s.coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	s.coreManager.SetConfig(s.cfg)
 	s.coreManager.SetOAuthModelAlias(s.cfg.OAuthModelAlias)
+	if s.translatorRegistry == nil {
+		s.translatorRegistry = sdktranslator.Default()
+	}
+	s.coreManager.SetTranslatorRegistry(s.translatorRegistry)
+	if s.pluginHost != nil {
+		s.pluginHost.SetTranslatorRegistry(s.translatorRegistry)
+	}
 	return nil
 }
 
