@@ -78,6 +78,44 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIUsageTotalOnlyIsUnclassified(t *testing.T) {
+	detail := ParseOpenAIUsage([]byte(`{"usage":{"total_tokens":42}}`))
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityUnclassified ||
+		detail.TotalTokens != 42 || detail.TokenBreakdown.UnclassifiedTokens != 42 {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsageExplicitZeroBucketsRemainInconsistent(t *testing.T) {
+	detail := ParseOpenAIUsage([]byte(`{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":42}}`))
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityInconsistent {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
+func TestParseCodexUsageIncludesCacheWriteTokens(t *testing.T) {
+	data := []byte(`{"response":{"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":30,"cache_write_tokens":40}}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 100 || detail.OutputTokens != 20 || detail.CachedTokens != 30 ||
+		detail.CacheReadTokens != 30 || detail.CacheCreationTokens != 40 || detail.TotalTokens != 120 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 30 || detail.TokenBreakdown.Input.CacheWriteTokens != 40 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageNormalizesCacheCreationAlias(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cache_creation_tokens":4}}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.CacheCreationTokens != 4 {
+		t.Fatalf("cache creation tokens = %d, want 4", detail.CacheCreationTokens)
+	}
+}
+
 func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
 	data := []byte(`{"usage":null}`)
 	detail := ParseOpenAIUsage(data)
@@ -168,7 +206,7 @@ func TestNormalizeUsageDetailTotalDoesNotDoubleCountReasoning(t *testing.T) {
 		InputTokens:     100,
 		OutputTokens:    30,
 		ReasoningTokens: 12,
-	})
+	}, "", "")
 	if detail.TotalTokens != 130 {
 		t.Fatalf("total tokens = %d, want 130", detail.TotalTokens)
 	}
