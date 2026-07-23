@@ -234,13 +234,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
-	if detail.TotalTokens == 0 {
-		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-		if total > 0 {
-			detail.TotalTokens = total
-		}
-	}
-	return detail
+	return usage.EnsureTokenBreakdown(detail)
 }
 
 func hasNonZeroTokenUsage(detail usage.Detail) bool {
@@ -250,7 +244,8 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.CachedTokens != 0 ||
 		detail.CacheReadTokens != 0 ||
 		detail.CacheCreationTokens != 0 ||
-		detail.TotalTokens != 0
+		detail.TotalTokens != 0 ||
+		detail.TokenBreakdown.TotalTokens != 0
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.
@@ -701,8 +696,21 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("total_tokens").Exists() ||
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
+		usageNode.Get("prompt_tokens_details.cache_write_tokens").Exists() ||
+		usageNode.Get("prompt_tokens_details.cache_creation_tokens").Exists() ||
+		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
+		usageNode.Get("input_tokens_details.cache_creation_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
 		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
+}
+
+func firstExistingUsageNode(root gjson.Result, paths ...string) gjson.Result {
+	for _, path := range paths {
+		if node := root.Get(path); node.Exists() {
+			return node
+		}
+	}
+	return gjson.Result{}
 }
 
 func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
@@ -725,6 +733,17 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
+	}
+	cacheCreation := firstExistingUsageNode(
+		usageNode,
+		"input_tokens_details.cache_creation_tokens",
+		"input_tokens_details.cache_write_tokens",
+		"prompt_tokens_details.cache_creation_tokens",
+		"prompt_tokens_details.cache_write_tokens",
+	)
+	if cacheCreation.Exists() {
+		detail.CacheCreationTokens = cacheCreation.Int()
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
@@ -732,6 +751,17 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	}
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
+	}
+	detail.TokenBreakdown = usage.NewSubsetTokenBreakdown(
+		detail.InputTokens,
+		detail.CacheReadTokens,
+		detail.CacheCreationTokens,
+		detail.OutputTokens,
+		detail.ReasoningTokens,
+		detail.TotalTokens,
+	)
+	if detail.TotalTokens == 0 {
+		detail.TotalTokens = detail.TokenBreakdown.TotalTokens
 	}
 	return detail
 }
@@ -782,20 +812,38 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.CachedTokens = detail.CacheCreationTokens
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	detail.TokenBreakdown = usage.NewIndependentTokenBreakdown(
+		detail.InputTokens,
+		detail.CacheReadTokens,
+		detail.CacheCreationTokens,
+		detail.OutputTokens,
+		detail.ReasoningTokens,
+		detail.TotalTokens,
+	)
 	return detail
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
+	cachedTokens := node.Get("cachedContentTokenCount").Int()
 	detail := usage.Detail{
 		InputTokens:     node.Get("promptTokenCount").Int(),
 		OutputTokens:    node.Get("candidatesTokenCount").Int(),
 		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
 		TotalTokens:     node.Get("totalTokenCount").Int(),
-		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
+		CachedTokens:    cachedTokens,
+		CacheReadTokens: cachedTokens,
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
+	detail.TokenBreakdown = usage.NewSeparateReasoningTokenBreakdown(
+		detail.InputTokens,
+		detail.CacheReadTokens,
+		detail.CacheCreationTokens,
+		detail.OutputTokens,
+		detail.ReasoningTokens,
+		detail.TotalTokens,
+	)
 	return detail
 }
 

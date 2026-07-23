@@ -30,22 +30,28 @@ func (e metadataStatusError) ProviderStatusCode() int { return e.status }
 func (e metadataStatusError) ErrorCode() string { return e.code }
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
-	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
+	data := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
 	detail := ParseOpenAIUsage(data)
-	if detail.InputTokens != 1 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 1)
+	if detail.InputTokens != 10 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
 	}
-	if detail.OutputTokens != 2 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 2)
+	if detail.OutputTokens != 6 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 6)
 	}
-	if detail.TotalTokens != 3 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 3)
+	if detail.TotalTokens != 16 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 16)
 	}
 	if detail.CachedTokens != 4 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 4)
 	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.Output.NonReasoningTokens != 1 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
@@ -66,6 +72,9 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 3 || detail.TokenBreakdown.Output.NonReasoningTokens != 11 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
@@ -128,6 +137,9 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	if detail.TotalTokens != 22859 {
 		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22859)
 	}
+	if detail.TokenBreakdown.Input.TotalTokens != 22606 || detail.TokenBreakdown.Input.UncachedTokens != 3085 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
 }
 
 func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
@@ -138,6 +150,30 @@ func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	}
 	if detail.TotalTokens != 22852 {
 		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22852)
+	}
+}
+
+func TestParseGeminiUsageNormalizesCachedContent(t *testing.T) {
+	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"cachedContentTokenCount":4,"totalTokenCount":12}}`))
+	if detail.CacheReadTokens != 4 {
+		t.Fatalf("cache read tokens = %d, want 4", detail.CacheReadTokens)
+	}
+	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.TotalTokens != 12 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestNormalizeUsageDetailTotalDoesNotDoubleCountReasoning(t *testing.T) {
+	detail := normalizeUsageDetailTotal(usage.Detail{
+		InputTokens:     100,
+		OutputTokens:    30,
+		ReasoningTokens: 12,
+	})
+	if detail.TotalTokens != 130 {
+		t.Fatalf("total tokens = %d, want 130", detail.TotalTokens)
+	}
+	if detail.TokenBreakdown.Quality != usage.TokenAccountingQualityUnclassified || detail.TokenBreakdown.UnclassifiedTokens != 130 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
 	}
 }
 
