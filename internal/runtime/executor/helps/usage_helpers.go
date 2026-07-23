@@ -756,14 +756,35 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		detail.ReasoningTokens = reasoning.Int()
 	}
 	if hasOpenAIStyleUsageBucketFields(usageNode) {
-		detail.TokenBreakdown = usage.NewSubsetTokenBreakdown(
-			detail.InputTokens,
-			detail.CacheReadTokens,
-			detail.CacheCreationTokens,
-			detail.OutputTokens,
-			detail.ReasoningTokens,
-			detail.TotalTokens,
-		)
+		if inputNode.Exists() && outputNode.Exists() {
+			detail.TokenBreakdown = usage.NewSubsetTokenBreakdown(
+				detail.InputTokens,
+				detail.CacheReadTokens,
+				detail.CacheCreationTokens,
+				detail.OutputTokens,
+				detail.ReasoningTokens,
+				detail.TotalTokens,
+			)
+		} else {
+			cacheReadTokens := detail.CacheReadTokens
+			cacheCreationTokens := detail.CacheCreationTokens
+			if !inputNode.Exists() {
+				cacheReadTokens = 0
+				cacheCreationTokens = 0
+			}
+			reasoningTokens := detail.ReasoningTokens
+			if !outputNode.Exists() {
+				reasoningTokens = 0
+			}
+			detail.TokenBreakdown = usage.NewPartialSubsetTokenBreakdown(
+				detail.InputTokens,
+				cacheReadTokens,
+				cacheCreationTokens,
+				detail.OutputTokens,
+				reasoningTokens,
+				detail.TotalTokens,
+			)
+		}
 	} else {
 		detail.TokenBreakdown = usage.NewUnclassifiedTokenBreakdown(detail.TotalTokens)
 	}
@@ -832,16 +853,28 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 	cachedTokens := node.Get("cachedContentTokenCount").Int()
+	toolUseTokens := firstExistingUsageNode(node, "toolUsePromptTokenCount", "tool_use_prompt_token_count").Int()
+	inputTokens, okInput := safeUsageTokenSum(node.Get("promptTokenCount").Int(), toolUseTokens)
 	detail := usage.Detail{
-		InputTokens:     node.Get("promptTokenCount").Int(),
+		InputTokens:     inputTokens,
 		OutputTokens:    node.Get("candidatesTokenCount").Int(),
 		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
 		TotalTokens:     node.Get("totalTokenCount").Int(),
 		CachedTokens:    cachedTokens,
 		CacheReadTokens: cachedTokens,
 	}
+	if !okInput {
+		detail.TokenBreakdown = invalidUsageTokenBreakdown(detail.TotalTokens)
+		return detail
+	}
 	if detail.TotalTokens == 0 {
-		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		var okTotal bool
+		detail.TotalTokens, okTotal = safeUsageTokenSum(detail.InputTokens, detail.OutputTokens, detail.ReasoningTokens)
+		if !okTotal {
+			detail.TotalTokens = 0
+			detail.TokenBreakdown = invalidUsageTokenBreakdown(0)
+			return detail
+		}
 	}
 	detail.TokenBreakdown = usage.NewSeparateReasoningTokenBreakdown(
 		detail.InputTokens,
@@ -879,6 +912,29 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
+}
+
+func safeUsageTokenSum(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || total > int64(^uint64(0)>>1)-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
+func invalidUsageTokenBreakdown(total int64) usage.TokenBreakdown {
+	if total < 0 {
+		total = 0
+	}
+	return usage.TokenBreakdown{
+		SchemaVersion:      usage.TokenAccountingSchemaVersion,
+		Quality:            usage.TokenAccountingQualityInconsistent,
+		TotalTokens:        total,
+		UnclassifiedTokens: total,
+	}
 }
 
 func ParseAntigravityUsage(data []byte) usage.Detail {
