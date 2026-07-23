@@ -343,6 +343,7 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *clipr
 		body, _ = sjson.DeleteBytes(body, "stream")
 	} else {
 		body = normalizeCodexStatelessPayload(body)
+		body, _ = sjson.DeleteBytes(body, "generate")
 		body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 		body, _ = sjson.DeleteBytes(body, "safety_identifier")
 		body, _ = sjson.DeleteBytes(body, "stream_options")

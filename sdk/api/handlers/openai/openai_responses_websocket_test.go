@@ -27,6 +27,39 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestResponsesWebsocketRequestRequiresCurrentUpstream(t *testing.T) {
+	cases := []struct {
+		payload string
+		want    bool
+	}{
+		{payload: `{"type":"response.create","previous_response_id":"resp-1","input":[]}`, want: true},
+		{payload: `{"type":"response.append","input":[]}`, want: true},
+		{payload: `{"type":"response.create","input":[]}`, want: false},
+	}
+	for _, tc := range cases {
+		if got := responsesWebsocketRequestRequiresCurrentUpstream([]byte(tc.payload)); got != tc.want {
+			t.Fatalf("responsesWebsocketRequestRequiresCurrentUpstream() = %t, want %t", got, tc.want)
+		}
+	}
+}
+
+func TestShouldReplayResponsesWebsocketPinnedAuthFailure(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{status: http.StatusUnauthorized, want: true},
+		{status: http.StatusTooManyRequests, want: true},
+		{status: http.StatusForbidden, want: false},
+		{status: http.StatusServiceUnavailable, want: false},
+	}
+	for _, tc := range cases {
+		if got := shouldReplayResponsesWebsocketPinnedAuthFailure(&interfaces.ErrorMessage{StatusCode: tc.status}); got != tc.want {
+			t.Fatalf("status %d replay = %t, want %t", tc.status, got, tc.want)
+		}
+	}
+}
+
 type websocketCaptureExecutor struct {
 	streamCalls     int
 	payloads        [][]byte
@@ -3203,10 +3236,10 @@ func TestResponsesWebsocketPinsOnlyWebsocketCapableAuth(t *testing.T) {
 	}
 }
 
-func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
+func TestResponsesWebsocketHTTPModeFailsOverWithinRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-b"}}
+	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-a", "auth-b"}}
 	executor := &websocketPinnedFailoverExecutor{}
 	manager := coreauth.NewManager(nil, selector, nil)
 	manager.RegisterExecutor(executor)
@@ -3255,9 +3288,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	requests := []string{
 		`{"type":"response.create","model":"quota-model","input":[{"type":"message","id":"msg-1"}]}`,
 		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`,
-		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-3"}]}`,
 	}
-	wantTypes := []string{wsEventTypeCompleted, wsEventTypeError, wsEventTypeCompleted}
 	for i := range requests {
 		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(requests[i])); errWrite != nil {
 			t.Fatalf("write websocket message %d: %v", i+1, errWrite)
@@ -3266,11 +3297,8 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 		if errReadMessage != nil {
 			t.Fatalf("read websocket message %d: %v", i+1, errReadMessage)
 		}
-		if got := gjson.GetBytes(payload, "type").String(); got != wantTypes[i] {
-			t.Fatalf("message %d payload type = %s, want %s: %s", i+1, got, wantTypes[i], payload)
-		}
-		if i == 1 && int(gjson.GetBytes(payload, "status").Int()) != http.StatusTooManyRequests {
-			t.Fatalf("quota payload status = %d, want %d: %s", gjson.GetBytes(payload, "status").Int(), http.StatusTooManyRequests, payload)
+		if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+			t.Fatalf("message %d payload type = %s, want %s: %s", i+1, got, wsEventTypeCompleted, payload)
 		}
 	}
 
@@ -3287,7 +3315,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 		t.Fatalf("previous_response_id leaked after auth failover: %s", authBPayload)
 	}
 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
-	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
+	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-2"`) {
 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
 	}
 

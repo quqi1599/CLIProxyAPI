@@ -23,6 +23,192 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestXAIWebsocketsEnabledForConfigAPIKey(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"api_key":    "xai-key",
+			"websockets": "true",
+		},
+	}
+	if !xaiWebsocketsEnabled(auth) {
+		t.Fatal("xaiWebsocketsEnabled() = false, want true")
+	}
+}
+
+func TestXAIAutoExecutorRequiredUpstreamWebsocketRejectsHTTPFallback(t *testing.T) {
+	exec := NewXAIAutoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-http-only",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"api_key": "xai-key",
+		},
+	}
+	ctx := cliproxyexecutor.WithRequiredUpstreamWebsocket(
+		cliproxyexecutor.WithDownstreamWebsocket(context.Background()),
+	)
+	_, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "grok-4",
+		Payload: []byte(`{"model":"grok-4","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-2"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if errExecute == nil {
+		t.Fatal("ExecuteStream() error = nil, want replay-required error")
+	}
+	statusErr, ok := errExecute.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != http.StatusUpgradeRequired {
+		t.Fatalf("ExecuteStream() error = %T %v, want status 426", errExecute, errExecute)
+	}
+	if got := gjson.Get(errExecute.Error(), "error.code").String(); got != "upstream_http_replay_required" {
+		t.Fatalf("ExecuteStream() error code = %q, want upstream_http_replay_required", got)
+	}
+	requestScoped, ok := errExecute.(cliproxyexecutor.RequestScopedError)
+	if !ok || !requestScoped.IsRequestScoped() {
+		t.Fatalf("ExecuteStream() error = %T, want request-scoped replay signal", errExecute)
+	}
+}
+
+func TestXAIWebsocketsRequiredUpstreamRejectsCompactionHTTPFallback(t *testing.T) {
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	ctx := cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background())
+	_, errExecute := exec.ExecuteStream(ctx, &cliproxyauth.Auth{}, cliproxyexecutor.Request{
+		Model:   "grok-4",
+		Payload: []byte(`{"model":"grok-4","input":[{"type":"compaction_trigger"}]}`),
+	}, cliproxyexecutor.Options{})
+	if !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errExecute) {
+		t.Fatalf("ExecuteStream() error = %T %v, want replay-required", errExecute, errExecute)
+	}
+}
+
+func TestMapXAIWebsocketWriteErrorStopsRetryForMessageTooBig(t *testing.T) {
+	networkWriteErr := errors.New("write: broken pipe")
+	tests := []struct {
+		name       string
+		closeCode  int
+		writeErr   error
+		wantStatus int
+		wantRetry  bool
+	}{
+		{
+			name:       "close sent after message too big is request scoped",
+			closeCode:  websocket.CloseMessageTooBig,
+			writeErr:   websocket.ErrCloseSent,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantRetry:  false,
+		},
+		{
+			name:       "network write error after message too big is request scoped",
+			closeCode:  websocket.CloseMessageTooBig,
+			writeErr:   networkWriteErr,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantRetry:  false,
+		},
+		{
+			name:      "other close keeps stale connection retry",
+			closeCode: websocket.CloseNormalClosure,
+			writeErr:  websocket.ErrCloseSent,
+			wantRetry: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &codexWebsocketSession{}
+			conn := &websocket.Conn{}
+			sess.resetUpstreamDisconnectError(conn)
+			sess.setUpstreamDisconnectError(conn, &websocket.CloseError{Code: tt.closeCode})
+
+			mappedErr := mapXAIWebsocketWriteError(sess, conn, tt.writeErr)
+			if got := shouldRetryXAIWebsocketSend(mappedErr); got != tt.wantRetry {
+				t.Fatalf("shouldRetryXAIWebsocketSend() = %v, want %v; err=%v", got, tt.wantRetry, mappedErr)
+			}
+			if tt.wantStatus == 0 {
+				if !errors.Is(mappedErr, tt.writeErr) {
+					t.Fatalf("mapped error = %v, want %v", mappedErr, tt.writeErr)
+				}
+				return
+			}
+			statusErr, ok := mappedErr.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != tt.wantStatus {
+				t.Fatalf("mapped status = %v, want %d; err=%v", statusErr, tt.wantStatus, mappedErr)
+			}
+			requestErr, ok := mappedErr.(interface{ IsRequestScoped() bool })
+			if !ok || !requestErr.IsRequestScoped() {
+				t.Fatalf("mapped error should be request scoped, got %T", mappedErr)
+			}
+		})
+	}
+}
+
+func TestXAIWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		deadline := time.Now().Add(time.Second)
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too big")
+		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, deadline); errWrite != nil {
+			t.Errorf("write close websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	select {
+	case chunk, ok := <-result.Chunks:
+		if !ok {
+			t.Fatal("stream closed before error chunk")
+		}
+		if chunk.Err == nil {
+			t.Fatal("error chunk Err = nil, want message-too-big error")
+		}
+		statusErr, ok := chunk.Err.(interface{ StatusCode() int })
+		if !ok || statusErr.StatusCode() != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status error = %v, want %d; err=%v", statusErr, http.StatusRequestEntityTooLarge, chunk.Err)
+		}
+		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
+			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
+		}
+		requestErr, ok := chunk.Err.(interface{ IsRequestScoped() bool })
+		if !ok || !requestErr.IsRequestScoped() {
+			t.Fatalf("message-too-big error should be request scoped, got %T", chunk.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for error stream chunk")
+	}
+}
+
 func TestXAIWebsocketsExecuteStreamSendsResponseCreateWithPreviousResponseID(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	capturedPayload := make(chan []byte, 1)

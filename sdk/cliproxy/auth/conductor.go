@@ -7089,8 +7089,20 @@ func resultErrorFromCause(err error) *Error {
 		resultErr.Kind = string(typed.Kind)
 		resultErr.Scope = string(typed.Scope)
 		resultErr.Retryable = typed.Retryable
+	} else if isExecutorRequestScopedError(err) {
+		resultErr.Kind = string(failurecontract.InvalidRequest)
+		resultErr.Scope = string(failurecontract.ScopeRequest)
+		resultErr.Retryable = false
 	}
 	return resultErr
+}
+
+func isExecutorRequestScopedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var requestErr cliproxyexecutor.RequestScopedError
+	return errors.As(err, &requestErr) && requestErr != nil && requestErr.IsRequestScoped()
 }
 
 func failureScopeFromResult(result Result) (failurecontract.Scope, bool) {
@@ -8096,6 +8108,9 @@ func isSpecificFallbackModel(model string, target string) bool {
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isExecutorRequestScopedError(err) {
+		return true
 	}
 	if typed, ok := failurecontract.As(err); ok {
 		if scope, controlled := controlledFailureScope(string(typed.Scope)); controlled {

@@ -240,3 +240,10 @@ type StatusError interface {
 	error
 	StatusCode() int
 }
+
+// RequestScopedError identifies a failure tied to the current request rather
+// than the selected credential.
+type RequestScopedError interface {
+	error
+	IsRequestScoped() bool
+}
