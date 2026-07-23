@@ -36,6 +36,16 @@ type websocketToolOutputSession struct {
 	bytes    int
 }
 
+type responsesWebsocketToolCacheTurn struct {
+	outputCache *websocketToolOutputCache
+	callCache   *websocketToolOutputCache
+	sessionKey  string
+	outputs     map[string]json.RawMessage
+	outputOrder []string
+	calls       map[string]json.RawMessage
+	callOrder   []string
+}
+
 func newWebsocketToolOutputCache(ttl time.Duration, maxPerSession int) *websocketToolOutputCache {
 	return newWebsocketToolOutputCacheWithBudget(ttl, maxPerSession, websocketToolOutputCacheMaxBytes)
 }
@@ -255,11 +265,103 @@ func normalizeResponsesWebsocketSessionKey(sessionKey string) string {
 	return sessionKey
 }
 
+func newResponsesWebsocketToolCacheTurn(outputCache, callCache *websocketToolOutputCache, sessionKey string) *responsesWebsocketToolCacheTurn {
+	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
+	if sessionKey == "" || outputCache == nil {
+		return nil
+	}
+	return &responsesWebsocketToolCacheTurn{
+		outputCache: outputCache,
+		callCache:   callCache,
+		sessionKey:  sessionKey,
+		outputs:     make(map[string]json.RawMessage),
+		calls:       make(map[string]json.RawMessage),
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) recordRequest(payload []byte) {
+	if t == nil || len(payload) == 0 {
+		return
+	}
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return
+	}
+	for _, item := range input.Array() {
+		t.recordItem(item)
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) recordResponse(payload []byte) {
+	if t == nil || len(payload) == 0 {
+		return
+	}
+	switch strings.TrimSpace(gjson.GetBytes(payload, "type").String()) {
+	case "response.completed":
+		output := gjson.GetBytes(payload, "response.output")
+		if !output.Exists() || !output.IsArray() {
+			return
+		}
+		for _, item := range output.Array() {
+			t.recordItem(item)
+		}
+	case "response.output_item.added", "response.output_item.done":
+		t.recordItem(gjson.GetBytes(payload, "item"))
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) recordItem(item gjson.Result) {
+	if t == nil || !item.Exists() {
+		return
+	}
+	callID := strings.TrimSpace(item.Get("call_id").String())
+	if callID == "" || strings.TrimSpace(item.Raw) == "" {
+		return
+	}
+	raw := append(json.RawMessage(nil), item.Raw...)
+	switch {
+	case isResponsesToolCallOutputType(item.Get("type").String()):
+		if _, exists := t.outputs[callID]; !exists {
+			t.outputOrder = append(t.outputOrder, callID)
+		}
+		t.outputs[callID] = raw
+	case isResponsesToolCallType(item.Get("type").String()):
+		if _, exists := t.calls[callID]; !exists {
+			t.callOrder = append(t.callOrder, callID)
+		}
+		t.calls[callID] = raw
+	}
+}
+
+func (t *responsesWebsocketToolCacheTurn) commit() {
+	if t == nil || t.sessionKey == "" {
+		return
+	}
+	if t.outputCache != nil {
+		for _, callID := range t.outputOrder {
+			t.outputCache.record(t.sessionKey, callID, t.outputs[callID])
+		}
+	}
+	if t.callCache != nil {
+		for _, callID := range t.callOrder {
+			t.callCache.record(t.sessionKey, callID, t.calls[callID])
+		}
+	}
+}
+
+func repairResponsesWebsocketToolCallsWithoutRecording(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
+	return repairResponsesWebsocketToolCallsWithCachesMode(outputCache, callCache, sessionKey, payload, false)
+}
+
 func repairResponsesWebsocketToolCallsWithCache(cache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
 	return repairResponsesWebsocketToolCallsWithCaches(cache, nil, sessionKey, payload)
 }
 
 func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte) []byte {
+	return repairResponsesWebsocketToolCallsWithCachesMode(outputCache, callCache, sessionKey, payload, true)
+}
+
+func repairResponsesWebsocketToolCallsWithCachesMode(outputCache, callCache *websocketToolOutputCache, sessionKey string, payload []byte, record bool) []byte {
 	sessionKey = normalizeResponsesWebsocketSessionKey(sessionKey)
 	if sessionKey == "" || outputCache == nil || len(payload) == 0 {
 		return payload
@@ -271,7 +373,7 @@ func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websock
 	}
 
 	allowOrphanOutputs := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != ""
-	updatedRaw, errRepair := repairResponsesToolCallsArray(outputCache, callCache, sessionKey, input.Raw, allowOrphanOutputs)
+	updatedRaw, errRepair := repairResponsesToolCallsArray(outputCache, callCache, sessionKey, input.Raw, allowOrphanOutputs, record)
 	if errRepair != nil || updatedRaw == "" || updatedRaw == input.Raw {
 		return payload
 	}
@@ -283,7 +385,7 @@ func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websock
 	return updated
 }
 
-func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCache, sessionKey string, rawArray string, allowOrphanOutputs bool) (string, error) {
+func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCache, sessionKey string, rawArray string, allowOrphanOutputs bool, record bool) (string, error) {
 	rawArray = strings.TrimSpace(rawArray)
 	if rawArray == "" {
 		return "[]", nil
@@ -309,14 +411,16 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 				continue
 			}
 			outputPresent[callID] = struct{}{}
-			outputCache.record(sessionKey, callID, item)
+			if record {
+				outputCache.record(sessionKey, callID, item)
+			}
 		case isResponsesToolCallType(itemType):
 			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 			if callID == "" {
 				continue
 			}
 			callPresent[callID] = struct{}{}
-			if callCache != nil {
+			if record && callCache != nil {
 				callCache.record(sessionKey, callID, item)
 			}
 		}

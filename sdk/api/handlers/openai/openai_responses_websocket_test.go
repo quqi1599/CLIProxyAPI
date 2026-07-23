@@ -489,10 +489,11 @@ func (e *websocketCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
 }
 
-func (e *websocketRetainedBudgetExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+func (e *websocketRetainedBudgetExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	e.mu.Lock()
 	call := e.calls
 	e.calls++
+	e.payloads = append(e.payloads, bytes.Clone(req.Payload))
 	if call >= len(e.plans) {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("unexpected retained-budget stream call %d", call+1)
@@ -1262,14 +1263,15 @@ func TestResponsesWebsocketRollbackRetainedBudgetTransfersAndReleases(t *testing
 		plans: []websocketRetainedStreamPlan{
 			{payload: completedPayload},
 			{payload: []byte(`{"type":"error","status":429,"error":{"message":"quota exhausted"}}`), beforeSend: blockFailure},
+			{payload: []byte(`{"type":"response.completed","response":{"id":"resp-after-failure","output":[{"type":"message","id":"out-after-failure"}]}}`)},
 		},
-		started: make(chan int, 2),
+		started: make(chan int, 3),
 	}
 	h, server := newResponsesRetainedBudgetTestServer(t, modelName, executor, 128<<10)
 	defer server.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
-	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"rollback-tool-cache-session"}})
 	if errDial != nil {
 		t.Fatalf("dial websocket: %v", errDial)
 	}
@@ -1287,7 +1289,7 @@ func TestResponsesWebsocketRollbackRetainedBudgetTransfersAndReleases(t *testing
 	writeAndReadResponsesWebsocketInvalidRequest(t, conn)
 	baseline := responsesWebsocketRetainedBytes(h.responsesWebsocketRetainedLimiter)
 
-	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","input":[{"type":"message","role":"user","content":"two"}]}`)); errWrite != nil {
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","input":[{"type":"function_call","id":"fc-failed","call_id":"failed-call","name":"failed_tool","arguments":"{}"},{"type":"function_call_output","id":"fco-failed","call_id":"failed-call","output":"must-not-survive"}]}`)); errWrite != nil {
 		t.Fatalf("write failing request: %v", errWrite)
 	}
 	select {
@@ -1314,6 +1316,22 @@ func TestResponsesWebsocketRollbackRetainedBudgetTransfersAndReleases(t *testing
 	writeAndReadResponsesWebsocketInvalidRequest(t, conn)
 	if afterRollback := responsesWebsocketRetainedBytes(h.responsesWebsocketRetainedLimiter); afterRollback != baseline {
 		t.Fatalf("rollback retained bytes = %d, want baseline %d", afterRollback, baseline)
+	}
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","input":[{"type":"message","id":"msg-after-failure"},{"type":"function_call","id":"fc-retry","call_id":"failed-call","name":"failed_tool","arguments":"{}"}]}`)); errWrite != nil {
+		t.Fatalf("write request after rollback: %v", errWrite)
+	}
+	if _, payload, errRead := conn.ReadMessage(); errRead != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		t.Fatalf("read request after rollback: type=%q err=%v", gjson.GetBytes(payload, "type").String(), errRead)
+	}
+	if call := <-executor.started; call != 3 {
+		t.Fatalf("third stream call = %d, want 3", call)
+	}
+	executor.mu.Lock()
+	thirdPayload := bytes.Clone(executor.payloads[2])
+	executor.mu.Unlock()
+	if bytes.Contains(thirdPayload, []byte(`"call_id":"failed-call"`)) || bytes.Contains(thirdPayload, []byte("must-not-survive")) {
+		t.Fatalf("failed turn contaminated tool cache: %s", thirdPayload)
 	}
 
 	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
@@ -1402,6 +1420,25 @@ func TestWebsocketDownstreamSessionKeyRejectsOversizedKey(t *testing.T) {
 	req.Header.Set("X-Client-Request-Id", strings.Repeat("x", websocketToolSessionKeyMaxBytes+1))
 	if got := websocketDownstreamSessionKey(req); got != "" {
 		t.Fatalf("session key = %q, want empty", got)
+	}
+}
+
+func TestResponsesWebsocketToolCacheTurnCommitsOnlyOnSuccess(t *testing.T) {
+	outputCache := newWebsocketToolOutputCache(time.Minute, 10)
+	callCache := newWebsocketToolOutputCache(time.Minute, 10)
+	const sessionKey = "tool-cache-turn-commit-session"
+	turn := newResponsesWebsocketToolCacheTurn(outputCache, callCache, sessionKey)
+	turn.recordRequest([]byte(`{"input":[{"type":"function_call_output","id":"fco-1","call_id":"call-1","output":"cached result"}]}`))
+	request := []byte(`{"input":[{"type":"function_call","id":"fc-next","call_id":"call-1","name":"lookup","arguments":"{}"}]}`)
+	if beforeCommit := repairResponsesWebsocketToolCallsWithoutRecording(outputCache, callCache, sessionKey, request); gjson.GetBytes(beforeCommit, "input.#").Int() != 0 {
+		t.Fatalf("uncommitted turn populated cache: %s", beforeCommit)
+	}
+
+	turn.commit()
+	afterCommit := repairResponsesWebsocketToolCallsWithoutRecording(outputCache, callCache, sessionKey, request)
+	input := gjson.GetBytes(afterCommit, "input").Array()
+	if len(input) != 2 || input[1].Get("output").String() != "cached result" {
+		t.Fatalf("committed turn was not available to tool repair: %s", afterCommit)
 	}
 }
 

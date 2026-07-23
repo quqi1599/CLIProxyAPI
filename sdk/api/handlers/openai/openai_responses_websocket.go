@@ -965,6 +965,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
+		toolCacheTurn := newResponsesWebsocketToolCacheTurn(toolOutputCache, toolCallCache, toolCacheKey)
 		previousLastRequest := []byte(nil)
 		previousLastResponseOutput := []byte(nil)
 		var previousLastRequestLease *responsesWebsocketFrameLease
@@ -997,7 +998,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				passthroughModelName = modelName
 			}
 		} else {
-			requestJSON = repairResponsesWebsocketToolCallsWithCaches(toolOutputCache, toolCallCache, toolCacheKey, requestJSON)
+			toolCacheTurn.recordRequest(requestJSON)
+			requestJSON = repairResponsesWebsocketToolCallsWithoutRecording(toolOutputCache, toolCallCache, toolCacheKey, requestJSON)
 			requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 			updatedLastRequestLease := retainedLimiter.acquire(int64(len(requestJSON)))
 			if updatedLastRequestLease == nil {
@@ -1066,7 +1068,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			toolCallCache,
 			toolCacheKey,
 			completedOutputLease,
-			responsesWebsocketForwardOptions{suppressError: replayPinnedAuthFailure},
+			responsesWebsocketForwardOptions{
+				toolCacheTurn: toolCacheTurn,
+				suppressError: replayPinnedAuthFailure,
+			},
 		)
 		if errForward != nil {
 			releasePreviousState()
@@ -1118,6 +1123,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
+		toolCacheTurn.commit()
 		upstreamMode = attemptedUpstreamMode
 		if upstreamMode == responsesWebsocketUpstreamModeWS {
 			completedOutputLease.release()
@@ -2140,6 +2146,7 @@ func normalizeJSONArrayRaw(raw []byte) string {
 }
 
 type responsesWebsocketForwardOptions struct {
+	toolCacheTurn *responsesWebsocketToolCacheTurn
 	suppressError func(*interfaces.ErrorMessage) bool
 }
 
@@ -2160,6 +2167,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	toolCacheTurn := opts.toolCacheTurn
 	completed := false
 	completedOutput := []byte("[]")
 	completedResponseID := ""
@@ -2240,7 +2248,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				recordResponsesWebsocketToolCallsFromPayloadWithCache(toolCallCache, toolCacheKey, payloads[i])
+				if toolCacheTurn != nil {
+					toolCacheTurn.recordResponse(payloads[i])
+				} else {
+					recordResponsesWebsocketToolCallsFromPayloadWithCache(toolCallCache, toolCacheKey, payloads[i])
+				}
 				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				var payloadErrMsg *interfaces.ErrorMessage
