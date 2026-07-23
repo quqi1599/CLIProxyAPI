@@ -106,7 +106,7 @@ type PayloadBodyLimitConfig struct {
 }
 
 // GlobalAdmissionConfig bounds aggregate request complexity before upstream execution.
-// File-based server configuration enables it by default; set enabled=false to opt out.
+// File-based server configuration requires an explicit opt-in.
 type GlobalAdmissionConfig struct {
 	Enabled                bool `yaml:"enabled" json:"enabled"`
 	Capacity               int  `yaml:"capacity,omitempty" json:"capacity,omitempty"`

@@ -31,7 +31,6 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
-	cfg.RequestGuards.GlobalAdmission.Enabled = true
 	cfg.RequestGuards.Amplification.Mode = "observe"
 	cfg.RequestGuards.PayloadBodyLimit.Mode = "observe"
 

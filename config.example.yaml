@@ -219,8 +219,8 @@ nonstream-keepalive-interval: 0
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 #   flush-interval-ms: 25   # Default: 0 (disabled). Coalesces chunk flushes up to this delay.
 
-# Traffic safety guards. Global admission is enabled by default; calibrate the
-# capacity for production traffic or set enabled: false only as an emergency rollback.
+# Optional traffic safety guards. Global admission is disabled by default;
+# calibrate it against production traffic before enabling it.
 # request-guards:
 #   amplification:
 #     mode: observe                   # Default for file config. Switch to enforce after checking exceeded transform metrics.
@@ -232,7 +232,7 @@ nonstream-keepalive-interval: 0
 #     websocket-bytes: 67108864       # Soft per-frame limit for downstream WebSocket requests (64 MiB).
 #                                      # A fixed 256 MiB emergency ceiling always applies and is not configurable.
 #   global-admission:
-#     enabled: true                  # Default: true. Set false only to opt out explicitly.
+#     enabled: true                  # Default: false. Opt in after calibrating limits for this deployment.
 #     capacity: 128                  # Total weighted in-flight request capacity. <= 0 uses 128.
 #     max-queue: 64                  # Maximum local waiters. <= 0 uses 64.
 #     max-wait-seconds: 30           # Pre-upstream queue wait only. <= 0 uses 30; it never limits an established upstream request.

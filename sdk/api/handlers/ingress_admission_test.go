@@ -167,6 +167,46 @@ func TestIngressAdmissionUsesPhysicalDecodedCeilingAndReleases(t *testing.T) {
 	}
 }
 
+func TestPreAuthAdmissionReweightsUnknownLengthAfterParsing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const capacity = 8
+	handler := newPayloadBodyLimitTestHandler(payloadBodyLimitObserve, 64, false)
+	controller := newAdmissionController(capacity, 1, time.Second)
+	handler.admission.Store(controller)
+	body := admissionRequestWithMessages(1)
+	wantVector, valid := inspectRequestComplexity(body)
+	if !valid {
+		t.Fatal("test request complexity is invalid")
+	}
+	wantWeight := complexityAdmissionWeight(wantVector)
+
+	engine := gin.New()
+	engine.Use(handler.PreAuthIngressAdmissionMiddleware())
+	engine.POST("/v1/chat/completions", func(c *gin.Context) {
+		if active, queued := controller.snapshot(); active != capacity || queued != 0 {
+			t.Fatalf("pre-parse admission = %d/%d, want %d/0", active, queued, capacity)
+		}
+		if _, errRead := ReadRequestBody(c); errRead != nil {
+			t.Fatalf("ReadRequestBody() error = %v", errRead)
+		}
+		if active, queued := controller.snapshot(); active != wantWeight || queued != 0 {
+			t.Fatalf("post-parse admission = %d/%d, want %d/0", active, queued, wantWeight)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	request.ContentLength = -1
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
+	}
+	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
+		t.Fatalf("released admission = %d/%d, want 0/0", active, queued)
+	}
+}
+
 func TestIdleResponsesWebsocketsDoNotConsumeGlobalAdmission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const connections = 128

@@ -214,7 +214,7 @@ func (r *admissionLeaseReference) upgrade(ctx context.Context, weight int) error
 		return nil
 	}
 	normalizedWeight := l.controller.normalizedWeight(weight)
-	if normalizedWeight <= r.weight {
+	if normalizedWeight == r.weight {
 		return nil
 	}
 	previousWeight := r.weight
@@ -671,7 +671,7 @@ func (c *admissionController) acquireUpgrade(ctx context.Context, heldWeight, re
 		c.mu.Unlock()
 		return 0, nil
 	}
-	if requestedWeight <= heldWeight {
+	if requestedWeight == heldWeight {
 		c.mu.Unlock()
 		return 0, nil
 	}
@@ -681,12 +681,15 @@ func (c *admissionController) acquireUpgrade(ctx context.Context, heldWeight, re
 		return 0, errAdmissionQueueFull
 	}
 	weight := requestedWeight - heldWeight
-	if c.activeWeight+weight > c.capacity {
+	if weight > 0 && c.activeWeight+weight > c.capacity {
 		c.observeRejectLocked(errAdmissionQueueFull)
 		c.mu.Unlock()
 		return 0, errAdmissionQueueFull
 	}
 	c.resizeAssignedLocked(heldWeight, requestedWeight)
+	if weight < 0 {
+		c.dispatchLocked()
+	}
 	c.updateSaturationLocked()
 	c.mu.Unlock()
 	return weight, nil
