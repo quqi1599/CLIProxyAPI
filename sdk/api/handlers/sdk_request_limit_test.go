@@ -81,6 +81,24 @@ func TestSDKRawJSONEmergencyCeilingAcceptsExactLimit(t *testing.T) {
 	release()
 }
 
+func TestRequestInterceptorDetectorSkipsNoopPayloadClone(t *testing.T) {
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.SetPluginHost(&handlerModelRouterTestHost{})
+	body := make([]byte, 1<<20)
+	req := coreexecutor.Request{Payload: body}
+	before := internalpayload.CurrentLargeCloneMetrics()
+
+	got, _ := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", "model", req, coreexecutor.Options{}, "")
+
+	after := internalpayload.CurrentLargeCloneMetrics()
+	if after.Count != before.Count || after.Bytes != before.Bytes {
+		t.Fatalf("no-op request interceptor cloned payload: before=%+v after=%+v", before, after)
+	}
+	if len(got.Payload) != len(body) || &got.Payload[0] != &body[0] {
+		t.Fatal("no-op request interceptor replaced the original payload")
+	}
+}
+
 func TestDownstreamWebsocketKeepsBoundedTranscriptReplayBudget(t *testing.T) {
 	ctx := coreexecutor.WithDownstreamWebsocket(context.Background())
 	var handler *BaseAPIHandler
