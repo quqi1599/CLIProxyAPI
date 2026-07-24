@@ -294,23 +294,22 @@ func effectiveSelectionPriority(auth *Auth, model string, now time.Time) int {
 	return authPriority(auth)*healthPriorityMultiplier + healthTier(auth, model, now)
 }
 
-func selectorGPTRoute(provider, model string, auths []*Auth) bool {
-	if isGPTRetryRoute([]string{provider}, model) {
-		return true
+func effectiveSelectionPriorityForRoute(auth *Auth, model string, now time.Time, includeHealth bool) int {
+	if !includeHealth {
+		return authPriority(auth)*healthPriorityMultiplier + healthScoreDefault/10
 	}
-	if !strings.EqualFold(strings.TrimSpace(provider), "mixed") {
-		return false
-	}
-	providers := make([]string, 0, len(auths))
-	for _, auth := range auths {
-		if auth != nil {
-			providers = append(providers, auth.Provider)
-		}
-	}
-	return isGPTRetryRoute(providers, model)
+	return effectiveSelectionPriority(auth, model, now)
 }
 
 func spreadSelectionWeight(auth *Auth, model string, now time.Time) int {
+	provider := ""
+	if auth != nil {
+		provider = auth.Provider
+	}
+	return spreadSelectionWeightForRoute(auth, model, now, isGPTRetryRoute([]string{provider}, model), true)
+}
+
+func spreadSelectionWeightForRoute(auth *Auth, model string, now time.Time, gptRoute, includeHealth bool) int {
 	priority := authPriority(auth)
 	if priority < 0 {
 		priority = 0
@@ -319,16 +318,15 @@ func spreadSelectionWeight(auth *Auth, model string, now time.Time) int {
 		priority = 20
 	}
 	baseWeight := priority + 1
-	score := recoveredHealthScore(resolveHealthState(auth, model), now)
+	score := healthScoreDefault
+	if includeHealth {
+		score = recoveredHealthScore(resolveHealthState(auth, model), now)
+	}
 	if score < 10 {
 		score = 10
 	}
 	weight := (baseWeight*score + healthScoreDefault - 1) / healthScoreDefault
-	provider := ""
-	if auth != nil {
-		provider = auth.Provider
-	}
-	if isGPTRetryRoute([]string{provider}, model) {
+	if gptRoute {
 		weight = baseWeight * score
 	}
 	if weight < 1 {
@@ -718,13 +716,14 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, model)
+		blocked, reason, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
 		if !blocked {
-			priority := effectiveSelectionPriority(candidate, model, now)
+			priority := effectiveSelectionPriorityForRoute(candidate, model, now, includeHealth)
 			available[priority] = append(available[priority], candidate)
 			continue
 		}
@@ -738,11 +737,12 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	return available, cooldownCount, earliest
 }
 
-func collectAvailableIgnoringPriority(auths []*Auth, model string, now time.Time) (available []*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableIgnoringPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available []*Auth, cooldownCount int, earliest time.Time) {
 	available = make([]*Auth, 0, len(auths))
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, model)
+		blocked, reason, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
 		if !blocked {
 			available = append(available, candidate)
 			continue
@@ -758,11 +758,15 @@ func collectAvailableIgnoringPriority(auths []*Auth, model string, now time.Time
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getAvailableAuthsForRoute(auths, provider, model, now, isGPTRetryRoute([]string{provider}, model))
+}
+
+func getAvailableAuthsForRoute(auths []*Auth, provider, model string, now time.Time, gptRoute bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now, gptRoute)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -795,11 +799,15 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 }
 
 func getSpreadAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getSpreadAvailableAuthsForRoute(auths, provider, model, now, isGPTRetryRoute([]string{provider}, model))
+}
+
+func getSpreadAvailableAuthsForRoute(auths []*Auth, provider, model string, now time.Time, gptRoute bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	available, cooldownCount, earliest := collectAvailableIgnoringPriority(auths, model, now)
+	available, cooldownCount, earliest := collectAvailableIgnoringPriority(auths, model, now, gptRoute)
 	if len(available) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -825,7 +833,7 @@ func getSpreadAvailableAuths(auths []*Auth, provider, model string, now time.Tim
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuthsForRoute(auths, provider, model, now, isGPTRequestRoute(ctx, []string{provider}, model))
 	if err != nil {
 		return nil, err
 	}
@@ -854,7 +862,8 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getSpreadAvailableAuths(auths, provider, model, now)
+	gptRoute := isGPTRequestRoute(ctx, []string{provider}, model)
+	available, err := getSpreadAvailableAuthsForRoute(auths, provider, model, now, gptRoute)
 	if err != nil {
 		return nil, err
 	}
@@ -899,7 +908,7 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 		return group[innerIndex%len(group)], nil
 	}
 
-	selected := s.pickWeightedLocked(key, provider, model, now, available, limit)
+	selected := s.pickWeightedLocked(key, model, now, available, limit, gptRoute)
 	s.mu.Unlock()
 	if selected == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
@@ -919,8 +928,8 @@ func (s *SpreadSelector) ensureWeightKey(key string, limit int) {
 	}
 }
 
-func (s *SpreadSelector) pickWeightedLocked(key, provider, model string, now time.Time, available []*Auth, limit int) *Auth {
-	if selectorGPTRoute(provider, model, available) {
+func (s *SpreadSelector) pickWeightedLocked(key, model string, now time.Time, available []*Auth, limit int, gptRoute bool) *Auth {
+	if gptRoute {
 		return s.pickGPTWeightedLocked(key, model, now, available, limit)
 	}
 	return s.pickLegacyWeightedLocked(key, model, now, available, limit)
@@ -970,7 +979,8 @@ func (s *SpreadSelector) pickLegacyWeightedLocked(key, model string, now time.Ti
 	for i, auth := range available {
 		authKey := authKeyByIndex[i]
 		active[authKey] = struct{}{}
-		baseWeight := spreadSelectionWeight(auth, model, now)
+		includeHealth := !isGPTRetryRoute([]string{auth.Provider}, model)
+		baseWeight := spreadSelectionWeightForRoute(auth, model, now, false, includeHealth)
 		record := loadSnapshot[authKey]
 		authLoad := record.recentHits + float64(record.inFlight*spreadLoadInflightWeight)
 		weight := adjustedSpreadSelectionWeight(baseWeight, authLoad, averageLoad)
@@ -1021,7 +1031,7 @@ func (s *SpreadSelector) pickGPTWeightedLocked(key, model string, now time.Time,
 			channelKeys = append(channelKeys, channelKey)
 		}
 		group.auths = append(group.auths, auth)
-		if weight := spreadSelectionWeight(auth, model, now); weight > group.baseWeight {
+		if weight := spreadSelectionWeightForRoute(auth, model, now, true, true); weight > group.baseWeight {
 			group.baseWeight = weight
 		}
 		if auth != nil && strings.TrimSpace(auth.ID) != "" {
@@ -1183,7 +1193,7 @@ func (s *SpreadSelector) MarkRouteResult(provider, authID, model string, success
 }
 
 func (s *SpreadSelector) keepAffinity(provider, model, authID string, auths []*Auth) bool {
-	if s == nil || len(auths) < 2 || strings.TrimSpace(authID) == "" || !selectorGPTRoute(provider, model, auths) {
+	if s == nil || len(auths) < 2 || strings.TrimSpace(authID) == "" {
 		return true
 	}
 	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
@@ -1215,7 +1225,7 @@ func (s *SpreadSelector) keepAffinity(provider, model, authID string, auths []*A
 			channelKeys = append(channelKeys, channelKey)
 		}
 		group.auths = append(group.auths, auth)
-		if weight := spreadSelectionWeight(auth, model, now); weight > group.baseWeight {
+		if weight := spreadSelectionWeightForRoute(auth, model, now, true, true); weight > group.baseWeight {
 			group.baseWeight = weight
 		}
 		s.load.bindAuth(key, auth.ID, channelKey, now, limit)
@@ -1308,7 +1318,7 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuthsForRoute(auths, provider, model, now, isGPTRequestRoute(ctx, []string{provider}, model))
 	if err != nil {
 		return nil, err
 	}
@@ -1320,10 +1330,9 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 // For mixed-provider requests, it sticks to the current provider until all its
 // credentials are exhausted, then advances to the next provider.
 func (s *SequentialFillSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = ctx
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuthsForRoute(auths, provider, model, now, isGPTRequestRoute(ctx, []string{provider}, model))
 	if err != nil {
 		return nil, err
 	}
@@ -1423,6 +1432,14 @@ func (s *SequentialFillSelector) pickSticky(provider, model string, available []
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	provider := ""
+	if auth != nil {
+		provider = auth.Provider
+	}
+	return isAuthBlockedForModelRoute(auth, model, now, isGPTRetryRoute([]string{provider}, model))
+}
+
+func isAuthBlockedForModelRoute(auth *Auth, model string, now time.Time, gptRoute bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -1433,7 +1450,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return false, blockReasonNone, time.Time{}
 	}
 	authBlocked, authReason, authNext := authLevelBlockState(auth, now)
-	if isGPTRetryRoute([]string{auth.Provider}, model) {
+	if gptRoute {
 		if blocked, next := healthBlockStateForAuth(auth, model, now); blocked {
 			return true, blockReasonOther, next
 		}
@@ -1560,27 +1577,27 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 }
 
-func sessionAffinityBinding(cache *SessionCache, key string, refresh bool) (string, bool) {
+func sessionAffinityBinding(cache *SessionCache, key string, refresh bool) (string, string, bool) {
 	if cache == nil {
-		return "", false
+		return "", "", false
 	}
 	if refresh {
-		return cache.GetAndRefresh(key)
+		return cache.GetAndRefreshBinding(key)
 	}
-	return cache.Get(key)
+	return cache.GetBinding(key)
 }
 
-func stageSessionAffinityBinding(ctx context.Context, cache *SessionCache, key, authID string, deferred bool) {
+func stageSessionAffinityBinding(ctx context.Context, cache *SessionCache, key, authID, channelKey string, deferred bool) {
 	if cache == nil || key == "" || authID == "" {
 		return
 	}
 	if deferred {
 		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-			trace.stageSessionBinding(cache, key, authID)
+			trace.stageSessionBinding(cache, key, authID, channelKey)
 			return
 		}
 	}
-	cache.Set(key, authID)
+	cache.SetBinding(key, authID, channelKey)
 }
 
 func markSessionAffinityPicked(selector Selector, provider, model string, auth *Auth) {
@@ -1603,17 +1620,29 @@ func keepSessionAffinity(selector Selector, provider, model, authID string, auth
 	}
 }
 
-func withoutRoutingChannel(auths []*Auth, excluded *Auth) []*Auth {
-	if excluded == nil {
+func withoutRoutingChannel(auths []*Auth, excludedKey string) []*Auth {
+	if excludedKey == "" {
 		return auths
 	}
-	excludedKey := routingChannelBaseKey(excluded)
 	out := make([]*Auth, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil || routingChannelBaseKey(auth) == excludedKey {
 			continue
 		}
 		out = append(out, auth)
+	}
+	return out
+}
+
+func inRoutingChannel(auths []*Auth, boundKey string) []*Auth {
+	if boundKey == "" {
+		return nil
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil && routingChannelBaseKey(auth) == boundKey {
+			out = append(out, auth)
+		}
 	}
 	return out
 }
@@ -1649,16 +1678,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	gptRoute := selectorGPTRoute(provider, model, auths)
+	gptRoute := isGPTRequestRoute(ctx, []string{provider}, model)
 	gptSpread := gptRoute && selectorUsesSpread(s.fallback)
 	var (
 		available []*Auth
 		err       error
 	)
 	if gptSpread {
-		available, err = getSpreadAvailableAuths(auths, provider, model, now)
+		available, err = getSpreadAvailableAuthsForRoute(auths, provider, model, now, gptRoute)
 	} else {
-		available, err = getAvailableAuths(auths, provider, model, now)
+		available, err = getAvailableAuthsForRoute(auths, provider, model, now, gptRoute)
 	}
 	if err != nil {
 		return nil, err
@@ -1667,34 +1696,78 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	cacheKey := provider + "::" + primaryID + "::" + model
 	deferBinding := gptRoute && requestAttemptTraceFromContext(ctx) != nil
 
-	pickFallback := func(excludedAuthID string) (*Auth, error) {
+	pickFallback := func(excludedAuthID, excludedChannelKey string) (*Auth, error) {
 		candidates := auths
 		if gptRoute {
 			candidates = available
-			if excluded := authByID(auths, excludedAuthID); excluded != nil {
-				candidates = withoutRoutingChannel(candidates, excluded)
+			if excludedChannelKey == "" {
+				if excluded := authByID(auths, excludedAuthID); excluded != nil {
+					excludedChannelKey = routingChannelBaseKey(excluded)
+				}
 			}
+			candidates = withoutRoutingChannel(candidates, excludedChannelKey)
 		}
 		auth, errPick := s.fallback.Pick(ctx, provider, model, opts, candidates)
 		if errPick != nil {
 			return nil, errPick
 		}
-		stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
+		channelKey := ""
+		if gptRoute {
+			channelKey = routingChannelBaseKey(auth)
+		}
+		stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, channelKey, deferBinding)
 		return auth, nil
 	}
-
-	if cachedAuthID, ok := sessionAffinityBinding(s.cache, cacheKey, !deferBinding); ok {
-		if auth := authByID(available, cachedAuthID); auth != nil {
-			if !gptRoute || keepSessionAffinity(s.fallback, provider, model, auth.ID, available) {
-				if gptRoute {
-					markSessionAffinityPicked(s.fallback, provider, model, auth)
-					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
-				}
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+	pickBound := func(cachedAuthID, cachedChannelKey string) (*Auth, bool, error) {
+		bound := authByID(available, cachedAuthID)
+		if !gptRoute {
+			if bound == nil {
+				return nil, false, nil
 			}
+			return bound, true, nil
 		}
-		auth, errPick := pickFallback(cachedAuthID)
+		anchor := authByID(auths, cachedAuthID)
+		if cachedChannelKey == "" && anchor != nil {
+			cachedChannelKey = routingChannelBaseKey(anchor)
+		}
+		if cachedChannelKey == "" {
+			return nil, false, nil
+		}
+		channelAuths := inRoutingChannel(available, cachedChannelKey)
+		if len(channelAuths) == 0 {
+			return nil, false, nil
+		}
+		healthAuthID := cachedAuthID
+		if bound == nil {
+			healthAuthID = channelAuths[0].ID
+		}
+		if !keepSessionAffinity(s.fallback, provider, model, healthAuthID, available) {
+			return nil, false, nil
+		}
+		selected := bound
+		if gptSpread || selected == nil {
+			var errPick error
+			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, channelAuths)
+			if errPick != nil {
+				return nil, false, errPick
+			}
+		} else {
+			markSessionAffinityPicked(s.fallback, provider, model, bound)
+		}
+		stageSessionAffinityBinding(ctx, s.cache, cacheKey, selected.ID, cachedChannelKey, deferBinding)
+		return selected, true, nil
+	}
+
+	if cachedAuthID, cachedChannelKey, ok := sessionAffinityBinding(s.cache, cacheKey, !deferBinding); ok {
+		auth, keep, errPick := pickBound(cachedAuthID, cachedChannelKey)
+		if errPick != nil {
+			return nil, errPick
+		}
+		if keep {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
+		auth, errPick = pickFallback(cachedAuthID, cachedChannelKey)
 		if errPick != nil {
 			return nil, errPick
 		}
@@ -1704,19 +1777,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			if auth := authByID(available, cachedAuthID); auth != nil {
-				if !gptRoute || keepSessionAffinity(s.fallback, provider, model, auth.ID, available) {
-					if gptRoute {
-						markSessionAffinityPicked(s.fallback, provider, model, auth)
-					}
-					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
+		if cachedAuthID, cachedChannelKey, ok := s.cache.GetBinding(fallbackKey); ok {
+			auth, keep, errPick := pickBound(cachedAuthID, cachedChannelKey)
+			if errPick != nil {
+				return nil, errPick
+			}
+			if keep {
+				if !gptRoute {
+					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, "", deferBinding)
 				}
+				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+				return auth, nil
 			}
 			if gptRoute {
-				auth, errPick := pickFallback(cachedAuthID)
+				auth, errPick = pickFallback(cachedAuthID, cachedChannelKey)
 				if errPick != nil {
 					return nil, errPick
 				}
@@ -1726,7 +1800,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, errPick := pickFallback("")
+	auth, errPick := pickFallback("", "")
 	if errPick != nil {
 		return nil, errPick
 	}

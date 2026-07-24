@@ -151,6 +151,60 @@ func TestSpreadDynamicWeight_NonGPTIgnoresOutcomeAndTTFTFactors(t *testing.T) {
 	selector.MarkDone(picked.ID, model)
 }
 
+func TestSpreadDynamicWeight_MixedNonGPTDoesNotUseGPTChannelGrouping(t *testing.T) {
+	const model = "claude-sonnet-mixed"
+	selector := &SpreadSelector{load: newSpreadLoadTracker()}
+	first := spreadDynamicTestAuth("mixed-codex-a")
+	second := spreadDynamicTestAuth("mixed-codex-b")
+	second.Attributes["base_url"] = first.Attributes["base_url"]
+
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(false)
+	picked, errPick := selector.Pick(ctx, "mixed", model, cliproxyexecutor.Options{}, []*Auth{first, second})
+	if errPick != nil {
+		t.Fatalf("pick mixed non-GPT auth: %v", errPick)
+	}
+
+	key := "mixed:" + canonicalModelKey(model)
+	selector.mu.Lock()
+	bindings := len(selector.load.channelByAuth[key])
+	selector.mu.Unlock()
+	if bindings != 0 {
+		t.Fatalf("mixed non-GPT channel bindings = %d, want legacy credential-level spread", bindings)
+	}
+	selector.MarkDone(picked.ID, model)
+}
+
+func TestMixedNonGPTIgnoresCodexChannelHealth(t *testing.T) {
+	const model = "claude-sonnet-mixed"
+	degraded := spreadDynamicTestAuth("mixed-degraded")
+	healthy := spreadDynamicTestAuth("mixed-healthy")
+	degraded.Attributes["priority"] = "10"
+	healthy.Attributes["priority"] = "10"
+	degraded.Health = HealthState{Observed: true, Score: 10}
+	healthy.Health = HealthState{Observed: true, Score: healthScoreDefault}
+
+	now := time.Now()
+	if got, want := spreadSelectionWeightForRoute(degraded, model, now, false, false), spreadSelectionWeightForRoute(healthy, model, now, false, false); got != want {
+		t.Fatalf("mixed non-GPT spread weights = %d and %d, want equal", got, want)
+	}
+
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(false)
+	selector := &RoundRobinSelector{}
+	first, errPick := selector.Pick(ctx, "mixed", model, cliproxyexecutor.Options{}, []*Auth{degraded, healthy})
+	if errPick != nil {
+		t.Fatalf("first mixed non-GPT pick: %v", errPick)
+	}
+	second, errPick := selector.Pick(ctx, "mixed", model, cliproxyexecutor.Options{}, []*Auth{degraded, healthy})
+	if errPick != nil {
+		t.Fatalf("second mixed non-GPT pick: %v", errPick)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("mixed non-GPT picks = %q twice, want both equal-priority credentials", first.ID)
+	}
+}
+
 func TestManagerMarkResult_UpdatesSpreadOutcomeAndReleasesInflight(t *testing.T) {
 	selector := &SpreadSelector{load: newSpreadLoadTracker()}
 	manager := NewManager(nil, selector, nil)

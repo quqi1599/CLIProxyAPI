@@ -9,8 +9,9 @@ const sessionCacheMaxEntries = 16384
 
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
-	authID    string
-	expiresAt time.Time
+	authID     string
+	channelKey string
+	expiresAt  time.Time
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -40,51 +41,65 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 // Get retrieves the auth ID bound to a session, if still valid.
 // Does NOT refresh the TTL on access.
 func (c *SessionCache) Get(sessionID string) (string, bool) {
+	authID, _, ok := c.GetBinding(sessionID)
+	return authID, ok && authID != ""
+}
+
+func (c *SessionCache) GetBinding(sessionID string) (string, string, bool) {
 	if sessionID == "" {
-		return "", false
+		return "", "", false
 	}
 	c.mu.RLock()
 	entry, ok := c.entries[sessionID]
 	c.mu.RUnlock()
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	if time.Now().After(entry.expiresAt) {
 		c.mu.Lock()
 		delete(c.entries, sessionID)
 		c.mu.Unlock()
-		return "", false
+		return "", "", false
 	}
-	return entry.authID, true
+	return entry.authID, entry.channelKey, entry.authID != "" || entry.channelKey != ""
 }
 
 // GetAndRefresh retrieves the auth ID bound to a session and refreshes TTL on hit.
 // This extends the binding lifetime for active sessions.
 func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
+	authID, _, ok := c.GetAndRefreshBinding(sessionID)
+	return authID, ok && authID != ""
+}
+
+func (c *SessionCache) GetAndRefreshBinding(sessionID string) (string, string, bool) {
 	if sessionID == "" {
-		return "", false
+		return "", "", false
 	}
 	now := time.Now()
 	c.mu.Lock()
 	entry, ok := c.entries[sessionID]
 	if !ok {
 		c.mu.Unlock()
-		return "", false
+		return "", "", false
 	}
 	if now.After(entry.expiresAt) {
 		delete(c.entries, sessionID)
 		c.mu.Unlock()
-		return "", false
+		return "", "", false
 	}
 	// Refresh TTL on successful access
 	entry.expiresAt = now.Add(c.ttl)
 	c.entries[sessionID] = entry
 	c.mu.Unlock()
-	return entry.authID, true
+	return entry.authID, entry.channelKey, entry.authID != "" || entry.channelKey != ""
 }
 
 // Set binds a session to an auth ID with TTL refresh.
 func (c *SessionCache) Set(sessionID, authID string) {
+	c.SetBinding(sessionID, authID, "")
+}
+
+func (c *SessionCache) SetBinding(sessionID, authID, channelKey string) {
 	if sessionID == "" || authID == "" {
 		return
 	}
@@ -98,8 +113,9 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		}
 	}
 	c.entries[sessionID] = sessionEntry{
-		authID:    authID,
-		expiresAt: now.Add(c.ttl),
+		authID:     authID,
+		channelKey: channelKey,
+		expiresAt:  now.Add(c.ttl),
 	}
 	c.mu.Unlock()
 }
@@ -114,8 +130,8 @@ func (c *SessionCache) Invalidate(sessionID string) {
 	c.mu.Unlock()
 }
 
-// InvalidateAuth removes all sessions bound to a specific auth ID.
-// Used when an auth becomes unavailable.
+// InvalidateAuth removes a credential binding while retaining its channel
+// identity when another credential can keep the session on that channel.
 func (c *SessionCache) InvalidateAuth(authID string) {
 	if authID == "" {
 		return
@@ -123,7 +139,12 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 	c.mu.Lock()
 	for sid, entry := range c.entries {
 		if entry.authID == authID {
-			delete(c.entries, sid)
+			if entry.channelKey == "" {
+				delete(c.entries, sid)
+				continue
+			}
+			entry.authID = ""
+			c.entries[sid] = entry
 		}
 	}
 	c.mu.Unlock()

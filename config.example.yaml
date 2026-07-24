@@ -193,7 +193,7 @@ routing:
   # X-Session-ID, Session_id (Codex), X-Client-Request-Id (PI), conversation_id,
   # or first few messages hash.
   # Automatic failover is always enabled when bound auth becomes unavailable.
-  session-affinity: false # set true for GPT soft affinity; default: false
+  session-affinity: false # set true with spread for GPT soft affinity; default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 

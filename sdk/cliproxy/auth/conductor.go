@@ -87,9 +87,10 @@ const (
 type requestAttemptTraceContextKey struct{}
 
 type pendingSessionBinding struct {
-	cache  *SessionCache
-	key    string
-	authID string
+	cache      *SessionCache
+	key        string
+	authID     string
+	channelKey string
 }
 
 type selectorRouteSelection struct {
@@ -284,12 +285,12 @@ func (t *requestAttemptTrace) recordFinalStatus(status int) {
 	t.mu.Unlock()
 }
 
-func (t *requestAttemptTrace) stageSessionBinding(cache *SessionCache, key, authID string) {
+func (t *requestAttemptTrace) stageSessionBinding(cache *SessionCache, key, authID, channelKey string) {
 	if t == nil || cache == nil || key == "" || authID == "" {
 		return
 	}
 	t.mu.Lock()
-	t.sessionBinding = pendingSessionBinding{cache: cache, key: key, authID: authID}
+	t.sessionBinding = pendingSessionBinding{cache: cache, key: key, authID: authID, channelKey: channelKey}
 	t.mu.Unlock()
 }
 
@@ -306,7 +307,7 @@ func (t *requestAttemptTrace) commitSessionBinding(authID string) {
 	}
 	t.mu.Unlock()
 	if pending.cache != nil {
-		pending.cache.Set(pending.key, pending.authID)
+		pending.cache.SetBinding(pending.key, pending.authID, pending.channelKey)
 	}
 }
 
@@ -2461,10 +2462,15 @@ func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelContext(context.Background(), auths, provider, routeModel, now)
+}
+
+func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
+	gptRoute := isGPTRequestRoute(ctx, []string{provider}, routeModel)
 	spreadAcrossPriorities := selectorUsesSpread(m.selectorForAuths(auths))
 	availableAll := make([]*Auth, 0, len(auths))
 	availableByPriority := make(map[int][]*Auth)
@@ -2472,15 +2478,15 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	cooldownCount := 0
 	activeFallbackAvailable := false
 	var earliest time.Time
-	recordAvailable := func(candidate *Auth, checkModel string) {
+	recordAvailable := func(candidate *Auth, checkModel string, includeHealth bool) {
 		availableAll = append(availableAll, candidate)
 		if spreadAcrossPriorities {
 			return
 		}
-		priority := effectiveSelectionPriority(candidate, checkModel, now)
+		priority := effectiveSelectionPriorityForRoute(candidate, checkModel, now, includeHealth)
 		availableByPriority[priority] = append(availableByPriority[priority], candidate)
 	}
-	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota bool) {
+	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota, includeHealth bool) {
 		cooldownCount++
 		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 			earliest = next
@@ -2489,40 +2495,45 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 			auth:     candidate,
 			model:    checkModel,
 			next:     next,
-			priority: effectiveSelectionPriority(candidate, checkModel, now),
+			priority: effectiveSelectionPriorityForRoute(candidate, checkModel, now, includeHealth),
 			quota:    quota,
 		})
 	}
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
-		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, checkModel)
+		blocked, reason, next := isAuthBlockedForModelRoute(candidate, checkModel, now, includeHealth)
 		if !blocked {
 			if m.halfOpenProbeActive(candidate.ID, checkModel, now) {
 				activeFallbackAvailable = true
-				recordAvailable(candidate, checkModel)
+				recordAvailable(candidate, checkModel, includeHealth)
 				continue
 			}
-			healthBlocked, healthNext := m.healthSelectionBlocked(candidate, checkModel, now)
+			healthBlocked, healthNext := false, time.Time{}
+			if includeHealth {
+				healthBlocked, healthNext = m.healthSelectionBlocked(candidate, checkModel, now)
+			}
 			if healthBlocked {
-				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel))
+				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth)
 				continue
 			}
-			recordAvailable(candidate, checkModel)
+			recordAvailable(candidate, checkModel, includeHealth)
 			continue
 		}
 		if (reason == blockReasonCooldown || reason == blockReasonOther) && !next.IsZero() {
 			if m.halfOpenProbeActive(candidate.ID, checkModel, now) {
 				activeFallbackAvailable = true
-				recordAvailable(candidate, checkModel)
+				recordAvailable(candidate, checkModel, includeHealth)
 				continue
 			}
-			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown)
+			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth)
 		}
 	}
 
 	if activeFallbackAvailable && len(fallbackCandidates) > 0 {
 		if fallback, _ := m.cooldownFallbackProbe(fallbackCandidates, now); fallback != nil {
-			recordAvailable(fallback.auth, fallback.model)
+			includeHealth := gptRoute || !isGPTRetryRoute([]string{fallback.auth.Provider}, fallback.model)
+			recordAvailable(fallback.auth, fallback.model, includeHealth)
 		}
 	}
 
@@ -5317,6 +5328,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	if defaultRetry < 0 {
 		defaultRetry = 0
 	}
+	gptRoute := isGPTRetryRoute(providers, model)
 	providerSet := make(map[string]struct{}, len(providers))
 	for i := range providers {
 		key := strings.TrimSpace(strings.ToLower(providers[i]))
@@ -5353,7 +5365,8 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if strings.TrimSpace(model) != "" {
 			checkModel = m.selectionModelForAuth(auth, model)
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
+		includeHealth := gptRoute || !isGPTRetryRoute([]string{auth.Provider}, checkModel)
+		blocked, reason, next := isAuthBlockedForModelRoute(auth, checkModel, now, includeHealth)
 		if !blocked || next.IsZero() || reason == blockReasonDisabled {
 			continue
 		}
@@ -8654,7 +8667,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -8872,7 +8885,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
@@ -8925,6 +8938,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
+	if !isGPTRequestRoute(ctx, providers, model) {
+		for _, provider := range providers {
+			if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+			}
+		}
 	}
 
 	eligibleProviders := make([]string, 0, len(providers))

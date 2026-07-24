@@ -160,6 +160,57 @@ func TestSessionAffinitySoft_SpreadCacheHitTracksInflight(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySoft_HealthyChannelRotatesCredentials(t *testing.T) {
+	spread := &SpreadSelector{load: newSpreadLoadTracker()}
+	selector := newSoftAffinityTestSelector(spread)
+	defer selector.Stop()
+
+	first := softAffinityTestAuth("soft-channel-key-a", "https://healthy-channel.example.com/v1")
+	second := softAffinityTestAuth("soft-channel-key-b", "https://healthy-channel.example.com/v1")
+	first.Attributes["provider_key"] = "healthy-channel"
+	second.Attributes["provider_key"] = "healthy-channel"
+	opts := softAffinityTestOptions("healthy-channel-rotation")
+	selector.cache.Set(softAffinityTestCacheKey(opts), first.ID)
+
+	seen := make(map[string]bool)
+	for range 4 {
+		ctx, _ := ensureRequestAttemptTrace(context.Background())
+		picked, errPick := selector.Pick(ctx, softAffinityTestProvider, softAffinityTestModel, opts, []*Auth{first, second})
+		if errPick != nil {
+			t.Fatalf("pick healthy channel credential: %v", errPick)
+		}
+		seen[picked.ID] = true
+		selector.MarkDone(picked.ID, softAffinityTestModel)
+	}
+	if !seen[first.ID] || !seen[second.ID] {
+		t.Fatalf("healthy channel credentials seen = %+v, want both credentials", seen)
+	}
+}
+
+func TestSessionAffinitySoft_UnavailableCredentialKeepsHealthyChannel(t *testing.T) {
+	spread := &SpreadSelector{load: newSpreadLoadTracker()}
+	selector := newSoftAffinityTestSelector(spread)
+	defer selector.Stop()
+
+	unavailable := softAffinityTestAuth("soft-unavailable-key", "https://shared-healthy-channel.example.com/v1")
+	peer := softAffinityTestAuth("soft-healthy-peer-key", "https://shared-healthy-channel.example.com/v1")
+	unavailable.Attributes["provider_key"] = "shared-healthy-channel"
+	peer.Attributes["provider_key"] = "shared-healthy-channel"
+	backup := softAffinityTestAuth("soft-other-channel", "https://other-channel.example.com/v1")
+	opts := softAffinityTestOptions("unavailable-key-healthy-channel")
+	selector.cache.SetBinding(softAffinityTestCacheKey(opts), unavailable.ID, routingChannelBaseKey(unavailable))
+	selector.InvalidateAuth(unavailable.ID)
+
+	ctx, _ := ensureRequestAttemptTrace(context.Background())
+	picked, errPick := selector.Pick(ctx, softAffinityTestProvider, softAffinityTestModel, opts, []*Auth{peer, backup})
+	if errPick != nil {
+		t.Fatalf("pick healthy peer credential: %v", errPick)
+	}
+	if picked.ID != peer.ID {
+		t.Fatalf("picked auth = %q, want healthy credential %q from bound channel", picked.ID, peer.ID)
+	}
+}
+
 func TestSessionAffinitySoft_OverloadedBindingMovesToPeer(t *testing.T) {
 	spread := &SpreadSelector{load: newSpreadLoadTracker()}
 	selector := newSoftAffinityTestSelector(spread)

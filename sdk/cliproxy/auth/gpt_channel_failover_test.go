@@ -496,3 +496,67 @@ func TestManagerMixedProviderNonGPTRouteDoesNotUseGPTChannelFailover(t *testing.
 		t.Fatalf("Claude fallback calls = %v, want none", got)
 	}
 }
+
+func TestManagerMixedProviderNonGPTRouteIgnoresGPTChannelBreaker(t *testing.T) {
+	const model = "claude-sonnet-mixed"
+	codexExecutor := &authFallbackExecutor{id: "codex"}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(codexExecutor)
+	manager.RegisterExecutor(&authFallbackExecutor{id: "claude"})
+
+	codexAuth := &Auth{
+		ID:       "mixed-non-gpt-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			AttributeAPIKey: "test-key",
+			"base_url":      "https://mixed-non-gpt.example/v1",
+		},
+		Health: HealthState{
+			Observed:     true,
+			Score:        10,
+			BreakerState: HealthBreakerOpen,
+			OpenUntil:    time.Now().Add(time.Minute),
+		},
+	}
+	registerGPTChannelFailoverAuths(t, manager, "codex", model, []*Auth{codexAuth})
+
+	if _, err := manager.Execute(context.Background(), []string{"codex", "claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil {
+		t.Fatalf("execute mixed non-GPT route: %v", err)
+	}
+	if got, want := codexExecutor.ExecuteCalls(), []string{codexAuth.ID}; !stringSlicesEqual(got, want) {
+		t.Fatalf("Codex execute calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerMixedProviderNonGPTRouteIgnoresGPTCooldownWait(t *testing.T) {
+	const model = "claude-sonnet-mixed"
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, 30*time.Second, 3)
+
+	codexAuth := &Auth{
+		ID:       "mixed-cooldown-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			AttributeAPIKey: "test-key",
+			"base_url":      "https://mixed-cooldown.example/v1",
+		},
+		Health: HealthState{
+			Observed:     true,
+			Score:        10,
+			BreakerState: HealthBreakerOpen,
+			OpenUntil:    time.Now().Add(time.Minute),
+		},
+	}
+	claudeAuth := &Auth{ID: "mixed-cooldown-claude", Provider: "claude", Status: StatusActive}
+	for _, auth := range []*Auth{codexAuth, claudeAuth} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+
+	if wait, found := manager.closestCooldownWait([]string{"codex", "claude"}, model, 0); found {
+		t.Fatalf("mixed non-GPT cooldown wait = %v, want no GPT-channel wait", wait)
+	}
+}

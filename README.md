@@ -53,8 +53,9 @@ future OpenAI-compatible providers, set
 
 GPT channel failover and circuit breaking are automatic: `429`, `502`, and
 `503` immediately switch to another channel, up to five distinct channels per
-request. Three consecutive `5xx` responses, or at least 80% failures among 10
-or more outcomes in 30 seconds, cool the channel for 30, 60, then 120 seconds.
+request. Three consecutive channel-scoped `5xx` responses, or at least 80%
+channel failures among 10 or more outcomes in 30 seconds, cool the channel for
+30, 60, then 120 seconds.
 Only one half-open probe is admitted at a time; two successful probes close the
 breaker. API keys sharing the same routing identity and BaseURL count as one
 channel.
