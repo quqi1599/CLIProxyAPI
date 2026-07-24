@@ -102,6 +102,7 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 		outcome.finalErr = outcome.returnErr
 		return outcome.result, outcome.returnErr
 	}
+	trace.configureGPTRoute(isGPTRetryRoute(providers, req.Model))
 
 	requestRetry, maxRetryCredentials, maxWait := manager.retrySettings()
 	trace.configureBudget(requestRetry+1, maxRetryCredentials)

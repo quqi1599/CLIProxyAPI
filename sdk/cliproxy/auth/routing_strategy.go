@@ -9,7 +9,7 @@ const (
 	RoutingStrategyFillFirst = "fill-first"
 	// RoutingStrategySequentialFill sticks to the current credential until it becomes unavailable.
 	RoutingStrategySequentialFill = "sequential-fill"
-	// RoutingStrategySpread rotates across all available credentials, ignoring static priority buckets.
+	// RoutingStrategySpread weights all available credentials without strict priority buckets.
 	RoutingStrategySpread = "spread"
 )
 

@@ -49,6 +49,30 @@ spread load more evenly, set `provider-strategies.claude: "spread"`. For
 future OpenAI-compatible providers, set
 `provider-strategies.openai-compatibility: "spread"`.
 
+### GPT Channel Self-Healing
+
+GPT channel failover and circuit breaking are automatic: `429`, `502`, and
+`503` immediately switch to another channel, up to five distinct channels per
+request. Three consecutive `5xx` responses, or at least 80% failures among 10
+or more outcomes in 30 seconds, cool the channel for 30, 60, then 120 seconds.
+Only one half-open probe is admitted at a time; two successful probes close the
+breaker. API keys sharing the same routing identity and BaseURL count as one
+channel.
+
+Use `spread` to dynamically favor channels with a higher recent success rate,
+lower time to first token (TTFT), and fewer in-flight requests. With `spread`
+selected, enable `session-affinity` for soft affinity: a session prefers its
+last successful channel, but migrates when that channel is slow, cooling, or
+overloaded and rebinds after a successful request.
+
+```yaml
+routing:
+  provider-strategies:
+    codex: "spread"
+    openai-compatibility: "spread"
+  session-affinity: true
+```
+
 When mixing Kimi OpenAI-compatible keys with Kimi Coding Agent keys, keep the
 two upstream surfaces separated. Some Kimi Coding keys only work through the
 Claude-compatible `/v1/messages` surface, while ordinary OpenAI-compatible keys

@@ -704,7 +704,7 @@ func TestManagerExecute_CodexAPIKeyAliasPoolRotatesWithinAuth(t *testing.T) {
 	}
 }
 
-func TestManagerExecuteStream_CodexAPIKeyAliasPoolFallsBackBeforeFirstByte(t *testing.T) {
+func TestManagerExecuteStream_CodexAPIKeyAliasPoolStopsOn429BeforeFirstByte(t *testing.T) {
 	alias := "gpt-latest"
 	executor := &apiKeyPoolExecutor{
 		id:                "codex",
@@ -720,19 +720,21 @@ func TestManagerExecuteStream_CodexAPIKeyAliasPoolFallsBackBeforeFirstByte(t *te
 		t.Fatalf("execute stream: %v", err)
 	}
 
-	var payload []byte
+	var streamErr error
 	for chunk := range streamResult.Chunks {
 		if chunk.Err != nil {
-			t.Fatalf("unexpected stream error: %v", chunk.Err)
+			streamErr = chunk.Err
+			break
 		}
-		payload = append(payload, chunk.Payload...)
 	}
-
-	if string(payload) != "gpt-5.3-codex" {
-		t.Fatalf("payload = %q, want %q", string(payload), "gpt-5.3-codex")
+	if streamErr == nil || statusCodeFromError(streamErr) != http.StatusTooManyRequests {
+		t.Fatalf("stream error = %v, want 429 without same-channel model fallback", streamErr)
 	}
 	got := executor.StreamModels()
-	want := []string{"gpt-5.2", "gpt-5.3-codex"}
+	want := []string{"gpt-5.2"}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])

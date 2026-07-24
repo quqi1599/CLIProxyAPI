@@ -47,6 +47,7 @@ func executeStreamLifecycleAttempt(t *testing.T, manager *Manager, ctx context.C
 		executor,
 		&Auth{ID: "stream-lifecycle-auth", Provider: "codex", Status: StatusActive},
 		"codex",
+		[]string{"codex"},
 		cliproxyexecutor.Request{Model: streamLifecycleTestModel},
 		cliproxyexecutor.Options{},
 		streamLifecycleTestModel,

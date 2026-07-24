@@ -1332,6 +1332,32 @@ func (s *Service) applyWatcherConfigUpdate(newCfg *config.Config) {
 	s.applyConfigUpdateWithAuthSynthesis(newCfg, false)
 }
 
+func normalizedServiceRoutingStrategy(strategy string) string {
+	normalized, ok := coreauth.NormalizeRoutingStrategy(strategy)
+	if !ok {
+		return coreauth.RoutingStrategyRoundRobin
+	}
+	return normalized
+}
+
+func serviceRoutingSelector(strategy string, sessionAffinity bool, sessionAffinityTTL string) coreauth.Selector {
+	selector := coreauth.SelectorForRoutingStrategy(strategy)
+	if !sessionAffinity {
+		return selector
+	}
+
+	ttl := time.Hour
+	if ttlStr := strings.TrimSpace(sessionAffinityTTL); ttlStr != "" {
+		if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+			ttl = parsed
+		}
+	}
+	return coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+		Fallback: selector,
+		TTL:      ttl,
+	})
+}
+
 func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synthesizeConfigAuths bool) {
 	if s == nil {
 		return
@@ -1345,7 +1371,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	var previousSessionAffinityTTL string
 	s.cfgMu.RLock()
 	if s.cfg != nil {
-		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		previousStrategy = normalizedServiceRoutingStrategy(s.cfg.Routing.Strategy)
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 	}
@@ -1360,17 +1386,7 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		return
 	}
 
-	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-	normalizeStrategy := func(strategy string) string {
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			return "fill-first"
-		default:
-			return "round-robin"
-		}
-	}
-	previousStrategy = normalizeStrategy(previousStrategy)
-	nextStrategy = normalizeStrategy(nextStrategy)
+	nextStrategy := normalizedServiceRoutingStrategy(newCfg.Routing.Strategy)
 
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
@@ -1380,28 +1396,11 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		previousSessionAffinityTTL != nextSessionAffinityTTL
 
 	if s.coreManager != nil && selectorChanged {
-		var selector coreauth.Selector
-		switch nextStrategy {
-		case "fill-first":
-			selector = &coreauth.FillFirstSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
-
-		if nextSessionAffinity {
-			ttl := time.Hour
-			if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
-				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-					ttl = parsed
-				}
-			}
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      ttl,
-			})
-		}
-
-		s.coreManager.SetSelector(selector)
+		s.coreManager.SetSelector(serviceRoutingSelector(
+			newCfg.Routing.Strategy,
+			newCfg.Routing.SessionAffinity,
+			newCfg.Routing.SessionAffinityTTL,
+		))
 	}
 
 	s.applyRetryConfig(newCfg)
@@ -2004,16 +2003,11 @@ func (s *Service) ensureDefaults() error {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(s.cfg.AuthDir)
 		}
-		strategy := strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-		var selector coreauth.Selector
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
-		case "sequential-fill", "sequentialfill", "sf":
-			selector = &coreauth.SequentialFillSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
-		}
+		selector := serviceRoutingSelector(
+			s.cfg.Routing.Strategy,
+			s.cfg.Routing.SessionAffinity,
+			s.cfg.Routing.SessionAffinityTTL,
+		)
 		s.coreManager = coreauth.NewManager(tokenStore, selector, serviceAuthHook{service: s})
 	}
 	s.coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

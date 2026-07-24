@@ -123,48 +123,6 @@ func TestManager_ShouldRetryAfterError_EmptyUpstreamResponseUsesConfiguredRetry(
 	}
 }
 
-func TestManager_GPTSoftRateLimitRetryWait_UsesShortBackoffAndStopsOuterRetry(t *testing.T) {
-	m := NewManager(nil, nil, nil)
-	m.SetRetryConfig(0, 30*time.Second, 0)
-
-	errCapacity := &Error{
-		HTTPStatus: http.StatusTooManyRequests,
-		Message:    "Selected model is at capacity. Please try a different model.",
-	}
-	wait, shouldRetry := m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 0)
-	if !shouldRetry {
-		t.Fatalf("expected GPT capacity 429 without retry-after to retry")
-	}
-	if wait != time.Second {
-		t.Fatalf("wait = %v, want %v", wait, time.Second)
-	}
-
-	wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 1)
-	if !shouldRetry {
-		t.Fatalf("expected second GPT capacity retry")
-	}
-	if wait != 2*time.Second {
-		t.Fatalf("wait = %v, want %v", wait, 2*time.Second)
-	}
-
-	wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 2)
-	if !shouldRetry {
-		t.Fatalf("expected third GPT capacity retry")
-	}
-	if wait != 3*time.Second {
-		t.Fatalf("wait = %v, want %v", wait, 3*time.Second)
-	}
-
-	if wait, shouldRetry = m.gptSoftRateLimitRetryWait(errCapacity, []string{"openai-compatibility"}, "gpt-5.5", 3); shouldRetry {
-		t.Fatalf("expected GPT capacity retry to stop after three short waits, got wait=%v", wait)
-	}
-
-	_, _, maxWait := m.retrySettings()
-	if wait, shouldRetry = m.shouldRetryAfterError(errCapacity, 0, []string{"openai-compatibility"}, "gpt-5.5", maxWait); shouldRetry {
-		t.Fatalf("expected outer retry loop to stop GPT capacity after credential fallback exhaustion, got wait=%v", wait)
-	}
-}
-
 func TestManager_ShouldRetryAfterError_GPTSoftRateLimitDoesNotRetryQuotaOrNonGPT(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
@@ -197,7 +155,7 @@ func TestManager_ShouldRetryAfterError_GPTSoftRateLimitDoesNotRetryQuotaOrNonGPT
 	}
 }
 
-func TestManager_Execute_GPTCapacityRetriesSameAuthBeforeFallback(t *testing.T) {
+func TestManager_Execute_GPTCapacityDoesNotRetrySameAuth(t *testing.T) {
 	const model = "gpt-5.5"
 
 	manager := NewManager(nil, nil, nil)
@@ -219,15 +177,12 @@ func TestManager_Execute_GPTCapacityRetriesSameAuthBeforeFallback(t *testing.T) 
 		t.Fatalf("register auth: %v", errRegister)
 	}
 
-	resp, errExecute := manager.Execute(context.Background(), []string{auth.Provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want same-auth retry success", errExecute)
+	_, errExecute := manager.Execute(context.Background(), []string{auth.Provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("execute unexpectedly retried the same GPT channel")
 	}
-	if string(resp.Payload) != auth.ID {
-		t.Fatalf("payload = %q, want %s", string(resp.Payload), auth.ID)
-	}
-	if got := executor.ExecuteCalls(); !stringSlicesEqual(got, []string{auth.ID, auth.ID}) {
-		t.Fatalf("execute calls = %v, want same auth retried once", got)
+	if got := executor.ExecuteCalls(); !stringSlicesEqual(got, []string{auth.ID}) {
+		t.Fatalf("execute calls = %v, want one attempt", got)
 	}
 }
 
@@ -854,9 +809,9 @@ func TestManager_Execute_OpenAICompatChannelBreakerBypassesHigherPriorityChannel
 	failingExecutor := &authFallbackExecutor{
 		id: "xixiapi-plus",
 		executeErrors: map[string]error{
-			"xixi-1": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "no available channel"},
-			"xixi-2": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "no available channel"},
-			"xixi-3": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "no available channel"},
+			"xixi-1": &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "no available channel"},
+			"xixi-2": &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "no available channel"},
+			"xixi-3": &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "no available channel"},
 		},
 	}
 	backupExecutor := &authFallbackExecutor{id: "backup-gpt"}
@@ -883,26 +838,28 @@ func TestManager_Execute_OpenAICompatChannelBreakerBypassesHigherPriorityChannel
 		}
 	})
 
-	_, errFirst := manager.Execute(context.Background(), []string{"xixiapi-plus", "backup-gpt"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errFirst == nil {
-		t.Fatal("first execute unexpectedly succeeded before the channel breaker opened")
-	}
-	if got := failingExecutor.ExecuteCalls(); len(got) != 2 {
-		t.Fatalf("first execute calls = %v, want two high-priority attempts", got)
-	}
-
-	resp, errSecond := manager.Execute(context.Background(), []string{"xixiapi-plus", "backup-gpt"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errSecond != nil {
-		t.Fatalf("second execute error = %v, want fallback channel success", errSecond)
-	}
-	if string(resp.Payload) != "backup-1" {
-		t.Fatalf("payload = %q, want backup-1", string(resp.Payload))
+	for attempt := 0; attempt < channelBreakerOpenFailures; attempt++ {
+		resp, errExecute := manager.Execute(context.Background(), []string{"xixiapi-plus", "backup-gpt"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("execute %d error = %v, want immediate backup success", attempt+1, errExecute)
+		}
+		if string(resp.Payload) != "backup-1" {
+			t.Fatalf("execute %d payload = %q, want backup-1", attempt+1, string(resp.Payload))
+		}
 	}
 	if got := failingExecutor.ExecuteCalls(); len(got) != channelBreakerOpenFailures {
 		t.Fatalf("failing channel calls = %v, want %d before breaker bypass", got, channelBreakerOpenFailures)
 	}
-	if got := backupExecutor.ExecuteCalls(); len(got) != 1 || got[0] != "backup-1" {
-		t.Fatalf("backup calls = %v, want [backup-1]", got)
+	if got := backupExecutor.ExecuteCalls(); len(got) != channelBreakerOpenFailures {
+		t.Fatalf("backup calls = %v, want %d immediate fallbacks", got, channelBreakerOpenFailures)
+	}
+
+	resp, errAfterOpen := manager.Execute(context.Background(), []string{"xixiapi-plus", "backup-gpt"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errAfterOpen != nil || string(resp.Payload) != "backup-1" {
+		t.Fatalf("execute after breaker = payload:%q err:%v, want backup-1", string(resp.Payload), errAfterOpen)
+	}
+	if got := failingExecutor.ExecuteCalls(); len(got) != channelBreakerOpenFailures {
+		t.Fatalf("failing channel calls after breaker = %v, want no additional call", got)
 	}
 	for _, authID := range []string{"xixi-1", "xixi-2", "xixi-3"} {
 		updated, ok := manager.GetByID(authID)
@@ -910,7 +867,7 @@ func TestManager_Execute_OpenAICompatChannelBreakerBypassesHigherPriorityChannel
 			t.Fatalf("auth %s not found", authID)
 		}
 		blocked, reason, next := isAuthBlockedForModel(updated, model, time.Now())
-		if !blocked || reason != blockReasonCooldown || next.IsZero() {
+		if !blocked || reason != blockReasonOther || next.IsZero() {
 			t.Fatalf("auth %s blocked=%v reason=%v next=%v, want channel cooldown", authID, blocked, reason, next)
 		}
 	}

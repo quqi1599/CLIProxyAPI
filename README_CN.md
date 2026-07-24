@@ -49,6 +49,27 @@ routing:
 OpenAI 兼容渠道，也可以通过
 `provider-strategies.openai-compatibility: "spread"` 自动继承分散策略。
 
+### GPT 渠道自愈
+
+GPT 渠道切换和熔断自动生效：遇到 `429`、`502`、`503` 会立即切换到
+不同渠道，单次请求最多尝试 5 个不同渠道。连续 3 次 `5xx`，或 30 秒内
+至少 10 个样本且失败率达到 80%，会按 30、60、120 秒逐级冷却。半开状态
+一次只放行一个探测请求，连续成功 2 次后关闭熔断。同一路由身份和 BaseURL
+下的多个 API key 按一个渠道统计。
+
+使用 `spread` 后，系统会根据近期成功率、首字延迟（TTFT）和当前
+in-flight 请求数动态增加稳定且快速渠道的流量。在 `spread` 基础上开启
+`session-affinity` 可获得软亲和：同一会话优先使用上次成功渠道；渠道
+变慢、冷却或过载时自动迁移，并在请求成功后重新绑定。
+
+```yaml
+routing:
+  provider-strategies:
+    codex: "spread"
+    openai-compatibility: "spread"
+  session-affinity: true
+```
+
 混用 Kimi OpenAI-compatible key 和 Kimi Coding Agent key 时，要把两类上游
 入口分清楚。有些 Kimi Coding key 只能走 Claude-compatible `/v1/messages`
 入口，普通 OpenAI-compatible key 才走 `/chat/completions`。如果同一个 key

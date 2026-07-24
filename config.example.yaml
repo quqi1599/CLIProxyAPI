@@ -171,6 +171,8 @@ quota-exceeded:
   antigravity-credits: true # Whether to use credits as last-resort fallback when all free-tier auths are exhausted for Claude models
 
 # Routing strategy for selecting credentials when multiple match.
+# GPT channel failover and circuit breaking are automatic: 429/502/503 switch
+# to a different channel; keys sharing a routing identity and BaseURL are one channel.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first, sequential-fill (sf), spread
   # Optional: override the strategy for a specific routing group.
@@ -181,17 +183,17 @@ routing:
   #   kimi: "sf"
   #   codex: "round-robin"
   # Optional: override the strategy for an entire provider family.
-  # New credentials added under the same provider automatically inherit it.
+  # "spread" dynamically weights recent success rate, TTFT, and in-flight requests.
+  # Minimal GPT setup:
   # provider-strategies:
-  #   claude: "spread"
+  #   codex: "spread"
   #   openai-compatibility: "spread"
-  #   codex: "round-robin"
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Client-Request-Id (PI), conversation_id,
   # or first few messages hash.
   # Automatic failover is always enabled when bound auth becomes unavailable.
-  session-affinity: false # default: false
+  session-affinity: false # set true for GPT soft affinity; default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 

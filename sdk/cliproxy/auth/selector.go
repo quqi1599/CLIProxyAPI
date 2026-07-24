@@ -30,8 +30,8 @@ type RoundRobinSelector struct {
 	maxKeys int
 }
 
-// SpreadSelector rotates evenly across all available credentials, ignoring
-// static priority buckets while still respecting disabled/cooldown state.
+// SpreadSelector distributes requests across all available credentials using
+// configured priority and recent load, with channel-aware GPT health metrics.
 type SpreadSelector struct {
 	mu             sync.Mutex
 	cursors        map[string]int
@@ -189,6 +189,12 @@ const (
 	spreadLoadOverTargetPower   = 3
 	spreadLoadDefaultKeyLimit   = 4096
 	spreadLoadInactiveRecordTTL = 10 * time.Minute
+	spreadOutcomeEWMAAlpha      = 0.2
+	spreadMinSuccessFactor      = 0.1
+	spreadMinTTFTFactor         = 0.25
+	spreadMaxTTFTFactor         = 2.0
+	spreadAffinityTTFTRatio     = 1.5
+	spreadAffinitySuccessGap    = 0.2
 )
 
 func healthStateKnown(state HealthState) bool {
@@ -199,21 +205,57 @@ func resolveHealthState(auth *Auth, model string) HealthState {
 	if auth == nil {
 		return HealthState{}
 	}
+	channelHealth := HealthState{}
+	if isGPTRetryRoute([]string{auth.Provider}, model) && healthStateKnown(auth.Health) {
+		channelHealth = auth.Health
+	}
 	if model != "" && len(auth.ModelStates) > 0 {
 		if state, ok := auth.ModelStates[model]; ok && state != nil && healthStateKnown(state.Health) {
-			return state.Health
+			return lessHealthyState(channelHealth, state.Health)
 		}
 		baseModel := canonicalModelKey(model)
 		if baseModel != "" && baseModel != model {
 			if state, ok := auth.ModelStates[baseModel]; ok && state != nil && healthStateKnown(state.Health) {
-				return state.Health
+				return lessHealthyState(channelHealth, state.Health)
 			}
 		}
+	}
+	if healthStateKnown(channelHealth) {
+		return channelHealth
 	}
 	if healthStateKnown(auth.Health) {
 		return auth.Health
 	}
 	return HealthState{}
+}
+
+func lessHealthyState(left, right HealthState) HealthState {
+	if !healthStateKnown(left) {
+		return right
+	}
+	if !healthStateKnown(right) {
+		return left
+	}
+	rank := func(state HealthState) int {
+		switch state.BreakerState {
+		case HealthBreakerOpen:
+			return 2
+		case HealthBreakerHalfOpen:
+			return 1
+		default:
+			return 0
+		}
+	}
+	if leftRank, rightRank := rank(left), rank(right); leftRank != rightRank {
+		if leftRank > rightRank {
+			return left
+		}
+		return right
+	}
+	if left.Score <= right.Score {
+		return left
+	}
+	return right
 }
 
 func recoveredHealthScore(state HealthState, now time.Time) int {
@@ -252,6 +294,22 @@ func effectiveSelectionPriority(auth *Auth, model string, now time.Time) int {
 	return authPriority(auth)*healthPriorityMultiplier + healthTier(auth, model, now)
 }
 
+func selectorGPTRoute(provider, model string, auths []*Auth) bool {
+	if isGPTRetryRoute([]string{provider}, model) {
+		return true
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "mixed") {
+		return false
+	}
+	providers := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			providers = append(providers, auth.Provider)
+		}
+	}
+	return isGPTRetryRoute(providers, model)
+}
+
 func spreadSelectionWeight(auth *Auth, model string, now time.Time) int {
 	priority := authPriority(auth)
 	if priority < 0 {
@@ -261,12 +319,18 @@ func spreadSelectionWeight(auth *Auth, model string, now time.Time) int {
 		priority = 20
 	}
 	baseWeight := priority + 1
-
 	score := recoveredHealthScore(resolveHealthState(auth, model), now)
 	if score < 10 {
 		score = 10
 	}
 	weight := (baseWeight*score + healthScoreDefault - 1) / healthScoreDefault
+	provider := ""
+	if auth != nil {
+		provider = auth.Provider
+	}
+	if isGPTRetryRoute([]string{provider}, model) {
+		weight = baseWeight * score
+	}
 	if weight < 1 {
 		return 1
 	}
@@ -274,18 +338,24 @@ func spreadSelectionWeight(auth *Auth, model string, now time.Time) int {
 }
 
 type spreadLoadRecord struct {
-	recentHits float64
-	inFlight   int
-	updatedAt  time.Time
+	recentHits      float64
+	inFlight        int
+	successEWMA     float64
+	ttftEWMA        time.Duration
+	outcomeObserved bool
+	ttftObserved    bool
+	updatedAt       time.Time
 }
 
 type spreadLoadTracker struct {
-	records map[string]map[string]*spreadLoadRecord
+	records       map[string]map[string]*spreadLoadRecord
+	channelByAuth map[string]map[string]string
 }
 
 func newSpreadLoadTracker() *spreadLoadTracker {
 	return &spreadLoadTracker{
-		records: make(map[string]map[string]*spreadLoadRecord),
+		records:       make(map[string]map[string]*spreadLoadRecord),
+		channelByAuth: make(map[string]map[string]string),
 	}
 }
 
@@ -301,10 +371,83 @@ func (t *spreadLoadTracker) ensureKey(key string, limit int) map[string]*spreadL
 	}
 	if len(t.records) >= limit {
 		t.records = make(map[string]map[string]*spreadLoadRecord)
+		t.channelByAuth = make(map[string]map[string]string)
 	}
 	records := make(map[string]*spreadLoadRecord)
 	t.records[key] = records
 	return records
+}
+
+func (t *spreadLoadTracker) bindAuth(key, authID, channelKey string, now time.Time, limit int) {
+	authID = strings.TrimSpace(authID)
+	channelKey = strings.TrimSpace(channelKey)
+	if authID == "" || channelKey == "" {
+		return
+	}
+	records := t.ensureKey(key, limit)
+	if t.channelByAuth == nil {
+		t.channelByAuth = make(map[string]map[string]string)
+	}
+	bindings := t.channelByAuth[key]
+	if bindings == nil {
+		bindings = make(map[string]string)
+		t.channelByAuth[key] = bindings
+	}
+	if _, exists := bindings[authID]; !exists && len(bindings) >= spreadLoadDefaultKeyLimit {
+		bindings = make(map[string]string)
+		t.channelByAuth[key] = bindings
+	}
+	if _, alreadyBound := bindings[authID]; !alreadyBound && authID != channelKey {
+		if source := records[authID]; source != nil {
+			target := records[channelKey]
+			if target == nil {
+				target = &spreadLoadRecord{updatedAt: now}
+				records[channelKey] = target
+			}
+			mergeSpreadLoadRecord(target, source, now)
+			delete(records, authID)
+		}
+	}
+	bindings[authID] = channelKey
+}
+
+func (t *spreadLoadTracker) recordKey(key, authID string) string {
+	authID = strings.TrimSpace(authID)
+	if bindings := t.channelByAuth[key]; bindings != nil {
+		if channelKey := strings.TrimSpace(bindings[authID]); channelKey != "" {
+			return channelKey
+		}
+	}
+	return authID
+}
+
+func mergeSpreadLoadRecord(target, source *spreadLoadRecord, now time.Time) {
+	if target == nil || source == nil || target == source {
+		return
+	}
+	decaySpreadHits(target, now)
+	decaySpreadHits(source, now)
+	target.recentHits += source.recentHits
+	target.inFlight += source.inFlight
+	if source.outcomeObserved {
+		if target.outcomeObserved {
+			target.successEWMA = (target.successEWMA + source.successEWMA) / 2
+		} else {
+			target.successEWMA = source.successEWMA
+			target.outcomeObserved = true
+		}
+	}
+	if source.ttftObserved {
+		if target.ttftObserved {
+			target.ttftEWMA = (target.ttftEWMA + source.ttftEWMA) / 2
+		} else {
+			target.ttftEWMA = source.ttftEWMA
+			target.ttftObserved = true
+		}
+	}
+	if source.updatedAt.After(target.updatedAt) {
+		target.updatedAt = source.updatedAt
+	}
 }
 
 func decaySpreadHits(record *spreadLoadRecord, now time.Time) {
@@ -357,6 +500,7 @@ func (t *spreadLoadTracker) markPicked(key, authKey string, now time.Time, limit
 	if authKey == "" {
 		return
 	}
+	authKey = t.recordKey(key, authKey)
 	record := t.ensureKey(key, limit)[authKey]
 	if record == nil {
 		record = &spreadLoadRecord{updatedAt: now}
@@ -375,20 +519,77 @@ func (t *spreadLoadTracker) markDone(authID, model string, now time.Time) {
 		return
 	}
 	suffix := ":" + modelKey
-	for key, records := range t.records {
+	for key := range t.records {
 		if !strings.HasSuffix(key, suffix) {
 			continue
 		}
-		record := records[authID]
-		if record == nil {
+		t.markRouteDone(key, authID, now)
+	}
+}
+
+func (t *spreadLoadTracker) markRouteDone(key, authID string, now time.Time) {
+	if t == nil || strings.TrimSpace(key) == "" || strings.TrimSpace(authID) == "" {
+		return
+	}
+	records := t.records[key]
+	record := records[t.recordKey(key, authID)]
+	if record == nil {
+		return
+	}
+	decaySpreadHits(record, now)
+	if record.inFlight > 0 {
+		record.inFlight--
+	}
+	record.updatedAt = now
+}
+
+func (t *spreadLoadTracker) markResult(authID, model string, success bool, ttft time.Duration, now time.Time) {
+	authID = strings.TrimSpace(authID)
+	modelKey := canonicalModelKey(model)
+	if authID == "" || modelKey == "" || t == nil || len(t.records) == 0 {
+		return
+	}
+	suffix := ":" + modelKey
+	for key := range t.records {
+		if !strings.HasSuffix(key, suffix) {
 			continue
 		}
-		decaySpreadHits(record, now)
-		if record.inFlight > 0 {
-			record.inFlight--
-		}
-		record.updatedAt = now
+		t.markRouteResult(key, authID, success, ttft, true, now)
 	}
+}
+
+func (t *spreadLoadTracker) markRouteResult(key, authID string, success bool, ttft time.Duration, release bool, now time.Time) {
+	if t == nil || strings.TrimSpace(key) == "" || strings.TrimSpace(authID) == "" {
+		return
+	}
+	records := t.records[key]
+	record := records[t.recordKey(key, authID)]
+	if record == nil {
+		return
+	}
+	decaySpreadHits(record, now)
+	if release && record.inFlight > 0 {
+		record.inFlight--
+	}
+	sample := 0.0
+	if success {
+		sample = 1
+	}
+	if !record.outcomeObserved {
+		record.successEWMA = sample
+		record.outcomeObserved = true
+	} else {
+		record.successEWMA = spreadOutcomeEWMAAlpha*sample + (1-spreadOutcomeEWMAAlpha)*record.successEWMA
+	}
+	if success && ttft > 0 {
+		if !record.ttftObserved {
+			record.ttftEWMA = ttft
+			record.ttftObserved = true
+		} else {
+			record.ttftEWMA = time.Duration(spreadOutcomeEWMAAlpha*float64(ttft) + (1-spreadOutcomeEWMAAlpha)*float64(record.ttftEWMA))
+		}
+	}
+	record.updatedAt = now
 }
 
 func adjustedSpreadSelectionWeight(baseWeight int, authLoad, averageLoad float64) int {
@@ -410,6 +611,38 @@ func adjustedSpreadSelectionWeight(baseWeight int, authLoad, averageLoad float64
 		penalty = 1
 	}
 	adjusted := int(math.Ceil(float64(baseWeight) / penalty))
+	if adjusted < 1 {
+		return 1
+	}
+	return adjusted
+}
+
+func adjustedGPTSpreadSelectionWeight(baseWeight int, record spreadLoadRecord, averageTTFT time.Duration) int {
+	if baseWeight < 1 {
+		baseWeight = 1
+	}
+	successFactor := 1.0
+	if record.outcomeObserved {
+		successFactor = record.successEWMA
+		if successFactor < spreadMinSuccessFactor {
+			successFactor = spreadMinSuccessFactor
+		}
+	}
+	ttftFactor := 1.0
+	if record.ttftObserved && record.ttftEWMA > 0 && averageTTFT > 0 {
+		ttftFactor = float64(averageTTFT) / float64(record.ttftEWMA)
+		if ttftFactor < spreadMinTTFTFactor {
+			ttftFactor = spreadMinTTFTFactor
+		}
+		if ttftFactor > spreadMaxTTFTFactor {
+			ttftFactor = spreadMaxTTFTFactor
+		}
+	}
+	loadDivisor := float64(record.inFlight)
+	if loadDivisor < 1 {
+		loadDivisor = 1
+	}
+	adjusted := int(math.Round(float64(baseWeight) * successFactor * ttftFactor / loadDivisor))
 	if adjusted < 1 {
 		return 1
 	}
@@ -666,7 +899,7 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 		return group[innerIndex%len(group)], nil
 	}
 
-	selected := s.pickWeightedLocked(key, model, now, available, limit)
+	selected := s.pickWeightedLocked(key, provider, model, now, available, limit)
 	s.mu.Unlock()
 	if selected == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
@@ -686,7 +919,14 @@ func (s *SpreadSelector) ensureWeightKey(key string, limit int) {
 	}
 }
 
-func (s *SpreadSelector) pickWeightedLocked(key, model string, now time.Time, available []*Auth, limit int) *Auth {
+func (s *SpreadSelector) pickWeightedLocked(key, provider, model string, now time.Time, available []*Auth, limit int) *Auth {
+	if selectorGPTRoute(provider, model, available) {
+		return s.pickGPTWeightedLocked(key, model, now, available, limit)
+	}
+	return s.pickLegacyWeightedLocked(key, model, now, available, limit)
+}
+
+func (s *SpreadSelector) pickLegacyWeightedLocked(key, model string, now time.Time, available []*Auth, limit int) *Auth {
 	if len(available) == 0 {
 		return nil
 	}
@@ -754,13 +994,279 @@ func (s *SpreadSelector) pickWeightedLocked(key, model string, now time.Time, av
 	return selected
 }
 
+type spreadChannelGroup struct {
+	auths      []*Auth
+	baseWeight int
+}
+
+func (s *SpreadSelector) pickGPTWeightedLocked(key, model string, now time.Time, available []*Auth, limit int) *Auth {
+	if len(available) == 0 {
+		return nil
+	}
+	if s.load == nil {
+		s.load = newSpreadLoadTracker()
+	}
+
+	groupsByKey := make(map[string]*spreadChannelGroup, len(available))
+	channelKeys := make([]string, 0, len(available))
+	for i, auth := range available {
+		channelKey := routingChannelBaseKey(auth)
+		if channelKey == "" {
+			channelKey = fmt.Sprintf("__index_%d", i)
+		}
+		group := groupsByKey[channelKey]
+		if group == nil {
+			group = &spreadChannelGroup{}
+			groupsByKey[channelKey] = group
+			channelKeys = append(channelKeys, channelKey)
+		}
+		group.auths = append(group.auths, auth)
+		if weight := spreadSelectionWeight(auth, model, now); weight > group.baseWeight {
+			group.baseWeight = weight
+		}
+		if auth != nil && strings.TrimSpace(auth.ID) != "" {
+			s.load.bindAuth(key, auth.ID, channelKey, now, limit)
+		}
+	}
+	sort.Strings(channelKeys)
+
+	weightKey := key + "::weighted"
+	s.ensureWeightKey(weightKey, limit)
+	state := s.currentWeights[weightKey]
+	if state == nil {
+		state = make(map[string]int, len(channelKeys))
+		s.currentWeights[weightKey] = state
+	}
+	loadSnapshot := s.load.snapshot(key, channelKeys, now, limit)
+	var ttftTotal time.Duration
+	ttftCount := 0
+	for _, channelKey := range channelKeys {
+		record := loadSnapshot[channelKey]
+		if record.ttftObserved && record.ttftEWMA > 0 {
+			ttftTotal += record.ttftEWMA
+			ttftCount++
+		}
+	}
+	var averageTTFT time.Duration
+	if ttftCount > 0 {
+		averageTTFT = ttftTotal / time.Duration(ttftCount)
+	}
+
+	active := make(map[string]struct{}, len(channelKeys))
+	totalWeight := 0
+	selectedKey := ""
+	selectedScore := 0
+	for _, channelKey := range channelKeys {
+		group := groupsByKey[channelKey]
+		active[channelKey] = struct{}{}
+		weight := adjustedGPTSpreadSelectionWeight(group.baseWeight, loadSnapshot[channelKey], averageTTFT)
+		totalWeight += weight
+		state[channelKey] += weight
+		if selectedKey == "" || state[channelKey] > selectedScore {
+			selectedKey = channelKey
+			selectedScore = state[channelKey]
+		}
+	}
+	for channelKey := range state {
+		if _, ok := active[channelKey]; !ok {
+			delete(state, channelKey)
+		}
+	}
+	group := groupsByKey[selectedKey]
+	if group == nil || len(group.auths) == 0 || totalWeight <= 0 {
+		return nil
+	}
+	state[selectedKey] -= totalWeight
+	s.load.markPicked(key, selectedKey, now, limit)
+
+	cursorKey := key + "::channel:" + selectedKey
+	s.ensureCursorKey(cursorKey, limit)
+	index := s.cursors[cursorKey]
+	if index >= 2_147_483_640 {
+		index = 0
+	}
+	s.cursors[cursorKey] = index + 1
+	return group.auths[index%len(group.auths)]
+}
+
 func (s *SpreadSelector) MarkDone(authID, model string) {
-	if s == nil || s.load == nil {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.load == nil {
+		return
+	}
 	s.load.markDone(authID, model, time.Now())
+}
+
+func (s *SpreadSelector) MarkPicked(provider, model, authID string) {
+	if s == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		s.load = newSpreadLoadTracker()
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = spreadLoadDefaultKeyLimit
+	}
+	s.load.markPicked(key, authID, time.Now(), limit)
+}
+
+func (s *SpreadSelector) markPickedAuth(provider, model string, auth *Auth) {
+	if s == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		s.load = newSpreadLoadTracker()
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = spreadLoadDefaultKeyLimit
+	}
+	recordKey := auth.ID
+	if isGPTRetryRoute([]string{provider}, model) || isGPTRetryRoute([]string{auth.Provider}, model) {
+		recordKey = routingChannelBaseKey(auth)
+		if recordKey == "" {
+			recordKey = auth.ID
+		}
+	}
+	s.load.bindAuth(key, auth.ID, recordKey, now, limit)
+	s.load.markPicked(key, auth.ID, now, limit)
+}
+
+func (s *SpreadSelector) MarkResult(authID, model string, success bool, ttft time.Duration) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		return
+	}
+	s.load.markResult(authID, model, success, ttft, time.Now())
+}
+
+func (s *SpreadSelector) MarkRouteDone(provider, authID, model string) {
+	if s == nil {
+		return
+	}
+	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		return
+	}
+	s.load.markRouteDone(key, authID, time.Now())
+}
+
+func (s *SpreadSelector) MarkRouteResult(provider, authID, model string, success bool, ttft time.Duration, release bool) {
+	if s == nil {
+		return
+	}
+	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		return
+	}
+	s.load.markRouteResult(key, authID, success, ttft, release, time.Now())
+}
+
+func (s *SpreadSelector) keepAffinity(provider, model, authID string, auths []*Auth) bool {
+	if s == nil || len(auths) < 2 || strings.TrimSpace(authID) == "" || !selectorGPTRoute(provider, model, auths) {
+		return true
+	}
+	key := strings.TrimSpace(provider) + ":" + canonicalModelKey(model)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		s.load = newSpreadLoadTracker()
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = spreadLoadDefaultKeyLimit
+	}
+	groups := make(map[string]*spreadChannelGroup, len(auths))
+	channelKeys := make([]string, 0, len(auths))
+	var bound *Auth
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		channelKey := routingChannelBaseKey(auth)
+		if channelKey == "" {
+			channelKey = auth.ID
+		}
+		group := groups[channelKey]
+		if group == nil {
+			group = &spreadChannelGroup{}
+			groups[channelKey] = group
+			channelKeys = append(channelKeys, channelKey)
+		}
+		group.auths = append(group.auths, auth)
+		if weight := spreadSelectionWeight(auth, model, now); weight > group.baseWeight {
+			group.baseWeight = weight
+		}
+		s.load.bindAuth(key, auth.ID, channelKey, now, limit)
+		if auth.ID == authID {
+			bound = auth
+		}
+	}
+	if bound == nil {
+		return true
+	}
+	boundChannel := routingChannelBaseKey(bound)
+	if boundChannel == "" {
+		boundChannel = bound.ID
+	}
+	if len(groups) < 2 {
+		return true
+	}
+	records := s.load.snapshot(key, channelKeys, now, limit)
+	boundRecord := records[boundChannel]
+	minInflight := boundRecord.inFlight
+	bestSuccess := boundRecord.successEWMA
+	fastestTTFT := boundRecord.ttftEWMA
+	bestHealthWeight := groups[boundChannel].baseWeight
+	for channelKey, group := range groups {
+		if channelKey == boundChannel {
+			continue
+		}
+		record := records[channelKey]
+		if record.inFlight < minInflight {
+			minInflight = record.inFlight
+		}
+		if record.outcomeObserved && (!boundRecord.outcomeObserved || record.successEWMA > bestSuccess) {
+			bestSuccess = record.successEWMA
+		}
+		if record.ttftObserved && record.ttftEWMA > 0 && (!boundRecord.ttftObserved || fastestTTFT <= 0 || record.ttftEWMA < fastestTTFT) {
+			fastestTTFT = record.ttftEWMA
+		}
+		if group.baseWeight > bestHealthWeight {
+			bestHealthWeight = group.baseWeight
+		}
+	}
+	if boundRecord.inFlight > minInflight+1 {
+		return false
+	}
+	if boundRecord.outcomeObserved && bestSuccess-boundRecord.successEWMA >= spreadAffinitySuccessGap {
+		return false
+	}
+	if boundRecord.ttftObserved && fastestTTFT > 0 && float64(boundRecord.ttftEWMA) > float64(fastestTTFT)*spreadAffinityTTFTRatio {
+		return false
+	}
+	return groups[boundChannel].baseWeight*2 >= bestHealthWeight
 }
 
 // groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
@@ -927,7 +1433,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return false, blockReasonNone, time.Time{}
 	}
 	authBlocked, authReason, authNext := authLevelBlockState(auth, now)
-	if isCodexAPIKeyAuth(auth) {
+	if isGPTRetryRoute([]string{auth.Provider}, model) {
 		if blocked, next := healthBlockStateForAuth(auth, model, now); blocked {
 			return true, blockReasonOther, next
 		}
@@ -1054,6 +1560,73 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 }
 
+func sessionAffinityBinding(cache *SessionCache, key string, refresh bool) (string, bool) {
+	if cache == nil {
+		return "", false
+	}
+	if refresh {
+		return cache.GetAndRefresh(key)
+	}
+	return cache.Get(key)
+}
+
+func stageSessionAffinityBinding(ctx context.Context, cache *SessionCache, key, authID string, deferred bool) {
+	if cache == nil || key == "" || authID == "" {
+		return
+	}
+	if deferred {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			trace.stageSessionBinding(cache, key, authID)
+			return
+		}
+	}
+	cache.Set(key, authID)
+}
+
+func markSessionAffinityPicked(selector Selector, provider, model string, auth *Auth) {
+	switch current := selector.(type) {
+	case *SpreadSelector:
+		current.markPickedAuth(provider, model, auth)
+	case *SessionAffinitySelector:
+		markSessionAffinityPicked(current.fallback, provider, model, auth)
+	}
+}
+
+func keepSessionAffinity(selector Selector, provider, model, authID string, auths []*Auth) bool {
+	switch current := selector.(type) {
+	case *SpreadSelector:
+		return current.keepAffinity(provider, model, authID, auths)
+	case *SessionAffinitySelector:
+		return keepSessionAffinity(current.fallback, provider, model, authID, auths)
+	default:
+		return true
+	}
+}
+
+func withoutRoutingChannel(auths []*Auth, excluded *Auth) []*Auth {
+	if excluded == nil {
+		return auths
+	}
+	excludedKey := routingChannelBaseKey(excluded)
+	out := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || routingChannelBaseKey(auth) == excludedKey {
+			continue
+		}
+		out = append(out, auth)
+	}
+	return out
+}
+
+func authByID(auths []*Auth, authID string) *Auth {
+	for _, auth := range auths {
+		if auth != nil && auth.ID == authID {
+			return auth
+		}
+	}
+	return nil
+}
+
 // Pick selects an auth with session affinity when possible.
 // Priority for session ID extraction:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
@@ -1076,26 +1649,55 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	gptRoute := selectorGPTRoute(provider, model, auths)
+	gptSpread := gptRoute && selectorUsesSpread(s.fallback)
+	var (
+		available []*Auth
+		err       error
+	)
+	if gptSpread {
+		available, err = getSpreadAvailableAuths(auths, provider, model, now)
+	} else {
+		available, err = getAvailableAuths(auths, provider, model, now)
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
+	deferBinding := gptRoute && requestAttemptTraceFromContext(ctx) != nil
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
+	pickFallback := func(excludedAuthID string) (*Auth, error) {
+		candidates := auths
+		if gptRoute {
+			candidates = available
+			if excluded := authByID(auths, excludedAuthID); excluded != nil {
+				candidates = withoutRoutingChannel(candidates, excluded)
+			}
+		}
+		auth, errPick := s.fallback.Pick(ctx, provider, model, opts, candidates)
+		if errPick != nil {
+			return nil, errPick
+		}
+		stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
+		return auth, nil
+	}
+
+	if cachedAuthID, ok := sessionAffinityBinding(s.cache, cacheKey, !deferBinding); ok {
+		if auth := authByID(available, cachedAuthID); auth != nil {
+			if !gptRoute || keepSessionAffinity(s.fallback, provider, model, auth.ID, available) {
+				if gptRoute {
+					markSessionAffinityPicked(s.fallback, provider, model, auth)
+					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
+				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
+		auth, errPick := pickFallback(cachedAuthID)
+		if errPick != nil {
+			return nil, errPick
 		}
-		s.cache.Set(cacheKey, auth.ID)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -1103,21 +1705,31 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+			if auth := authByID(available, cachedAuthID); auth != nil {
+				if !gptRoute || keepSessionAffinity(s.fallback, provider, model, auth.ID, available) {
+					if gptRoute {
+						markSessionAffinityPicked(s.fallback, provider, model, auth)
+					}
+					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, deferBinding)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
 			}
+			if gptRoute {
+				auth, errPick := pickFallback(cachedAuthID)
+				if errPick != nil {
+					return nil, errPick
+				}
+				entry.Infof("session-affinity: fallback cache hit but channel unavailable, reselected | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+				return auth, nil
+			}
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-	if err != nil {
-		return nil, err
+	auth, errPick := pickFallback("")
+	if errPick != nil {
+		return nil, errPick
 	}
-	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }
@@ -1128,6 +1740,51 @@ func (s *SessionAffinitySelector) MarkDone(authID, model string) {
 	}
 	if selector, ok := s.fallback.(loadAwareSelector); ok {
 		selector.MarkDone(authID, model)
+	}
+}
+
+func (s *SessionAffinitySelector) MarkResult(authID, model string, success bool, ttft time.Duration) {
+	if s == nil || s.fallback == nil {
+		return
+	}
+	if selector, ok := s.fallback.(interface {
+		MarkResult(string, string, bool, time.Duration)
+	}); ok {
+		selector.MarkResult(authID, model, success, ttft)
+		return
+	}
+	if selector, ok := s.fallback.(loadAwareSelector); ok {
+		selector.MarkDone(authID, model)
+	}
+}
+
+func (s *SessionAffinitySelector) MarkRouteDone(provider, authID, model string) {
+	if s == nil || s.fallback == nil {
+		return
+	}
+	if selector, ok := s.fallback.(routeLoadAwareSelector); ok {
+		selector.MarkRouteDone(provider, authID, model)
+		return
+	}
+	if selector, ok := s.fallback.(loadAwareSelector); ok {
+		selector.MarkDone(authID, model)
+	}
+}
+
+func (s *SessionAffinitySelector) MarkRouteResult(provider, authID, model string, success bool, ttft time.Duration, release bool) {
+	if s == nil || s.fallback == nil {
+		return
+	}
+	if selector, ok := s.fallback.(routeResultAwareSelector); ok {
+		selector.MarkRouteResult(provider, authID, model, success, ttft, release)
+		return
+	}
+	if selector, ok := s.fallback.(resultAwareSelector); ok {
+		selector.MarkResult(authID, model, success, ttft)
+		return
+	}
+	if release {
+		s.MarkRouteDone(provider, authID, model)
 	}
 }
 

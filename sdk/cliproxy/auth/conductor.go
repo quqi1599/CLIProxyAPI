@@ -86,6 +86,19 @@ const (
 
 type requestAttemptTraceContextKey struct{}
 
+type pendingSessionBinding struct {
+	cache  *SessionCache
+	key    string
+	authID string
+}
+
+type selectorRouteSelection struct {
+	selector Selector
+	provider string
+	model    string
+	authID   string
+}
+
 type requestAttemptTrace struct {
 	mu             sync.Mutex
 	requestID      string
@@ -98,6 +111,12 @@ type requestAttemptTrace struct {
 	finalModel     string
 	finalExecutor  string
 	finalStatus    int
+	sessionBinding pendingSessionBinding
+	gptChannels    map[string]struct{}
+	failedChannels map[string]struct{}
+	gptRoute       bool
+	gptRouteSet    bool
+	selection      selectorRouteSelection
 }
 
 type requestExecutionSummary struct {
@@ -219,6 +238,25 @@ func (t *requestAttemptTrace) configureBudget(maxAttempts, maxFallbacks int) {
 	t.mu.Unlock()
 }
 
+func (t *requestAttemptTrace) configureGPTRoute(enabled bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.gptRoute = enabled
+	t.gptRouteSet = true
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) gptRouteValue() (bool, bool) {
+	if t == nil {
+		return false, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gptRoute, t.gptRouteSet
+}
+
 func (t *requestAttemptTrace) recordExecution(provider, model, executor string) {
 	if t == nil {
 		return
@@ -244,6 +282,122 @@ func (t *requestAttemptTrace) recordFinalStatus(status int) {
 	t.mu.Lock()
 	t.finalStatus = status
 	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) stageSessionBinding(cache *SessionCache, key, authID string) {
+	if t == nil || cache == nil || key == "" || authID == "" {
+		return
+	}
+	t.mu.Lock()
+	t.sessionBinding = pendingSessionBinding{cache: cache, key: key, authID: authID}
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) commitSessionBinding(authID string) {
+	if t == nil || authID == "" {
+		return
+	}
+	t.mu.Lock()
+	pending := t.sessionBinding
+	if pending.authID == authID {
+		t.sessionBinding = pendingSessionBinding{}
+	} else {
+		pending = pendingSessionBinding{}
+	}
+	t.mu.Unlock()
+	if pending.cache != nil {
+		pending.cache.Set(pending.key, pending.authID)
+	}
+}
+
+func (t *requestAttemptTrace) stageSelectorSelection(selector Selector, provider, model, authID string) {
+	if t == nil || selector == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	t.mu.Lock()
+	t.selection = selectorRouteSelection{
+		selector: selector,
+		provider: strings.TrimSpace(provider),
+		model:    strings.TrimSpace(model),
+		authID:   strings.TrimSpace(authID),
+	}
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) selectorSelection(authID string, release bool) (selectorRouteSelection, bool) {
+	if t == nil || strings.TrimSpace(authID) == "" {
+		return selectorRouteSelection{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.selection.selector == nil || t.selection.authID != strings.TrimSpace(authID) {
+		return selectorRouteSelection{}, false
+	}
+	selection := t.selection
+	if release {
+		t.selection = selectorRouteSelection{}
+	}
+	return selection, true
+}
+
+func (t *requestAttemptTrace) reserveGPTChannel(key string, limit int) (newChannel, allowed bool) {
+	if t == nil || key == "" {
+		return true, true
+	}
+	if limit <= 0 {
+		limit = gptImmediateFailoverMaxChannels
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gptChannels == nil {
+		t.gptChannels = make(map[string]struct{})
+	}
+	if _, exists := t.gptChannels[key]; exists {
+		return false, true
+	}
+	if len(t.gptChannels) >= limit {
+		return false, false
+	}
+	t.gptChannels[key] = struct{}{}
+	return true, true
+}
+
+func (t *requestAttemptTrace) markFailedChannel(key string) {
+	if t == nil || key == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.failedChannels == nil {
+		t.failedChannels = make(map[string]struct{})
+	}
+	t.failedChannels[key] = struct{}{}
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) failedChannelKeys() map[string]struct{} {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.failedChannels) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(t.failedChannels))
+	for key := range t.failedChannels {
+		out[key] = struct{}{}
+	}
+	return out
+}
+
+func (t *requestAttemptTrace) failedGPTChannel(key string) bool {
+	if t == nil || key == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, failed := t.failedChannels[key]
+	return failed
 }
 
 func (t *requestAttemptTrace) summary() requestExecutionSummary {
@@ -752,6 +906,8 @@ const (
 	slowRequestSoftPenalty           = 10
 	slowRequestHardPenalty           = 25
 	slowRequestMinHealthScore        = 10
+	gptImmediateFailoverMaxChannels  = 5
+	gptChannelProbeLease             = 10 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -845,10 +1001,14 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Duration records the upstream attempt duration for health-weight adjustment.
 	Duration time.Duration
+	// TTFT records time to first response data. Non-streaming calls may use
+	// Duration as a conservative approximation when this value is unavailable.
+	TTFT time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
 	// Cause keeps the original executor error for typed infrastructure failures.
-	Cause error
+	Cause             error
+	keepSelectorLease bool
 }
 
 // Selector chooses an auth candidate for execution.
@@ -858,6 +1018,18 @@ type Selector interface {
 
 type loadAwareSelector interface {
 	MarkDone(authID, model string)
+}
+
+type resultAwareSelector interface {
+	MarkResult(authID, model string, success bool, ttft time.Duration)
+}
+
+type routeResultAwareSelector interface {
+	MarkRouteResult(provider, authID, model string, success bool, ttft time.Duration, release bool)
+}
+
+type routeLoadAwareSelector interface {
+	MarkRouteDone(provider, authID, model string)
 }
 
 type PluginScheduler interface {
@@ -899,14 +1071,15 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store         Store
-	cooldownStore CooldownStateStore
-	executors     map[string]ProviderExecutor
-	selector      Selector
-	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	store            Store
+	cooldownStore    CooldownStateStore
+	executors        map[string]ProviderExecutor
+	selector         Selector
+	hook             Hook
+	mu               sync.RWMutex
+	selectorUpdateMu sync.Mutex
+	auths            map[string]*Auth
+	scheduler        *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -955,6 +1128,7 @@ type Manager struct {
 	halfOpenProbeNext        map[string]time.Time
 	halfOpenProbeActiveUntil map[string]time.Time
 	channelBreakers          map[string]HealthState
+	gptChannelBreakers       map[string]*codexChannelBreakerState
 
 	codexModelLoadMu sync.Mutex
 	codexModelLoads  map[string]int
@@ -984,6 +1158,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		halfOpenProbeNext:        make(map[string]time.Time),
 		halfOpenProbeActiveUntil: make(map[string]time.Time),
 		channelBreakers:          make(map[string]HealthState),
+		gptChannelBreakers:       make(map[string]*codexChannelBreakerState),
 		codexModelLoads:          make(map[string]int),
 		activeStreams:            newActiveStreamTracker(),
 	}
@@ -1458,12 +1633,20 @@ func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
 	}
+	m.selectorUpdateMu.Lock()
+	defer m.selectorUpdateMu.Unlock()
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
+	previousSessionSelector, _ := m.selector.(*SessionAffinitySelector)
+	nextSessionSelector, _ := selector.(*SessionAffinitySelector)
 	m.selector = selector
 	m.mu.Unlock()
+	m.stopDynamicSelectors()
+	if previousSessionSelector != nil && previousSessionSelector != nextSessionSelector {
+		previousSessionSelector.Stop()
+	}
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
@@ -2613,6 +2796,52 @@ func (m *Manager) healthSelectionBlocked(auth *Auth, model string, now time.Time
 	return false, time.Time{}
 }
 
+func (m *Manager) reserveGPTChannelAttempt(ctx context.Context, auth *Auth, provider, model string, now time.Time) bool {
+	if m == nil || auth == nil || !isGPTRequestRoute(ctx, []string{provider, auth.Provider}, model) {
+		return true
+	}
+	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
+		return true
+	}
+	key := routingChannelBaseKey(auth)
+	requestID := ""
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		requestID = trace.requestIDValue()
+	}
+	m.mu.Lock()
+	state := m.gptChannelBreakers[key]
+	allowed := state == nil || reserveCodexChannelProbe(state, requestID, now)
+	m.mu.Unlock()
+	return allowed
+}
+
+func (m *Manager) releaseGPTChannelAttempt(ctx context.Context, auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	trace := requestAttemptTraceFromContext(ctx)
+	requestID := trace.requestIDValue()
+	if requestID == "" {
+		return
+	}
+	m.mu.Lock()
+	releaseCodexChannelProbe(m.gptChannelBreakers[routingChannelBaseKey(auth)], requestID)
+	m.mu.Unlock()
+}
+
+func (m *Manager) gptChannelBreakerOpen(auth *Auth, now time.Time) bool {
+	if m == nil || auth == nil {
+		return false
+	}
+	m.mu.RLock()
+	state := m.gptChannelBreakers[routingChannelBaseKey(auth)]
+	open := state != nil &&
+		state.Health.BreakerState == HealthBreakerOpen &&
+		state.Health.OpenUntil.After(now)
+	m.mu.RUnlock()
+	return open
+}
+
 func selectionArgForSelector(selector Selector, routeModel string) string {
 	if isBuiltInSelector(selector) {
 		return ""
@@ -3046,6 +3275,17 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 	go func() {
 		defer close(out)
 		defer cancel()
+		selectorModel := meta.upstreamModel
+		if requestedModel := coreusage.RequestedModelAliasFromContext(ctx); requestedModel != "" {
+			selectorModel = requestedModel
+		}
+		resultRecorded := false
+		defer func() {
+			if !resultRecorded {
+				m.markSelectorLoadDone(ctx, auth.ID, selectorModel)
+			}
+			m.releaseGPTChannelAttempt(ctx, auth)
+		}()
 		if m != nil && m.activeStreams != nil {
 			defer m.activeStreams.stop(runtime.trackerID)
 		}
@@ -3089,7 +3329,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := resultErrorFromCause(chunk.Err)
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: chunk.Err})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: chunk.Err})
+				resultRecorded = true
 				runtime.recordFinalStatus(statusCodeFromError(chunk.Err))
 				if shouldEvictUnauthorizedError(chunk.Err) {
 					if errEvict := m.evictUnauthorizedAuth(ctx, auth, meta.provider, meta.upstreamModel); errEvict != nil {
@@ -3156,7 +3397,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: true, Duration: time.Since(startedAt)})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: true, Duration: time.Since(startedAt), TTFT: firstPayloadDelay})
+			resultRecorded = true
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(http.StatusOK)
 			}
@@ -3165,13 +3407,22 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out, Cancel: cancel}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, routeProviders []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
+		if idx > 0 && isGPTRetryRoute(routeProviders, routeModel) &&
+			!m.reserveGPTChannelAttempt(ctx, auth, provider, routeModel, time.Now()) {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			m.releaseGPTChannelAttempt(ctx, auth)
+			if lastErr != nil {
+				return nil, markGPTChannelFailoverError(lastErr)
+			}
+			return nil, &Error{Code: "auth_not_found", Message: "GPT channel unavailable"}
+		}
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
@@ -3179,7 +3430,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		releaseSlot, errReserve := m.reserveCodexModelSlot(provider, resultModel)
 		if errReserve != nil {
-			m.markSelectorLoadDone(auth.ID, resultModel)
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			m.releaseGPTChannelAttempt(ctx, auth)
 			return nil, errReserve
 		}
 		logRoutePlan(ctx, auth, provider, routeModel, resultModel, execModel, execOpts, executor, "stream")
@@ -3201,21 +3453,44 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if errStream != nil {
 			cleanupAttempt()
 			if errCtx := ctx.Err(); errCtx != nil {
+				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, errCtx
 			}
 			rerr := resultErrorFromCause(errStream)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: errStream}
+			elapsed := time.Since(startedAt)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: elapsed, TTFT: elapsed, Error: rerr, Cause: errStream}
 			result.RetryAfter = retryAfterFromError(errStream)
+			channelFailover := shouldFailoverGPTChannel(errStream, routeProviders, routeModel)
+			directFailover := channelFailover
+			unauthorized := shouldEvictUnauthorizedError(errStream)
+			requestInvalid := isRequestInvalidError(errStream)
+			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
+			result.keepSelectorLease = idx < len(execModels)-1 &&
+				!channelFailover &&
+				!unauthorized &&
+				(!requestInvalid || routeFallback)
 			m.MarkResult(ctx, result)
+			channelFailover = channelFailover ||
+				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+			if channelFailover && result.keepSelectorLease {
+				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			}
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(statusCodeFromError(errStream))
 			}
 			m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, errStream)
-			if shouldEvictUnauthorizedError(errStream) {
+			if channelFailover {
+				if !directFailover {
+					return nil, markGPTChannelFailoverError(errStream)
+				}
 				return nil, errStream
 			}
-			if isRequestInvalidError(errStream) {
-				if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream) {
+			if unauthorized {
+				return nil, errStream
+			}
+			if requestInvalid {
+				if routeFallback {
 					lastErr = errStream
 					if idx < len(execModels)-1 {
 						if trace := requestAttemptTraceFromContext(ctx); trace != nil {
@@ -3239,19 +3514,43 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				cleanupAttempt()
+				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, errCtx
 			}
-			if isRequestInvalidError(bootstrapErr) {
-				rerr := resultErrorFromCause(bootstrapErr)
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: bootstrapErr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
-				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
-				}
+			rerr := resultErrorFromCause(bootstrapErr)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: bootstrapErr}
+			result.RetryAfter = retryAfterFromError(bootstrapErr)
+			channelFailover := shouldFailoverGPTChannel(bootstrapErr, routeProviders, routeModel)
+			directFailover := channelFailover
+			unauthorized := shouldEvictUnauthorizedError(bootstrapErr)
+			requestInvalid := isRequestInvalidError(bootstrapErr)
+			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr)
+			result.keepSelectorLease = idx < len(execModels)-1 &&
+				!channelFailover &&
+				!unauthorized &&
+				(!requestInvalid || routeFallback)
+			m.MarkResult(ctx, result)
+			channelFailover = channelFailover ||
+				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+			if channelFailover && result.keepSelectorLease {
+				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			}
+			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+				trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
+			}
+			if requestInvalid {
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
-				cleanupAttempt()
-				if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr) {
+			}
+			cleanupAttempt()
+			if channelFailover || unauthorized {
+				if channelFailover && !directFailover {
+					bootstrapErr = markGPTChannelFailoverError(bootstrapErr)
+				}
+				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+			}
+			if requestInvalid {
+				if routeFallback {
 					lastErr = bootstrapErr
 					if idx < len(execModels)-1 {
 						if trace := requestAttemptTraceFromContext(ctx); trace != nil {
@@ -3262,49 +3561,32 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				return nil, bootstrapErr
 			}
-			if shouldEvictUnauthorizedError(bootstrapErr) {
-				rerr := resultErrorFromCause(bootstrapErr)
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: bootstrapErr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
-				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
-				}
-				cleanupAttempt()
-				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
-			}
 			if idx < len(execModels)-1 {
-				rerr := resultErrorFromCause(bootstrapErr)
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: bootstrapErr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				lastErr = bootstrapErr
 				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-					trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
 					trace.recordFallback()
 				}
-				cleanupAttempt()
-				lastErr = bootstrapErr
 				continue
 			}
-			rerr := resultErrorFromCause(bootstrapErr)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: rerr, Cause: bootstrapErr}
-			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
-			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-				trace.recordFinalStatus(statusCodeFromError(bootstrapErr))
-			}
-			cleanupAttempt()
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: emptyErr}
+			result.keepSelectorLease = idx < len(execModels)-1
 			m.MarkResult(ctx, result)
+			channelFailover := isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now())
+			if channelFailover && result.keepSelectorLease {
+				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			}
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(statusCodeFromError(emptyErr))
 			}
 			cleanupAttempt()
+			if channelFailover {
+				return nil, newStreamBootstrapError(markGPTChannelFailoverError(emptyErr), streamResult.Headers)
+			}
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				if trace := requestAttemptTraceFromContext(ctx); trace != nil {
@@ -3684,7 +3966,10 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	if invalidator, ok := selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
 }
@@ -3850,6 +4135,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	trace := requestAttemptTraceFromContext(ctx)
+	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
 	for {
@@ -3874,6 +4160,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 		tried[auth.ID] = struct{}{}
 		if fallbackGuard.shouldSkipAuth(auth) {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
 		}
 		fallbackGuard.markAuth(auth)
@@ -3897,12 +4184,13 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
 		if len(models) == 0 {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			attempted[auth.ID] = struct{}{}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -3911,81 +4199,125 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			trace.recordFallback()
 			continue
 		}
+		if isGPTRetryRoute(providers, routeModel) {
+			channelKey := routingChannelBaseKey(auth)
+			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.markRetryChannelTried(ctx, tried, auth)
+				continue
+			}
+			newChannel, allowed := trace.reserveGPTChannel(channelKey, gptChannelAttemptLimit(maxRetryCredentials))
+			if !allowed {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(execCtx, auth)
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "GPT channel attempt limit reached"}
+			}
+			if !newChannel && trace.failedGPTChannel(channelKey) {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(execCtx, auth)
+				m.markRetryChannelTried(ctx, tried, auth)
+				continue
+			}
+		}
+		attempted[auth.ID] = struct{}{}
 		var authErr error
 		countAttempt := false
 	modelLoop:
 		for idx, upstreamModel := range models {
+			if idx > 0 && isGPTRetryRoute(providers, routeModel) &&
+				!m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				authErr = markGPTChannelFailoverError(authErr)
+				break modelLoop
+			}
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			softRetryAttempt := 0
-			for {
-				logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, operation)
-				if trace != nil {
-					trace.recordExecution(provider, resultModel, providerExecutorName(executor))
-				}
-				resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-				if errExec != nil {
-					if errCtx := execCtx.Err(); errCtx != nil {
-						return cliproxyexecutor.Response{}, errCtx
-					}
-					result.Error = resultErrorFromCause(errExec)
-					result.Cause = errExec
-					if ra := retryAfterFromError(errExec); ra != nil {
-						result.RetryAfter = ra
-					}
-					m.MarkResult(execCtx, result)
-					trace.recordFinalStatus(statusCodeFromError(errExec))
-					m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
-					if wait, shouldRetry := m.gptSoftRateLimitRetryWait(errExec, providers, routeModel, softRetryAttempt); shouldRetry {
-						softRetryAttempt++
-						trace.recordFallback()
-						if errWait := waitForCooldown(execCtx, wait); errWait != nil {
-							return cliproxyexecutor.Response{}, errWait
-						}
-						continue
-					}
-					if shouldEvictUnauthorizedError(errExec) {
-						if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
-							logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
-						}
-						authErr = errExec
-						countAttempt = false
-						break modelLoop
-					}
-					if isRequestInvalidError(errExec) {
-						if shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec) {
-							if isDeepSeekCompatibilityFallbackError(errExec) {
-								m.markCompatibilityFallbackRouteTried(tried, auth)
-							}
-							authErr = errExec
-							countAttempt = true
-							if idx < len(models)-1 {
-								trace.recordFallback()
-							}
-							continue modelLoop
-						}
-						return cliproxyexecutor.Response{}, errExec
-					}
-					authErr = errExec
-					countAttempt = true
-					if idx < len(models)-1 {
-						trace.recordFallback()
-					}
-					continue modelLoop
-				}
-				m.MarkResult(execCtx, result)
-				trace.recordFinalStatus(http.StatusOK)
-				if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
-					resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
-				}
-				return resp, nil
+			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, operation)
+			if trace != nil {
+				trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 			}
+			startedAt := time.Now()
+			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
+			elapsed := time.Since(startedAt)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
+			if errExec != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+					m.releaseGPTChannelAttempt(execCtx, auth)
+					return cliproxyexecutor.Response{}, errCtx
+				}
+				result.Error = resultErrorFromCause(errExec)
+				result.Cause = errExec
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				channelFailover := shouldFailoverGPTChannel(errExec, providers, routeModel)
+				unauthorized := shouldEvictUnauthorizedError(errExec)
+				requestInvalid := isRequestInvalidError(errExec)
+				routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec)
+				result.keepSelectorLease = idx < len(models)-1 &&
+					!channelFailover &&
+					!unauthorized &&
+					(!requestInvalid || routeFallback)
+				m.MarkResult(execCtx, result)
+				channelFailover = channelFailover ||
+					(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+				if channelFailover && result.keepSelectorLease {
+					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				}
+				trace.recordFinalStatus(statusCodeFromError(errExec))
+				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
+				authErr = errExec
+				countAttempt = true
+				if channelFailover {
+					if !shouldFailoverGPTChannel(errExec, providers, routeModel) {
+						authErr = markGPTChannelFailoverError(errExec)
+					}
+					break modelLoop
+				}
+				if unauthorized {
+					if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, resultModel); errEvict != nil {
+						logEntryWithRequestID(execCtx).Warnf("evict unauthorized auth %s failed: %v", auth.ID, errEvict)
+					}
+					countAttempt = false
+					break modelLoop
+				}
+				if requestInvalid {
+					if routeFallback {
+						if isDeepSeekCompatibilityFallbackError(errExec) {
+							m.markCompatibilityFallbackRouteTried(tried, auth)
+						}
+						if idx < len(models)-1 {
+							trace.recordFallback()
+						}
+						continue modelLoop
+					}
+					return cliproxyexecutor.Response{}, errExec
+				}
+				if idx < len(models)-1 {
+					trace.recordFallback()
+				}
+				continue modelLoop
+			}
+			m.MarkResult(execCtx, result)
+			trace.recordFinalStatus(http.StatusOK)
+			if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
+				resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
+			}
+			return resp, nil
 		}
 		if authErr != nil {
+			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
+				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+			if channelFailover {
+				m.markRetryChannelTried(ctx, tried, auth)
+			}
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, authErr)
 			transientNetworkFallback := isTransientRoutingError(authErr)
 			emptyUpstreamFallback := isRetryableEmptyUpstreamResponseError(authErr)
@@ -4002,7 +4334,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
+			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
 				}
@@ -4025,6 +4357,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	trace := requestAttemptTraceFromContext(ctx)
+	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
 	for {
@@ -4049,6 +4382,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		tried[auth.ID] = struct{}{}
 		if fallbackGuard.shouldSkipAuth(auth) {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
 		}
 		fallbackGuard.markAuth(auth)
@@ -4071,12 +4405,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
 		if len(models) == 0 {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			attempted[auth.ID] = struct{}{}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -4085,24 +4420,40 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			trace.recordFallback()
 			continue
 		}
-		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
-		softRetryAttempt := 0
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
-		for errStream != nil {
-			if wait, shouldRetry := m.gptSoftRateLimitRetryWait(errStream, []string{provider}, routeModel, softRetryAttempt); shouldRetry {
-				softRetryAttempt++
-				trace.recordFallback()
-				if errWait := waitForCooldown(execCtx, wait); errWait != nil {
-					return nil, errWait
-				}
-				streamResult, errStream = m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
+		if isGPTRetryRoute(providers, routeModel) {
+			channelKey := routingChannelBaseKey(auth)
+			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.markRetryChannelTried(ctx, tried, auth)
 				continue
 			}
-			break
+			newChannel, allowed := trace.reserveGPTChannel(channelKey, gptChannelAttemptLimit(maxRetryCredentials))
+			if !allowed {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(execCtx, auth)
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, &Error{Code: "auth_not_found", Message: "GPT channel attempt limit reached"}
+			}
+			if !newChannel && trace.failedGPTChannel(channelKey) {
+				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+				m.releaseGPTChannelAttempt(execCtx, auth)
+				m.markRetryChannelTried(ctx, tried, auth)
+				continue
+			}
 		}
+		attempted[auth.ID] = struct{}{}
+		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, providers, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
+			}
+			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
+				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+			if channelFailover {
+				m.markRetryChannelTried(ctx, tried, auth)
 			}
 			if shouldEvictUnauthorizedError(errStream) {
 				if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, routeModel); errEvict != nil {
@@ -4135,7 +4486,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
+			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return nil, errWait
 				}
@@ -5066,6 +5417,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	if shouldFailoverGPTChannel(err, providers, model) {
+		return 0, false
+	}
 	if typed, ok := failurecontract.As(err); ok {
 		if _, controlled := controlledFailureScope(string(typed.Scope)); controlled {
 			return m.shouldRetryTypedFailure(typed, attempt, providers, model, maxWait)
@@ -5095,9 +5449,6 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 			return 0, false
 		}
 		return 0, true
-	}
-	if isRetryableGPTSoftRateLimit(err, providers, model) {
-		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
@@ -5138,54 +5489,127 @@ func (m *Manager) shouldRetryTypedFailure(failure *failurecontract.Failure, atte
 	return transientNetworkRetryDelay(attempt, maxWait)
 }
 
-func (m *Manager) gptSoftRateLimitRetryWait(err error, providers []string, model string, attempt int) (time.Duration, bool) {
-	if !isRetryableGPTSoftRateLimit(err, providers, model) {
-		return 0, false
-	}
-	_, _, maxWait := m.retrySettings()
-	return transientNetworkRetryDelay(attempt, maxWait)
-}
-
-func isRetryableGPTSoftRateLimit(err error, providers []string, model string) bool {
-	if err == nil || !isGPTRetryRoute(providers, model) {
-		return false
-	}
-	if statusCodeFromError(err) != http.StatusTooManyRequests {
-		return false
-	}
-	if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > 0 {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(errorString(err)))
-	if message == "" || isAccountQuotaExhaustedMessage(message) {
-		return false
-	}
-	patterns := [...]string{
-		"selected model is at capacity",
-		"model is at capacity",
-		"rate limit",
-		"rate_limit",
-		"too many requests",
-	}
-	for _, pattern := range patterns {
-		if strings.Contains(message, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
 func isGPTRetryRoute(providers []string, model string) bool {
 	modelKey := strings.ToLower(strings.TrimSpace(canonicalModelKey(model)))
 	if strings.HasPrefix(modelKey, "gpt-") {
 		return true
 	}
+	hasProvider := false
 	for _, provider := range providers {
-		if strings.EqualFold(strings.TrimSpace(provider), "codex") {
-			return true
+		provider = strings.TrimSpace(provider)
+		if provider == "" {
+			continue
+		}
+		hasProvider = true
+		if !strings.EqualFold(provider, "codex") {
+			return false
 		}
 	}
-	return false
+	return hasProvider
+}
+
+func isGPTRequestRoute(ctx context.Context, providers []string, model string) bool {
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		if enabled, configured := trace.gptRouteValue(); configured {
+			return enabled
+		}
+	}
+	return isGPTRetryRoute(providers, model)
+}
+
+type gptChannelFailoverError struct {
+	cause error
+}
+
+func (e *gptChannelFailoverError) Error() string {
+	if e == nil || e.cause == nil {
+		return "GPT channel unavailable"
+	}
+	return e.cause.Error()
+}
+
+func (e *gptChannelFailoverError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func markGPTChannelFailoverError(err error) error {
+	if err == nil {
+		err = &Error{Code: "gpt_channel_unavailable", Message: "GPT channel unavailable", Retryable: true}
+	}
+	var marked *gptChannelFailoverError
+	if errors.As(err, &marked) {
+		return err
+	}
+	return &gptChannelFailoverError{cause: err}
+}
+
+func shouldFailoverGPTChannel(err error, providers []string, model string) bool {
+	if err == nil || !isGPTRetryRoute(providers, model) {
+		return false
+	}
+	var marked *gptChannelFailoverError
+	if errors.As(err, &marked) {
+		return true
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		return false
+	}
+	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
+		return false
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func gptChannelAttemptLimit(maxRetryCredentials int) int {
+	limit := gptImmediateFailoverMaxChannels
+	if maxRetryCredentials > 0 && maxRetryCredentials+1 < limit {
+		limit = maxRetryCredentials + 1
+	}
+	return limit
+}
+
+func (m *Manager) markRetryChannelTried(ctx context.Context, tried map[string]struct{}, auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	key := routingChannelBaseKey(auth)
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		trace.markFailedChannel(key)
+	}
+	m.mu.RLock()
+	for _, peer := range m.auths {
+		if peer != nil && routingChannelBaseKey(peer) == key {
+			tried[peer.ID] = struct{}{}
+		}
+	}
+	m.mu.RUnlock()
+}
+
+func (m *Manager) markPreviouslyFailedGPTChannels(ctx context.Context, tried map[string]struct{}) {
+	trace := requestAttemptTraceFromContext(ctx)
+	failed := trace.failedChannelKeys()
+	if len(failed) == 0 {
+		return
+	}
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		if _, blocked := failed[routingChannelBaseKey(auth)]; blocked {
+			tried[auth.ID] = struct{}{}
+		}
+	}
+	m.mu.RUnlock()
 }
 
 func transientNetworkRetryDelay(attempt int, maxWait time.Duration) (time.Duration, bool) {
@@ -5241,7 +5665,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
-	m.markSelectorLoadDone(result.AuthID, result.Model)
+	selectorResult := result
+	if requestedModel := coreusage.RequestedModelAliasFromContext(ctx); requestedModel != "" {
+		selectorResult.Model = requestedModel
+	}
+	m.markSelectorResult(ctx, selectorResult)
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -5273,7 +5701,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		failureScope, hasTypedFailureScope := failureScopeFromResult(result)
 		slowPenalty := 0
 		if result.Success && m.slowRequestPenaltyEnabledLocked(auth) {
-			slowPenalty = slowRequestHealthPenalty(result.Duration)
+			latency := result.TTFT
+			if latency <= 0 {
+				latency = result.Duration
+			}
+			slowPenalty = slowRequestHealthPenalty(latency)
 		}
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
@@ -5519,7 +5951,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
 		}
-		schedulerSnapshots = append(schedulerSnapshots, m.applyChannelBreakerResultLocked(auth, result, requestedModelAlias, now)...)
+		schedulerSnapshots = append(schedulerSnapshots, m.applyChannelBreakerResultLocked(ctx, auth, result, requestedModelAlias, now)...)
 		if slowPenalty > 0 {
 			schedulerSnapshots = append(schedulerSnapshots, m.applySlowRequestGroupPenaltyLocked(auth, result, now, slowPenalty)...)
 		}
@@ -5575,6 +6007,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	if authSnapshot != nil {
 		m.logAuthResultMetric(ctx, authSnapshot, result)
+	}
+	if result.Success {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			trace.commitSessionBinding(result.AuthID)
+		}
 	}
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
@@ -5735,12 +6172,19 @@ func channelBreakerModelKeyForResult(auth *Auth, result Result, requestedModelAl
 	return modelKey
 }
 
-func (m *Manager) applyChannelBreakerResultLocked(auth *Auth, result Result, requestedModelAlias string, now time.Time) []*Auth {
+func (m *Manager) applyChannelBreakerResultLocked(ctx context.Context, auth *Auth, result Result, requestedModelAlias string, now time.Time) []*Auth {
 	if m == nil || auth == nil || quotaCooldownDisabledForAuth(auth) {
 		return nil
 	}
-	if isCodexAPIKeyAuth(auth) {
-		return m.applyCodexAPIKeyChannelHealthResultLocked(auth, result, now)
+	routeModel := strings.TrimSpace(requestedModelAlias)
+	if routeModel == "" {
+		routeModel = result.Model
+	}
+	if isGPTRequestRoute(ctx, []string{result.Provider, auth.Provider}, routeModel) {
+		if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
+			return nil
+		}
+		return m.applyGPTChannelBreakerResultLocked(ctx, auth, result, now)
 	}
 	aliasScoped := openAICompatAvailabilityAliasForResult(auth, requestedModelAlias, result) != ""
 	breakerModel := channelBreakerModelKeyForResult(auth, result, requestedModelAlias)
@@ -5802,6 +6246,81 @@ func (m *Manager) recordChannelBreakerSuccessLocked(key string, now time.Time) {
 		return
 	}
 	m.channelBreakers[key] = health
+}
+
+func (m *Manager) applyGPTChannelBreakerResultLocked(ctx context.Context, auth *Auth, result Result, now time.Time) []*Auth {
+	key := routingChannelBaseKey(auth)
+	if key == "" {
+		return nil
+	}
+	counted := result.Success || shouldCountCodexChannelBreakerFailure(result)
+	if m.gptChannelBreakers == nil {
+		if !counted {
+			return nil
+		}
+		m.gptChannelBreakers = make(map[string]*codexChannelBreakerState)
+	}
+	state := m.gptChannelBreakers[key]
+	if state == nil {
+		if !counted {
+			return nil
+		}
+		state = &codexChannelBreakerState{}
+		m.gptChannelBreakers[key] = state
+	}
+	requestID := ""
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		requestID = trace.requestIDValue()
+	}
+	previousHealth := state.Health
+	applyCodexChannelBreakerResult(state, result, now, requestID)
+	if !counted {
+		return nil
+	}
+	ordinaryClosedSuccess := result.Success &&
+		(previousHealth.BreakerState == "" || previousHealth.BreakerState == HealthBreakerClosed) &&
+		previousHealth.ConsecutiveFailures == 0 &&
+		recoveredHealthScore(previousHealth, now) >= healthScoreDefault &&
+		state.Health.BreakerState == HealthBreakerClosed
+	if ordinaryClosedSuccess {
+		m.pruneGPTChannelBreakersLocked()
+		return nil
+	}
+
+	snapshots := make([]*Auth, 0)
+	for _, peer := range m.auths {
+		if peer == nil || peer.Disabled || peer.Status == StatusDisabled || routingChannelBaseKey(peer) != key {
+			continue
+		}
+		peer.Health = state.Health
+		if !result.Success && result.Model != "" && isCodexAPIKeyAuth(peer) {
+			if modelState := ensureModelState(peer, result.Model); modelState != nil && modelState.Status != StatusDisabled {
+				modelState.Health = state.Health
+				modelState.UpdatedAt = now
+			}
+		}
+		peer.UpdatedAt = now
+		snapshots = append(snapshots, peer.Clone())
+	}
+	m.pruneGPTChannelBreakersLocked()
+	return snapshots
+}
+
+func (m *Manager) pruneGPTChannelBreakersLocked() {
+	if m == nil || len(m.gptChannelBreakers) <= channelBreakerStateLimit {
+		return
+	}
+	for key, state := range m.gptChannelBreakers {
+		if state == nil || state.Health.BreakerState == HealthBreakerClosed {
+			delete(m.gptChannelBreakers, key)
+		}
+	}
+	for len(m.gptChannelBreakers) > channelBreakerStateLimit {
+		for key := range m.gptChannelBreakers {
+			delete(m.gptChannelBreakers, key)
+			break
+		}
+	}
 }
 
 func (m *Manager) applyChannelBreakerCooldownLocked(auth *Auth, result Result, breakerModel string, aliasScoped bool, health HealthState, now time.Time) []*Auth {
@@ -5885,79 +6404,6 @@ func shouldCountChannelBreakerFailure(result Result) bool {
 		return false
 	}
 	return isRetryableAvailabilityErrorMessage(result.Error.Code + " " + result.Error.Message)
-}
-
-func (m *Manager) applyCodexAPIKeyChannelHealthResultLocked(auth *Auth, result Result, now time.Time) []*Auth {
-	key := codexAPIKeyChannelKey(auth, result.Model)
-	if key == "" {
-		return nil
-	}
-	m.pruneChannelBreakersLocked(now)
-	if result.Success {
-		m.recordChannelBreakerSuccessLocked(key, now)
-		return nil
-	}
-	if !shouldCountCodexAPIKeyHealthFailure(result) {
-		return nil
-	}
-
-	statusCode := statusCodeFromResult(result.Error)
-	health := m.channelBreakers[key]
-	applyCodexAPIKeyHealthFailure(&health, now, statusCode)
-	if health.BreakerState == HealthBreakerClosed && health.ConsecutiveFailures == 0 {
-		delete(m.channelBreakers, key)
-		return nil
-	}
-	if m.channelBreakers == nil {
-		m.channelBreakers = make(map[string]HealthState)
-	}
-	m.channelBreakers[key] = health
-	if health.ConsecutiveFailures < channelBreakerOpenFailures {
-		return nil
-	}
-	return m.applyCodexAPIKeyChannelHealthPenaltyLocked(auth, result, health, now)
-}
-
-func (m *Manager) applyCodexAPIKeyChannelHealthPenaltyLocked(auth *Auth, result Result, health HealthState, now time.Time) []*Auth {
-	baseKey := codexAPIKeyChannelBaseKey(auth)
-	if m == nil || baseKey == "" || result.Model == "" {
-		return nil
-	}
-	snapshots := make([]*Auth, 0)
-	for _, peer := range m.auths {
-		if peer == nil || peer.Disabled || peer.Status == StatusDisabled {
-			continue
-		}
-		if codexAPIKeyChannelBaseKey(peer) != baseKey {
-			continue
-		}
-		state := ensureModelState(peer, result.Model)
-		if state == nil || state.Status == StatusDisabled {
-			continue
-		}
-		if !shouldApplyCodexAPIKeyChannelHealth(state.Health, health, now) {
-			continue
-		}
-		state.Health = health
-		state.UpdatedAt = now
-		snapshots = append(snapshots, peer.Clone())
-	}
-	return snapshots
-}
-
-func shouldApplyCodexAPIKeyChannelHealth(current, candidate HealthState, now time.Time) bool {
-	if !healthStateKnown(candidate) {
-		return false
-	}
-	if !healthStateKnown(current) {
-		return true
-	}
-	currentScore := recoveredHealthScore(current, now)
-	candidateScore := recoveredHealthScore(candidate, now)
-	if candidateScore < currentScore {
-		return true
-	}
-	return candidateScore == currentScore && candidate.ConsecutiveFailures > current.ConsecutiveFailures
 }
 
 func slowRequestHealthPenalty(duration time.Duration) int {
@@ -6064,18 +6510,6 @@ func codexAPIKeyChannelBaseKey(auth *Auth) string {
 	}, "\x00")
 }
 
-func codexAPIKeyChannelKey(auth *Auth, model string) string {
-	baseKey := codexAPIKeyChannelBaseKey(auth)
-	modelKey := canonicalModelKey(model)
-	if modelKey == "" {
-		modelKey = strings.ToLower(strings.TrimSpace(model))
-	}
-	if baseKey == "" || modelKey == "" {
-		return ""
-	}
-	return baseKey + "\x00model=" + modelKey
-}
-
 func channelBreakerBaseKey(auth *Auth) string {
 	if auth == nil || auth.Attributes == nil {
 		return ""
@@ -6103,6 +6537,19 @@ func channelBreakerBaseKey(auth *Auth) string {
 		prefix,
 		routingGroup,
 	}, "\x00")
+}
+
+func routingChannelBaseKey(auth *Auth) string {
+	if key := codexAPIKeyChannelBaseKey(auth); key != "" {
+		return key
+	}
+	if key := channelBreakerBaseKey(auth); key != "" {
+		return key
+	}
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return ""
+	}
+	return "auth\x00" + strings.TrimSpace(auth.ID)
 }
 
 func channelBreakerKey(auth *Auth, model string) string {
@@ -6143,11 +6590,24 @@ func (m *Manager) pruneChannelBreakersLocked(now time.Time) {
 	}
 }
 
-func (m *Manager) markSelectorLoadDone(authID, model string) {
+func (m *Manager) markSelectorLoadDone(ctx context.Context, authID, model string) {
 	if m == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(model) == "" {
 		return
 	}
-	if selector, ok := m.selector.(loadAwareSelector); ok {
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		if selection, ok := trace.selectorSelection(authID, true); ok {
+			if selector, routeAware := selection.selector.(routeLoadAwareSelector); routeAware {
+				selector.MarkRouteDone(selection.provider, selection.authID, selection.model)
+			} else if selector, loadAware := selection.selector.(loadAwareSelector); loadAware {
+				selector.MarkDone(selection.authID, selection.model)
+			}
+			return
+		}
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	if selector, ok := selector.(loadAwareSelector); ok {
 		selector.MarkDone(authID, model)
 	}
 
@@ -6164,6 +6624,61 @@ func (m *Manager) markSelectorLoadDone(authID, model string) {
 		if loadAware, ok := selector.(loadAwareSelector); ok {
 			loadAware.MarkDone(authID, model)
 		}
+	}
+}
+
+func (m *Manager) markSelectorResult(ctx context.Context, result Result) {
+	if m == nil || strings.TrimSpace(result.AuthID) == "" || strings.TrimSpace(result.Model) == "" {
+		return
+	}
+	ttft := result.TTFT
+	if ttft <= 0 {
+		ttft = result.Duration
+	}
+	recordOutcome := result.Success || shouldCountCodexChannelBreakerFailure(result)
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		release := !result.keepSelectorLease
+		if selection, ok := trace.selectorSelection(result.AuthID, release); ok {
+			if recordOutcome {
+				if selector, routeAware := selection.selector.(routeResultAwareSelector); routeAware {
+					selector.MarkRouteResult(selection.provider, selection.authID, selection.model, result.Success, ttft, release)
+				} else if selector, resultAware := selection.selector.(resultAwareSelector); resultAware {
+					selector.MarkResult(selection.authID, selection.model, result.Success, ttft)
+				}
+			} else if release {
+				if selector, routeAware := selection.selector.(routeLoadAwareSelector); routeAware {
+					selector.MarkRouteDone(selection.provider, selection.authID, selection.model)
+				} else if selector, loadAware := selection.selector.(loadAwareSelector); loadAware {
+					selector.MarkDone(selection.authID, selection.model)
+				}
+			}
+			return
+		}
+	}
+	record := func(selector Selector) {
+		if resultAware, ok := selector.(resultAwareSelector); ok && recordOutcome {
+			resultAware.MarkResult(result.AuthID, result.Model, result.Success, ttft)
+			return
+		}
+		if loadAware, ok := selector.(loadAwareSelector); ok {
+			loadAware.MarkDone(result.AuthID, result.Model)
+		}
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	record(selector)
+
+	m.dynamicSelectorsMu.Lock()
+	selectors := make([]Selector, 0, len(m.dynamicSelectors))
+	for _, selector := range m.dynamicSelectors {
+		if selector != nil {
+			selectors = append(selectors, selector)
+		}
+	}
+	m.dynamicSelectorsMu.Unlock()
+	for _, selector := range selectors {
+		record(selector)
 	}
 }
 
@@ -8041,7 +8556,10 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m.hasRoutingStrategyOverrides() {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	return isBuiltInSelector(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -8142,6 +8660,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errAvailable
 	}
 	available = cloneAuthSlice(available)
+	selector = m.selectorForAuths(available)
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
@@ -8156,6 +8675,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if !handled && selectorUsesSpread(selector) {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			trace.stageSelectorSelection(selector, provider, model, selected.ID)
+		}
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -8354,6 +8878,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errAvailable
 	}
 	available = cloneAuthSlice(available)
+	selector = m.selectorForAuths(available)
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
@@ -8375,6 +8900,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	m.mu.RUnlock()
 	if providerKey == "" || executor == nil {
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	if !handled && selectorUsesSpread(selector) {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			trace.stageSelectorSelection(selector, "mixed", model, selected.ID)
+		}
 	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
@@ -9049,7 +9579,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, []string{c.provider}, req, creditsOpts, routeModel, models, len(models) > 1)
 		if errStream != nil {
 			continue
 		}
@@ -9129,6 +9659,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 func (m *Manager) StopAutoRefresh() {
 	m.mu.Lock()
 	cancel := m.refreshCancel
+	selector := m.selector
 	m.refreshCancel = nil
 	m.refreshLoop = nil
 	m.mu.Unlock()
@@ -9136,7 +9667,7 @@ func (m *Manager) StopAutoRefresh() {
 		cancel()
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	if stoppable, ok := m.selector.(StoppableSelector); ok {
+	if stoppable, ok := selector.(StoppableSelector); ok {
 		stoppable.Stop()
 	}
 	m.stopDynamicSelectors()
@@ -9630,7 +10161,10 @@ func (m *Manager) authMetricRouting(auth *Auth) (string, string) {
 	if group, strategy, ok := m.routingStrategyForAuths([]*Auth{auth}); ok {
 		return group, strategy
 	}
-	return "default", selectorMetricStrategy(m.selector)
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	return "default", selectorMetricStrategy(selector)
 }
 
 func (m *Manager) authMetricFields(auth *Auth, provider, model string) log.Fields {
