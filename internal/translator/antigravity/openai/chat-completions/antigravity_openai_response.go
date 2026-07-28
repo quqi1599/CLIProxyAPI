@@ -267,17 +267,36 @@ func restoreAntigravityOpenAIFunctionNames(rawJSON, originalRequestRawJSON []byt
 		return rawJSON
 	}
 	candidates := gjson.GetBytes(rawJSON, "candidates")
-	for candidateIndex, candidate := range candidates.Array() {
-		for partIndex, part := range candidate.Get("content.parts").Array() {
-			for _, field := range []string{"functionCall", "functionResponse"} {
-				name := part.Get(field + ".name").String()
-				if name == "" {
-					continue
-				}
-				path := fmt.Sprintf("candidates.%d.content.parts.%d.%s.name", candidateIndex, partIndex, field)
-				rawJSON, _ = sjson.SetBytes(rawJSON, path, util.RestoreSanitizedToolName(nameMap, name))
-			}
-		}
+	if !candidates.IsArray() {
+		return rawJSON
 	}
+	rewrittenCandidates := make([]string, 0, len(candidates.Array()))
+	for _, candidate := range candidates.Array() {
+		parts := candidate.Get("content.parts")
+		if !parts.IsArray() {
+			rewrittenCandidates = append(rewrittenCandidates, candidate.Raw)
+			continue
+		}
+		rewrittenParts := make([]string, 0, len(parts.Array()))
+		for _, part := range parts.Array() {
+			partJSON := []byte(part.Raw)
+			partJSON = restoreAntigravityOpenAIFunctionNameField(partJSON, part, "functionCall", nameMap)
+			partJSON = restoreAntigravityOpenAIFunctionNameField(partJSON, part, "functionResponse", nameMap)
+			rewrittenParts = append(rewrittenParts, string(partJSON))
+		}
+		candidateJSON := []byte(candidate.Raw)
+		candidateJSON, _ = sjson.SetRawBytes(candidateJSON, "content.parts", internalpayload.BuildRaw(rewrittenParts))
+		rewrittenCandidates = append(rewrittenCandidates, string(candidateJSON))
+	}
+	rawJSON, _ = sjson.SetRawBytes(rawJSON, "candidates", internalpayload.BuildRaw(rewrittenCandidates))
 	return rawJSON
+}
+
+func restoreAntigravityOpenAIFunctionNameField(partJSON []byte, part gjson.Result, field string, nameMap map[string]string) []byte {
+	name := part.Get(field + ".name").String()
+	if name == "" {
+		return partJSON
+	}
+	partJSON, _ = sjson.SetBytes(partJSON, field+".name", util.RestoreSanitizedToolName(nameMap, name))
+	return partJSON
 }

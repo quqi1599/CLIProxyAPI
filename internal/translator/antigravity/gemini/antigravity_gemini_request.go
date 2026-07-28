@@ -98,42 +98,20 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	toolsResult := gjson.GetBytes(rawJSON, "request.tools")
 	if toolsResult.IsArray() {
 		seenFunctionNames := make(map[string]struct{})
-		for toolIndex := range toolsResult.Array() {
-			for _, key := range []string{"functionDeclarations", "function_declarations"} {
-				path := fmt.Sprintf("request.tools.%d.%s", toolIndex, key)
-				declarations := gjson.GetBytes(rawJSON, path)
-				if !declarations.IsArray() {
-					continue
-				}
-
-				parts := make([]string, 0, len(declarations.Array()))
-				for _, declaration := range declarations.Array() {
-					name := declaration.Get("name").String()
-					mappedName := util.MapSanitizedFunctionName(functionNameMap, name)
-					if mappedName != "" {
-						if _, exists := seenFunctionNames[mappedName]; exists {
-							continue
-						}
-						seenFunctionNames[mappedName] = struct{}{}
-					}
-
-					declarationJSON := []byte(declaration.Raw)
-					declarationJSON, _ = sjson.SetBytes(declarationJSON, "name", mappedName)
-					if parameters := declaration.Get("parameters"); parameters.Exists() {
-						declarationJSON, _ = sjson.SetRawBytes(declarationJSON, "parametersJsonSchema", []byte(parameters.Raw))
-						declarationJSON, _ = sjson.DeleteBytes(declarationJSON, "parameters")
-					}
-					parts = append(parts, string(declarationJSON))
-				}
-				deduplicated := []byte("[" + strings.Join(parts, ",") + "]")
-				var errSet error
-				rawJSON, errSet = sjson.SetRawBytes(rawJSON, path, deduplicated)
-				if errSet != nil {
-					log.Warnf("failed to normalize function declarations in tool %d: %v", toolIndex, errSet)
-				}
+		rewrittenTools := make([]string, 0, len(toolsResult.Array()))
+		for _, toolResult := range toolsResult.Array() {
+			toolJSON := []byte(toolResult.Raw)
+			toolJSON = normalizeGeminiFunctionDeclarations(toolJSON, toolResult.Get("functionDeclarations"), "functionDeclarations", functionNameMap, seenFunctionNames)
+			toolJSON = normalizeGeminiFunctionDeclarations(toolJSON, toolResult.Get("function_declarations"), "function_declarations", functionNameMap, seenFunctionNames)
+			if len(gjson.ParseBytes(toolJSON).Map()) > 0 {
+				rewrittenTools = append(rewrittenTools, string(toolJSON))
 			}
 		}
-		rawJSON = removeEmptyGeminiFunctionTools(rawJSON)
+		if len(rewrittenTools) == 0 {
+			rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.tools")
+		} else {
+			rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.tools", internalpayload.BuildRaw(rewrittenTools))
+		}
 	}
 	rawJSON = rewriteGeminiFunctionNames(rawJSON, functionNameMap)
 
@@ -146,55 +124,87 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")
 }
 
-func removeEmptyGeminiFunctionTools(rawJSON []byte) []byte {
-	tools := gjson.GetBytes(rawJSON, "request.tools")
-	cleanedTools := []byte(`[]`)
-	for _, tool := range tools.Array() {
-		toolJSON := []byte(tool.Raw)
-		if tool.IsObject() {
-			for _, key := range []string{"functionDeclarations", "function_declarations"} {
-				if declarations := tool.Get(key); declarations.IsArray() && len(declarations.Array()) == 0 {
-					toolJSON, _ = sjson.DeleteBytes(toolJSON, key)
-				}
-			}
-			if len(gjson.ParseBytes(toolJSON).Map()) == 0 {
+func normalizeGeminiFunctionDeclarations(toolJSON []byte, declarations gjson.Result, key string, functionNameMap map[string]string, seenFunctionNames map[string]struct{}) []byte {
+	if !declarations.IsArray() {
+		return toolJSON
+	}
+	parts := make([]string, 0, len(declarations.Array()))
+	for _, declaration := range declarations.Array() {
+		name := declaration.Get("name").String()
+		mappedName := util.MapSanitizedFunctionName(functionNameMap, name)
+		if mappedName != "" {
+			if _, exists := seenFunctionNames[mappedName]; exists {
 				continue
 			}
+			seenFunctionNames[mappedName] = struct{}{}
 		}
-		cleanedTools, _ = sjson.SetRawBytes(cleanedTools, "-1", toolJSON)
+
+		declarationJSON := []byte(declaration.Raw)
+		declarationJSON, _ = sjson.SetBytes(declarationJSON, "name", mappedName)
+		if parameters := declaration.Get("parameters"); parameters.Exists() {
+			declarationJSON, _ = sjson.SetRawBytes(declarationJSON, "parametersJsonSchema", []byte(parameters.Raw))
+			declarationJSON, _ = sjson.DeleteBytes(declarationJSON, "parameters")
+		}
+		parts = append(parts, string(declarationJSON))
 	}
-	if len(gjson.ParseBytes(cleanedTools).Array()) == 0 {
-		rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.tools")
-		return rawJSON
+	if len(parts) == 0 {
+		toolJSON, _ = sjson.DeleteBytes(toolJSON, key)
+		return toolJSON
 	}
-	rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.tools", cleanedTools)
-	return rawJSON
+	toolJSON, _ = sjson.SetRawBytes(toolJSON, key, internalpayload.BuildRaw(parts))
+	return toolJSON
 }
 
 func rewriteGeminiFunctionNames(rawJSON []byte, functionNameMap map[string]string) []byte {
 	contents := gjson.GetBytes(rawJSON, "request.contents")
-	for contentIndex, content := range contents.Array() {
-		for partIndex, part := range content.Get("parts").Array() {
-			for _, field := range []string{"functionCall", "functionResponse", "function_call", "function_response"} {
-				name := part.Get(field + ".name").String()
-				if name == "" {
-					continue
-				}
-				path := fmt.Sprintf("request.contents.%d.parts.%d.%s.name", contentIndex, partIndex, field)
-				rawJSON, _ = sjson.SetBytes(rawJSON, path, util.MapSanitizedFunctionName(functionNameMap, name))
+	if contents.IsArray() {
+		rewrittenContents := make([]string, 0, len(contents.Array()))
+		for _, content := range contents.Array() {
+			parts := content.Get("parts")
+			if !parts.IsArray() {
+				rewrittenContents = append(rewrittenContents, content.Raw)
+				continue
 			}
+			rewrittenParts := make([]string, 0, len(parts.Array()))
+			for _, part := range parts.Array() {
+				partJSON := []byte(part.Raw)
+				partJSON = rewriteGeminiFunctionNameField(partJSON, part, "functionCall", functionNameMap)
+				partJSON = rewriteGeminiFunctionNameField(partJSON, part, "functionResponse", functionNameMap)
+				partJSON = rewriteGeminiFunctionNameField(partJSON, part, "function_call", functionNameMap)
+				partJSON = rewriteGeminiFunctionNameField(partJSON, part, "function_response", functionNameMap)
+				rewrittenParts = append(rewrittenParts, string(partJSON))
+			}
+			contentJSON := []byte(content.Raw)
+			contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts", internalpayload.BuildRaw(rewrittenParts))
+			rewrittenContents = append(rewrittenContents, string(contentJSON))
 		}
+		rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.contents", internalpayload.BuildRaw(rewrittenContents))
 	}
-	for _, allowedPath := range []string{
-		"request.toolConfig.functionCallingConfig.allowedFunctionNames",
-		"request.tool_config.function_calling_config.allowed_function_names",
-	} {
-		allowedNames := gjson.GetBytes(rawJSON, allowedPath)
-		for index, name := range allowedNames.Array() {
-			path := fmt.Sprintf("%s.%d", allowedPath, index)
-			rawJSON, _ = sjson.SetBytes(rawJSON, path, util.MapSanitizedFunctionName(functionNameMap, name.String()))
-		}
+	rawJSON = rewriteGeminiAllowedFunctionNames(rawJSON, "request.toolConfig.functionCallingConfig.allowedFunctionNames", functionNameMap)
+	rawJSON = rewriteGeminiAllowedFunctionNames(rawJSON, "request.tool_config.function_calling_config.allowed_function_names", functionNameMap)
+	return rawJSON
+}
+
+func rewriteGeminiFunctionNameField(partJSON []byte, part gjson.Result, field string, functionNameMap map[string]string) []byte {
+	name := part.Get(field + ".name").String()
+	if name == "" {
+		return partJSON
 	}
+	partJSON, _ = sjson.SetBytes(partJSON, field+".name", util.MapSanitizedFunctionName(functionNameMap, name))
+	return partJSON
+}
+
+func rewriteGeminiAllowedFunctionNames(rawJSON []byte, path string, functionNameMap map[string]string) []byte {
+	allowedNames := gjson.GetBytes(rawJSON, path)
+	if !allowedNames.IsArray() {
+		return rawJSON
+	}
+	mappedNames := make([]string, 0, len(allowedNames.Array()))
+	for _, name := range allowedNames.Array() {
+		mappedNames = append(mappedNames, util.MapSanitizedFunctionName(functionNameMap, name.String()))
+	}
+	encodedNames, _ := json.Marshal(mappedNames)
+	rawJSON, _ = sjson.SetRawBytes(rawJSON, path, encodedNames)
 	return rawJSON
 }
 

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -491,7 +492,7 @@ func DeduplicateFunctionDeclarations(raw []byte) []byte {
 		}
 		parts = append(parts, declaration.Raw)
 	}
-	return []byte("[" + strings.Join(parts, ",") + "]")
+	return internalpayload.BuildRaw(parts)
 }
 
 // RestoreSanitizedToolName looks up a sanitized function name in the provided map

@@ -8,7 +8,6 @@ package gemini
 import (
 	"bytes"
 	"context"
-	"fmt"
 
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
@@ -91,19 +90,40 @@ func restoreGeminiFunctionNames(chunk, originalRequestRawJSON []byte) []byte {
 		return chunk
 	}
 	candidates := gjson.GetBytes(chunk, "candidates")
-	for candidateIndex, candidate := range candidates.Array() {
-		for partIndex, part := range candidate.Get("content.parts").Array() {
-			for _, field := range []string{"functionCall", "functionResponse", "function_call", "function_response"} {
-				name := part.Get(field + ".name").String()
-				if name == "" {
-					continue
-				}
-				path := fmt.Sprintf("candidates.%d.content.parts.%d.%s.name", candidateIndex, partIndex, field)
-				chunk, _ = sjson.SetBytes(chunk, path, util.RestoreSanitizedToolName(nameMap, name))
-			}
-		}
+	if !candidates.IsArray() {
+		return chunk
 	}
+	rewrittenCandidates := make([]string, 0, len(candidates.Array()))
+	for _, candidate := range candidates.Array() {
+		parts := candidate.Get("content.parts")
+		if !parts.IsArray() {
+			rewrittenCandidates = append(rewrittenCandidates, candidate.Raw)
+			continue
+		}
+		rewrittenParts := make([]string, 0, len(parts.Array()))
+		for _, part := range parts.Array() {
+			partJSON := []byte(part.Raw)
+			partJSON = restoreGeminiFunctionNameField(partJSON, part, "functionCall", nameMap)
+			partJSON = restoreGeminiFunctionNameField(partJSON, part, "functionResponse", nameMap)
+			partJSON = restoreGeminiFunctionNameField(partJSON, part, "function_call", nameMap)
+			partJSON = restoreGeminiFunctionNameField(partJSON, part, "function_response", nameMap)
+			rewrittenParts = append(rewrittenParts, string(partJSON))
+		}
+		candidateJSON := []byte(candidate.Raw)
+		candidateJSON, _ = sjson.SetRawBytes(candidateJSON, "content.parts", internalpayload.BuildRaw(rewrittenParts))
+		rewrittenCandidates = append(rewrittenCandidates, string(candidateJSON))
+	}
+	chunk, _ = sjson.SetRawBytes(chunk, "candidates", internalpayload.BuildRaw(rewrittenCandidates))
 	return chunk
+}
+
+func restoreGeminiFunctionNameField(partJSON []byte, part gjson.Result, field string, nameMap map[string]string) []byte {
+	name := part.Get(field + ".name").String()
+	if name == "" {
+		return partJSON
+	}
+	partJSON, _ = sjson.SetBytes(partJSON, field+".name", util.RestoreSanitizedToolName(nameMap, name))
+	return partJSON
 }
 
 func GeminiTokenCount(ctx context.Context, count int64) []byte {
