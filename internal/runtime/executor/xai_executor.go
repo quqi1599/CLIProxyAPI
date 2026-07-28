@@ -214,9 +214,11 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	}
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stream")
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "tools")
-	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
-		prepared.body, _ = sjson.DeleteBytes(prepared.body, field)
-	}
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "max_output_tokens")
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "temperature")
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "top_p")
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "top_k")
+	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stop")
 	prepared.body = xaiRemoveInputItemsByType(prepared.body, "compaction_trigger")
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
 		Stage:       "request_plan.xai.compact",
@@ -1074,11 +1076,14 @@ func preserveXAIResponsesOutputControls(body, source []byte, from sdktranslator.
 	if maxOutputTokens.Exists() && maxOutputTokens.Type != gjson.Null {
 		body, _ = sjson.SetRawBytes(body, "max_output_tokens", []byte(maxOutputTokens.Raw))
 	}
-	for _, field := range []string{"temperature", "top_p", "top_k"} {
-		value := gjson.GetBytes(source, field)
-		if value.Exists() && value.Type != gjson.Null {
-			body, _ = sjson.SetRawBytes(body, field, []byte(value.Raw))
-		}
+	if temperature := gjson.GetBytes(source, "temperature"); temperature.Exists() && temperature.Type != gjson.Null {
+		body, _ = sjson.SetRawBytes(body, "temperature", []byte(temperature.Raw))
+	}
+	if topP := gjson.GetBytes(source, "top_p"); topP.Exists() && topP.Type != gjson.Null {
+		body, _ = sjson.SetRawBytes(body, "top_p", []byte(topP.Raw))
+	}
+	if topK := gjson.GetBytes(source, "top_k"); topK.Exists() && topK.Type != gjson.Null {
+		body, _ = sjson.SetRawBytes(body, "top_k", []byte(topK.Raw))
 	}
 	return body
 }
