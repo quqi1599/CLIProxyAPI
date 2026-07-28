@@ -214,6 +214,9 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	}
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stream")
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "tools")
+	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
+		prepared.body, _ = sjson.DeleteBytes(prepared.body, field)
+	}
 	prepared.body = xaiRemoveInputItemsByType(prepared.body, "compaction_trigger")
 	if err = internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
 		Stage:       "request_plan.xai.compact",
@@ -864,6 +867,8 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	if err != nil {
 		return nil, err
 	}
+	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
+	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
 	if err != nil {
@@ -1052,8 +1057,35 @@ func xaiMetadataString(meta map[string]any, key string) string {
 	}
 }
 
+func preserveXAIResponsesOutputControls(body, source []byte, from sdktranslator.Format) []byte {
+	var maxOutputTokens gjson.Result
+	switch from {
+	case sdktranslator.FormatOpenAI:
+		maxOutputTokens = gjson.GetBytes(source, "max_completion_tokens")
+		if !maxOutputTokens.Exists() || maxOutputTokens.Type == gjson.Null {
+			maxOutputTokens = gjson.GetBytes(source, "max_tokens")
+		}
+	case sdktranslator.FormatOpenAIResponse:
+		maxOutputTokens = gjson.GetBytes(source, "max_output_tokens")
+	default:
+		return body
+	}
+
+	if maxOutputTokens.Exists() && maxOutputTokens.Type != gjson.Null {
+		body, _ = sjson.SetRawBytes(body, "max_output_tokens", []byte(maxOutputTokens.Raw))
+	}
+	for _, field := range []string{"temperature", "top_p", "top_k"} {
+		value := gjson.GetBytes(source, field)
+		if value.Exists() && value.Type != gjson.Null {
+			body, _ = sjson.SetRawBytes(body, field, []byte(value.Raw))
+		}
+	}
+	return body
+}
+
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	body = removeXAIEncryptedReasoningInclude(body)
+	body, _ = sjson.DeleteBytes(body, "stop")
 	if !xaiSupportsReasoningEffort(model) {
 		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}

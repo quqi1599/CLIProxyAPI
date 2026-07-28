@@ -490,6 +490,10 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 func setToolCallOutputContent(funcOutput []byte, content gjson.Result) []byte {
 	switch {
 	case content.Type == gjson.String:
+		structuredContent := gjson.Parse(content.String())
+		if hasToolOutputImagePart(structuredContent) {
+			return setToolCallOutputContent(funcOutput, structuredContent)
+		}
 		funcOutput, _ = sjson.SetBytes(funcOutput, "output", content.String())
 	case content.IsArray():
 		outputItems := make([]json.RawMessage, 0)
@@ -509,15 +513,20 @@ func setToolCallOutputContent(funcOutput []byte, content gjson.Result) []byte {
 }
 
 func appendToolOutputContentPart(output []json.RawMessage, item gjson.Result) []json.RawMessage {
-	switch item.Get("type").String() {
-	case "text":
+	itemType := item.Get("type").String()
+	switch itemType {
+	case "text", "input_text", "output_text":
 		part := []byte(`{}`)
 		part, _ = sjson.SetBytes(part, "type", "input_text")
 		part, _ = sjson.SetBytes(part, "text", item.Get("text").String())
 		output = append(output, json.RawMessage(part))
-	case "image_url":
+	case "image_url", "input_image":
 		imageURL := item.Get("image_url.url").String()
 		fileID := item.Get("image_url.file_id").String()
+		if itemType == "input_image" {
+			imageURL = item.Get("image_url").String()
+			fileID = item.Get("file_id").String()
+		}
 		if imageURL == "" && fileID == "" {
 			return appendToolOutputFallbackPart(output, item)
 		}
@@ -529,7 +538,11 @@ func appendToolOutputContentPart(output []json.RawMessage, item gjson.Result) []
 		if fileID != "" {
 			part, _ = sjson.SetBytes(part, "file_id", fileID)
 		}
-		if detail := item.Get("image_url.detail").String(); detail != "" {
+		detail := item.Get("image_url.detail").String()
+		if itemType == "input_image" {
+			detail = item.Get("detail").String()
+		}
+		if detail != "" {
 			part, _ = sjson.SetBytes(part, "detail", detail)
 		}
 		output = append(output, json.RawMessage(part))
@@ -559,6 +572,25 @@ func appendToolOutputContentPart(output []json.RawMessage, item gjson.Result) []
 		output = appendToolOutputFallbackPart(output, item)
 	}
 	return output
+}
+
+func hasToolOutputImagePart(content gjson.Result) bool {
+	if !content.IsArray() {
+		return false
+	}
+	for _, item := range content.Array() {
+		switch item.Get("type").String() {
+		case "image_url":
+			if item.Get("image_url.url").String() != "" || item.Get("image_url.file_id").String() != "" {
+				return true
+			}
+		case "input_image":
+			if item.Get("image_url").String() != "" || item.Get("file_id").String() != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func appendToolOutputFallbackPart(output []json.RawMessage, item gjson.Result) []json.RawMessage {
