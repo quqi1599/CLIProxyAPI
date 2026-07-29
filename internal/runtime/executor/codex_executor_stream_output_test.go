@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -206,6 +207,23 @@ func TestCodexTerminalStreamErrHandlesUsageLimitResponseFailed(t *testing.T) {
 	}
 	if streamErr.RetryAfter() == nil {
 		t.Fatal("expected retryAfter from usage_limit_reached response.failed terminal error")
+	}
+}
+
+func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
+	for _, eventType := range []string{"response.completed", "response.done"} {
+		streamErr, _, ok := codexTerminalStreamErr([]byte(fmt.Sprintf(`{"type":%q,"response":{"status":"failed","error":{"type":"server_error","code":"model_at_capacity","message":"Selected model is at capacity. Please try a different model."}}}`, eventType)))
+		if !ok {
+			t.Fatalf("expected capacity %s terminal error to be handled", eventType)
+		}
+		if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+			t.Fatalf("%s status code = %d, want %d", eventType, got, http.StatusTooManyRequests)
+		}
+	}
+
+	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null}}`))
+	if ok {
+		t.Fatal("successful response.completed should not be handled as an error")
 	}
 }
 

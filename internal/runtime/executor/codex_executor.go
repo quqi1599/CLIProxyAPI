@@ -162,7 +162,7 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 		if len(body) == 0 {
 			body = codexTerminalTopLevelErrorBody(eventData)
 		}
-	case "response.failed":
+	case "response.failed", "response.completed", "response.done":
 		body = codexTerminalErrorBody(eventData, "response.error")
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
