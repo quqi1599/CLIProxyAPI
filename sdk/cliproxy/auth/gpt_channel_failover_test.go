@@ -432,6 +432,34 @@ func TestShouldRetryGPTRoundPolicy(t *testing.T) {
 	}
 }
 
+func TestManagerAttemptRunnerGPTPreservesShortModelCooldownWait(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 50*time.Millisecond, 0)
+	auth := &Auth{ID: "cooldown-auth", Provider: "codex", Status: StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(true)
+	calls := 0
+	runner := managerAttemptRunner[cliproxyexecutor.Response]{
+		manager: manager,
+		runOnce: func(context.Context, []string, cliproxyexecutor.Request, cliproxyexecutor.Options, int) (cliproxyexecutor.Response, error) {
+			calls++
+			if calls == 1 {
+				return cliproxyexecutor.Response{}, newModelCooldownError("gpt-5.5", "codex", time.Millisecond)
+			}
+			return cliproxyexecutor.Response{}, nil
+		},
+	}
+
+	outcome := runner.run(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.5"}, cliproxyexecutor.Options{}, 0, 50*time.Millisecond)
+	if !outcome.success || calls != 2 {
+		t.Fatalf("outcome success/calls = %t/%d, want true/2", outcome.success, calls)
+	}
+}
+
 func TestManagerGPTChannelFailoverDoesNotGateCodexOAuth(t *testing.T) {
 	const (
 		model    = "gpt-5.5"

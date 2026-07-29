@@ -862,7 +862,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		compatDiagnostic := newOpenAICompatPayloadDiagnostic(plan.diagnosticSource, plan.body, profile, auth, baseModel, plan.endpoint, plan.requestPath, opts.Headers, httpResp.Header)
 		failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, body)
-		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), body)
+		err = normalizeOpenAICompatImageGenerationPermissionError(
+			newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), body),
+			plan.body,
+		)
 		return resp, err
 	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
@@ -1064,7 +1067,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		compatDiagnostic := newOpenAICompatPayloadDiagnostic(plan.diagnosticSource, plan.body, profile, auth, baseModel, plan.endpoint, plan.requestPath, opts.Headers, httpResp.Header)
 		failureCtx = cliproxyusage.WithFailureDiagnostic(failureCtx, compatDiagnostic.failureDiagnostic())
 		logOpenAICompatCompatibilityDiagnostic(ctx, compatDiagnostic, httpResp.StatusCode, httpResp.Header, b)
-		err = newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
+		err = normalizeOpenAICompatImageGenerationPermissionError(
+			newOpenAICompatStatusErr(profile, auth, req.Model, httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b),
+			plan.body,
+		)
 		return nil, err
 	}
 	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
@@ -1685,6 +1691,26 @@ func (e statusErr) Headers() http.Header {
 	return e.headers.Clone()
 }
 func (e statusErr) Unwrap() error { return e.failure }
+
+func normalizeOpenAICompatImageGenerationPermissionError(err statusErr, requestPayload []byte) statusErr {
+	if err.ProviderStatusCode() != http.StatusForbidden || !codexHasImageGenerationTool(requestPayload) {
+		return err
+	}
+	original := err
+	unsupported := codexUnsupportedImageGenerationToolError()
+	unsupported.providerStatusCode = err.ProviderStatusCode()
+	unsupported.headers = err.Headers()
+	unsupported.failure = &failurecontract.Failure{
+		Kind:          failurecontract.UnsupportedFeature,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    unsupported.code,
+		ProviderCode:  unsupported.errorCode,
+		Retryable:     false,
+		Cause:         original,
+		PublicMessage: unsupported.msg,
+	}
+	return unsupported
+}
 
 func classifyOpenAICompatFailure(statusCode, providerStatusCode int, message, errorCode string, retryAfter *time.Duration) *failurecontract.Failure {
 	kind, scope, retryable := openAICompatFailureSemantics(statusCode, providerStatusCode, message, errorCode)

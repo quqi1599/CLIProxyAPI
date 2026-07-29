@@ -149,6 +149,38 @@ func TestNewOpenAICompatStatusErrTypedFailureParity(t *testing.T) {
 	}
 }
 
+func TestNormalizeOpenAICompatImageGenerationPermissionError(t *testing.T) {
+	upstream := newOpenAICompatStatusErr(
+		openAICompatProfileForKind("codex"),
+		nil,
+		"gpt-5.5",
+		http.StatusForbidden,
+		nil,
+		"application/json",
+		[]byte(`{"error":{"message":"permission denied","code":"insufficient_quota"}}`),
+	)
+
+	got := normalizeOpenAICompatImageGenerationPermissionError(
+		upstream,
+		[]byte(`{"model":"gpt-5.5","tools":[{"type":"image_generation"}]}`),
+	)
+	if got.StatusCode() != http.StatusBadRequest || got.ErrorCode() != "unsupported_builtin_tool" {
+		t.Fatalf("normalized status/code = %d/%q", got.StatusCode(), got.ErrorCode())
+	}
+	failure, ok := failurecontract.As(got)
+	if !ok || failure.Scope != failurecontract.ScopeRequest || failure.Retryable {
+		t.Fatalf("normalized failure = %#v", failure)
+	}
+
+	unchanged := normalizeOpenAICompatImageGenerationPermissionError(
+		upstream,
+		[]byte(`{"model":"gpt-5.5","tools":[{"type":"web_search"}]}`),
+	)
+	if unchanged.StatusCode() != http.StatusTooManyRequests || unchanged.ProviderStatusCode() != http.StatusForbidden {
+		t.Fatalf("non-image request status/provider status = %d/%d, want 429/403", unchanged.StatusCode(), unchanged.ProviderStatusCode())
+	}
+}
+
 func legacyOpenAICompatStatusErrForParity(statusCode int, headers http.Header, body []byte) statusErr {
 	retryAfter := openAICompatRetryAfter(headers, body)
 	jsonBody := openAICompatJSONErrorBody(body)

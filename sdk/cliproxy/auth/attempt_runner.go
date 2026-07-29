@@ -49,7 +49,10 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 				if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
 					wait, shouldRetry = 0, false
 				} else {
-					wait, shouldRetry = shouldRetryGPTRound(errRun, attempt, providers, req.Model, trace)
+					var cooldownErr *modelCooldownError
+					if !errors.As(errRun, &cooldownErr) || !shouldRetry {
+						wait, shouldRetry = shouldRetryGPTRound(errRun, attempt, providers, req.Model, trace)
+					}
 				}
 			}
 		}
