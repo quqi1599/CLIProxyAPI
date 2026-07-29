@@ -262,7 +262,7 @@ func TestCodexExecutorExecuteStreamCapacityOutputErrorsBeforePayload(t *testing.
 			`{"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
 			`{"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
 			`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}`,
-			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[{"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
 		}
 		for _, event := range events {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", event)

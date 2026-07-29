@@ -123,7 +123,8 @@ func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][
 
 func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
-	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
+	collectedItemCount := len(outputItemsByIndex) + len(outputItemsFallback)
+	shouldPatchOutput := collectedItemCount > 0 && (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) < collectedItemCount)
 	if !shouldPatchOutput {
 		return eventData
 	}
