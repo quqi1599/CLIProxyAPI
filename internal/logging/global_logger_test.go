@@ -41,6 +41,8 @@ func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 	entry.Data["base_url"] = "https://upstream.example/v1"
 	entry.Data["token_hash"] = "abc123"
 	entry.Data["request_path"] = "/v1/chat/completions"
+	entry.Data["round_no"] = 2
+	entry.Data["gpt_round_count"] = 3
 	entry.Data["status_code"] = 524
 	entry.Data["upstream_status"] = 524
 	entry.Data["total_duration_ms"] = 12000
@@ -65,6 +67,8 @@ func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 		"base_url=https://upstream.example/v1",
 		"token_hash=abc123",
 		"request_path=/v1/chat/completions",
+		"round_no=2",
+		"gpt_round_count=3",
 		"status_code=524",
 		"upstream_status=524",
 		"total_duration_ms=12000",
