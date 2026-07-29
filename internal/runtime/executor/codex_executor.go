@@ -161,14 +161,6 @@ func codexCompletedIsReasoningOnly(eventData []byte) bool {
 	return hasReasoning
 }
 
-func codexCompletedReportsZeroOutput(eventData []byte) bool {
-	outputTokens := gjson.GetBytes(eventData, "response.usage.output_tokens")
-	completionTokens := gjson.GetBytes(eventData, "response.usage.completion_tokens")
-	return (outputTokens.Exists() || completionTokens.Exists()) &&
-		outputTokens.Int() == 0 &&
-		completionTokens.Int() == 0
-}
-
 func codexOutputItemHasUsableContent(item gjson.Result) bool {
 	switch item.Get("type").String() {
 	case "reasoning":
@@ -219,8 +211,7 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 		}
 		if !codexTerminalStreamErrShouldHandle(body) &&
 			(isCodexModelCapacityError(eventData) ||
-				(codexCompletedIsReasoningOnly(eventData) &&
-					codexCompletedReportsZeroOutput(eventData))) &&
+				codexCompletedIsReasoningOnly(eventData)) &&
 			gjson.GetBytes(eventData, "response.usage.output_tokens").Int() == 0 &&
 			gjson.GetBytes(eventData, "response.usage.completion_tokens").Int() == 0 {
 			body = []byte(codexModelCapacityErrorJSON)

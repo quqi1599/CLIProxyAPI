@@ -244,9 +244,9 @@ func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
 		t.Fatal("response.completed with usable output should not be handled as an error")
 	}
 
-	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"reasoning","summary":[],"encrypted_content":"encrypted"}]}}`))
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"reasoning","summary":[],"encrypted_content":"encrypted"}],"usage":{"output_tokens":1}}}`))
 	if ok {
-		t.Fatal("reasoning-only response.completed without usage should retain replay behavior")
+		t.Fatal("positive-usage reasoning-only response.completed should retain replay behavior")
 	}
 }
 
