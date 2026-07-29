@@ -731,7 +731,7 @@ func TestManagerExecuteStream_CodexAPIKeyAliasPoolStopsOn429BeforeFirstByte(t *t
 		t.Fatalf("stream error = %v, want 429 without same-channel model fallback", streamErr)
 	}
 	got := executor.StreamModels()
-	want := []string{"gpt-5.2"}
+	want := []string{"gpt-5.2", "gpt-5.2"}
 	if len(got) != len(want) {
 		t.Fatalf("stream calls = %v, want %v", got, want)
 	}

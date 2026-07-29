@@ -149,7 +149,7 @@ func TestManagerGPTChannelFailoverSwitchesBaseURLImmediately(t *testing.T) {
 	}
 }
 
-func TestManagerGPTChannelFailoverStopsWithinModelPool(t *testing.T) {
+func TestManagerGPTChannelFailoverDoesNotSwitchModelsAcrossRounds(t *testing.T) {
 	const (
 		alias      = "gpt-pool"
 		firstModel = "gpt-pool-a"
@@ -221,7 +221,7 @@ func TestManagerGPTChannelFailoverStopsWithinModelPool(t *testing.T) {
 				t.Fatalf("%s unexpectedly succeeded via the same channel model pool", test.name)
 			}
 			got := test.calls(test.executor)
-			want := []string{firstModel}
+			want := []string{firstModel, firstModel, firstModel}
 			if !stringSlicesEqual(got, want) {
 				t.Fatalf("%s models = %v, want %v", test.name, got, want)
 			}
@@ -306,53 +306,127 @@ func TestManagerGPTChannelBreakerStopsModelPoolAfterThree5xx(t *testing.T) {
 	}
 }
 
-func TestManagerGPTChannelFailoverCapsFiveDistinctChannelsWithoutOuterRetry(t *testing.T) {
+func TestManagerGPTChannelFailoverUsesBoundedRounds(t *testing.T) {
 	const (
 		model    = "gpt-5.5"
 		provider = "gpt-channel-cap"
 	)
-	for _, operation := range gptChannelFailoverOperations() {
-		t.Run(operation.name, func(t *testing.T) {
-			failure := retryableGPTChannelFailure(http.StatusServiceUnavailable)
-			executor := &authFallbackExecutor{
-				id:                provider,
-				executeErrors:     make(map[string]error),
-				countErrors:       make(map[string]error),
-				streamFirstErrors: make(map[string]error),
-			}
-			manager := NewManager(nil, nil, nil)
-			manager.SetRetryConfig(10, 30*time.Second, 10)
-			manager.RegisterExecutor(executor)
+	tests := []struct {
+		status int
+		rounds int
+	}{
+		{status: http.StatusTooManyRequests, rounds: 2},
+		{status: http.StatusBadGateway, rounds: 2},
+		{status: http.StatusServiceUnavailable, rounds: 3},
+	}
+	for _, test := range tests {
+		for _, channelCount := range []int{6, gptImmediateFailoverMaxChannels} {
+			for _, operation := range gptChannelFailoverOperations() {
+				t.Run(fmt.Sprintf("%s/%d/%d-channels", operation.name, test.status, channelCount), func(t *testing.T) {
+					failure := retryableGPTChannelFailure(test.status)
+					executor := &authFallbackExecutor{
+						id:                provider,
+						executeErrors:     make(map[string]error),
+						countErrors:       make(map[string]error),
+						streamFirstErrors: make(map[string]error),
+					}
+					manager := NewManager(nil, nil, nil)
+					manager.SetRetryConfig(10, 30*time.Second, 10)
+					manager.RegisterExecutor(executor)
 
-			auths := make([]*Auth, 0, 6)
-			for i := 1; i <= 6; i++ {
-				authID := fmt.Sprintf("channel-%d-%s", i, operation.name)
-				executor.executeErrors[authID] = failure
-				executor.countErrors[authID] = failure
-				executor.streamFirstErrors[authID] = failure
-				auths = append(auths, openAICompatChannelBreakerAuth(
-					authID,
-					provider,
-					fmt.Sprintf("https://channel-%d.example/v1", i),
-					10,
-				))
-			}
-			registerGPTChannelFailoverAuths(t, manager, provider, model, auths)
+					auths := make([]*Auth, 0, channelCount)
+					for i := 1; i <= channelCount; i++ {
+						authID := fmt.Sprintf("channel-%d-%s-%d", i, operation.name, test.status)
+						executor.executeErrors[authID] = failure
+						executor.countErrors[authID] = failure
+						executor.streamFirstErrors[authID] = failure
+						auths = append(auths, openAICompatChannelBreakerAuth(
+							authID,
+							provider,
+							fmt.Sprintf("https://channel-%d.example/v1", i),
+							10,
+						))
+					}
+					registerGPTChannelFailoverAuths(t, manager, provider, model, auths)
 
-			err := operation.invoke(context.Background(), manager, provider, cliproxyexecutor.Request{Model: model})
-			if err == nil {
-				t.Fatalf("%s unexpectedly succeeded", operation.name)
+					err := operation.invoke(context.Background(), manager, provider, cliproxyexecutor.Request{Model: model})
+					if err == nil {
+						t.Fatalf("%s unexpectedly succeeded", operation.name)
+					}
+					got := operation.calls(executor)
+					if want := channelCount * test.rounds; len(got) != want {
+						t.Fatalf("%s calls = %d, want %d: %v", operation.name, len(got), want, got)
+					}
+					for round := 0; round < test.rounds; round++ {
+						seen := make(map[string]struct{}, channelCount)
+						for _, authID := range got[round*channelCount : (round+1)*channelCount] {
+							seen[authID] = struct{}{}
+						}
+						if len(seen) != channelCount {
+							t.Fatalf("%s round %d did not try %d distinct channels: %v", operation.name, round+1, channelCount, got)
+						}
+					}
+				})
 			}
-			got := operation.calls(executor)
-			if len(got) != 5 {
-				t.Fatalf("%s calls = %v, want five distinct channels", operation.name, got)
-			}
-			seen := make(map[string]struct{}, len(got))
-			for _, authID := range got {
-				if _, duplicate := seen[authID]; duplicate {
-					t.Fatalf("%s retried an outer channel round: %v", operation.name, got)
-				}
-				seen[authID] = struct{}{}
+		}
+	}
+}
+
+func TestManagerGPTChannelFailoverThirdRoundOnlyRetriesEligibleChannels(t *testing.T) {
+	const (
+		model    = "gpt-5.5"
+		provider = "gpt-third-round"
+	)
+	executor := &authFallbackExecutor{
+		id: provider,
+		executeErrors: map[string]error{
+			"channel-429": retryableGPTChannelFailure(http.StatusTooManyRequests),
+			"channel-502": retryableGPTChannelFailure(http.StatusBadGateway),
+			"channel-503": retryableGPTChannelFailure(http.StatusServiceUnavailable),
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(10, 30*time.Second, 10)
+	manager.RegisterExecutor(executor)
+	registerGPTChannelFailoverAuths(t, manager, provider, model, []*Auth{
+		openAICompatChannelBreakerAuth("channel-429", provider, "https://channel-429.example/v1", 10),
+		openAICompatChannelBreakerAuth("channel-502", provider, "https://channel-502.example/v1", 10),
+		openAICompatChannelBreakerAuth("channel-503", provider, "https://channel-503.example/v1", 10),
+	})
+
+	if _, err := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("execute unexpectedly succeeded")
+	}
+	counts := make(map[string]int)
+	for _, authID := range executor.ExecuteCalls() {
+		counts[authID]++
+	}
+	if counts["channel-429"] != 2 || counts["channel-502"] != 2 || counts["channel-503"] != 3 {
+		t.Fatalf("channel attempt counts = %v, want 429=2, 502=2, 503=3", counts)
+	}
+}
+
+func TestShouldRetryGPTRoundPolicy(t *testing.T) {
+	tests := []struct {
+		name  string
+		err   error
+		round int
+		want  bool
+	}{
+		{name: "first 429", err: retryableGPTChannelFailure(http.StatusTooManyRequests), round: 0, want: true},
+		{name: "third 429 blocked", err: retryableGPTChannelFailure(http.StatusTooManyRequests), round: 1, want: false},
+		{name: "third 502 blocked", err: retryableGPTChannelFailure(http.StatusBadGateway), round: 1, want: false},
+		{name: "third 503", err: retryableGPTChannelFailure(http.StatusServiceUnavailable), round: 1, want: true},
+		{name: "third network", err: &Error{Code: "upstream_network_error", Message: "connection reset by peer", Retryable: true}, round: 1, want: true},
+		{name: "third auth unavailable", err: &Error{Code: "auth_unavailable", Message: "no auth available"}, round: 1, want: true},
+		{name: "400 blocked", err: &Error{HTTPStatus: http.StatusBadRequest, Code: "invalid_request_error", Message: "bad request"}, round: 0, want: false},
+		{name: "fourth blocked", err: retryableGPTChannelFailure(http.StatusServiceUnavailable), round: 2, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, got := shouldRetryGPTRound(test.err, test.round, []string{"codex"}, "gpt-5.5", nil)
+			if got != test.want {
+				t.Fatalf("shouldRetryGPTRound() = %v, want %v", got, test.want)
 			}
 		})
 	}

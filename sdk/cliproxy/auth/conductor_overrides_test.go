@@ -155,7 +155,7 @@ func TestManager_ShouldRetryAfterError_GPTSoftRateLimitDoesNotRetryQuotaOrNonGPT
 	}
 }
 
-func TestManager_Execute_GPTCapacityDoesNotRetrySameAuth(t *testing.T) {
+func TestManager_Execute_GPTCapacityRetriesSameChannelSecondRound(t *testing.T) {
 	const model = "gpt-5.5"
 
 	manager := NewManager(nil, nil, nil)
@@ -178,11 +178,11 @@ func TestManager_Execute_GPTCapacityDoesNotRetrySameAuth(t *testing.T) {
 	}
 
 	_, errExecute := manager.Execute(context.Background(), []string{auth.Provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute == nil {
-		t.Fatal("execute unexpectedly retried the same GPT channel")
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want second-round recovery", errExecute)
 	}
-	if got := executor.ExecuteCalls(); !stringSlicesEqual(got, []string{auth.ID}) {
-		t.Fatalf("execute calls = %v, want one attempt", got)
+	if got := executor.ExecuteCalls(); !stringSlicesEqual(got, []string{auth.ID, auth.ID}) {
+		t.Fatalf("execute calls = %v, want two rounds on the same channel", got)
 	}
 }
 
@@ -1780,7 +1780,7 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *te
 		{
 			name: "execute",
 			invoke: func(m *Manager, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
-				_, errExecute := m.executeMixedOnce(context.Background(), []string{"codex"}, req, opts, 0)
+				_, errExecute := m.Execute(context.Background(), []string{"codex"}, req, opts)
 				return errExecute
 			},
 			getCalls: func(e *authFallbackExecutor) []string { return e.ExecuteCalls() },
@@ -1803,7 +1803,7 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *te
 		{
 			name: "execute_count",
 			invoke: func(m *Manager, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
-				_, errExecute := m.executeCountMixedOnce(context.Background(), []string{"codex"}, req, opts, 0)
+				_, errExecute := m.ExecuteCount(context.Background(), []string{"codex"}, req, opts)
 				return errExecute
 			},
 			getCalls: func(e *authFallbackExecutor) []string { return e.CountCalls() },
@@ -1826,8 +1826,16 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *te
 		{
 			name: "execute_stream",
 			invoke: func(m *Manager, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) error {
-				_, errExecute := m.executeStreamMixedOnce(context.Background(), []string{"codex"}, req, opts, 0)
-				return errExecute
+				result, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, req, opts)
+				if errExecute != nil {
+					return errExecute
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
 			},
 			getCalls: func(e *authFallbackExecutor) []string { return e.StreamCalls() },
 			errorMap: func(err error) *authFallbackExecutor {
@@ -1848,7 +1856,7 @@ func TestManager_GPTLargeToolResponses_CapsCodexFallbackAtSixTotalAttempts(t *te
 		},
 	}
 
-	errUpstream := &Error{HTTPStatus: http.StatusInternalServerError, Message: "api_error"}
+	errUpstream := &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "api_error"}
 	request := cliproxyexecutor.Request{Model: model}
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{
 		cliproxyexecutor.RequestPathMetadataKey:     "/v1/responses",

@@ -115,6 +115,9 @@ type requestAttemptTrace struct {
 	sessionBinding pendingSessionBinding
 	gptChannels    map[string]struct{}
 	failedChannels map[string]struct{}
+	gptModels      map[string]string
+	gptRound       int
+	gptThirdRound  map[string]struct{}
 	gptRoute       bool
 	gptRouteSet    bool
 	selection      selectorRouteSelection
@@ -131,6 +134,7 @@ type requestExecutionSummary struct {
 	FinalModel     string
 	FinalExecutor  string
 	FinalStatus    int
+	GPTRoundCount  int
 }
 
 type routePlanSummary struct {
@@ -258,6 +262,32 @@ func (t *requestAttemptTrace) gptRouteValue() (bool, bool) {
 	return t.gptRoute, t.gptRouteSet
 }
 
+func (t *requestAttemptTrace) beginGPTRound(round int) {
+	if t == nil || round <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.gptRoute {
+		return
+	}
+	t.gptRound = round
+	t.gptChannels = make(map[string]struct{})
+	t.failedChannels = make(map[string]struct{})
+	if round == 2 {
+		t.gptThirdRound = make(map[string]struct{})
+	}
+}
+
+func (t *requestAttemptTrace) gptRoundValue() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gptRound
+}
+
 func (t *requestAttemptTrace) recordExecution(provider, model, executor string) {
 	if t == nil {
 		return
@@ -363,7 +393,7 @@ func (t *requestAttemptTrace) reserveGPTChannel(key string, limit int) (newChann
 	return true, true
 }
 
-func (t *requestAttemptTrace) markFailedChannel(key string) {
+func (t *requestAttemptTrace) markFailedChannel(key string, err error) {
 	if t == nil || key == "" {
 		return
 	}
@@ -372,6 +402,12 @@ func (t *requestAttemptTrace) markFailedChannel(key string) {
 		t.failedChannels = make(map[string]struct{})
 	}
 	t.failedChannels[key] = struct{}{}
+	if t.gptRound == 2 && isGPTThirdRoundFailure(err) {
+		if t.gptThirdRound == nil {
+			t.gptThirdRound = make(map[string]struct{})
+		}
+		t.gptThirdRound[key] = struct{}{}
+	}
 	t.mu.Unlock()
 }
 
@@ -401,6 +437,53 @@ func (t *requestAttemptTrace) failedGPTChannel(key string) bool {
 	return failed
 }
 
+func (t *requestAttemptTrace) pinGPTChannelModel(key string, models []string) []string {
+	if t == nil || key == "" || len(models) == 0 {
+		return models
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gptModels == nil {
+		t.gptModels = make(map[string]string)
+	}
+	pinned := t.gptModels[key]
+	if pinned == "" {
+		t.gptModels[key] = models[0]
+		return models
+	}
+	for _, model := range models {
+		if model == pinned {
+			return []string{pinned}
+		}
+	}
+	return models
+}
+
+func (t *requestAttemptTrace) hasGPTThirdRoundChannels() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.gptThirdRound) > 0
+}
+
+func (t *requestAttemptTrace) gptThirdRoundChannelKeys() (map[string]struct{}, bool) {
+	if t == nil {
+		return nil, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gptRound != 3 || len(t.gptThirdRound) == 0 {
+		return nil, false
+	}
+	out := make(map[string]struct{}, len(t.gptThirdRound))
+	for key := range t.gptThirdRound {
+		out[key] = struct{}{}
+	}
+	return out, true
+}
+
 func (t *requestAttemptTrace) summary() requestExecutionSummary {
 	if t == nil {
 		return requestExecutionSummary{}
@@ -418,6 +501,7 @@ func (t *requestAttemptTrace) summary() requestExecutionSummary {
 		FinalModel:     t.finalModel,
 		FinalExecutor:  t.finalExecutor,
 		FinalStatus:    t.finalStatus,
+		GPTRoundCount:  t.gptRound,
 	}
 }
 
@@ -464,6 +548,11 @@ func addRequestAttemptLogFields(ctx context.Context, fields log.Fields) {
 	}
 	if attempt.RetryReason != "" {
 		fields["retry_reason"] = attempt.RetryReason
+	}
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		if round := trace.gptRoundValue(); round > 0 {
+			fields["round_no"] = round
+		}
 	}
 }
 
@@ -531,6 +620,9 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	}
 	if summary.FinalExecutor != "" {
 		fields["final_executor"] = summary.FinalExecutor
+	}
+	if summary.GPTRoundCount > 0 {
+		fields["gpt_round_count"] = summary.GPTRoundCount
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
@@ -907,7 +999,8 @@ const (
 	slowRequestSoftPenalty           = 10
 	slowRequestHardPenalty           = 25
 	slowRequestMinHealthScore        = 10
-	gptImmediateFailoverMaxChannels  = 5
+	gptImmediateFailoverMaxChannels  = 8
+	gptImmediateFailoverMaxRounds    = 3
 	gptChannelProbeLease             = 10 * time.Minute
 )
 
@@ -4140,6 +4233,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	if isGPTRetryRoute(providers, routeModel) {
+		maxRetryCredentials = gptImmediateFailoverMaxChannels - 1
+	}
 	maxRetryCredentials = fallbackGuard.effectiveMaxRetryCredentials(maxRetryCredentials)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
@@ -4194,6 +4290,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
+		if isGPTRetryRoute(providers, routeModel) {
+			models = trace.pinGPTChannelModel(routingChannelBaseKey(auth), models)
+		}
 		if len(models) == 0 {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
@@ -4214,7 +4313,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			channelKey := routingChannelBaseKey(auth)
 			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
-				m.markRetryChannelTried(ctx, tried, auth)
+				m.markRetryChannelTried(ctx, tried, auth, nil)
 				continue
 			}
 			newChannel, allowed := trace.reserveGPTChannel(channelKey, gptChannelAttemptLimit(maxRetryCredentials))
@@ -4229,7 +4328,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			if !newChannel && trace.failedGPTChannel(channelKey) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 				m.releaseGPTChannelAttempt(execCtx, auth)
-				m.markRetryChannelTried(ctx, tried, auth)
+				m.markRetryChannelTried(ctx, tried, auth, nil)
 				continue
 			}
 		}
@@ -4326,8 +4425,8 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		if authErr != nil {
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
 				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
-			if channelFailover {
-				m.markRetryChannelTried(ctx, tried, auth)
+			if channelFailover || isGPTNetworkRoundFailure(authErr) {
+				m.markRetryChannelTried(ctx, tried, auth, authErr)
 			}
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, authErr)
 			transientNetworkFallback := isTransientRoutingError(authErr)
@@ -4362,6 +4461,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	if isGPTRetryRoute(providers, routeModel) {
+		maxRetryCredentials = gptImmediateFailoverMaxChannels - 1
+	}
 	maxRetryCredentials = fallbackGuard.effectiveMaxRetryCredentials(maxRetryCredentials)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
@@ -4415,6 +4517,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			nextRetryReason = ""
 		}
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
+		if isGPTRetryRoute(providers, routeModel) {
+			models = trace.pinGPTChannelModel(routingChannelBaseKey(auth), models)
+		}
 		if len(models) == 0 {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
@@ -4435,7 +4540,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			channelKey := routingChannelBaseKey(auth)
 			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
-				m.markRetryChannelTried(ctx, tried, auth)
+				m.markRetryChannelTried(ctx, tried, auth, nil)
 				continue
 			}
 			newChannel, allowed := trace.reserveGPTChannel(channelKey, gptChannelAttemptLimit(maxRetryCredentials))
@@ -4450,7 +4555,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if !newChannel && trace.failedGPTChannel(channelKey) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 				m.releaseGPTChannelAttempt(execCtx, auth)
-				m.markRetryChannelTried(ctx, tried, auth)
+				m.markRetryChannelTried(ctx, tried, auth, nil)
 				continue
 			}
 		}
@@ -4463,8 +4568,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
 				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
-			if channelFailover {
-				m.markRetryChannelTried(ctx, tried, auth)
+			if channelFailover || isGPTNetworkRoundFailure(errStream) {
+				m.markRetryChannelTried(ctx, tried, auth, errStream)
 			}
 			if shouldEvictUnauthorizedError(errStream) {
 				if errEvict := m.evictUnauthorizedAuth(execCtx, auth, provider, routeModel); errEvict != nil {
@@ -5426,6 +5531,64 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 	return false
 }
 
+func shouldRetryGPTRound(err error, completedRound int, providers []string, model string, trace *requestAttemptTrace) (time.Duration, bool) {
+	if err == nil || completedRound < 0 || completedRound >= gptImmediateFailoverMaxRounds-1 {
+		return 0, false
+	}
+	if isRequestInvalidError(err) {
+		return 0, false
+	}
+	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
+		return 0, false
+	}
+	if completedRound == 0 {
+		return 0, shouldFailoverGPTChannel(err, providers, model) ||
+			isGPTAuthUnavailableError(err) ||
+			isGPTNetworkRoundFailure(err)
+	}
+	return 0, (trace != nil && trace.hasGPTThirdRoundChannels()) ||
+		isGPTThirdRoundFailure(err)
+}
+
+func isGPTAuthUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil &&
+		strings.EqualFold(strings.TrimSpace(authErr.Code), "auth_unavailable")
+}
+
+func isGPTNetworkRoundFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTransientNetworkError(err) || isRetryableEmptyUpstreamResponseError(err) {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(errorCodeFromError(err)), "empty_stream") {
+		return true
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout, 520, 521, 522, 523, 524:
+		return true
+	default:
+		return false
+	}
+}
+
+func isGPTThirdRoundFailure(err error) bool {
+	if err == nil || isRequestInvalidError(err) {
+		return false
+	}
+	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
+		return false
+	}
+	return statusCodeFromError(err) == http.StatusServiceUnavailable ||
+		isGPTAuthUnavailableError(err) ||
+		isGPTNetworkRoundFailure(err)
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -5590,13 +5753,13 @@ func gptChannelAttemptLimit(maxRetryCredentials int) int {
 	return limit
 }
 
-func (m *Manager) markRetryChannelTried(ctx context.Context, tried map[string]struct{}, auth *Auth) {
+func (m *Manager) markRetryChannelTried(ctx context.Context, tried map[string]struct{}, auth *Auth, err error) {
 	if m == nil || auth == nil {
 		return
 	}
 	key := routingChannelBaseKey(auth)
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
-		trace.markFailedChannel(key)
+		trace.markFailedChannel(key, err)
 	}
 	m.mu.RLock()
 	for _, peer := range m.auths {
@@ -5610,7 +5773,8 @@ func (m *Manager) markRetryChannelTried(ctx context.Context, tried map[string]st
 func (m *Manager) markPreviouslyFailedGPTChannels(ctx context.Context, tried map[string]struct{}) {
 	trace := requestAttemptTraceFromContext(ctx)
 	failed := trace.failedChannelKeys()
-	if len(failed) == 0 {
+	thirdRound, restrictThirdRound := trace.gptThirdRoundChannelKeys()
+	if len(failed) == 0 && !restrictThirdRound {
 		return
 	}
 	m.mu.RLock()
@@ -5618,7 +5782,10 @@ func (m *Manager) markPreviouslyFailedGPTChannels(ctx context.Context, tried map
 		if auth == nil {
 			continue
 		}
-		if _, blocked := failed[routingChannelBaseKey(auth)]; blocked {
+		channelKey := routingChannelBaseKey(auth)
+		_, failedChannel := failed[channelKey]
+		_, thirdRoundAllowed := thirdRound[channelKey]
+		if failedChannel || (restrictThirdRound && !thirdRoundAllowed) {
 			tried[auth.ID] = struct{}{}
 		}
 	}

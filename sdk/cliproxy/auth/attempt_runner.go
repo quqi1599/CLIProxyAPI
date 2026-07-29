@@ -33,6 +33,10 @@ type managerAttemptRunner[T any] struct {
 func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration) managerAttemptOutcome[T] {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		trace := requestAttemptTraceFromContext(ctx)
+		if trace != nil {
+			trace.beginGPTRound(attempt + 1)
+		}
 		result, errRun := runner.runOnce(ctx, providers, req, opts, maxRetryCredentials)
 		if errRun == nil {
 			recordManagerAttemptSuccess(ctx)
@@ -40,6 +44,15 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 		}
 		lastErr = errRun
 		wait, shouldRetry := runner.manager.shouldRetryAfterError(errRun, attempt, providers, req.Model, maxWait)
+		if trace != nil {
+			if gptRoute, configured := trace.gptRouteValue(); configured && gptRoute {
+				if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
+					wait, shouldRetry = 0, false
+				} else {
+					wait, shouldRetry = shouldRetryGPTRound(errRun, attempt, providers, req.Model, trace)
+				}
+			}
+		}
 		if !shouldRetry {
 			break
 		}
@@ -102,10 +115,19 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 		outcome.finalErr = outcome.returnErr
 		return outcome.result, outcome.returnErr
 	}
-	trace.configureGPTRoute(isGPTRetryRoute(providers, req.Model))
+	gptRoute := isGPTRetryRoute(providers, req.Model)
+	trace.configureGPTRoute(gptRoute)
 
 	requestRetry, maxRetryCredentials, maxWait := manager.retrySettings()
-	trace.configureBudget(requestRetry+1, maxRetryCredentials)
+	if gptRoute {
+		if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
+			trace.configureBudget(gptLargeToolHistoryMaxRetryCredentials+1, gptLargeToolHistoryMaxRetryCredentials)
+		} else {
+			trace.configureBudget(gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds, gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds-1)
+		}
+	} else {
+		trace.configureBudget(requestRetry+1, maxRetryCredentials)
+	}
 	outcome = runner.run(ctx, providers, req, opts, maxRetryCredentials, maxWait)
 	return outcome.result, outcome.returnErr
 }

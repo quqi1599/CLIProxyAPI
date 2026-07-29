@@ -52,8 +52,11 @@ future OpenAI-compatible providers, set
 ### GPT Channel Self-Healing
 
 GPT channel failover and circuit breaking are automatic: `429`, `502`, and
-`503` immediately switch to another channel, up to five distinct channels per
-request. Three consecutive channel-scoped `5xx` responses, or at least 80%
+`503` immediately switch to another channel. A normal request tries up to eight
+distinct channels in each of two rounds; a third round is limited to channels
+that failed with `503` or a network error, or to `auth_unavailable` recovery.
+Large `/v1/responses` tool histories remain capped at six total attempts. Three
+consecutive channel-scoped `5xx` responses, or at least 80%
 channel failures among 10 or more outcomes in 30 seconds, cool the channel for
 30, 60, then 120 seconds.
 Only one half-open probe is admitted at a time; two successful probes close the
