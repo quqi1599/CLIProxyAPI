@@ -1443,7 +1443,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 					keepPending := false
 					switch eventType {
-					case "response.created", "response.in_progress", "response.output_item.added", "response.content_part.added":
+					case "response.created",
+						"response.in_progress",
+						"response.output_item.added",
+						"response.content_part.added",
+						"response.reasoning_summary_part.added",
+						"response.reasoning_summary_part.done",
+						"response.reasoning_summary_text.delta",
+						"response.reasoning_summary_text.done",
+						"response.reasoning_text.delta",
+						"response.reasoning_text.done":
 						keepPending = true
 					case "response.output_text.delta":
 						capacityProbeText.WriteString(gjson.GetBytes(data, "delta").String())
@@ -1459,7 +1468,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						}
 						keepPending = isCodexModelCapacityError([]byte(capacityProbeText.String()))
 					case "response.output_item.done":
-						keepPending = isCodexModelCapacityError(data)
+						keepPending = gjson.GetBytes(data, "item.type").String() == "reasoning" ||
+							isCodexModelCapacityError(data)
 					}
 					if keepPending {
 						continue

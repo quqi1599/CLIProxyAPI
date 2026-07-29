@@ -246,11 +246,11 @@ func TestCodexExecutorExecuteStreamCapacityOutputErrorsBeforePayload(t *testing.
 		events := []string{
 			`{"type":"response.created","response":{"id":"resp_capacity","model":"gpt-5.6-sol"}}`,
 			`{"type":"response.in_progress","response":{"id":"resp_capacity"}}`,
-			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
-			`{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`,
-			`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Selected model is at capacity. Please try a different model."}`,
-			`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Selected model is at capacity. Please try a different model."}`,
-			`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","summary":[]}}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"}}`,
+			`{"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}`,
+			`{"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
+			`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}`,
 			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
 		}
 		for _, event := range events {
