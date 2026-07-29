@@ -250,6 +250,7 @@ func TestCodexExecutorExecuteStreamCapacityOutputErrorsBeforePayload(t *testing.
 			`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"}}`,
 			`{"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}`,
 			`{"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
+			`{"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}}`,
 			`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}`,
 			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
 		}

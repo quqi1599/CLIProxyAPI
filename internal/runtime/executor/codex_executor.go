@@ -1441,19 +1441,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						continue
 					}
 
-					keepPending := false
+					keepPending := true
 					switch eventType {
 					case "response.created",
 						"response.in_progress",
 						"response.output_item.added",
 						"response.content_part.added",
 						"response.reasoning_summary_part.added",
-						"response.reasoning_summary_part.done",
-						"response.reasoning_summary_text.delta",
+						"response.reasoning_summary_part.done":
+					case "response.reasoning_summary_text.delta",
 						"response.reasoning_summary_text.done",
 						"response.reasoning_text.delta",
-						"response.reasoning_text.done":
-						keepPending = true
+						"response.reasoning_text.done",
+						"response.function_call_arguments.delta",
+						"response.function_call_arguments.done",
+						"response.image_generation_call.partial_image",
+						"response.web_search_call.in_progress",
+						"response.web_search_call.searching",
+						"response.web_search_call.completed",
+						"response.completed",
+						"response.done":
+						keepPending = false
 					case "response.output_text.delta":
 						capacityProbeText.WriteString(gjson.GetBytes(data, "delta").String())
 						probeText := strings.ToLower(strings.TrimSpace(capacityProbeText.String()))
@@ -1468,8 +1476,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						}
 						keepPending = isCodexModelCapacityError([]byte(capacityProbeText.String()))
 					case "response.output_item.done":
-						keepPending = gjson.GetBytes(data, "item.type").String() == "reasoning" ||
-							isCodexModelCapacityError(data)
+						switch gjson.GetBytes(data, "item.type").String() {
+						case "reasoning":
+							keepPending = strings.TrimSpace(gjson.GetBytes(data, "item.summary.0.text").String()) == ""
+						case "message":
+							keepPending = isCodexModelCapacityError(data)
+						default:
+							keepPending = false
+						}
 					}
 					if keepPending {
 						continue
