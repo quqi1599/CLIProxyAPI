@@ -221,7 +221,20 @@ func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
 		}
 	}
 
-	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null}}`))
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}]}}`))
+	if !ok {
+		t.Fatal("expected zero-usage capacity response.completed terminal error to be handled")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("zero-usage capacity status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}],"usage":{"output_tokens":9}}}`))
+	if ok {
+		t.Fatal("positive-usage capacity text should remain a normal response")
+	}
+
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null}}`))
 	if ok {
 		t.Fatal("successful response.completed should not be handled as an error")
 	}

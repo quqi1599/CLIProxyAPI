@@ -167,6 +167,12 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
 		}
+		if !codexTerminalStreamErrShouldHandle(body) &&
+			isCodexModelCapacityError(eventData) &&
+			gjson.GetBytes(eventData, "response.usage.output_tokens").Int() == 0 &&
+			gjson.GetBytes(eventData, "response.usage.completion_tokens").Int() == 0 {
+			body = []byte(`{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"server_error","code":"model_at_capacity"}}`)
+		}
 	default:
 		return statusErr{}, nil, false
 	}
