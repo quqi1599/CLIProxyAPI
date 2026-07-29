@@ -26,6 +26,36 @@ type streamSummaryFields struct {
 	finishReason         string
 }
 
+func streamBootstrapPayloadIsMetadataOnly(payload []byte) bool {
+	sawMetadata := false
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")),
+			bytes.HasPrefix(trimmed, []byte("id:")),
+			bytes.HasPrefix(trimmed, []byte("retry:")),
+			bytes.HasPrefix(trimmed, []byte(":")):
+			sawMetadata = true
+			continue
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			trimmed = bytes.TrimSpace(trimmed[len("data:"):])
+		}
+		if !gjson.ValidBytes(trimmed) {
+			return false
+		}
+		switch gjson.GetBytes(trimmed, "type").String() {
+		case "response.created", "response.in_progress":
+			sawMetadata = true
+		default:
+			return false
+		}
+	}
+	return sawMetadata
+}
+
 func (f *streamSummaryFields) observePayload(payload []byte) {
 	if f == nil || len(payload) == 0 || !shouldObserveSummaryPayload(payload) {
 		return

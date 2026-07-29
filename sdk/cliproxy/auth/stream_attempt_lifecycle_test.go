@@ -285,6 +285,24 @@ func TestStreamAttemptLifecycleEmptyStreamClosesProvider(t *testing.T) {
 	}
 }
 
+func TestReadStreamBootstrapWaitsPastResponsesMetadata(t *testing.T) {
+	streamErr := errors.New("selected model is at capacity")
+	chunks := make(chan cliproxyexecutor.StreamChunk, 4)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("event: response.created\n")}
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp_1"}}` + "\n\n")}
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("event: error\n")}
+	chunks <- cliproxyexecutor.StreamChunk{Err: streamErr}
+	close(chunks)
+
+	buffered, closed, _, err := readStreamBootstrap(context.Background(), chunks, time.Now())
+	if !errors.Is(err, streamErr) {
+		t.Fatalf("bootstrap error = %v, want %v", err, streamErr)
+	}
+	if buffered != nil || closed {
+		t.Fatalf("bootstrap result = (%#v, %t), want no committed payload", buffered, closed)
+	}
+}
+
 func TestStreamAttemptLifecycleConcurrentCloseReleasesEachSlotOnce(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	closeCalls := [2]atomic.Int32{}

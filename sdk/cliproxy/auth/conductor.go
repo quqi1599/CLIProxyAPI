@@ -3282,7 +3282,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			return nil, false, 0, chunk.Err
 		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		if len(chunk.Payload) > 0 && !streamBootstrapPayloadIsMetadataOnly(chunk.Payload) {
 			return buffered, false, time.Since(startedAt), nil
 		}
 	}
