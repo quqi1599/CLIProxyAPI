@@ -146,6 +146,49 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+func codexCompletedIsEmptyCapacity(eventData []byte) bool {
+	hasReasoning := false
+	hasEmptyMessage := false
+	for _, item := range gjson.GetBytes(eventData, "response.output").Array() {
+		switch item.Get("type").String() {
+		case "reasoning":
+			hasReasoning = true
+		case "message":
+			hasEmptyMessage = !codexOutputItemHasUsableContent(item)
+		}
+		if codexOutputItemHasUsableContent(item) {
+			return false
+		}
+	}
+	return hasReasoning && hasEmptyMessage
+}
+
+func codexOutputItemHasUsableContent(item gjson.Result) bool {
+	switch item.Get("type").String() {
+	case "reasoning":
+		for _, summary := range item.Get("summary").Array() {
+			if strings.TrimSpace(summary.Get("text").String()) != "" {
+				return true
+			}
+		}
+		return false
+	case "message":
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+			if contentType := content.Get("type").String(); contentType != "" && contentType != "output_text" {
+				return true
+			}
+		}
+		return false
+	case "":
+		return strings.TrimSpace(item.Raw) != ""
+	default:
+		return true
+	}
+}
+
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 	streamErr, body, ok := codexTerminalStreamErr(eventData)
 	if !ok || !codexTerminalErrorIsContextLength(body) {
@@ -169,10 +212,11 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 			body = codexTerminalErrorBody(eventData, "error")
 		}
 		if !codexTerminalStreamErrShouldHandle(body) &&
-			isCodexModelCapacityError(eventData) &&
+			(isCodexModelCapacityError(eventData) ||
+				codexCompletedIsEmptyCapacity(eventData)) &&
 			gjson.GetBytes(eventData, "response.usage.output_tokens").Int() == 0 &&
 			gjson.GetBytes(eventData, "response.usage.completion_tokens").Int() == 0 {
-			body = []byte(`{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"server_error","code":"model_at_capacity"}}`)
+			body = []byte(codexModelCapacityErrorJSON)
 		}
 	default:
 		return statusErr{}, nil, false
@@ -1476,14 +1520,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						}
 						keepPending = isCodexModelCapacityError([]byte(capacityProbeText.String()))
 					case "response.output_item.done":
-						switch gjson.GetBytes(data, "item.type").String() {
-						case "reasoning":
-							keepPending = strings.TrimSpace(gjson.GetBytes(data, "item.summary.0.text").String()) == ""
-						case "message":
-							keepPending = isCodexModelCapacityError(data)
-						default:
-							keepPending = false
-						}
+						item := gjson.GetBytes(data, "item")
+						keepPending = !codexOutputItemHasUsableContent(item) || isCodexModelCapacityError(data)
 					}
 					if keepPending {
 						continue

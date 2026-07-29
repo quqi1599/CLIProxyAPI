@@ -234,9 +234,19 @@ func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
 		t.Fatal("positive-usage capacity text should remain a normal response")
 	}
 
-	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null}}`))
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[],"usage":{"output_tokens":0}}}`))
 	if ok {
-		t.Fatal("successful response.completed should not be handled as an error")
+		t.Fatal("empty response.completed without reasoning should retain the existing empty-stream behavior")
+	}
+
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"output_tokens":0}}}`))
+	if ok {
+		t.Fatal("response.completed with usable output should not be handled as an error")
+	}
+
+	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"reasoning","summary":[],"encrypted_content":"encrypted"}],"usage":{"output_tokens":0}}}`))
+	if ok {
+		t.Fatal("reasoning-only response.completed should retain replay behavior")
 	}
 }
 
@@ -250,8 +260,8 @@ func TestCodexExecutorExecuteStreamCapacityOutputErrorsBeforePayload(t *testing.
 			`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"encrypted-reasoning"}}`,
 			`{"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}`,
 			`{"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
-			`{"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}}`,
-			`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}`,
+			`{"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}`,
+			`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}`,
 			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
 		}
 		for _, event := range events {
