@@ -1456,12 +1456,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 									contentTypes = append(contentTypes, content.Get("type").String())
 								}
 							}
-							helps.LogWithRequestID(ctx).WithFields(log.Fields{
-								"event":             "codex_completed_output_shape",
-								"output_types":      strings.Join(outputTypes, ","),
-								"content_types":     strings.Join(contentTypes, ","),
-								"output_item_count": len(outputTypes),
-							}).Info("codex completed output shape")
+							helps.LogWithRequestID(ctx).Infof(
+								"codex completed output shape output_types=%s content_types=%s output_item_count=%d",
+								strings.Join(outputTypes, ","),
+								strings.Join(contentTypes, ","),
+								len(outputTypes),
+							)
 						}
 					}
 					if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
