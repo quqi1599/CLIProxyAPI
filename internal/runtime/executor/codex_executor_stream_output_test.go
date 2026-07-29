@@ -245,8 +245,8 @@ func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
 	}
 
 	_, _, ok = codexTerminalStreamErr([]byte(`{"type":"response.completed","response":{"status":"completed","error":null,"output":[{"type":"reasoning","summary":[],"encrypted_content":"encrypted"}],"usage":{"output_tokens":1}}}`))
-	if ok {
-		t.Fatal("positive-usage reasoning-only response.completed should retain replay behavior")
+	if !ok {
+		t.Fatal("positive-usage reasoning-only response.completed should be handled as capacity")
 	}
 }
 

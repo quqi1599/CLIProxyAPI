@@ -210,10 +210,10 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 			body = codexTerminalErrorBody(eventData, "error")
 		}
 		if !codexTerminalStreamErrShouldHandle(body) &&
-			(isCodexModelCapacityError(eventData) ||
-				codexCompletedIsReasoningOnly(eventData)) &&
-			gjson.GetBytes(eventData, "response.usage.output_tokens").Int() == 0 &&
-			gjson.GetBytes(eventData, "response.usage.completion_tokens").Int() == 0 {
+			(codexCompletedIsReasoningOnly(eventData) ||
+				(isCodexModelCapacityError(eventData) &&
+					gjson.GetBytes(eventData, "response.usage.output_tokens").Int() == 0 &&
+					gjson.GetBytes(eventData, "response.usage.completion_tokens").Int() == 0)) {
 			body = []byte(codexModelCapacityErrorJSON)
 		}
 	default:
@@ -1447,25 +1447,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					case "response.completed", "response.done":
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 						translatedLine = append([]byte("data: "), data...)
-						if gjson.GetBytes(data, "response.usage.output_tokens").Int() == 0 &&
-							gjson.GetBytes(data, "response.usage.completion_tokens").Int() == 0 {
-							outputTypes := make([]string, 0)
-							contentTypes := make([]string, 0)
-							for _, item := range gjson.GetBytes(data, "response.output").Array() {
-								outputTypes = append(outputTypes, item.Get("type").String())
-								for _, content := range item.Get("content").Array() {
-									contentTypes = append(contentTypes, content.Get("type").String())
-								}
-							}
-							helps.LogWithRequestID(ctx).WithFields(log.Fields{
-								"event":                       "codex_zero_output_shape",
-								"output_item_count":           len(outputTypes),
-								"output_types":                strings.Join(outputTypes, ","),
-								"content_types":               strings.Join(contentTypes, ","),
-								"collected_output_item_count": len(outputItemsByIndex) + len(outputItemsFallback),
-								"usage_present":               gjson.GetBytes(data, "response.usage").Exists(),
-							}).Info("codex zero output shape")
-						}
 					}
 					if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 						if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
