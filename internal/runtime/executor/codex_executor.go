@@ -38,10 +38,11 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
-	codexOriginator            = "codex-tui"
-	codexDefaultImageToolModel = "gpt-image-2"
-	codexAlphaSearchBodyBytes  = 32 << 20
+	codexUserAgent              = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexOriginator             = "codex-tui"
+	codexDefaultImageToolModel  = "gpt-image-2"
+	codexAlphaSearchBodyBytes   = 32 << 20
+	codexModelCapacityErrorJSON = `{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"server_error","code":"model_at_capacity"}}`
 )
 
 var dataTag = []byte("data:")
@@ -1092,14 +1093,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
 
-		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
-			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
-				return resp, errClearReplay
-			}
-			err = streamErr
-			return resp, err
-		}
-
 		if eventType == "response.output_item.done" {
 			itemResult := gjson.GetBytes(eventData, "item")
 			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
@@ -1113,6 +1106,16 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			}
 			continue
 		}
+		if eventType == "response.completed" || eventType == "response.done" {
+			eventData = patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		}
+		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
+				return resp, errClearReplay
+			}
+			err = streamErr
+			return resp, err
+		}
 
 		if eventType != "response.completed" {
 			continue
@@ -1123,7 +1126,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
-		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		completedData := eventData
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 
 		var param any
@@ -1349,10 +1352,33 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		var capacityProbeText strings.Builder
+		var capacityProbePending [][]byte
+		capacityProbeResolved := false
 		for {
 			event, readErr := sseStream.ReadEvent()
 			if readErr != nil {
-				if requestCtx.Err() != nil || errors.Is(readErr, io.EOF) {
+				if requestCtx.Err() != nil {
+					return
+				}
+				if errors.Is(readErr, io.EOF) {
+					if !capacityProbeResolved && isCodexModelCapacityError([]byte(capacityProbeText.String())) {
+						streamErr := newCodexStatusErr(http.StatusBadRequest, []byte(codexModelCapacityErrorJSON))
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						reporter.PublishFailure(ctx, streamErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+						case <-requestCtx.Done():
+						}
+						return
+					}
+					for i := range capacityProbePending {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: capacityProbePending[i]}:
+						case <-requestCtx.Done():
+							return
+						}
+					}
 					return
 				}
 				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
@@ -1367,9 +1393,19 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.AppendAPIResponseChunk(ctx, e.cfg, event)
 			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
 				translatedLine := internalpayload.CloneBytes(line)
+				eventType := ""
+				var data []byte
 
 				if bytes.HasPrefix(line, dataTag) {
-					data := bytes.TrimSpace(line[5:])
+					data = bytes.TrimSpace(line[5:])
+					eventType = gjson.GetBytes(data, "type").String()
+					switch eventType {
+					case "response.output_item.done":
+						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
+					case "response.completed", "response.done":
+						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+						translatedLine = append([]byte("data: "), data...)
+					}
 					if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 						if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 							helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
@@ -1388,22 +1424,50 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						}
 						return
 					}
-					switch gjson.GetBytes(data, "type").String() {
-					case "response.output_item.done":
-						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-					case "response.completed":
+					if eventType == "response.completed" {
 						if detail, ok := helps.ParseCodexUsage(data); ok {
 							reporter.Publish(ctx, detail)
 						}
 						publishCodexImageToolUsage(ctx, reporter, body, data)
-						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
-						translatedLine = append([]byte("data: "), data...)
 					}
 				}
 
 				translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
+				if !capacityProbeResolved {
+					capacityProbePending = append(capacityProbePending, chunks...)
+					if eventType == "" {
+						continue
+					}
+
+					keepPending := false
+					switch eventType {
+					case "response.created", "response.in_progress", "response.output_item.added", "response.content_part.added":
+						keepPending = true
+					case "response.output_text.delta":
+						capacityProbeText.WriteString(gjson.GetBytes(data, "delta").String())
+						probeText := strings.ToLower(strings.TrimSpace(capacityProbeText.String()))
+						keepPending = probeText == "" ||
+							strings.HasPrefix("selected model is at capacity. please try a different model.", probeText) ||
+							strings.HasPrefix("model is at capacity. please try a different model.", probeText) ||
+							strings.Contains(probeText, "selected model is at capacity")
+					case "response.output_text.done":
+						if doneText := strings.TrimSpace(gjson.GetBytes(data, "text").String()); doneText != "" {
+							capacityProbeText.Reset()
+							capacityProbeText.WriteString(doneText)
+						}
+						keepPending = isCodexModelCapacityError([]byte(capacityProbeText.String()))
+					case "response.output_item.done":
+						keepPending = isCodexModelCapacityError(data)
+					}
+					if keepPending {
+						continue
+					}
+					capacityProbeResolved = true
+					chunks = capacityProbePending
+					capacityProbePending = nil
+				}
 				for i := range chunks {
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:

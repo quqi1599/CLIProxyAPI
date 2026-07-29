@@ -240,6 +240,62 @@ func TestCodexTerminalStreamErrHandlesCapacityCompleted(t *testing.T) {
 	}
 }
 
+func TestCodexExecutorExecuteStreamCapacityOutputErrorsBeforePayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		events := []string{
+			`{"type":"response.created","response":{"id":"resp_capacity","model":"gpt-5.6-sol"}}`,
+			`{"type":"response.in_progress","response":{"id":"resp_capacity"}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+			`{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`,
+			`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Selected model is at capacity. Please try a different model."}`,
+			`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Selected model is at capacity. Please try a different model."}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}`,
+			`{"type":"response.completed","response":{"id":"resp_capacity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`,
+		}
+		for _, event := range events {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var payloads int
+	var streamErr error
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloads++
+		}
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if payloads != 0 {
+		t.Fatalf("payloads before capacity error = %d, want 0", payloads)
+	}
+	if streamErr == nil {
+		t.Fatal("missing capacity stream error")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("capacity status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
 func statusCodeFromTestError(t *testing.T, err error) int {
 	t.Helper()
 
