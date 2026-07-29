@@ -1447,22 +1447,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					case "response.completed", "response.done":
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 						translatedLine = append([]byte("data: "), data...)
-						if strings.EqualFold(req.Model, "gpt-5.6-sol") {
-							outputTypes := make([]string, 0)
-							contentTypes := make([]string, 0)
-							for _, item := range gjson.GetBytes(data, "response.output").Array() {
-								outputTypes = append(outputTypes, item.Get("type").String())
-								for _, content := range item.Get("content").Array() {
-									contentTypes = append(contentTypes, content.Get("type").String())
-								}
-							}
-							helps.LogWithRequestID(ctx).Infof(
-								"codex completed output shape output_types=%s content_types=%s output_item_count=%d",
-								strings.Join(outputTypes, ","),
-								strings.Join(contentTypes, ","),
-								len(outputTypes),
-							)
-						}
 					}
 					if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 						if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
