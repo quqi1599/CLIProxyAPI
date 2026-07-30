@@ -6231,7 +6231,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
-							hardCooldown := !disableCooling && shouldHardCooldownQuota(state.Health, result.RetryAfter)
+							hardCooldown := !disableCooling && shouldHardCooldownQuotaForAuth(auth, state.Health, result.RetryAfter)
 							if hardCooldown {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
@@ -7312,6 +7312,13 @@ func shouldHardCooldownQuota(health HealthState, retryAfter *time.Duration) bool
 		return true
 	}
 	return health.ConsecutiveFailures >= quotaHardCooldownFailures
+}
+
+func shouldHardCooldownQuotaForAuth(auth *Auth, health HealthState, retryAfter *time.Duration) bool {
+	if executorKeyFromAuth(auth) == "kimi" || authRoutingGroup(auth) == "kimi" {
+		return true
+	}
+	return shouldHardCooldownQuota(health, retryAfter)
 }
 
 func transientHardCooldownUntil(health HealthState) time.Time {
@@ -8586,7 +8593,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
-		if !disableCooling && shouldHardCooldownQuota(auth.Health, retryAfter) {
+		if !disableCooling && shouldHardCooldownQuotaForAuth(auth, auth.Health, retryAfter) {
 			if retryAfter != nil {
 				next = now.Add(*retryAfter)
 			} else {

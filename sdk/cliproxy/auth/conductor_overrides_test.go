@@ -619,6 +619,121 @@ func TestManager_MarkResult_429ModerateRetryAfterDoesNotHardCooldownImmediately(
 	}
 }
 
+func TestManager_MarkResult_KimiCredential429ImmediatelyCoolsAuth(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	tests := []struct {
+		name string
+		auth *Auth
+	}{
+		{
+			name: "native",
+			auth: &Auth{
+				ID:       "kimi-native-rate-limit-auth",
+				Provider: "kimi",
+			},
+		},
+		{
+			name: "openai-compatible",
+			auth: &Auth{
+				ID:       "kimi-compatible-rate-limit-auth",
+				Provider: "openai-compatibility",
+				Attributes: map[string]string{
+					"provider_key": "openai-compatible-pool",
+					"compat_name":  "kimi",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			if _, errRegister := m.Register(context.Background(), tt.auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			before := time.Now()
+			m.MarkResult(context.Background(), Result{
+				AuthID:   tt.auth.ID,
+				Provider: tt.auth.Provider,
+				Model:    "kimi-k3",
+				Success:  false,
+				Error: &Error{
+					Kind:       "rate_limited",
+					Scope:      "credential",
+					Code:       "rate_limit_exceeded",
+					Message:    "rate limit reached",
+					Retryable:  true,
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+			})
+			after := time.Now()
+
+			updated, ok := m.GetByID(tt.auth.ID)
+			if !ok {
+				t.Fatal("auth not found after 429")
+			}
+			if updated.NextRetryAfter.IsZero() {
+				t.Fatal("Kimi credential 429 should set an immediate cooldown")
+			}
+			minExpected := before.Add(quotaBackoffBase)
+			maxExpected := after.Add(quotaBackoffBase + time.Second)
+			if updated.NextRetryAfter.Before(minExpected) || updated.NextRetryAfter.After(maxExpected) {
+				t.Fatalf("cooldown = %v, want within [%v, %v]", updated.NextRetryAfter, minExpected, maxExpected)
+			}
+			if !updated.Quota.Exceeded || updated.Quota.BackoffLevel != 1 {
+				t.Fatalf("auth quota = %+v, want exceeded with backoff level 1", updated.Quota)
+			}
+			blocked, reason, next := isAuthBlockedForModel(updated, "kimi-k3", after)
+			if !blocked || reason != blockReasonCooldown || next.IsZero() {
+				t.Fatalf("blocked = %v, reason = %v, next = %v; want cooldown block", blocked, reason, next)
+			}
+		})
+	}
+}
+
+func TestManager_MarkResult_KimiUntyped429ImmediatelyCoolsModel(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "kimi-untyped-rate-limit-auth",
+		Provider: "kimi",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "kimi-k3"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limit reached"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found after 429")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatal("model state not found after 429")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatal("untyped Kimi 429 should set an immediate model cooldown")
+	}
+	if !state.Quota.Exceeded || state.Quota.BackoffLevel != 1 {
+		t.Fatalf("model quota = %+v, want exceeded with backoff level 1", state.Quota)
+	}
+}
+
 func TestManager_MarkResult_KimiBillingCycleQuotaBlocksEntireAuth(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
