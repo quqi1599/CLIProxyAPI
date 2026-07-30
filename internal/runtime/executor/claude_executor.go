@@ -544,7 +544,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	reporter.SetTranslatedReasoningEffort(plan.bodyForUpstream, plan.upstreamFormat.String())
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
+	url := claudeEndpointURL(plan.baseURL, false)
 	exchange := helps.ProviderExchange{Config: e.cfg, Auth: auth, Provider: e.Identifier(), Reporter: reporter}
 	exchangeResponse, err := exchange.Do(ctx, helps.ProviderExchangeRequest{
 		Method: http.MethodPost,
@@ -618,7 +618,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		progressStartInputTokens = estimateClaudeProgressInputTokens(baseModel, plan.bodyForUpstream)
 	}
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", plan.baseURL)
+	url := claudeEndpointURL(plan.baseURL, false)
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	exchange := helps.ProviderExchange{Config: e.cfg, Auth: auth, Provider: e.Identifier(), Reporter: reporter}
 	exchangeResponse, err := exchange.Do(requestCtx, helps.ProviderExchangeRequest{
@@ -989,7 +989,7 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
-	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
+	url := claudeEndpointURL(baseURL, true)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -1404,6 +1404,42 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func claudeEndpointURL(baseURL string, countTokens bool) string {
+	baseURL = strings.TrimSpace(baseURL)
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		suffix := "/v1/messages"
+		if countTokens {
+			suffix += "/count_tokens"
+		}
+		return strings.TrimRight(baseURL, "/") + suffix + "?beta=true"
+	}
+
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	lowerPath := strings.ToLower(parsed.Path)
+	switch {
+	case strings.HasSuffix(lowerPath, "/v1/messages/count_tokens"):
+		if !countTokens {
+			parsed.Path = parsed.Path[:len(parsed.Path)-len("/count_tokens")]
+		}
+	case strings.HasSuffix(lowerPath, "/v1/messages"):
+		if countTokens {
+			parsed.Path += "/count_tokens"
+		}
+	default:
+		parsed.Path += "/v1/messages"
+		if countTokens {
+			parsed.Path += "/count_tokens"
+		}
+	}
+	parsed.RawPath = ""
+
+	query := parsed.Query()
+	query.Set("beta", "true")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func checkSystemInstructions(payload []byte) []byte {

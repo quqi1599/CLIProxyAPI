@@ -34,6 +34,94 @@ func resetClaudeDeviceProfileCache() {
 	helps.ResetClaudeDeviceProfileCache()
 }
 
+func TestClaudeEndpointURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		baseURL     string
+		countTokens bool
+		want        string
+	}{
+		{
+			name:    "anthropic base",
+			baseURL: "https://api.anthropic.com",
+			want:    "https://api.anthropic.com/v1/messages?beta=true",
+		},
+		{
+			name:    "step plan base",
+			baseURL: "https://api.stepfun.com/step_plan",
+			want:    "https://api.stepfun.com/step_plan/v1/messages?beta=true",
+		},
+		{
+			name:    "step full messages endpoint",
+			baseURL: "https://api.stepfun.com/step_plan/v1/messages",
+			want:    "https://api.stepfun.com/step_plan/v1/messages?beta=true",
+		},
+		{
+			name:        "step full messages endpoint count tokens",
+			baseURL:     "https://api.stepfun.com/step_plan/v1/messages",
+			countTokens: true,
+			want:        "https://api.stepfun.com/step_plan/v1/messages/count_tokens?beta=true",
+		},
+		{
+			name:        "existing count tokens endpoint",
+			baseURL:     "https://api.example.com/custom/v1/messages/count_tokens?region=cn",
+			countTokens: true,
+			want:        "https://api.example.com/custom/v1/messages/count_tokens?beta=true&region=cn",
+		},
+		{
+			name:    "count tokens endpoint reused for messages",
+			baseURL: "https://api.example.com/custom/v1/messages/count_tokens",
+			want:    "https://api.example.com/custom/v1/messages?beta=true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := claudeEndpointURL(tt.baseURL, tt.countTokens); got != tt.want {
+				t.Fatalf("claudeEndpointURL(%q, %v) = %q, want %q", tt.baseURL, tt.countTokens, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClaudeExecutorExecutePreservesConfiguredFullMessagesEndpoint(t *testing.T) {
+	var gotPath string
+	var gotBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBeta = r.URL.Query().Get("beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"step-3.7-flash","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "test-key",
+			"base_url": server.URL + "/step_plan/v1/messages",
+		},
+	}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "step-3.7-flash",
+		Payload: []byte(`{
+			"model":"step-3.7-flash",
+			"max_tokens":16,
+			"messages":[{"role":"user","content":"hello"}]
+		}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if gotPath != "/step_plan/v1/messages" {
+		t.Fatalf("upstream path = %q, want /step_plan/v1/messages", gotPath)
+	}
+	if gotBeta != "true" {
+		t.Fatalf("upstream beta query = %q, want true", gotBeta)
+	}
+}
+
 func TestPrepareClaudeRequest_StreamAndNonStreamShareCommonFixture(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
 	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
