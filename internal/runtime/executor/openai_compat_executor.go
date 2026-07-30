@@ -301,26 +301,30 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 }
 
 const (
-	largeOpenAICompatToolHistoryLimitMultiplier = 3
-	largeOpenAICompatToolHistoryPayloadBytes    = largeOpenAICompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
-	largeOpenAICompatToolOutputMessages         = largeOpenAICompatToolHistoryLimitMultiplier * 40
+	largeOpenAICompatToolHistoryDefaultMultiplier  = 2
+	largeOpenAICompatToolHistoryExtendedMultiplier = largeOpenAICompatToolHistoryDefaultMultiplier * 3
+	largeOpenAICompatToolHistoryBasePayloadBytes   = 1 * 1024 * 1024
+	largeOpenAICompatToolHistoryBaseOutputMessages = 40
 )
 
 func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
-	if len(body) < largeOpenAICompatToolHistoryPayloadBytes || !hasOpenAICompatToolOutputMarker(body) {
+	payloadBytesLimit, toolOutputMessagesLimit := largeOpenAICompatToolHistoryLimits(model)
+	if len(body) < payloadBytesLimit || !hasOpenAICompatToolOutputMarker(body) {
 		return nil
 	}
 	toolOutputs := countOpenAICompatToolOutputMessages(body)
-	if toolOutputs < largeOpenAICompatToolOutputMessages {
+	if toolOutputs < toolOutputMessagesLimit {
 		return nil
 	}
 	fields := log.Fields{
-		"event":                "openai_compat_tool_history_guard",
-		"model":                model,
-		"compat_kind":          config.NormalizeOpenAICompatibilityKind(profile.Kind),
-		"request_path":         path,
-		"payload_bytes":        len(body),
-		"tool_output_messages": toolOutputs,
+		"event":                      "openai_compat_tool_history_guard",
+		"model":                      model,
+		"compat_kind":                config.NormalizeOpenAICompatibilityKind(profile.Kind),
+		"request_path":               path,
+		"payload_bytes":              len(body),
+		"payload_bytes_limit":        payloadBytesLimit,
+		"tool_output_messages":       toolOutputs,
+		"tool_output_messages_limit": toolOutputMessagesLimit,
 	}
 	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large OpenAI-compatible tool history rejected before compat repair")
 	return statusErr{
@@ -328,6 +332,17 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 		errorCode: "request_feature_unsupported",
 		msg:       largeOpenAICompatToolHistoryUserMessage(),
 	}
+}
+
+func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOutputMessages int) {
+	multiplier := largeOpenAICompatToolHistoryDefaultMultiplier
+	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	switch baseModel {
+	case "kimi-k3", "glm-5.2":
+		multiplier = largeOpenAICompatToolHistoryExtendedMultiplier
+	}
+	return multiplier * largeOpenAICompatToolHistoryBasePayloadBytes,
+		multiplier * largeOpenAICompatToolHistoryBaseOutputMessages
 }
 
 func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {

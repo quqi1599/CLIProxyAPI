@@ -355,7 +355,7 @@ func TestOpenAICompatExecutorStreamDecodesBrotliSSE(t *testing.T) {
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T) {
-	body := buildOpenAICompatToolHistoryBody(125, strings.Repeat("x", 32*1024))
+	body := buildOpenAICompatToolHistoryBody("gpt-5.5", 125, strings.Repeat("x", 32*1024))
 	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 	err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
@@ -375,11 +375,56 @@ func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyAllowsPreviouslyGuardedToolHistory(t *testing.T) {
-	body := buildOpenAICompatToolHistoryBody(45, strings.Repeat("x", 24*1024))
+	body := buildOpenAICompatToolHistoryBody("gpt-5.5", 45, strings.Repeat("x", 24*1024))
 	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 	if err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1"); err != nil {
 		t.Fatalf("unexpected rejection for previously guarded OpenAI-compatible tool history: %v", err)
+	}
+}
+
+func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
+	tests := []struct {
+		model              string
+		wantPayloadBytes   int
+		wantOutputMessages int
+	}{
+		{model: "gpt-5.5", wantPayloadBytes: 2 * 1024 * 1024, wantOutputMessages: 80},
+		{model: "kimi-k3", wantPayloadBytes: 6 * 1024 * 1024, wantOutputMessages: 240},
+		{model: "glm-5.2", wantPayloadBytes: 6 * 1024 * 1024, wantOutputMessages: 240},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			payloadBytes, outputMessages := largeOpenAICompatToolHistoryLimits(tt.model)
+			if payloadBytes != tt.wantPayloadBytes || outputMessages != tt.wantOutputMessages {
+				t.Fatalf("limits = (%d, %d), want (%d, %d)", payloadBytes, outputMessages, tt.wantPayloadBytes, tt.wantOutputMessages)
+			}
+		})
+	}
+}
+
+func TestSanitizeOpenAICompatHTTPRequestBodyAllowsExtendedToolHistoryForLongContextModels(t *testing.T) {
+	for _, model := range []string{"kimi-k3", "glm-5.2"} {
+		t.Run(model, func(t *testing.T) {
+			body := buildOpenAICompatToolHistoryBody(model, 125, strings.Repeat("x", 32*1024))
+			req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
+
+			if err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1"); err != nil {
+				t.Fatalf("unexpected rejection for extended %s tool history: %v", model, err)
+			}
+		})
+	}
+}
+
+func TestSanitizeOpenAICompatHTTPRequestBodyRejectsToolHistoryBeyondExtendedLimit(t *testing.T) {
+	for _, model := range []string{"kimi-k3", "glm-5.2"} {
+		t.Run(model, func(t *testing.T) {
+			body := buildOpenAICompatToolHistoryBody(model, 245, strings.Repeat("x", 26*1024))
+			req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
+
+			err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
+			assertLargeOpenAICompatToolHistoryError(t, err)
+		})
 	}
 }
 
@@ -405,7 +450,7 @@ func TestOpenAICompatExecutorRejectsLargeToolHistoryBeforeUpstream(t *testing.T)
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5.5",
-		Payload: []byte(buildOpenAICompatToolHistoryBody(125, strings.Repeat("x", 32*1024))),
+		Payload: []byte(buildOpenAICompatToolHistoryBody("gpt-5.5", 125, strings.Repeat("x", 32*1024))),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
 
@@ -435,9 +480,11 @@ func assertLargeOpenAICompatToolHistoryError(t *testing.T, err error) {
 	}
 }
 
-func buildOpenAICompatToolHistoryBody(count int, content string) string {
+func buildOpenAICompatToolHistoryBody(model string, count int, content string) string {
 	var b strings.Builder
-	b.WriteString(`{"model":"gpt-5.5","messages":[{"role":"assistant","content":"read files","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`)
+	b.WriteString(`{"model":"`)
+	b.WriteString(model)
+	b.WriteString(`","messages":[{"role":"assistant","content":"read files","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}`)
 	for i := 0; i < count; i++ {
 		b.WriteString(`,{"role":"tool","tool_call_id":"call_1","content":"`)
 		b.WriteString(content)
