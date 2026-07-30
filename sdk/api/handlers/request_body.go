@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	maxWireRequestBodyBytes     int64 = 32 << 20 // 32 MiB
-	maxDecodedRequestBodyBytes  int64 = 32 << 20 // 32 MiB
+	maxWireRequestBodyBytes     int64 = 256 << 20 // 256 MiB
+	maxDecodedRequestBodyBytes  int64 = 256 << 20 // 256 MiB
 	emergencyRequestBodyBytes   int64 = EmergencyPayloadBodyBytes
 	minZstdDecoderMemoryBytes   int64 = 1 << 20 // 1 MiB
 	maxRequestEncodingLayers          = 4

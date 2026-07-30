@@ -19,6 +19,12 @@ type failingExecutorRequestBody struct {
 	closes int
 }
 
+func TestExecutorHTTPRequestBodyLimitIs256MiB(t *testing.T) {
+	if executorHTTPRequestBodyBytes != 256<<20 {
+		t.Fatalf("executor request body limit = %d, want %d", executorHTTPRequestBodyBytes, int64(256<<20))
+	}
+}
+
 func (b *failingExecutorRequestBody) Read([]byte) (int, error) {
 	return 0, io.ErrUnexpectedEOF
 }

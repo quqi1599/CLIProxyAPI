@@ -355,7 +355,7 @@ func TestOpenAICompatExecutorStreamDecodesBrotliSSE(t *testing.T) {
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyRejectsLargeToolHistory(t *testing.T) {
-	body := buildOpenAICompatToolHistoryBody("gpt-5.5", 125, strings.Repeat("x", 32*1024))
+	body := buildOpenAICompatToolHistoryBody("gpt-5.5", 305, strings.Repeat("x", 35*1024))
 	req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 	err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
@@ -389,9 +389,13 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 		wantPayloadBytes   int
 		wantOutputMessages int
 	}{
-		{model: "gpt-5.5", wantPayloadBytes: 2 * 1024 * 1024, wantOutputMessages: 80},
-		{model: "kimi-k3", wantPayloadBytes: 6 * 1024 * 1024, wantOutputMessages: 240},
-		{model: "glm-5.2", wantPayloadBytes: 6 * 1024 * 1024, wantOutputMessages: 240},
+		{model: "gpt-5.5", wantPayloadBytes: 10 * 1024 * 1024, wantOutputMessages: 300},
+		{model: "MiniMax-M2.5", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "MiniMax-M2.5-highspeed", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "kimi-k3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "glm-5.2", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "deepseek-v4-pro[1m]", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "deepseek-v4-flash(high)", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
@@ -404,9 +408,9 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyAllowsExtendedToolHistoryForLongContextModels(t *testing.T) {
-	for _, model := range []string{"kimi-k3", "glm-5.2"} {
+	for _, model := range []string{"MiniMax-M2.5", "kimi-k3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"} {
 		t.Run(model, func(t *testing.T) {
-			body := buildOpenAICompatToolHistoryBody(model, 125, strings.Repeat("x", 32*1024))
+			body := buildOpenAICompatToolHistoryBody(model, 305, strings.Repeat("x", 35*1024))
 			req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 			if err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1"); err != nil {
@@ -417,9 +421,9 @@ func TestSanitizeOpenAICompatHTTPRequestBodyAllowsExtendedToolHistoryForLongCont
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyRejectsToolHistoryBeyondExtendedLimit(t *testing.T) {
-	for _, model := range []string{"kimi-k3", "glm-5.2"} {
+	for _, model := range []string{"kimi-k3", "deepseek-v4-pro"} {
 		t.Run(model, func(t *testing.T) {
-			body := buildOpenAICompatToolHistoryBody(model, 245, strings.Repeat("x", 26*1024))
+			body := buildOpenAICompatToolHistoryBody(model, 605, strings.Repeat("x", 52*1024))
 			req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))
 
 			err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("newapi"), "https://example.test/v1")
@@ -450,7 +454,7 @@ func TestOpenAICompatExecutorRejectsLargeToolHistoryBeforeUpstream(t *testing.T)
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5.5",
-		Payload: []byte(buildOpenAICompatToolHistoryBody("gpt-5.5", 125, strings.Repeat("x", 32*1024))),
+		Payload: []byte(buildOpenAICompatToolHistoryBody("gpt-5.5", 305, strings.Repeat("x", 35*1024))),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
 

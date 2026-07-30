@@ -21,6 +21,12 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestDefaultRequestBodyLimitsAre256MiB(t *testing.T) {
+	if maxWireRequestBodyBytes != 256<<20 || maxDecodedRequestBodyBytes != 256<<20 {
+		t.Fatalf("request body limits = wire:%d decoded:%d, want %d", maxWireRequestBodyBytes, maxDecodedRequestBodyBytes, int64(256<<20))
+	}
+}
+
 func TestReadRequestBodyWithLimitsBoundsIdentityAndRestoresBody(t *testing.T) {
 	t.Parallel()
 

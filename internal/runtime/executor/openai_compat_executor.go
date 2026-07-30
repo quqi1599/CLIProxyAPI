@@ -41,7 +41,7 @@ const (
 	openAICompatImagesEditsPath                     = "/images/edits"
 	openAICompatDefaultImageEndpoint                = openAICompatImagesGenerationsPath
 	openAICompatMultipartMemory               int64 = 8 << 20
-	executorHTTPRequestBodyBytes              int64 = 32 << 20
+	executorHTTPRequestBodyBytes              int64 = 256 << 20
 	openAICompatRequestPlanTransformStage           = "request_plan.openai_compat"
 	openAICompatProviderResolveTransformStage       = "request_plan.openai_compat.provider_resolve"
 	openAICompatProviderConfigTransformStage        = "request_plan.openai_compat.provider_config"
@@ -301,10 +301,10 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 }
 
 const (
-	largeOpenAICompatToolHistoryDefaultMultiplier  = 2
-	largeOpenAICompatToolHistoryExtendedMultiplier = largeOpenAICompatToolHistoryDefaultMultiplier * 3
-	largeOpenAICompatToolHistoryBasePayloadBytes   = 1 * 1024 * 1024
-	largeOpenAICompatToolHistoryBaseOutputMessages = 40
+	largeOpenAICompatToolHistoryPayloadBytes            = 10 * 1024 * 1024
+	largeOpenAICompatToolOutputMessages                 = 300
+	largeOpenAICompatLongContextToolHistoryPayloadBytes = 30 * 1024 * 1024
+	largeOpenAICompatLongContextToolOutputMessages      = 600
 )
 
 func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
@@ -335,14 +335,17 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 }
 
 func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOutputMessages int) {
-	multiplier := largeOpenAICompatToolHistoryDefaultMultiplier
-	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	switch baseModel {
-	case "kimi-k3", "glm-5.2":
-		multiplier = largeOpenAICompatToolHistoryExtendedMultiplier
+	baseModel, _ := thinking.StripPublicModelHint(model)
+	baseModel = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(baseModel).ModelName))
+	if strings.HasPrefix(baseModel, "minimax-m2.5") ||
+		strings.HasPrefix(baseModel, "kimi-k3") ||
+		strings.HasPrefix(baseModel, "glm-5.2") ||
+		strings.HasPrefix(baseModel, "deepseek-v4-pro") ||
+		strings.HasPrefix(baseModel, "deepseek-v4-flash") {
+		return largeOpenAICompatLongContextToolHistoryPayloadBytes,
+			largeOpenAICompatLongContextToolOutputMessages
 	}
-	return multiplier * largeOpenAICompatToolHistoryBasePayloadBytes,
-		multiplier * largeOpenAICompatToolHistoryBaseOutputMessages
+	return largeOpenAICompatToolHistoryPayloadBytes, largeOpenAICompatToolOutputMessages
 }
 
 func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
