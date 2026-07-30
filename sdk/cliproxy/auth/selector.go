@@ -1447,6 +1447,9 @@ func isAuthBlockedForModelRoute(auth *Auth, model string, now time.Time, gptRout
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
+		if hasUnauthorizedAuthFailure(auth) {
+			return true, blockReasonOther, time.Time{}
+		}
 		return false, blockReasonNone, time.Time{}
 	}
 	authBlocked, authReason, authNext := authLevelBlockState(auth, now)

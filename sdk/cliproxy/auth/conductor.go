@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1274,6 +1275,7 @@ type Manager struct {
 	codexModelLoads  map[string]int
 
 	requestPrepareLocks sync.Map
+	refreshLocks        sync.Map
 	activeStreams       *activeStreamTracker
 }
 
@@ -2341,6 +2343,12 @@ func isCodexAPIKeyAuth(auth *Auth) bool {
 	return isCodexAuth(auth) && isAPIKeyAuth(auth)
 }
 
+func isCodexOAuthCredential(auth *Auth) bool {
+	return isCodexAuth(auth) &&
+		!isCodexAPIKeyAuth(auth) &&
+		(authAccessToken(auth) != "" || authHasRefreshCredential(auth))
+}
+
 func isOpenAICompatAPIKeyAuth(auth *Auth) bool {
 	if !isAPIKeyAuth(auth) {
 		return false
@@ -2555,7 +2563,8 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	if len(candidates) == 0 {
 		return nil
 	}
-	if isCodexAuth(auth) {
+	if isCodexAuth(auth) &&
+		(isCodexAPIKeyAuth(auth) || !hasUnauthorizedAuthFailure(auth)) {
 		return append([]string(nil), candidates...)
 	}
 	now := time.Now()
@@ -3249,6 +3258,13 @@ func closeStreamResult(result *cliproxyexecutor.StreamResult) {
 	result.Close()
 }
 
+func streamResultHeaders(result *cliproxyexecutor.StreamResult) http.Header {
+	if result == nil {
+		return nil
+	}
+	return result.Headers
+}
+
 type streamBootstrapError struct {
 	cause   error
 	headers http.Header
@@ -3630,6 +3646,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
+	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
 		if idx > 0 && isGPTRetryRoute(routeProviders, routeModel) &&
 			!m.reserveGPTChannelAttempt(ctx, auth, provider, routeModel, time.Now()) {
@@ -3668,12 +3685,36 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		if errStream != nil {
-			cleanupAttempt()
 			if errCtx := ctx.Err(); errCtx != nil {
+				cleanupAttempt()
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, errCtx
 			}
+			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
+				closeStreamResult(streamResult)
+				auth = refreshed
+				didRefreshOnUnauthorized = true
+				streamResult, errStream = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+				if errStream != nil {
+					if errCtx := ctx.Err(); errCtx != nil {
+						cleanupAttempt()
+						m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+						m.releaseGPTChannelAttempt(ctx, auth)
+						return nil, errCtx
+					}
+				}
+			}
+		}
+		if errStream == nil && (streamResult == nil || streamResult.Chunks == nil) {
+			errStream = &Error{
+				Code:      "invalid_stream_result",
+				Message:   "upstream returned an invalid stream result",
+				Retryable: true,
+			}
+		}
+		if errStream != nil {
+			cleanupAttempt()
 			rerr := resultErrorFromCause(errStream)
 			elapsed := time.Since(startedAt)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: elapsed, TTFT: elapsed, Error: rerr, Cause: errStream}
@@ -3746,6 +3787,44 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			bootstrapErr = newEmptyUpstreamResponseFailure()
 		}
 		if bootstrapErr != nil {
+			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, bootstrapErr, didRefreshOnUnauthorized); okRefresh {
+				closeStreamResult(streamResult)
+				auth = refreshed
+				didRefreshOnUnauthorized = true
+				streamResult, bootstrapErr = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+				buffered = nil
+				closed = false
+				firstPayloadDelay = time.Since(startedAt)
+				if bootstrapErr == nil {
+					if streamResult == nil || streamResult.Chunks == nil {
+						bootstrapErr = &Error{
+							Code:      "invalid_stream_result",
+							Message:   "upstream returned an invalid stream result",
+							Retryable: true,
+						}
+					} else {
+						deliveryTracker = nil
+						if emptyPolicy.enabled && !emptyPolicy.auditOnly {
+							deliveryTracker = newDeliverableOutputTracker(emptyPolicy.format)
+						}
+						bootstrapRead = readStreamBootstrapWithDelivery(attemptCtx, streamResult.Chunks, startedAt, deliveryTracker, emptyPolicy)
+						buffered = bootstrapRead.buffered
+						closed = bootstrapRead.closed
+						firstPayloadDelay = bootstrapRead.firstPayloadDelay
+						bootstrapErr = bootstrapRead.err
+						if bootstrapRead.emptyResponse {
+							m.logEmptyResponseDetected(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, false, false, 0)
+							bootstrapErr = newEmptyUpstreamResponseFailure()
+						}
+						if bootstrapRead.bufferLimitReached {
+							m.logEmptyResponseBufferLimit(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, emptyPolicy)
+							bootstrapErr = newEmptyUpstreamResponseFailure()
+						}
+					}
+				}
+			}
+		}
+		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				cleanupAttempt()
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
@@ -3781,7 +3860,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if channelFailover && !directFailover {
 					bootstrapErr = markGPTChannelFailoverError(bootstrapErr)
 				}
-				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 			}
 			if requestInvalid {
 				if routeFallback {
@@ -3802,7 +3881,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				continue
 			}
-			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+			return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 		}
 
 		if closed && len(buffered) == 0 {
@@ -3819,7 +3898,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			cleanupAttempt()
 			if channelFailover {
-				return nil, newStreamBootstrapError(markGPTChannelFailoverError(emptyErr), streamResult.Headers)
+				return nil, newStreamBootstrapError(markGPTChannelFailoverError(emptyErr), streamResultHeaders(streamResult))
 			}
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -3828,7 +3907,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				continue
 			}
-			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
+			return nil, newStreamBootstrapError(emptyErr, streamResultHeaders(streamResult))
 		}
 
 		remaining := streamResult.Chunks
@@ -4478,6 +4557,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		countAttempt := false
+		didRefreshOnUnauthorized := false
 	modelLoop:
 		for idx, upstreamModel := range models {
 			if idx > 0 && isGPTRetryRoute(providers, routeModel) &&
@@ -4497,6 +4577,18 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			}
 			startedAt := time.Now()
 			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
+			if errExec != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
+					m.releaseGPTChannelAttempt(execCtx, auth)
+					return cliproxyexecutor.Response{}, errCtx
+				}
+				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+					auth = refreshed
+					didRefreshOnUnauthorized = true
+					resp, errExec = execute(executor, execCtx, auth, execReq, execOpts)
+				}
+			}
 			if errExec == nil && operation == "execute" {
 				emptyPolicy := m.emptyResponsePolicy(routeModel, opts)
 				if emptyPolicy.enabled {
@@ -6038,7 +6130,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			registryModel = strings.TrimSpace(result.Model)
 		}
 		codexAPIKeyHealthOnly := isCodexAPIKeyAuth(auth)
-		codexBypassCooling := isCodexAuth(auth) && !codexAPIKeyHealthOnly
+		codexOAuthUnauthorized := isCodexOAuthCredential(auth) &&
+			isCredentialUnauthorizedResult(result)
+		codexBypassCooling := isCodexAuth(auth) &&
+			!codexAPIKeyHealthOnly &&
+			!codexOAuthUnauthorized
 		failureScope, hasTypedFailureScope := failureScopeFromResult(result)
 		slowPenalty := 0
 		if result.Success && m.slowRequestPenaltyEnabledLocked(auth) {
@@ -6117,6 +6213,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if hasTypedFailureScope && failureScope == failurecontract.ScopeRequest {
 				// Request failures are terminal for this payload and must not alter
 				// credential, model, or provider availability.
+			} else if codexOAuthUnauthorized {
+				disableCooling := m.cooldownDisabledForAuth(auth)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			} else if codexBypassCooling {
 				if result.Model != "" {
 					state := ensureModelState(auth, result.Model)
@@ -7452,6 +7551,15 @@ func failureScopeFromResult(result Result) (failurecontract.Scope, bool) {
 	return controlledFailureScope(result.Error.Scope)
 }
 
+func isCredentialUnauthorizedResult(result Result) bool {
+	if result.Cause != nil {
+		return shouldEvictUnauthorizedError(result.Cause)
+	}
+	return result.Error != nil &&
+		statusCodeFromResult(result.Error) == http.StatusUnauthorized &&
+		!isModelSupportResultError(result.Error)
+}
+
 func controlledFailureScope(value string) (failurecontract.Scope, bool) {
 	scope := failurecontract.Scope(strings.ToLower(strings.TrimSpace(value)))
 	switch scope {
@@ -8519,7 +8627,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if auth == nil {
 		return
 	}
-	if isCodexAuth(auth) {
+	statusCode := statusCodeFromResult(resultErr)
+	if isCodexAuth(auth) && statusCode != http.StatusUnauthorized {
 		clearAuthStateOnSuccess(auth, now)
 		return
 	}
@@ -8530,7 +8639,6 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		isTransientRoutingResultError(resultErr) {
 		return
 	}
-	statusCode := statusCodeFromResult(resultErr)
 	applyHealthFailure(&auth.Health, now, statusCode)
 	auth.Unavailable = true
 	auth.Status = StatusError
@@ -10074,7 +10182,10 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return false
 	}
 	if hasUnauthorizedAuthFailure(a) {
-		return false
+		if !authHasRefreshCredential(a) || a.NextRefreshAfter.IsZero() {
+			return false
+		}
+		return !now.Before(a.NextRefreshAfter)
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
@@ -10296,40 +10407,215 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	return true
 }
 
+type authRefreshLock struct {
+	mu          sync.Mutex
+	lastFailure *authRefreshFailure
+}
+
+type authRefreshFailure struct {
+	credentialVersion [sha256.Size]byte
+	err               *Error
+	retryAt           time.Time
+	terminal          bool
+}
+
+func authAccessToken(auth *Auth) string {
+	if token := authMetadataString(auth, "access_token"); token != "" {
+		return token
+	}
+	return authMetadataString(auth, "accessToken")
+}
+
+func authRefreshToken(auth *Auth) string {
+	if token := authMetadataString(auth, "refresh_token"); token != "" {
+		return token
+	}
+	return authMetadataString(auth, "refreshToken")
+}
+
+func authHasRefreshCredential(auth *Auth) bool {
+	return authRefreshToken(auth) != ""
+}
+
+func authRefreshCredentialVersion(auth *Auth) [sha256.Size]byte {
+	if auth == nil {
+		return [sha256.Size]byte{}
+	}
+	hasher := sha256.New()
+	_, _ = io.WriteString(hasher, authAccessToken(auth))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = io.WriteString(hasher, authRefreshToken(auth))
+	_, _ = hasher.Write([]byte{0})
+	lastRefreshedAt := auth.LastRefreshedAt
+	if lastRefreshedAt.IsZero() {
+		if ts, ok := authLastRefreshTimestamp(auth); ok {
+			lastRefreshedAt = ts
+		}
+	}
+	if !lastRefreshedAt.IsZero() {
+		_, _ = io.WriteString(hasher, lastRefreshedAt.UTC().Format(time.RFC3339Nano))
+	}
+	var version [sha256.Size]byte
+	copy(version[:], hasher.Sum(nil))
+	return version
+}
+
+func isTerminalAuthRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isUnauthorizedError(err) || isInvalidGrantError(err) {
+		return true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(errorCodeFromError(err) + " " + err.Error()))
+	return strings.Contains(normalized, "refresh_token_reused")
+}
+
+func terminalAuthRefreshStatus(err error) string {
+	if isInvalidGrantError(err) {
+		return "invalid_grant"
+	}
+	normalized := strings.ToLower(strings.TrimSpace(errorCodeFromError(err) + " " + err.Error()))
+	if strings.Contains(normalized, "refresh_token_reused") {
+		return "refresh_token_reused"
+	}
+	return "unauthorized"
+}
+
+func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	var resumed []string
+	for model, state := range auth.ModelStates {
+		if state == nil || state.LastError == nil {
+			continue
+		}
+		if state.LastError.StatusCode() != http.StatusUnauthorized &&
+			!strings.EqualFold(state.LastError.Code, "unauthorized") {
+			continue
+		}
+		resetModelState(state, now)
+		resumed = append(resumed, model)
+	}
+	if len(resumed) > 0 {
+		updateAggregatedAvailability(auth, now)
+	}
+	return resumed
+}
+
+func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
+	if m == nil || auth == nil || alreadyTried || execErr == nil {
+		return auth, false
+	}
+	if !isCodexAuth(auth) ||
+		isCodexAPIKeyAuth(auth) ||
+		!shouldEvictUnauthorizedError(execErr) ||
+		!authHasRefreshCredential(auth) {
+		return auth, false
+	}
+	refreshed, errRefresh := m.refreshAuthForRequest(ctx, auth.ID, authAccessToken(auth))
+	if errRefresh != nil || refreshed == nil {
+		logEntryWithRequestID(ctx).WithFields(log.Fields{
+			"provider":   auth.Provider,
+			"auth_index": authMetricIndex(auth),
+			"status":     statusCodeFromError(errRefresh),
+			"error_code": errorCodeFromError(errRefresh),
+		}).Warn("credential refresh after unauthorized response failed")
+		return auth, false
+	}
+	return refreshed, true
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _ = m.refreshAuthForRequest(ctx, id, "")
+}
+
+func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	if m == nil {
+		return nil, errors.New("auth manager is nil")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errors.New("auth id is empty")
+	}
+
+	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
+	lock, _ := lockValue.(*authRefreshLock)
+	if lock == nil {
+		lock = &authRefreshLock{}
+		m.refreshLocks.Store(id, lock)
+	}
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+
 	m.mu.RLock()
-	auth := m.auths[id]
+	storedAuth := m.auths[id]
 	var exec ProviderExecutor
-	var cloned *Auth
-	if auth != nil {
-		exec = m.executors[auth.Provider]
-		cloned = auth.Clone()
+	var auth *Auth
+	if storedAuth != nil {
+		exec = m.executors[storedAuth.Provider]
+		auth = storedAuth.Clone()
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
-		return
+		return nil, errors.New("auth or executor not found")
 	}
+	credentialVersion := authRefreshCredentialVersion(auth)
+	if failedAccessToken != "" {
+		currentToken := authAccessToken(auth)
+		if currentToken != "" && currentToken != failedAccessToken {
+			return auth.Clone(), nil
+		}
+		now := time.Now()
+		if failure := lock.lastFailure; failure != nil &&
+			failure.credentialVersion == credentialVersion &&
+			(failure.terminal || now.Before(failure.retryAt)) {
+			if failure.err != nil {
+				return nil, cloneError(failure.err)
+			}
+			return nil, &Error{
+				Code:      "credential_refresh_backoff",
+				Message:   "credential refresh is in backoff",
+				Retryable: !failure.terminal,
+			}
+		}
+	}
+
+	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return nil, err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		unauthorized := isUnauthorizedError(err)
+		terminalFailure := isTerminalAuthRefreshError(err)
+		refreshErr := refreshErrorFromError(err)
+		retryAt := now.Add(refreshFailureBackoff)
+		if terminalFailure {
+			refreshErr.Code = "unauthorized"
+			retryAt = time.Time{}
+		}
+		lock.lastFailure = &authRefreshFailure{
+			credentialVersion: credentialVersion,
+			err:               cloneError(refreshErr),
+			retryAt:           retryAt,
+			terminal:          terminalFailure,
+		}
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.LastError = refreshErrorFromError(err)
-			if unauthorized {
+			current.LastError = cloneError(refreshErr)
+			if terminalFailure {
 				current.NextRefreshAfter = time.Time{}
 				current.Unavailable = true
 				current.Status = StatusError
-				current.StatusMessage = "unauthorized"
+				current.StatusMessage = terminalAuthRefreshStatus(err)
 			} else {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			}
@@ -10343,7 +10629,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
-		return
+		return nil, err
 	}
 	if updated == nil {
 		updated = cloned
@@ -10356,13 +10642,79 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
+	updated.StatusMessage = ""
+	updated.Unavailable = false
+	if updated.Status == StatusError {
+		updated.Status = StatusActive
+	}
 	updated.UpdatedAt = now
-	if m.shouldRefresh(updated, now) {
+	modelsToResume := clearUnauthorizedModelStates(updated, now)
+	updatedAccessToken := authAccessToken(updated)
+	if failedAccessToken != "" &&
+		(updatedAccessToken == "" || updatedAccessToken == failedAccessToken) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	} else if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
+	saved, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
+		retryAt := now.Add(refreshFailureBackoff)
+		lock.lastFailure = &authRefreshFailure{
+			credentialVersion: credentialVersion,
+			err: &Error{
+				Code:      "credential_refresh_persist_failed",
+				Message:   "credential refresh could not be persisted",
+				Retryable: true,
+			},
+			retryAt: retryAt,
+		}
+		shouldReschedule := false
+		m.mu.Lock()
+		if current := m.auths[id]; current != nil {
+			current.LastError = &Error{
+				Code:       "unauthorized",
+				Message:    "credential refresh could not be persisted",
+				HTTPStatus: http.StatusUnauthorized,
+			}
+			current.NextRefreshAfter = retryAt
+			current.Unavailable = true
+			current.Status = StatusError
+			current.StatusMessage = "refresh persistence failed"
+			m.auths[id] = current
+			shouldReschedule = true
+			if m.scheduler != nil {
+				m.scheduler.upsertAuth(current.Clone())
+			}
+		}
+		m.mu.Unlock()
+		if shouldReschedule {
+			m.queueRefreshReschedule(id)
+		}
 		log.Warnf("failed to persist refreshed auth %s, %s: %v", auth.Provider, auth.ID, errUpdate)
+		return nil, errUpdate
 	}
+	for _, model := range modelsToResume {
+		registry.GetGlobalRegistry().ResumeClientModel(id, model)
+	}
+	if saved != nil {
+		if failedAccessToken != "" &&
+			(authAccessToken(saved) == "" || authAccessToken(saved) == failedAccessToken) {
+			lock.lastFailure = &authRefreshFailure{
+				credentialVersion: authRefreshCredentialVersion(saved),
+				err: &Error{
+					Code:      "credential_refresh_ineffective",
+					Message:   "credential refresh did not replace the rejected access token",
+					Retryable: true,
+				},
+				retryAt: saved.NextRefreshAfter,
+			}
+		} else {
+			lock.lastFailure = nil
+		}
+		return saved, nil
+	}
+	lock.lastFailure = nil
+	return updated.Clone(), nil
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

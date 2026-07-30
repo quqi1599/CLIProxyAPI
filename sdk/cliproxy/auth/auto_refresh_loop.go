@@ -340,7 +340,13 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return time.Time{}, false
 	}
 	if hasUnauthorizedAuthFailure(auth) {
-		return time.Time{}, false
+		if !authHasRefreshCredential(auth) || auth.NextRefreshAfter.IsZero() {
+			return time.Time{}, false
+		}
+		if now.Before(auth.NextRefreshAfter) {
+			return auth.NextRefreshAfter, true
+		}
+		return now, true
 	}
 
 	accountType, _ := auth.AccountInfo()
