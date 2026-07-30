@@ -336,8 +336,8 @@ func rejectLargeOpenAICompatToolHistory(ctx context.Context, body []byte, profil
 
 func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOutputMessages int) {
 	baseModel, _ := thinking.StripPublicModelHint(model)
-	baseModel = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(baseModel).ModelName))
-	if strings.HasPrefix(baseModel, "minimax-m2.5") ||
+	baseModel = normalizedOpenAICompatPolicyModelName(baseModel)
+	if strings.HasPrefix(baseModel, "mimo-v2.5") ||
 		strings.HasPrefix(baseModel, "kimi-k3") ||
 		strings.HasPrefix(baseModel, "glm-5.2") ||
 		strings.HasPrefix(baseModel, "deepseek-v4-pro") ||
