@@ -90,6 +90,7 @@ func TestManager_WrapStreamResult_LogsStreamExecutionSummary(t *testing.T) {
 		startedAt,
 		40*time.Millisecond,
 		nil,
+		nil,
 	)
 
 	chunks := 0
@@ -205,6 +206,7 @@ func TestManager_WrapStreamResult_LogsSemanticFinishReasonAndUsage(t *testing.T)
 		nil,
 		startedAt,
 		100*time.Millisecond,
+		nil,
 		nil,
 	)
 

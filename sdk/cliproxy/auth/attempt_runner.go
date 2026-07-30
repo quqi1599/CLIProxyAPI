@@ -59,6 +59,9 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 		if !shouldRetry {
 			break
 		}
+		if trace != nil && isRetryableEmptyUpstreamResponseError(errRun) {
+			trace.recordEmptyResponseRetry()
+		}
 		wait = runner.manager.effectiveRetryWait(errRun, wait)
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return managerAttemptOutcome[T]{returnErr: errWait, finalErr: errWait}

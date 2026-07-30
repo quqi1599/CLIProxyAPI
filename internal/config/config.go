@@ -116,6 +116,10 @@ type Config struct {
 	// RetryQueueDelay defines the base delay in seconds before falling back to another credential.
 	RetryQueueDelay int `yaml:"retry-queue-delay" json:"retry-queue-delay"`
 
+	// EmptyResponseRetry detects successful upstream responses that contain no
+	// downstream-deliverable output before allowing the request to complete.
+	EmptyResponseRetry EmptyResponseRetryConfig `yaml:"empty-response-retry" json:"empty-response-retry"`
+
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
 
@@ -186,6 +190,37 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// EmptyResponseRetryConfig controls targeted detection of upstream responses
+// that complete without text, tool calls, media, refusal, or another
+// downstream-deliverable result.
+type EmptyResponseRetryConfig struct {
+	// Enabled activates empty-response observation for matching requests.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// AuditOnly records matches without changing request behavior.
+	AuditOnly bool `yaml:"audit-only" json:"audit-only"`
+
+	// Models limits detection to exact requested model names.
+	// When omitted, the safe P0 default is gpt-5.6-sol.
+	Models []string `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// ClientProfiles limits detection to inferred client profiles.
+	// When omitted, the safe P0 default is workbuddy.
+	ClientProfiles []string `yaml:"client-profiles,omitempty" json:"client-profiles,omitempty"`
+
+	// SourceFormats limits detection to downstream translator formats.
+	// When omitted, the safe P0 defaults are openai and openai-response.
+	SourceFormats []string `yaml:"source-formats,omitempty" json:"source-formats,omitempty"`
+
+	// MaxBufferBytes bounds bytes retained before the first deliverable output.
+	// Values <= 0 use a safe default.
+	MaxBufferBytes int `yaml:"max-buffer-bytes,omitempty" json:"max-buffer-bytes,omitempty"`
+
+	// MaxBufferEvents bounds stream chunks retained before the first
+	// deliverable output. Values <= 0 use a safe default.
+	MaxBufferEvents int `yaml:"max-buffer-events,omitempty" json:"max-buffer-events,omitempty"`
 }
 
 // PluginsConfig holds dynamic plugin system settings.

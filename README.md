@@ -84,6 +84,38 @@ work through `/chat/completions`. If a key is duplicated in both pools, disable
 or remove it in both places when it is exhausted so routing state and management
 tests do not diverge.
 
+### Empty Successful Response Recovery
+
+Targeted requests can treat an upstream HTTP 2xx response with no deliverable
+text, tool call, media, or refusal as a retryable provider failure. Before the
+first deliverable event, stream headers and control events remain buffered. An
+empty terminal stream is discarded and routed through the existing GPT channel
+failover and circuit breaker. Once any deliverable event is committed, the
+request is never replayed.
+
+The feature is disabled by default. Start in audit mode, review
+`event=empty_response_detected` logs, and then enable enforcement for the
+validated traffic:
+
+```yaml
+empty-response-retry:
+  enabled: true
+  audit-only: true
+  models:
+    - "gpt-5.6-sol"
+  client-profiles:
+    - "workbuddy"
+  source-formats:
+    - "openai"
+    - "openai-response"
+  max-buffer-bytes: 8388608
+  max-buffer-events: 2000
+```
+
+When every eligible channel fails this way, the request ends with HTTP `502`
+and error code `empty_upstream_response`. A client cancellation stops the
+attempt without starting another upstream request.
+
 ### Usage Statistics Persistence
 
 Control database persistence for usage statistics:

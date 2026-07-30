@@ -78,6 +78,36 @@ routing:
 同时放在两个池子里，额度耗尽或失效时需要在两边同时禁用或移除，避免路由
 状态和管理面板测试结果分叉。
 
+### 空成功响应自动恢复
+
+对定向启用的请求，如果上游虽然返回 HTTP 2xx 并正常结束，但整个响应没有
+可交付正文、工具调用、媒体或 refusal，CPA 会把它视为可重试的渠道失败。
+首个可交付事件出现前，响应头和控制事件会暂存在内存中；若最终只有空结束
+事件，本次缓存会被丢弃，并进入现有 GPT 渠道切换与熔断流程。一旦已经提交
+任何可交付事件，就不会重放请求。
+
+该能力默认关闭。建议先开启审计模式，观察
+`event=empty_response_detected` 日志，确认样本后再切换为强制模式：
+
+```yaml
+empty-response-retry:
+  enabled: true
+  audit-only: true
+  models:
+    - "gpt-5.6-sol"
+  client-profiles:
+    - "workbuddy"
+  source-formats:
+    - "openai"
+    - "openai-response"
+  max-buffer-bytes: 8388608
+  max-buffer-events: 2000
+```
+
+所有可用渠道都返回空成功时，请求最终返回 HTTP `502`，错误码为
+`empty_upstream_response`。客户端主动断开会立即结束当前处理，不会发起新的
+上游尝试。
+
 ### 使用量统计持久化
 
 控制使用量统计的数据库持久化：

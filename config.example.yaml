@@ -128,6 +128,23 @@ max-retry-interval: 30
 # The runtime adds jitter up to the same duration to avoid retry bursts.
 retry-queue-delay: 0
 
+# Detect HTTP 2xx responses that complete without downstream-deliverable output.
+# Start with audit-only=true, then disable audit-only after validating the
+# targeted model/client traffic. The default target lists below are also used
+# when the corresponding lists are omitted.
+empty-response-retry:
+  enabled: false
+  audit-only: true
+  models:
+    - "gpt-5.6-sol"
+  client-profiles:
+    - "workbuddy"
+  source-formats:
+    - "openai"
+    - "openai-response"
+  max-buffer-bytes: 8388608
+  max-buffer-events: 2000
+
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 

@@ -112,6 +112,9 @@ type requestAttemptTrace struct {
 	finalModel     string
 	finalExecutor  string
 	finalStatus    int
+	emptyResponses int
+	emptyRetries   int
+	emptyUpstreams map[string]struct{}
 	sessionBinding pendingSessionBinding
 	gptChannels    map[string]struct{}
 	failedChannels map[string]struct{}
@@ -135,6 +138,9 @@ type requestExecutionSummary struct {
 	FinalExecutor  string
 	FinalStatus    int
 	GPTRoundCount  int
+	EmptyResponses int
+	EmptyRetries   int
+	EmptyUpstreams int
 }
 
 type routePlanSummary struct {
@@ -193,11 +199,39 @@ func (t *requestAttemptTrace) nextAttempt(retryReason string) coreusage.RequestA
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.attempts++
+	if strings.EqualFold(retryReason, emptyUpstreamResponseErrorCode) {
+		t.emptyRetries++
+	}
 	return coreusage.RequestAttempt{
 		RequestID:   t.requestID,
 		AttemptNo:   t.attempts,
 		RetryReason: retryReason,
 	}
+}
+
+func (t *requestAttemptTrace) recordEmptyResponse(upstream string) {
+	if t == nil {
+		return
+	}
+	upstream = strings.TrimSpace(upstream)
+	t.mu.Lock()
+	t.emptyResponses++
+	if upstream != "" {
+		if t.emptyUpstreams == nil {
+			t.emptyUpstreams = make(map[string]struct{})
+		}
+		t.emptyUpstreams[upstream] = struct{}{}
+	}
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) recordEmptyResponseRetry() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.emptyRetries++
+	t.mu.Unlock()
 }
 
 func (t *requestAttemptTrace) attemptCount() int {
@@ -502,6 +536,9 @@ func (t *requestAttemptTrace) summary() requestExecutionSummary {
 		FinalExecutor:  t.finalExecutor,
 		FinalStatus:    t.finalStatus,
 		GPTRoundCount:  t.gptRound,
+		EmptyResponses: t.emptyResponses,
+		EmptyRetries:   t.emptyRetries,
+		EmptyUpstreams: len(t.emptyUpstreams),
 	}
 }
 
@@ -623,6 +660,15 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	}
 	if summary.GPTRoundCount > 0 {
 		fields["gpt_round_count"] = summary.GPTRoundCount
+	}
+	if summary.EmptyResponses > 0 {
+		finalEmptyResponse := strings.EqualFold(errorCodeFromError(finalErr), emptyUpstreamResponseErrorCode)
+		fields["empty_response_count"] = summary.EmptyResponses
+		fields["empty_response_retry_count"] = summary.EmptyRetries
+		fields["empty_response_upstream_count"] = summary.EmptyUpstreams
+		fields["empty_response_recovered"] = logFinalSuccess
+		fields["empty_response_exhausted"] = !logFinalSuccess && finalEmptyResponse
+		fields["final_empty_response"] = finalEmptyResponse
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
@@ -3256,9 +3302,29 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+type streamBootstrapReadResult struct {
+	buffered           []cliproxyexecutor.StreamChunk
+	closed             bool
+	firstPayloadDelay  time.Duration
+	err                error
+	emptyResponse      bool
+	bufferLimitReached bool
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, startedAt time.Time) ([]cliproxyexecutor.StreamChunk, bool, time.Duration, error) {
+	result := readStreamBootstrapWithDelivery(ctx, ch, startedAt, nil, emptyResponsePolicy{})
+	return result.buffered, result.closed, result.firstPayloadDelay, result.err
+}
+
+func readStreamBootstrapWithDelivery(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, startedAt time.Time, tracker *deliverableOutputTracker, policy emptyResponsePolicy) streamBootstrapReadResult {
 	if ch == nil {
-		return nil, true, 0, nil
+		if tracker != nil {
+			tracker.Finish()
+		}
+		return streamBootstrapReadResult{
+			closed:        true,
+			emptyResponse: tracker != nil && !tracker.deliverable,
+		}
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
 	for {
@@ -3269,21 +3335,49 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				return nil, false, 0, ctx.Err()
+				return streamBootstrapReadResult{err: ctx.Err()}
 			case chunk, ok = <-ch:
 			}
 		} else {
 			chunk, ok = <-ch
 		}
 		if !ok {
-			return buffered, true, 0, nil
+			if tracker != nil {
+				tracker.Finish()
+			}
+			return streamBootstrapReadResult{
+				buffered:          buffered,
+				closed:            true,
+				firstPayloadDelay: time.Since(startedAt),
+				emptyResponse:     tracker != nil && !tracker.deliverable,
+			}
 		}
 		if chunk.Err != nil {
-			return nil, false, 0, chunk.Err
+			return streamBootstrapReadResult{err: chunk.Err}
 		}
 		buffered = append(buffered, chunk)
+		if tracker != nil {
+			tracker.Observe(chunk.Payload)
+			if tracker.deliverable {
+				return streamBootstrapReadResult{
+					buffered:          buffered,
+					firstPayloadDelay: time.Since(startedAt),
+				}
+			}
+			if tracker.bytesReceived >= policy.maxBytes || tracker.chunksCount >= policy.maxEvents {
+				return streamBootstrapReadResult{
+					buffered:           buffered,
+					firstPayloadDelay:  time.Since(startedAt),
+					bufferLimitReached: true,
+				}
+			}
+			continue
+		}
 		if len(chunk.Payload) > 0 && !streamBootstrapPayloadIsMetadataOnly(chunk.Payload) {
-			return buffered, false, time.Since(startedAt), nil
+			return streamBootstrapReadResult{
+				buffered:          buffered,
+				firstPayloadDelay: time.Since(startedAt),
+			}
 		}
 	}
 }
@@ -3358,7 +3452,7 @@ func (r *streamRequestRuntime) recordFinalStatus(status int) {
 	r.trace.recordFinalStatus(status)
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamExecutionLogMeta, responseModelAlias string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, cancelUpstream func(), startedAt time.Time, firstPayloadDelay time.Duration, releaseSlot func()) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamExecutionLogMeta, responseModelAlias string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, cancelUpstream func(), startedAt time.Time, firstPayloadDelay time.Duration, releaseSlot func(), deliveryAudit *emptyResponseAudit) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	var cancelOnce sync.Once
 	cancel := func() {
@@ -3396,6 +3490,22 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 		var failed bool
 		var clientGone bool
 		defer func() {
+			if deliveryAudit != nil && deliveryAudit.tracker != nil {
+				deliveryAudit.tracker.Finish()
+				if !failed && !clientGone && !deliveryAudit.tracker.deliverable {
+					m.logEmptyResponseDetected(
+						ctx,
+						auth,
+						meta.provider,
+						deliveryAudit.routeModel,
+						deliveryAudit.opts,
+						deliveryAudit.tracker,
+						true,
+						false,
+						int64(runtime.stats.bytesOut),
+					)
+				}
+			}
 			totalDuration := time.Since(startedAt)
 			streamDuration := totalDuration - firstPayloadDelay
 			if streamDuration < 0 {
@@ -3446,6 +3556,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				return false
 			}
 			if len(chunk.Payload) > 0 {
+				if deliveryAudit != nil && deliveryAudit.tracker != nil {
+					deliveryAudit.tracker.Observe(chunk.Payload)
+				}
 				chunk.Payload = runtime.rewritePayload(chunk.Payload)
 				runtime.stats.observe(chunk.Payload)
 			}
@@ -3614,7 +3727,24 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, firstPayloadDelay, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks, startedAt)
+		emptyPolicy := m.emptyResponsePolicy(routeModel, opts)
+		var deliveryTracker *deliverableOutputTracker
+		if emptyPolicy.enabled && !emptyPolicy.auditOnly {
+			deliveryTracker = newDeliverableOutputTracker(emptyPolicy.format)
+		}
+		bootstrapRead := readStreamBootstrapWithDelivery(attemptCtx, streamResult.Chunks, startedAt, deliveryTracker, emptyPolicy)
+		buffered := bootstrapRead.buffered
+		closed := bootstrapRead.closed
+		firstPayloadDelay := bootstrapRead.firstPayloadDelay
+		bootstrapErr := bootstrapRead.err
+		if bootstrapRead.emptyResponse {
+			m.logEmptyResponseDetected(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, false, false, 0)
+			bootstrapErr = newEmptyUpstreamResponseFailure()
+		}
+		if bootstrapRead.bufferLimitReached {
+			m.logEmptyResponseBufferLimit(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, emptyPolicy)
+			bootstrapErr = newEmptyUpstreamResponseFailure()
+		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				cleanupAttempt()
@@ -3724,7 +3854,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
 			toolShape:        toolShapeFromOptions(opts),
 		}
-		return m.wrapStreamResult(attemptCtx, auth.Clone(), streamMeta, responseModelAlias, streamResult.Headers, buffered, remaining, cleanupAttempt, startedAt, firstPayloadDelay, nil), nil
+		return m.wrapStreamResult(
+			attemptCtx,
+			auth.Clone(),
+			streamMeta,
+			responseModelAlias,
+			streamResult.Headers,
+			buffered,
+			remaining,
+			cleanupAttempt,
+			startedAt,
+			firstPayloadDelay,
+			nil,
+			newEmptyResponseAudit(emptyPolicy, routeModel, opts),
+		), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -4354,6 +4497,24 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			}
 			startedAt := time.Now()
 			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
+			if errExec == nil && operation == "execute" {
+				emptyPolicy := m.emptyResponsePolicy(routeModel, opts)
+				if emptyPolicy.enabled {
+					deliveryTracker := newDeliverableOutputTracker(emptyPolicy.format)
+					deliveryTracker.Observe(resp.Payload)
+					deliveryTracker.Finish()
+					if !deliveryTracker.deliverable {
+						downstreamBytes := int64(0)
+						if emptyPolicy.auditOnly {
+							downstreamBytes = int64(len(resp.Payload))
+						}
+						m.logEmptyResponseDetected(execCtx, auth, provider, routeModel, opts, deliveryTracker, emptyPolicy.auditOnly, false, downstreamBytes)
+						if !emptyPolicy.auditOnly {
+							errExec = newEmptyUpstreamResponseFailure()
+						}
+					}
+				}
+			}
 			elapsed := time.Since(startedAt)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
 			if errExec != nil {
