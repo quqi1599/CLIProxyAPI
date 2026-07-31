@@ -28,6 +28,33 @@ func NormalizeDeepSeekOfficialReasoningEffort(level string) string {
 	}
 }
 
+// NormalizeDeepSeekOfficialReasoningEffortForModel preserves the native low
+// effort level supported by DeepSeek V4 Flash while retaining the compatibility
+// mapping required by other official DeepSeek models.
+func NormalizeDeepSeekOfficialReasoningEffortForModel(model string, level string) string {
+	normalized := strings.ToLower(strings.TrimSpace(level))
+	baseModel, _ := StripPublicModelHint(model)
+	baseModel = strings.ToLower(strings.TrimSpace(ParseSuffix(baseModel).ModelName))
+	if slash := strings.LastIndex(baseModel, "/"); slash >= 0 {
+		baseModel = baseModel[slash+1:]
+	}
+	if strings.HasPrefix(baseModel, "deepseek-v4-flash") {
+		switch normalized {
+		case "low":
+			return "low"
+		case "medium":
+			return "high"
+		case "high":
+			return "high"
+		case "xhigh", "max":
+			return "max"
+		default:
+			return normalized
+		}
+	}
+	return NormalizeDeepSeekOfficialReasoningEffort(normalized)
+}
+
 // StripPublicModelHint removes a trailing public hint suffix such as "[1m]".
 func StripPublicModelHint(model string) (baseModel string, hint string) {
 	model = strings.TrimSpace(model)

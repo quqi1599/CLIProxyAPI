@@ -130,7 +130,7 @@ func TestOpenAICompatPostConfigPolicyFixture(t *testing.T) {
 func TestOpenAICompatPostConfigSkipsPreCanonicalization(t *testing.T) {
 	payload := []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object","properties":{"value":"object"}}}}]}`)
 	profile := genericOpenAICompatProfile()
-	postConfig := scrubOpenAICompatPostConfigPayload(payload, profile, "gpt-5", "https://api.openai.com/v1")
+	postConfig := scrubOpenAICompatPostConfigPayload(payload, profile, "gpt-5", "https://api.openai.com/v1", "chat")
 	if !bytes.Equal(postConfig, payload) {
 		t.Fatalf("post-config revalidation reran pre-canonicalization: %s", postConfig)
 	}

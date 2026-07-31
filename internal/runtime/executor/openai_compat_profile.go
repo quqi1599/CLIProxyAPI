@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
@@ -111,6 +112,18 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		SupportsReasoning:        false,
 		SupportsMetadata:         false,
 		SupportsStore:            false,
+	},
+	"deepseek": {
+		Kind:                     "deepseek",
+		SupportsResponses:        true,
+		SupportsNativeResponses:  true,
+		SupportsStreamUsage:      true,
+		SupportsParallelToolCall: true,
+		SupportsReasoning:        true,
+		PreserveReasoningContent: true,
+		NormalizeToolHistory:     true,
+		SupportsMetadata:         true,
+		SupportsStore:            true,
 	},
 	"xfyun": {
 		Kind:                     "xfyun",
@@ -266,7 +279,7 @@ func scrubOpenAICompatCapabilityFields(payload []byte, profile openAICompatProfi
 	return mutateOpenAICompatJSON(payload, deletePaths, nil)
 }
 
-func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
+func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProfile, model string, baseURL string, endpoint compat.EndpointKind) []byte {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "kimi" {
 		payload = normalizeKimiThinkingConfig(payload, model)
@@ -282,8 +295,13 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 	}
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
-	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	if endpoint != "responses" {
+		payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
+	}
 	payload = scrubOpenAICompatLegacyProviderQuirks(payload, profile, model)
+	if endpoint == "responses" && config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" {
+		return payload
+	}
 	return scrubOpenAICompatPayloadAfterProviderQuirks(payload, profile, model, baseURL)
 }
 
@@ -1881,7 +1899,7 @@ func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL 
 	}
 
 	effortPath, effort := deepSeekReasoningEffortPath(payload)
-	normalizedEffort := thinking.NormalizeDeepSeekOfficialReasoningEffort(effort)
+	normalizedEffort := thinking.NormalizeDeepSeekOfficialReasoningEffortForModel(model, effort)
 	switch normalizedEffort {
 	case "none", "disabled", "off":
 		payload, _ = sjson.SetBytes(payload, "thinking.type", "disabled")
@@ -1890,7 +1908,7 @@ func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL 
 	case "auto", "adaptive", "enabled", "enable", "true":
 		payload, _ = sjson.SetBytes(payload, "thinking.type", "enabled")
 		payload = stripOpenAICompatReasoningEffort(payload)
-	case "high", "max":
+	case "low", "high", "max":
 		switch effortPath {
 		case "reasoning.effort":
 			payload, _ = sjson.SetBytes(payload, effortPath, normalizedEffort)

@@ -60,14 +60,16 @@ type openAICompatPolicyContextKey struct{}
 type openAICompatPostConfigContextKey struct{}
 
 type openAICompatPolicyContext struct {
-	model   string
-	baseURL string
+	model    string
+	baseURL  string
+	endpoint compat.EndpointKind
 }
 
 type openAICompatPostConfigContext struct {
-	profile openAICompatProfile
-	model   string
-	baseURL string
+	profile  openAICompatProfile
+	model    string
+	baseURL  string
+	endpoint compat.EndpointKind
 }
 
 func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload []byte, profile openAICompatProfile, model string, baseURL string, match compat.MatchContext) ([]byte, error) {
@@ -92,7 +94,7 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 	if openAICompatPolicyRegistryErr != nil {
 		return nil, openAICompatPolicyRegistryErr
 	}
-	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL})
+	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL, endpoint: match.Endpoint})
 	result, err := openAICompatPolicyPipeline.Apply(ctx, openAICompatPolicyMatchContext(profile, payload, model, match), payload)
 	if err != nil {
 		return nil, err
@@ -137,11 +139,12 @@ func revalidateOpenAICompatPayloadAfterConfig(ctx context.Context, payload []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL})
+	ctx = context.WithValue(ctx, openAICompatPolicyContextKey{}, openAICompatPolicyContext{model: model, baseURL: baseURL, endpoint: match.Endpoint})
 	ctx = context.WithValue(ctx, openAICompatPostConfigContextKey{}, openAICompatPostConfigContext{
-		profile: profile,
-		model:   model,
-		baseURL: baseURL,
+		profile:  profile,
+		model:    model,
+		baseURL:  baseURL,
+		endpoint: match.Endpoint,
 	})
 	result, err := openAICompatPostConfigPipeline.Apply(ctx, openAICompatPolicyMatchContext(profile, payload, model, match), payload)
 	if err != nil {
@@ -240,7 +243,7 @@ func applyOpenAICompatPostConfigRevalidatePolicy(ctx context.Context, input []by
 	if !ok {
 		return compat.TransformResult{}, fmt.Errorf("openai compat post-config context is missing")
 	}
-	output := scrubOpenAICompatPostConfigPayload(input, state.profile, state.model, state.baseURL)
+	output := scrubOpenAICompatPostConfigPayload(input, state.profile, state.model, state.baseURL, state.endpoint)
 	return compat.TransformResult{
 		Payload:    output,
 		Downgrades: openAICompatPostConfigDowngrades(ctx, input, output, state.profile),
@@ -543,6 +546,12 @@ func openAICompatXiaomiPolicy() compat.Policy {
 func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
 	state := openAICompatPolicyState(ctx, input)
 	output := scrubDeepSeekThinkingBudgetForCompat(input, state.model, state.baseURL, "deepseek")
+	if state.endpoint == "responses" {
+		return compat.TransformResult{
+			Payload:    output,
+			Downgrades: openAICompatDeepSeekPolicyDowngrades(input, output),
+		}, nil
+	}
 	output = scrubDeepSeekThinkingToolChoice(output, state.model, state.baseURL, "deepseek")
 	if requiresDeepSeekToolSchemaCompatibility(state.model) {
 		output = scrubDeepSeekToolPayload(output, state.baseURL)

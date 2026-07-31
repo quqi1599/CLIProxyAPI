@@ -168,16 +168,24 @@ func translateOpenAICompatStreamLine(ctx context.Context, upstreamFormat, downst
 	return sdktranslator.TranslateStream(ctx, upstreamFormat, downstreamFormat, model, originalRequestRawJSON, requestRawJSON, rawCopy, param)
 }
 
-func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliproxyexecutor.Options, profile openAICompatProfile) (sdktranslator.Format, string) {
+func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliproxyexecutor.Options, profile openAICompatProfile, model string) (sdktranslator.Format, string) {
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
 	if opts.Alt == "responses/compact" && profile.SupportsResponses {
 		return sdktranslator.FromString("openai-response"), "/responses/compact"
 	}
-	if opts.Alt == "" && profile.SupportsNativeResponses && strings.EqualFold(strings.TrimSpace(from.String()), "openai-response") {
+	if opts.Alt == "" && profile.SupportsNativeResponses && openAICompatModelSupportsNativeResponses(profile, model) &&
+		strings.EqualFold(strings.TrimSpace(from.String()), "openai-response") {
 		return sdktranslator.FromString("openai-response"), "/responses"
 	}
 	return to, endpoint
+}
+
+func openAICompatModelSupportsNativeResponses(profile openAICompatProfile, model string) bool {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
+		return true
+	}
+	return strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "deepseek-v4-flash")
 }
 
 func openAICompatPolicyRequestMatch(from, to sdktranslator.Format, endpoint string, stream bool) compat.MatchContext {
@@ -610,7 +618,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.failureCtx = ctx
 	from := opts.SourceFormat
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
-	plan.upstreamFormat, plan.endpoint = openAICompatTargetFormatAndEndpoint(from, opts, profile)
+	plan.upstreamFormat, plan.endpoint = openAICompatTargetFormatAndEndpoint(from, opts, profile, baseModel)
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -733,7 +741,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
 	if stream {
-		if profile.SupportsStreamUsage {
+		if profile.SupportsStreamUsage && plan.endpoint == "/chat/completions" {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 		}
 	} else if opts.Alt == "responses/compact" {
@@ -1165,7 +1173,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				responseLog.AppendChunk(event)
 			}
 		}
-		if cleanEOF {
+		if cleanEOF && plan.upstreamFormat.String() != "openai-response" {
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
@@ -1481,6 +1489,10 @@ func normalizeOpenAICompatRouteReasoningEffort(payload []byte, opts cliproxyexec
 		support = modelInfo.Thinking
 	}
 	normalized := thinking.NormalizeReasoningEffortForTarget(original, support, deepSeekOfficial)
+	if deepSeekOfficial {
+		normalized.Normalized = thinking.NormalizeDeepSeekOfficialReasoningEffortForModel(finalModel, original)
+		normalized.Stripped = false
+	}
 	if normalized.Stripped {
 		return stripOpenAICompatReasoningEffort(payload)
 	}
