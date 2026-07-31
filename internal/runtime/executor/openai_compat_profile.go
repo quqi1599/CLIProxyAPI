@@ -282,6 +282,7 @@ func scrubOpenAICompatCapabilityFields(payload []byte, profile openAICompatProfi
 func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProfile, model string, baseURL string, endpoint compat.EndpointKind) []byte {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "kimi" {
+		payload = omitKimiEmptyAssistantToolCallContent(payload)
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoEffort, doubaoThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
@@ -325,6 +326,7 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 	}
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "kimi" {
+		payload = omitKimiEmptyAssistantToolCallContent(payload)
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)

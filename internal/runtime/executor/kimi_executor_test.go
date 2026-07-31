@@ -54,6 +54,143 @@ func TestNormalizeKimiToolMessageLinks_InferSinglePendingID(t *testing.T) {
 	}
 }
 
+func TestSanitizeKimiOpenAICompatibleRequestBodyOmitsEmptyAssistantToolCallContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "empty string", content: `""`},
+		{name: "whitespace string", content: `"   "`},
+		{name: "null", content: `null`},
+		{name: "empty text part", content: `[{"type":"text","text":"  "}]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{
+				"model":"kimi-k3",
+				"messages":[
+					{"role":"user","content":"start"},
+					{"role":"assistant","content":` + tt.content + `,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+					{"role":"tool","tool_call_id":"call_123","content":"file-content"}
+				]
+			}`)
+
+			out, err := sanitizeKimiOpenAICompatibleRequestBody(body)
+			if err != nil {
+				t.Fatalf("sanitizeKimiOpenAICompatibleRequestBody() error = %v", err)
+			}
+
+			if gjson.GetBytes(out, "messages.1.content").Exists() {
+				t.Fatalf("empty assistant content should be omitted: %s", string(out))
+			}
+			if got := gjson.GetBytes(out, "messages.1.tool_calls.0.id").String(); got != "call_123" {
+				t.Fatalf("tool call id = %q, want call_123: %s", got, string(out))
+			}
+			if got := gjson.GetBytes(out, "messages.2.tool_call_id").String(); got != "call_123" {
+				t.Fatalf("tool result link = %q, want call_123: %s", got, string(out))
+			}
+		})
+	}
+}
+
+func TestSanitizeKimiOpenAICompatibleRequestBodyPreservesNonEmptyAssistantContent(t *testing.T) {
+	body := []byte(`{
+		"model":"kimi-k3",
+		"messages":[
+			{"role":"assistant","content":"Calling the tool.","tool_calls":[{"id":"call_123","type":"function","function":{"name":"read_file","arguments":"{}"}}]}
+		]
+	}`)
+
+	out, err := sanitizeKimiOpenAICompatibleRequestBody(body)
+	if err != nil {
+		t.Fatalf("sanitizeKimiOpenAICompatibleRequestBody() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "Calling the tool." {
+		t.Fatalf("assistant content = %q, want preserved text: %s", got, string(out))
+	}
+}
+
+func TestSanitizeKimiClaudeEmptyTextBlocks(t *testing.T) {
+	body := []byte(`{
+		"model":"kimi-k3",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"text","text":"   "},
+				{"type":"tool_use","id":"toolu_123","name":"read_file","input":{}}
+			]}
+		]
+	}`)
+
+	out := sanitizeKimiClaudeEmptyTextBlocks(body, "kimi")
+	content := gjson.GetBytes(out, "messages.0.content")
+	if got := len(content.Array()); got != 1 {
+		t.Fatalf("assistant content blocks = %d, want 1: %s", got, string(out))
+	}
+	if got := content.Get("0.type").String(); got != "tool_use" {
+		t.Fatalf("remaining content type = %q, want tool_use: %s", got, string(out))
+	}
+
+	inferredOut := sanitizeKimiClaudeEmptyTextBlocks(body, "")
+	if got := len(gjson.GetBytes(inferredOut, "messages.0.content").Array()); got != 1 {
+		t.Fatalf("model-inferred assistant content blocks = %d, want 1: %s", got, string(inferredOut))
+	}
+}
+
+func TestSanitizeKimiClaudeEmptyTextBlocksPreservesOtherPayloads(t *testing.T) {
+	body := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"text","text":"Calling the tool."},
+				{"type":"tool_use","id":"toolu_123","name":"read_file","input":{}}
+			]}
+		]
+	}`)
+
+	kimiOut := sanitizeKimiClaudeEmptyTextBlocks(body, "kimi")
+	if got := gjson.GetBytes(kimiOut, "messages.0.content.0.text").String(); got != "Calling the tool." {
+		t.Fatalf("non-empty Kimi text = %q, want preserved: %s", got, string(kimiOut))
+	}
+
+	otherOut := sanitizeKimiClaudeEmptyTextBlocks(body, "deepseek")
+	if string(otherOut) != string(body) {
+		t.Fatalf("non-Kimi payload changed:\n%s\nwant:\n%s", string(otherOut), string(body))
+	}
+}
+
+func TestSanitizeClaudeHTTPRequestToolNamesForKimiOmitsEmptyAssistantText(t *testing.T) {
+	body := `{
+		"model":"kimi-k3",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"text","text":""},
+				{"type":"tool_use","id":"toolu_123","name":"read_file","input":{}}
+			]}
+		]
+	}`
+	req, err := http.NewRequest(http.MethodPost, "https://api.moonshot.cn/anthropic/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	if _, err = sanitizeClaudeHTTPRequestToolNamesForCompatKind(req, "kimi"); err != nil {
+		t.Fatalf("sanitizeClaudeHTTPRequestToolNamesForCompatKind() error = %v", err)
+	}
+	out, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read sanitized body: %v", err)
+	}
+
+	content := gjson.GetBytes(out, "messages.0.content")
+	if got := len(content.Array()); got != 1 {
+		t.Fatalf("assistant content blocks = %d, want 1: %s", got, string(out))
+	}
+	if got := content.Get("0.type").String(); got != "tool_use" {
+		t.Fatalf("remaining content type = %q, want tool_use: %s", got, string(out))
+	}
+}
+
 func TestSanitizeKimiOpenAICompatibleRequestBodyDropsOrphanReplyToolCall(t *testing.T) {
 	body := []byte(`{
 		"model":"kimi-k2.5",

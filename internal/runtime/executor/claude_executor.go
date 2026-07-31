@@ -442,6 +442,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if err != nil {
 		return plan, err
 	}
+	body = sanitizeKimiClaudeEmptyTextBlocks(body, plan.providerIdentity.Kind)
 	if !capabilityManaged {
 		if preflight.hasTools || preflight.hasToolSearch {
 			body = downgradeClaudeToolSearchForCompatKind(plan.providerIdentity.Kind, plan.baseURL, body)
@@ -913,6 +914,7 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if err != nil {
 			return cliproxyexecutor.Response{}, err
 		}
+		body = sanitizeKimiClaudeEmptyTextBlocks(body, identity.Kind)
 		if !capabilityManaged && (helps.HasClaudeToolsMarker(body) || helps.HasClaudeToolSearchMarker(body)) {
 			body = downgradeClaudeToolSearchForCompatKind(identity.Kind, baseURL, body)
 		}
@@ -3362,6 +3364,7 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 	if errCapability != nil {
 		return nil, errCapability
 	}
+	body = sanitizeKimiClaudeEmptyTextBlocks(body, compatKind)
 	if !capabilityManaged {
 		body = downgradeClaudeToolSearchForCompatKind(compatKind, requestURLString(req), body)
 	}

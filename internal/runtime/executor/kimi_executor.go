@@ -862,6 +862,113 @@ func sanitizeKimiOpenAICompatibleRequestBodyForModel(body []byte, model string, 
 	return body, nil
 }
 
+func omitKimiEmptyAssistantToolCallContent(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	updatedMessages := make([]string, 0, len(messages.Array()))
+	changed := false
+	for _, message := range messages.Array() {
+		updatedMessages = append(updatedMessages, message.Raw)
+		if strings.TrimSpace(message.Get("role").String()) != "assistant" {
+			continue
+		}
+		if !hasOpenAICompatToolCalls(message) && !hasOpenAICompatLegacyFunctionCall(message) {
+			continue
+		}
+		content := message.Get("content")
+		if content.Raw == "" || !isOpenAICompatAssistantContentEmpty(content) {
+			continue
+		}
+		updatedMessage, err := sjson.DeleteBytes([]byte(message.Raw), "content")
+		if err != nil {
+			continue
+		}
+		updatedMessages[len(updatedMessages)-1] = string(updatedMessage)
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+
+	updated, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(updatedMessages))
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func sanitizeKimiClaudeEmptyTextBlocks(body []byte, compatKind string) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	model := normalizedOpenAICompatPolicyModelName(gjson.GetBytes(body, "model").String())
+	if config.NormalizeOpenAICompatibilityKind(compatKind) != "kimi" && !strings.HasPrefix(model, "kimi-") {
+		return body
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	updatedMessages := make([]string, 0, len(messages.Array()))
+	changed := false
+	for _, message := range messages.Array() {
+		updatedMessages = append(updatedMessages, message.Raw)
+		if strings.TrimSpace(message.Get("role").String()) != "assistant" {
+			continue
+		}
+		content := message.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		contentParts := content.Array()
+		hasToolUse := false
+		for _, part := range contentParts {
+			if strings.TrimSpace(part.Get("type").String()) == "tool_use" {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
+			continue
+		}
+
+		updatedContent := make([]string, 0, len(contentParts))
+		messageChanged := false
+		for _, part := range contentParts {
+			if strings.TrimSpace(part.Get("type").String()) == "text" && strings.TrimSpace(part.Get("text").String()) == "" {
+				messageChanged = true
+				continue
+			}
+			updatedContent = append(updatedContent, part.Raw)
+		}
+		if !messageChanged {
+			continue
+		}
+		updatedMessage, err := sjson.SetRawBytes([]byte(message.Raw), "content", internalpayload.BuildRaw(updatedContent))
+		if err != nil {
+			continue
+		}
+		updatedMessages[len(updatedMessages)-1] = string(updatedMessage)
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+
+	updated, err := sjson.SetRawBytes(body, "messages", internalpayload.BuildRaw(updatedMessages))
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	return normalizeOpenAICompatToolMessageLinks(body, "kimi executor")
 }
