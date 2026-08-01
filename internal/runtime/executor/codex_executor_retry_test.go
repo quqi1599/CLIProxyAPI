@@ -94,6 +94,22 @@ func TestNewCodexStatusErrTreatsUsageLimitAsRetryableRateLimit(t *testing.T) {
 	}
 }
 
+func TestNewCodexStatusErrTreatsTransientRateLimitAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`)
+
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if got := err.ErrorCode(); got != "rate_limit_exceeded" {
+		t.Fatalf("error code = %q, want rate_limit_exceeded", got)
+	}
+	if err.RetryAfter() != nil {
+		t.Fatalf("expected nil explicit retryAfter for transient rate limit, got %v", *err.RetryAfter())
+	}
+}
+
 func TestIsCodexUsageLimitError(t *testing.T) {
 	tests := []struct {
 		name string

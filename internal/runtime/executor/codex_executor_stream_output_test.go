@@ -141,6 +141,54 @@ func TestCodexExecutorExecuteStreamSurfacesTerminalStreamError(t *testing.T) {
 	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "context_too_large")
 }
 
+func TestCodexExecutorExecuteStreamWithholdsTerminalRateLimitEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-terra"}}` + "\n\n"))
+		_, _ = w.Write([]byte("event: response.failed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Selected model is at capacity. Please try a different model."}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream error: %v", errExecute)
+	}
+
+	var (
+		payload   []byte
+		streamErr error
+	)
+	for chunk := range result.Chunks {
+		payload = append(payload, chunk.Payload...)
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if len(payload) != 0 {
+		t.Fatalf("terminal rate limit payload reached downstream: %q", payload)
+	}
+	if streamErr == nil {
+		t.Fatal("missing terminal rate limit stream error")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusTooManyRequests, streamErr)
+	}
+	assertCodexErrorCode(t, streamErr.Error(), "rate_limit_error", "rate_limit_exceeded")
+}
+
 func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {
 	err, ok := codexTerminalStreamContextLengthErr([]byte(`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`))
 	if !ok {
@@ -173,11 +221,26 @@ func TestCodexTerminalStreamContextLengthErrIgnoresOtherTerminalErrors(t *testin
 	}
 }
 
-func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
-	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
-	if ok {
-		t.Fatal("rate limit terminal error should not be handled by replay terminal error path")
+func TestCodexTerminalStreamErrHandlesRateLimitTerminalErrors(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
+	if !ok {
+		t.Fatal("rate limit terminal error should be handled before downstream delivery")
 	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	assertCodexErrorCode(t, streamErr.Error(), "rate_limit_error", "rate_limit_exceeded")
+}
+
+func TestCodexTerminalStreamErrHandlesInvalidRequestResponseFailed(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"invalid_request_error","code":"invalid_parameter","message":"invalid parameter"}}}`))
+	if !ok {
+		t.Fatal("response.failed should be handled before downstream delivery")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "invalid_parameter")
 }
 
 func TestCodexTerminalStreamErrHandlesUsageLimitErrorEvent(t *testing.T) {

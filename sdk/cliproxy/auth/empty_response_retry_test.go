@@ -96,10 +96,9 @@ func TestDeliverableOutputTrackerClassifiesChatAndResponses(t *testing.T) {
 			wantTerminal: true,
 		},
 		{
-			name:         "responses explicit error is not replayed as empty",
+			name:         "responses explicit error waits for bootstrap failure",
 			format:       sdktranslator.FormatOpenAIResponse,
 			payloads:     []string{`{"type":"response.failed","response":{"id":"resp-1","status":"failed","error":{"code":"content_filter"}}}`},
-			wantOutput:   true,
 			wantTerminal: true,
 			wantError:    true,
 		},
@@ -487,6 +486,85 @@ func TestManagerEmptyResponseRetryHandlesResponsesStream(t *testing.T) {
 		t.Fatalf("responses stream = %q, want only recovered attempt", response.String())
 	}
 	if got, want := executor.StreamCalls(), []string{"aa-empty", "ba-good"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerResponsesBootstrapCapacityRetriesNextCredential(t *testing.T) {
+	const (
+		provider = "responses-bootstrap-capacity"
+		model    = "gpt-5.6-terra"
+	)
+	capacityErr := &Error{
+		Code:       "rate_limit_exceeded",
+		Message:    "Selected model is at capacity. Please try a different model.",
+		Retryable:  true,
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+	executor := &emptyResponseScenarioExecutor{
+		id: provider,
+		streamChunks: map[string][]cliproxyexecutor.StreamChunk{
+			"aa-capacity": {
+				{Payload: []byte("event: response.created\n")},
+				{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp-capacity"}}` + "\n\n")},
+				{Payload: []byte("event: response.failed\n")},
+				{Payload: []byte(`data: {"type":"response.failed","response":{"id":"resp-capacity","status":"failed","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Selected model is at capacity. Please try a different model."}}}` + "\n\n")},
+				{Err: capacityErr},
+			},
+		},
+		streamPayloads: map[string][]string{
+			"ba-good": {
+				`data: {"type":"response.output_text.delta","delta":"recovered"}` + "\n\n",
+				`data: {"type":"response.completed","response":{"id":"resp-good","output":[{"type":"message","content":[{"type":"output_text","text":"recovered"}]}]}}` + "\n\n",
+			},
+		},
+	}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{
+		EmptyResponseRetry: internalconfig.EmptyResponseRetryConfig{
+			Enabled:        true,
+			Models:         []string{model},
+			ClientProfiles: []string{"workbuddy"},
+			SourceFormats:  []string{"openai-response"},
+		},
+	})
+	manager.SetRetryConfig(3, 30*time.Second, 10)
+	manager.RegisterExecutor(executor)
+	auths := []*Auth{
+		openAICompatChannelBreakerAuth("aa-capacity", provider, "https://channel-a.example/v1", 10),
+		openAICompatChannelBreakerAuth("ba-good", provider, "https://channel-b.example/v1", 10),
+	}
+	registerGPTChannelFailoverAuths(t, manager, provider, model, auths)
+
+	opts := emptyResponseRequestOptions()
+	opts.SourceFormat = sdktranslator.FormatOpenAIResponse
+	opts.Metadata[cliproxyexecutor.RequestPathMetadataKey] = "/v1/responses"
+	result, errExecute := manager.ExecuteStream(
+		context.Background(),
+		[]string{provider},
+		cliproxyexecutor.Request{Model: model},
+		opts,
+	)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	if got := result.Headers.Get("X-Upstream-Auth"); got != "ba-good" {
+		t.Fatalf("upstream auth header = %q, want ba-good", got)
+	}
+	var response strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		response.Write(chunk.Payload)
+	}
+	if !strings.Contains(response.String(), "recovered") {
+		t.Fatalf("response = %q, want recovered output", response.String())
+	}
+	if strings.Contains(response.String(), "resp-capacity") || strings.Contains(strings.ToLower(response.String()), "capacity") {
+		t.Fatalf("failed bootstrap payload leaked downstream: %q", response.String())
+	}
+	if got, want := executor.StreamCalls(), []string{"aa-capacity", "ba-good"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("stream calls = %v, want %v", got, want)
 	}
 }

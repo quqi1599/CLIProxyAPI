@@ -204,7 +204,12 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 		if len(body) == 0 {
 			body = codexTerminalTopLevelErrorBody(eventData)
 		}
-	case "response.failed", "response.completed", "response.done":
+	case "response.failed":
+		body = codexTerminalErrorBody(eventData, "response.error")
+		if len(body) == 0 {
+			body = codexTerminalErrorBody(eventData, "error")
+		}
+	case "response.completed", "response.done":
 		body = codexTerminalErrorBody(eventData, "response.error")
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
@@ -222,7 +227,7 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 	if len(body) == 0 {
 		return statusErr{}, nil, false
 	}
-	if !codexTerminalStreamErrShouldHandle(body) {
+	if eventType != "error" && eventType != "response.failed" && !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
 	}
 	return newCodexStatusErr(http.StatusBadRequest, body), body, true
@@ -232,7 +237,7 @@ func codexTerminalStreamErrShouldHandle(body []byte) bool {
 	if codexTerminalErrorIsContextLength(body) {
 		return true
 	}
-	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) {
+	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) || isCodexTransientRateLimitError(body) {
 		return true
 	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
@@ -1979,7 +1984,7 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	originalBody := body
 	body = sanitizeCodexStatusErrorBody(body)
 	errCode := statusCode
-	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) {
+	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) || isCodexTransientRateLimitError(body) {
 		errCode = http.StatusTooManyRequests
 	}
 	if isCodexCloudflareTimeoutError(statusCode, body) {
@@ -2430,6 +2435,30 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		}
 	}
 	return false
+}
+
+func isCodexTransientRateLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	for _, candidate := range []string{
+		gjson.GetBytes(errorBody, "error.type").String(),
+		gjson.GetBytes(errorBody, "error.code").String(),
+		gjson.GetBytes(errorBody, "type").String(),
+		gjson.GetBytes(errorBody, "code").String(),
+	} {
+		switch strings.ToLower(strings.TrimSpace(candidate)) {
+		case "rate_limit", "rate_limit_error", "rate_limit_exceeded", "resource_exhausted":
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.message").String()))
+	if message == "" {
+		message = strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "message").String()))
+	}
+	return strings.Contains(message, "rate limit") ||
+		strings.Contains(message, "too many requests") ||
+		strings.Contains(message, "resource exhausted")
 }
 
 // isCodexUsageLimitError reports whether the error body represents a Codex

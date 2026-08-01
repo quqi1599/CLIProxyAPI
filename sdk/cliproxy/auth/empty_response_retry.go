@@ -319,14 +319,20 @@ func (t *deliverableOutputTracker) observeJSON(root gjson.Result, eventType stri
 	if eventType == "" {
 		eventType = root.Get("type").String()
 	}
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
 	if resultHasExplicitError(root.Get("error")) ||
 		resultHasExplicitError(root.Get("response.error")) ||
-		strings.EqualFold(strings.TrimSpace(eventType), "error") {
+		eventType == "error" {
 		t.sawError = true
 		t.sawTerminal = true
-		t.deliverable = true
+		if eventType != "error" && eventType != "response.failed" {
+			t.deliverable = true
+		}
 		if t.finishReason == "" {
-			t.finishReason = "error"
+			t.finishReason = strings.TrimPrefix(eventType, "response.")
+			if t.finishReason == "" {
+				t.finishReason = "error"
+			}
 		}
 		return
 	}
@@ -451,11 +457,16 @@ func (t *deliverableOutputTracker) observeResponsesJSON(root gjson.Result, event
 		}
 		t.observeResponsesOutput(root.Get("response.output"))
 		return
-	case "response.failed", "response.incomplete", "error":
+	case "response.failed", "error":
+		t.sawError = true
+		t.sawTerminal = true
+		t.finishReason = strings.TrimPrefix(eventType, "response.")
+		return
+	case "response.incomplete":
 		t.sawError = true
 		t.sawTerminal = true
 		t.deliverable = true
-		t.finishReason = strings.TrimPrefix(eventType, "response.")
+		t.finishReason = "incomplete"
 		return
 	case "response.output_text.delta", "response.output_text.done":
 		if resultHasVisibleText(root.Get("delta")) || resultHasVisibleText(root.Get("text")) {
