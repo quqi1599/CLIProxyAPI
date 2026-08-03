@@ -216,6 +216,46 @@ func TestNormalizeOpenAIThinkingHistoryKeepsPlainAssistantForOtherModels(t *test
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryQwenPreservesOnlyRealReasoning(t *testing.T) {
+	body := []byte(`{
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"assistant","content":"first answer","reasoning_content":"real reasoning"},
+			{"role":"assistant","content":"tool answer","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	models := []string{
+		"qwen3.8-max",
+		"qwen3.8-max-preview",
+		"qwen3.7-max",
+		"qwen3.7-plus",
+		"provider/qwen-plus-latest(high)",
+		"provider/qwen3.8-max(high)",
+		"provider/qwen3.8-max-preview(xhigh)",
+	}
+	for _, model := range models {
+		t.Run(model, func(t *testing.T) {
+			out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReport(body, "openai", model)
+			if err != nil {
+				t.Fatalf("normalizeThinkingHistoryForModelWithReport() error = %v", err)
+			}
+			if changed || downgraded || !bytes.Equal(out, body) {
+				t.Fatalf("Qwen history should remain unchanged: changed=%v downgraded=%v body=%s", changed, downgraded, string(out))
+			}
+			if report.PatchedCount != 0 || report.SyntheticBytes != 0 || report.PlaceholderCount != 0 || report.InputBytes != len(body) || report.OutputBytes != len(body) {
+				t.Fatalf("Qwen history report = %+v", report)
+			}
+			if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "real reasoning" {
+				t.Fatalf("real reasoning_content = %q, want preserved", got)
+			}
+			if gjson.GetBytes(out, "messages.1.reasoning_content").Exists() {
+				t.Fatalf("missing reasoning_content must not be synthesized: %s", string(out))
+			}
+		})
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryModelCapabilityBoundaries(t *testing.T) {
 	body := []byte(`{
 		"reasoning_effort":"high",

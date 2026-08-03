@@ -83,6 +83,9 @@ func normalizeThinkingHistoryWithReport(body []byte, provider string) ([]byte, b
 
 func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, model string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
 	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
+	if preservesOnlyRealReasoningHistory(model) {
+		return body, false, false, report, nil
+	}
 	requested := thinkingHistoryRequested(body, provider)
 	if !requested && requiresReturnedThinkingHistory(model) {
 		switch strings.ToLower(strings.TrimSpace(provider)) {
@@ -104,6 +107,10 @@ func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, mo
 	default:
 		return body, false, false, report, nil
 	}
+}
+
+func preservesOnlyRealReasoningHistory(model string) bool {
+	return strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "qwen")
 }
 
 func openAIHistoryNeedsThinkingNormalization(body []byte) bool {

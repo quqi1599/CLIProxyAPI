@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
@@ -41,7 +42,8 @@ func TestOpenAICompatPolicyFixturesMatchLegacyBehavior(t *testing.T) {
 		"testdata/compat/doubao_request_quirks.json",
 		"testdata/compat/kimi_model_quirks.json",
 		"testdata/compat/minimax_request_quirks.json",
-		"testdata/compat/qwen38_thinking.json",
+		"testdata/compat/qwen38_formal_thinking.json",
+		"testdata/compat/qwen38_preview_thinking.json",
 		"testdata/compat/xiaomi_request_quirks.json",
 	}
 	for _, fixturePath := range fixturePaths {
@@ -227,7 +229,8 @@ func TestOpenAICompatFirstPolicyScrubIsIdempotent(t *testing.T) {
 		"testdata/compat/doubao_request_quirks.json",
 		"testdata/compat/kimi_model_quirks.json",
 		"testdata/compat/minimax_request_quirks.json",
-		"testdata/compat/qwen38_thinking.json",
+		"testdata/compat/qwen38_formal_thinking.json",
+		"testdata/compat/qwen38_preview_thinking.json",
 		"testdata/compat/xiaomi_request_quirks.json",
 	} {
 		fixture := readOpenAICompatPolicyFixture(t, fixturePath)
@@ -278,7 +281,8 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		openAICompatDoubaoPolicyID,
 		openAICompatKimiPolicyID,
 		openAICompatMiniMaxPolicyID,
-		openAICompatQwen38PolicyID,
+		openAICompatQwen38FormalPolicyID,
+		openAICompatQwen38PreviewPolicyID,
 		openAICompatXiaomiPolicyID,
 		openAICompatPostConfigRevalidatePolicyID,
 	}
@@ -304,6 +308,16 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		}
 		if policy.ID == openAICompatXiaomiPolicyID && !slices.Contains(policy.DowngradeIDs, openAICompatXiaomiToolSchemaDowngrade) {
 			t.Fatalf("Xiaomi policy does not declare tool schema downgrade: %+v", policy.DowngradeIDs)
+		}
+		if policy.ID == openAICompatQwen38FormalPolicyID {
+			if policy.Match.ModelPattern != qwen38MaxFormalModel || strings.Contains(strings.ToLower(policy.Lifecycle.UpstreamEvidence), "thinking-only") || len(policy.DowngradeIDs) != 0 {
+				t.Fatalf("formal Qwen policy must remain hybrid-thinking only: %+v", policy)
+			}
+		}
+		if policy.ID == openAICompatQwen38PreviewPolicyID {
+			if policy.Match.ModelPattern != qwen38MaxPreviewModel || !strings.Contains(strings.ToLower(policy.Lifecycle.UpstreamEvidence), "thinking-only") || !slices.Contains(policy.DowngradeIDs, openAICompatQwen38PreviewDowngrade) {
+				t.Fatalf("preview Qwen policy must remain thinking-only: %+v", policy)
+			}
 		}
 		if policy.ID == openAICompatPostConfigRevalidatePolicyID {
 			if !slices.Contains(policy.MutatedFields, "body.metadata") || !slices.Contains(policy.DowngradeIDs, openAICompatKimiToolChoiceDowngrade) {
@@ -806,22 +820,24 @@ func TestOpenAICompatQwenPolicyMatchAndApplyUseCanonicalModel(t *testing.T) {
 		name         string
 		model        string
 		payloadModel string
-		wantMatch    bool
+		wantPolicyID string
 	}{
-		{name: "preview", model: "Qwen3.8-Max-Preview", payloadModel: "configured-preview-alias", wantMatch: true},
-		{name: "namespaced suffix", model: "provider/Qwen3.8-Max(high)", payloadModel: "configured-namespaced-alias", wantMatch: true},
-		{name: "payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Max-Preview", wantMatch: true},
-		{name: "earlier model", model: "qwen3.7-max", payloadModel: "qwen3.7-max", wantMatch: false},
-		{name: "suffix lookalike", model: "qwen3.8-max-extra", payloadModel: "qwen3.8-max-extra", wantMatch: false},
+		{name: "preview", model: "Qwen3.8-Max-Preview", payloadModel: "configured-preview-alias", wantPolicyID: openAICompatQwen38PreviewPolicyID},
+		{name: "formal namespaced suffix", model: "provider/Qwen3.8-Max(high)", payloadModel: "configured-namespaced-alias", wantPolicyID: openAICompatQwen38FormalPolicyID},
+		{name: "preview payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Max-Preview", wantPolicyID: openAICompatQwen38PreviewPolicyID},
+		{name: "formal payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Max", wantPolicyID: openAICompatQwen38FormalPolicyID},
+		{name: "preview wins conflicting aliases", model: "Qwen3.8-Max", payloadModel: "Qwen3.8-Max-Preview", wantPolicyID: openAICompatQwen38PreviewPolicyID},
+		{name: "earlier model", model: "qwen3.7-max", payloadModel: "qwen3.7-max"},
+		{name: "suffix lookalike", model: "qwen3.8-max-extra", payloadModel: "qwen3.8-max-extra"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			payload := []byte(`{"model":"` + test.payloadModel + `","messages":[{"role":"user","content":"hi"}],"enable_thinking":false,"reasoning_effort":"none"}`)
 			match := openAICompatPolicyMatchContext(profile, payload, test.model, compat.MatchContext{})
 			policies := openAICompatPolicyRegistry.PoliciesFor(match)
-			matched := len(policies) == 1 && policies[0].ID == openAICompatQwen38PolicyID
-			if matched != test.wantMatch {
-				t.Fatalf("PoliciesFor(%+v) IDs = %v, want match=%t", match, policyIDsForTest(policies), test.wantMatch)
+			matched := len(policies) == 1 && policies[0].ID == test.wantPolicyID
+			if matched != (test.wantPolicyID != "") {
+				t.Fatalf("PoliciesFor(%+v) IDs = %v, want policy=%q", match, policyIDsForTest(policies), test.wantPolicyID)
 			}
 
 			legacy := scrubOpenAICompatPayloadForModel(payload, profile, test.model, "https://example.test/v1")
@@ -834,16 +850,21 @@ func TestOpenAICompatQwenPolicyMatchAndApplyUseCanonicalModel(t *testing.T) {
 			report, ok := internalpayload.TransformReportFromContext(ctx)
 			providerStages := 0
 			for _, stage := range report.Stages {
-				if stage.Stage == "compat/"+string(compat.ProviderQuirkPatch) && slices.Contains(stage.AppliedPolicies, openAICompatQwen38PolicyID) {
+				if stage.Stage == "compat/"+string(compat.ProviderQuirkPatch) && slices.Contains(stage.AppliedPolicies, test.wantPolicyID) {
 					providerStages++
 				}
 			}
-			if !ok || (providerStages == 1) != test.wantMatch || len(report.Stages) != 2+providerStages {
-				t.Fatalf("Apply stages = %+v, ok=%v, provider stages=%d, want match=%t", report.Stages, ok, providerStages, test.wantMatch)
+			if !ok || (providerStages == 1) != (test.wantPolicyID != "") || len(report.Stages) != 2+providerStages {
+				t.Fatalf("Apply stages = %+v, ok=%v, provider stages=%d, want policy=%q", report.Stages, ok, providerStages, test.wantPolicyID)
 			}
-			if test.wantMatch {
+			switch test.wantPolicyID {
+			case openAICompatQwen38FormalPolicyID:
+				if gjson.GetBytes(actual, "enable_thinking").Bool() || gjson.GetBytes(actual, "reasoning_effort").Exists() {
+					t.Fatalf("formal Qwen disabled thinking was not preserved: %s", actual)
+				}
+			case openAICompatQwen38PreviewPolicyID:
 				if !gjson.GetBytes(actual, "enable_thinking").Bool() || gjson.GetBytes(actual, "reasoning_effort").String() != "low" {
-					t.Fatalf("matched Qwen payload was not normalized: %s", actual)
+					t.Fatalf("preview Qwen thinking-only payload was not normalized: %s", actual)
 				}
 			}
 		})

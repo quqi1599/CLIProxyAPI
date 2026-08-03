@@ -1,13 +1,13 @@
 {
-  "policy_id": "openai_compat.qwen38.thinking",
+  "policy_id": "openai_compat.qwen38.preview_thinking_only",
   "compat_kind": "qwen",
   "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "cases": [
     {
       "name": "disabled thinking becomes low",
-      "model": "qwen3.8-max",
+      "model": "qwen3.8-max-preview",
       "input": {
-        "model": "configured-qwen-alias",
+        "model": "configured-qwen-preview-alias",
         "messages": [
           {
             "role": "user",
@@ -27,7 +27,7 @@
         "temperature": 0.2
       },
       "expected": {
-        "model": "configured-qwen-alias",
+        "model": "configured-qwen-preview-alias",
         "messages": [
           {
             "role": "user",
@@ -39,31 +39,33 @@
         "temperature": 0.2
       },
       "downgrades": [
-        "openai_compat.qwen38.disabled_to_low"
+        "openai_compat.qwen38_preview.disabled_to_low"
       ]
     },
     {
-      "name": "xhigh effort wins over budget",
-      "model": "qwen3.8-max",
+      "name": "preview retains legacy medium mapping",
+      "model": "qwen3.8-max-preview",
       "input": {
-        "model": "configured-qwen-xhigh-alias",
-        "messages": [
-          {
-            "role": "user",
-            "content": "hi"
-          }
-        ],
+        "model": "configured-qwen-preview-medium-alias",
+        "reasoning_effort": "medium"
+      },
+      "expected": {
+        "model": "configured-qwen-preview-medium-alias",
+        "enable_thinking": true,
+        "reasoning_effort": "high"
+      },
+      "downgrades": []
+    },
+    {
+      "name": "xhigh effort wins over budget",
+      "model": "qwen3.8-max-preview",
+      "input": {
+        "model": "configured-qwen-preview-xhigh-alias",
         "reasoning_effort": "xhigh",
         "thinking_budget": 4096
       },
       "expected": {
-        "model": "configured-qwen-xhigh-alias",
-        "messages": [
-          {
-            "role": "user",
-            "content": "hi"
-          }
-        ],
+        "model": "configured-qwen-preview-xhigh-alias",
         "enable_thinking": true,
         "reasoning_effort": "xhigh"
       },
@@ -71,28 +73,16 @@
     },
     {
       "name": "positive nested budget becomes canonical",
-      "model": "qwen3.8-max",
+      "model": "qwen3.8-max-preview",
       "input": {
-        "model": "configured-qwen-budget-alias",
-        "messages": [
-          {
-            "role": "user",
-            "content": "hi"
-          }
-        ],
+        "model": "configured-qwen-preview-budget-alias",
         "thinking": {
           "type": "enabled",
           "budget_tokens": 4096
         }
       },
       "expected": {
-        "model": "configured-qwen-budget-alias",
-        "messages": [
-          {
-            "role": "user",
-            "content": "hi"
-          }
-        ],
+        "model": "configured-qwen-preview-budget-alias",
         "enable_thinking": true,
         "thinking_budget": 4096
       },

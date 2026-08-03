@@ -17,7 +17,8 @@ const (
 	openAICompatDoubaoPolicyID               = "openai_compat.doubao.request_quirks"
 	openAICompatKimiPolicyID                 = "openai_compat.kimi.model_quirks"
 	openAICompatMiniMaxPolicyID              = "openai_compat.minimax.request_quirks"
-	openAICompatQwen38PolicyID               = "openai_compat.qwen38.thinking"
+	openAICompatQwen38FormalPolicyID         = "openai_compat.qwen38.formal_hybrid_thinking"
+	openAICompatQwen38PreviewPolicyID        = "openai_compat.qwen38.preview_thinking_only"
 	openAICompatXiaomiPolicyID               = "openai_compat.xiaomi.request_quirks"
 	openAICompatPostConfigRevalidatePolicyID = "openai_compat.post_config_revalidate"
 	openAICompatPostConfigRevalidateStage    = "compat/" + string(compat.PostConfigRevalidate)
@@ -34,7 +35,7 @@ const (
 	openAICompatKimiToolChoiceDowngrade     = "openai_compat.kimi.tool_choice_normalized"
 	openAICompatKimiWebSearchDowngrade      = "openai_compat.kimi.web_search_disables_thinking"
 	openAICompatMiniMaxPenaltyDowngrade     = "openai_compat.minimax.penalties_removed"
-	openAICompatQwen38ThinkingDowngrade     = "openai_compat.qwen38.disabled_to_low"
+	openAICompatQwen38PreviewDowngrade      = "openai_compat.qwen38_preview.disabled_to_low"
 	openAICompatXiaomiReasoningDowngrade    = "openai_compat.xiaomi.reasoning_normalized"
 	openAICompatXiaomiTokenDowngrade        = "openai_compat.xiaomi.token_limits_normalized"
 	openAICompatXiaomiToolSchemaDowngrade   = "openai_compat.xiaomi.tool_schema_normalized"
@@ -46,7 +47,8 @@ var (
 		openAICompatDoubaoPolicy(),
 		openAICompatKimiPolicy(),
 		openAICompatMiniMaxPolicy(),
-		openAICompatQwen38Policy(),
+		openAICompatQwen38FormalPolicy(),
+		openAICompatQwen38PreviewPolicy(),
 		openAICompatXiaomiPolicy(),
 	)
 	openAICompatPolicyPipeline                                        = compat.NewPipeline(openAICompatPolicyRegistry)
@@ -119,10 +121,9 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 func openAICompatPolicyMatchContext(profile openAICompatProfile, payload []byte, model string, match compat.MatchContext) compat.MatchContext {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	matchModel := normalizedOpenAICompatPolicyModelName(model)
-	if compatKind == "qwen" && !isQwen38MaxThinkingModel(matchModel) {
-		if payloadModel := normalizedOpenAICompatPolicyModelName(gjson.GetBytes(payload, "model").String()); isQwen38MaxThinkingModel(payloadModel) {
-			matchModel = payloadModel
-		} else {
+	if compatKind == "qwen" {
+		matchModel = qwen38MaxPolicyModel(payload, model)
+		if matchModel == "" {
 			matchModel = "__no_qwen38_match__"
 		}
 	}
@@ -229,7 +230,7 @@ func openAICompatPostConfigRevalidatePolicy() compat.Policy {
 			openAICompatKimiToolChoiceDowngrade,
 			openAICompatKimiWebSearchDowngrade,
 			openAICompatMiniMaxPenaltyDowngrade,
-			openAICompatQwen38ThinkingDowngrade,
+			openAICompatQwen38PreviewDowngrade,
 			openAICompatXiaomiReasoningDowngrade,
 			openAICompatXiaomiTokenDowngrade,
 			openAICompatXiaomiToolSchemaDowngrade,
@@ -262,7 +263,7 @@ func openAICompatPostConfigDowngrades(ctx context.Context, input, output []byte,
 	case "minimax":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatMiniMaxPolicyDowngrades(input, output))
 	case "qwen":
-		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatQwen38PolicyDowngrades(ctx, input, output))
+		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatQwen38PreviewPolicyDowngrades(ctx, input, output))
 	case "xiaomi":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatXiaomiPolicyDowngrades(input, output))
 	}
@@ -460,14 +461,14 @@ func openAICompatMiniMaxPolicy() compat.Policy {
 	}
 }
 
-func openAICompatQwen38Policy() compat.Policy {
+func openAICompatQwen38FormalPolicy() compat.Policy {
 	return compat.Policy{
-		ID:    openAICompatQwen38PolicyID,
+		ID:    openAICompatQwen38FormalPolicyID,
 		Owner: "runtime/executor",
 		Match: compat.MatchSpec{
 			ProviderFamily: "openai-compatibility",
 			CompatKind:     "qwen",
-			ModelPattern:   "qwen3.8-max*",
+			ModelPattern:   qwen38MaxFormalModel,
 		},
 		Phase:    compat.ProviderQuirkPatch,
 		Priority: 100,
@@ -477,11 +478,11 @@ func openAICompatQwen38Policy() compat.Policy {
 			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
 			MayCopyLargeFields: true,
 		},
-		RemovalCondition: "Remove when Qwen 3.8 Max supports canonical optional thinking controls.",
+		RemovalCondition: "Remove when Qwen 3.8 Max accepts canonical OpenAI hybrid-thinking controls without normalization.",
 		Lifecycle: compat.LifecycleMetadata{
-			IntroducedVersion: "git:d4254b33",
-			Fixture:           "internal/runtime/executor/testdata/compat/qwen38_thinking.json",
-			UpstreamEvidence:  "Qwen 3.8 Max requires thinking mode and one canonical effort or budget control.",
+			IntroducedVersion: "release:2026-08-03",
+			Fixture:           "internal/runtime/executor/testdata/compat/qwen38_formal_thinking.json",
+			UpstreamEvidence:  "The released Qwen 3.8 Max is a hybrid-thinking model: none or enable_thinking=false disables thinking, while low, medium, and xhigh are canonical efforts.",
 			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
 			ReviewDate:        "2026-10-22",
 		},
@@ -492,8 +493,44 @@ func openAICompatQwen38Policy() compat.Policy {
 			"body.thinking",
 			"body.thinking_budget",
 		},
-		DowngradeIDs: []string{openAICompatQwen38ThinkingDowngrade},
-		Apply:        applyOpenAICompatQwen38Policy,
+		Apply: applyOpenAICompatQwen38FormalPolicy,
+	}
+}
+
+func openAICompatQwen38PreviewPolicy() compat.Policy {
+	return compat.Policy{
+		ID:    openAICompatQwen38PreviewPolicyID,
+		Owner: "runtime/executor",
+		Match: compat.MatchSpec{
+			ProviderFamily: "openai-compatibility",
+			CompatKind:     "qwen",
+			ModelPattern:   qwen38MaxPreviewModel,
+		},
+		Phase:    compat.ProviderQuirkPatch,
+		Priority: 100,
+		Cost: compat.CostContract{
+			Complexity:         "O(bytes)",
+			MaxExpansionBytes:  internalpayload.DefaultMaxExpansionBytes,
+			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
+			MayCopyLargeFields: true,
+		},
+		RemovalCondition: "Remove when Qwen 3.8 Max Preview accepts disabled thinking instead of requiring thinking-only requests.",
+		Lifecycle: compat.LifecycleMetadata{
+			IntroducedVersion: "git:d4254b33",
+			Fixture:           "internal/runtime/executor/testdata/compat/qwen38_preview_thinking.json",
+			UpstreamEvidence:  "Qwen 3.8 Max Preview is thinking-only and rejects enable_thinking=false; disabled intent must fall back to low effort.",
+			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
+			ReviewDate:        "2026-10-22",
+		},
+		MutatedFields: []string{
+			"body.enable_thinking",
+			"body.reasoning",
+			"body.reasoning_effort",
+			"body.thinking",
+			"body.thinking_budget",
+		},
+		DowngradeIDs: []string{openAICompatQwen38PreviewDowngrade},
+		Apply:        applyOpenAICompatQwen38PreviewPolicy,
 	}
 }
 
@@ -590,11 +627,15 @@ func applyOpenAICompatMiniMaxPolicy(ctx context.Context, input []byte) (compat.T
 	}, nil
 }
 
-func applyOpenAICompatQwen38Policy(ctx context.Context, input []byte) (compat.TransformResult, error) {
-	output := normalizeQwen38MaxThinking(input, openAICompatPolicyModel(ctx, input))
+func applyOpenAICompatQwen38FormalPolicy(_ context.Context, input []byte) (compat.TransformResult, error) {
+	return compat.TransformResult{Payload: normalizeQwen38FormalThinking(input)}, nil
+}
+
+func applyOpenAICompatQwen38PreviewPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
+	output := normalizeQwen38PreviewThinking(input)
 	return compat.TransformResult{
 		Payload:    output,
-		Downgrades: openAICompatQwen38PolicyDowngrades(ctx, input, output),
+		Downgrades: openAICompatQwen38PreviewPolicyDowngrades(ctx, input, output),
 	}, nil
 }
 
@@ -741,15 +782,15 @@ func openAICompatMiniMaxPolicyDowngrades(input, output []byte) []string {
 	return nil
 }
 
-func openAICompatQwen38PolicyDowngrades(ctx context.Context, input, output []byte) []string {
-	if !requiresQwen38MaxThinking(input, openAICompatPolicyModel(ctx, input)) {
+func openAICompatQwen38PreviewPolicyDowngrades(ctx context.Context, input, output []byte) []string {
+	if qwen38MaxPolicyModel(input, openAICompatPolicyModel(ctx, input)) != qwen38MaxPreviewModel {
 		return nil
 	}
-	_, _, disabledEffort := qwen38MaxReasoningEffort(input)
+	_, _, disabledEffort := qwen38PreviewReasoningEffort(input)
 	budget, hasBudget := firstOpenAICompatIntegerValue(input, "thinking_budget", "thinking.budget_tokens")
 	disabled := disabledEffort || qwen38MaxThinkingDisabled(input) || hasBudget && budget <= 0
 	if disabled && gjson.GetBytes(output, "enable_thinking").Bool() && gjson.GetBytes(output, "reasoning_effort").String() == "low" {
-		return []string{openAICompatQwen38ThinkingDowngrade}
+		return []string{openAICompatQwen38PreviewDowngrade}
 	}
 	return nil
 }

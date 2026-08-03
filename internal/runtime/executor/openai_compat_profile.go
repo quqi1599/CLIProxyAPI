@@ -1758,12 +1758,42 @@ func normalizeMiniMaxM3Thinking(payload []byte, model string) []byte {
 	return payload
 }
 
+const (
+	qwen38MaxFormalModel  = "qwen3.8-max"
+	qwen38MaxPreviewModel = "qwen3.8-max-preview"
+)
+
 func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) || !requiresQwen38MaxThinking(payload, model) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
+	switch qwen38MaxPolicyModel(payload, model) {
+	case qwen38MaxFormalModel:
+		return normalizeQwen38FormalThinking(payload)
+	case qwen38MaxPreviewModel:
+		return normalizeQwen38PreviewThinking(payload)
+	default:
+		return payload
+	}
+}
 
-	effort, hasEffort, disabledEffort := qwen38MaxReasoningEffort(payload)
+func normalizeQwen38FormalThinking(payload []byte) []byte {
+	effort, hasEffort, disabledEffort := qwen38FormalReasoningEffort(payload)
+	budget, hasBudget := firstOpenAICompatIntegerValue(payload, "thinking_budget", "thinking.budget_tokens")
+	disabled := disabledEffort || qwen38MaxThinkingDisabled(payload) || (hasBudget && budget <= 0)
+	if disabled {
+		return mutateOpenAICompatJSON(payload, []string{
+			"reasoning",
+			"reasoning_effort",
+			"thinking",
+			"thinking_budget",
+		}, map[string]any{"enable_thinking": false})
+	}
+	return normalizeQwen38EnabledThinking(payload, effort, hasEffort, budget, hasBudget)
+}
+
+func normalizeQwen38PreviewThinking(payload []byte) []byte {
+	effort, hasEffort, disabledEffort := qwen38PreviewReasoningEffort(payload)
 	budget, hasBudget := firstOpenAICompatIntegerValue(payload, "thinking_budget", "thinking.budget_tokens")
 	disabled := disabledEffort || qwen38MaxThinkingDisabled(payload) || (hasBudget && budget <= 0)
 	if disabled {
@@ -1771,7 +1801,10 @@ func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
 		hasEffort = true
 		hasBudget = false
 	}
+	return normalizeQwen38EnabledThinking(payload, effort, hasEffort, budget, hasBudget)
+}
 
+func normalizeQwen38EnabledThinking(payload []byte, effort string, hasEffort bool, budget int64, hasBudget bool) []byte {
 	deletePaths := []string{"reasoning", "thinking"}
 	sets := map[string]any{"enable_thinking": true}
 	if hasEffort && effort != "" {
@@ -1788,16 +1821,49 @@ func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
 	return mutateOpenAICompatJSON(payload, deletePaths, sets)
 }
 
-func requiresQwen38MaxThinking(payload []byte, model string) bool {
-	return isQwen38MaxThinkingModel(model) || isQwen38MaxThinkingModel(gjson.GetBytes(payload, "model").String())
+func qwen38MaxPolicyModel(payload []byte, model string) string {
+	modelName := normalizedOpenAICompatPolicyModelName(model)
+	payloadModel := normalizedOpenAICompatPolicyModelName(gjson.GetBytes(payload, "model").String())
+	if modelName == qwen38MaxPreviewModel || payloadModel == qwen38MaxPreviewModel {
+		return qwen38MaxPreviewModel
+	}
+	if modelName == qwen38MaxFormalModel || payloadModel == qwen38MaxFormalModel {
+		return qwen38MaxFormalModel
+	}
+	return ""
 }
 
 func isQwen38MaxThinkingModel(model string) bool {
 	model = normalizedOpenAICompatPolicyModelName(model)
-	return model == "qwen3.8-max" || model == "qwen3.8-max-preview"
+	return model == qwen38MaxFormalModel || model == qwen38MaxPreviewModel
 }
 
-func qwen38MaxReasoningEffort(payload []byte) (effort string, exists bool, disabled bool) {
+func qwen38FormalReasoningEffort(payload []byte) (effort string, exists bool, disabled bool) {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		exists = true
+		switch strings.ToLower(strings.TrimSpace(value.String())) {
+		case "none", "off", "disabled", "disable", "false":
+			return "", true, true
+		case "minimal", "low":
+			return "low", true, false
+		case "medium":
+			return "medium", true, false
+		case "high", "xhigh", "max":
+			return "xhigh", true, false
+		case "", "default", "auto", "adaptive", "enabled", "enable", "true":
+			return "", true, false
+		default:
+			return "", true, false
+		}
+	}
+	return "", false, false
+}
+
+func qwen38PreviewReasoningEffort(payload []byte) (effort string, exists bool, disabled bool) {
 	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
 		value := gjson.GetBytes(payload, path)
 		if !value.Exists() || value.Type != gjson.String {
