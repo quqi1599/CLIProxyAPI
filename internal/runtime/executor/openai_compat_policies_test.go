@@ -142,6 +142,118 @@ func TestOpenAICompatPostConfigSkipsPreCanonicalization(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatDeepSeekChatAliasesRespectEndpointAndCanonicalFields(t *testing.T) {
+	profile := openAICompatProfileForKind("deepseek")
+	tests := []struct {
+		name                    string
+		endpoint                compat.EndpointKind
+		input                   []byte
+		wantThinkingType        string
+		wantMaxTokens           int64
+		wantEnableThinking      bool
+		wantMaxCompletionTokens bool
+		wantChatAliasDowngrade  bool
+	}{
+		{
+			name:                   "chat aliases become official fields",
+			endpoint:               "chat",
+			input:                  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"enable_thinking":false,"max_completion_tokens":4096}`),
+			wantThinkingType:       "disabled",
+			wantMaxTokens:          4096,
+			wantChatAliasDowngrade: true,
+		},
+		{
+			name:                   "canonical chat fields win",
+			endpoint:               "chat",
+			input:                  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"},"enable_thinking":false,"max_tokens":2048,"max_completion_tokens":4096}`),
+			wantThinkingType:       "enabled",
+			wantMaxTokens:          2048,
+			wantChatAliasDowngrade: true,
+		},
+		{
+			name:                    "responses leaves chat aliases untouched",
+			endpoint:                "responses",
+			input:                   []byte(`{"model":"deepseek-v4-flash","input":"hi","enable_thinking":false,"max_completion_tokens":4096}`),
+			wantEnableThinking:      true,
+			wantMaxCompletionTokens: true,
+		},
+		{
+			name:                    "invalid aliases are not guessed",
+			endpoint:                "chat",
+			input:                   []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"enable_thinking":1.5,"max_completion_tokens":3.5}`),
+			wantEnableThinking:      true,
+			wantMaxCompletionTokens: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := internalpayload.WithTransformReport(context.Background(), int64(len(test.input)))
+			actual, err := scrubOpenAICompatPayloadForModelWithPolicies(
+				ctx,
+				test.input,
+				profile,
+				gjson.GetBytes(test.input, "model").String(),
+				"https://api.deepseek.com/v1",
+				compat.MatchContext{Endpoint: test.endpoint, Mode: "non-stream", SourceFormat: "openai", TargetFormat: "openai"},
+			)
+			if err != nil {
+				t.Fatalf("scrubOpenAICompatPayloadForModelWithPolicies() error = %v", err)
+			}
+			if got := gjson.GetBytes(actual, "thinking.type").String(); got != test.wantThinkingType {
+				t.Fatalf("thinking.type = %q, want %q; body=%s", got, test.wantThinkingType, actual)
+			}
+			if got := gjson.GetBytes(actual, "max_tokens").Int(); got != test.wantMaxTokens {
+				t.Fatalf("max_tokens = %d, want %d; body=%s", got, test.wantMaxTokens, actual)
+			}
+			if got := gjson.GetBytes(actual, "enable_thinking").Exists(); got != test.wantEnableThinking {
+				t.Fatalf("enable_thinking exists = %v, want %v; body=%s", got, test.wantEnableThinking, actual)
+			}
+			if got := gjson.GetBytes(actual, "max_completion_tokens").Exists(); got != test.wantMaxCompletionTokens {
+				t.Fatalf("max_completion_tokens exists = %v, want %v; body=%s", got, test.wantMaxCompletionTokens, actual)
+			}
+
+			report, ok := internalpayload.TransformReportFromContext(ctx)
+			if !ok || len(report.Stages) != 3 {
+				t.Fatalf("transform report = %+v, ok=%v", report, ok)
+			}
+			gotDowngrade := slices.Contains(report.Stages[1].Downgrades, openAICompatDeepSeekChatAliasDowngrade)
+			if gotDowngrade != test.wantChatAliasDowngrade {
+				t.Fatalf("chat alias downgrade = %v, want %v; report=%+v", gotDowngrade, test.wantChatAliasDowngrade, report)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatPostConfigRevalidatesDeepSeekChatAliases(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"enable_thinking":true,"max_completion_tokens":"8192"}`)
+	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(input)))
+	actual, err := revalidateOpenAICompatPayloadAfterConfig(
+		ctx,
+		input,
+		openAICompatProfileForKind("deepseek"),
+		"deepseek-v4-pro",
+		"https://api.deepseek.com/v1",
+		compat.MatchContext{Endpoint: "chat", Mode: "non-stream", SourceFormat: "openai", TargetFormat: "openai"},
+	)
+	if err != nil {
+		t.Fatalf("revalidateOpenAICompatPayloadAfterConfig() error = %v", err)
+	}
+	if got := gjson.GetBytes(actual, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled; body=%s", got, actual)
+	}
+	if got := gjson.GetBytes(actual, "max_tokens").Int(); got != 8192 {
+		t.Fatalf("max_tokens = %d, want 8192; body=%s", got, actual)
+	}
+	if gjson.GetBytes(actual, "enable_thinking").Exists() || gjson.GetBytes(actual, "max_completion_tokens").Exists() {
+		t.Fatalf("post-config aliases were retained: %s", actual)
+	}
+	report, ok := internalpayload.TransformReportFromContext(ctx)
+	if !ok || len(report.Stages) != 1 || !slices.Contains(report.Stages[0].Downgrades, openAICompatDeepSeekChatAliasDowngrade) {
+		t.Fatalf("post-config transform report = %+v, ok=%v", report, ok)
+	}
+}
+
 func TestOpenAICompatXiaomiArgumentRepairDoesNotReportSchemaDowngrade(t *testing.T) {
 	input := []byte(`{"model":"mimo-v2.5","temperature":1.0,"messages":[{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{bad"}}]}],"tools":[{"function":{"parameters":{"properties":{},"type":"object"},"name":"lookup"},"type":"function"}]}`)
 	output := scrubXiaomiPayloadForModel(input, "mimo-v2.5")

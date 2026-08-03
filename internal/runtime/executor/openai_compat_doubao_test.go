@@ -325,7 +325,7 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
 			"tool_choice":{"type":"auto"},
 			"parallel_tool_calls":false,
-			"response_format":{"type":"json_schema"},
+			"response_format":{"type":"json_object"},
 			"thinking":{"type":"enabled"},
 			"reasoning_effort":"max"
 		}`),
@@ -406,8 +406,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if !logFieldContains(entry.Data["removed_fields"], "tool_choice") {
 		t.Fatalf("removed_fields should contain tool_choice, got %#v", entry.Data["removed_fields"])
 	}
-	if got := entry.Data["response_format_type"]; got != "json_schema" {
-		t.Fatalf("response_format_type = %#v, want json_schema", got)
+	if got := entry.Data["response_format_type"]; got != "json_object" {
+		t.Fatalf("response_format_type = %#v, want json_object", got)
 	}
 	if got := entry.Data["parallel_tool_calls"]; got != "false" {
 		t.Fatalf("parallel_tool_calls = %#v, want false", got)
@@ -450,8 +450,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := failureEntry.Data["thinking_type"]; got != "enabled" {
 		t.Fatalf("failure thinking_type = %#v, want enabled", got)
 	}
-	if got := failureEntry.Data["response_format_type"]; got != "json_schema" {
-		t.Fatalf("failure response_format_type = %#v, want json_schema", got)
+	if got := failureEntry.Data["response_format_type"]; got != "json_object" {
+		t.Fatalf("failure response_format_type = %#v, want json_object", got)
 	}
 	if got := failureEntry.Data["parallel_tool_calls"]; got != "false" {
 		t.Fatalf("failure parallel_tool_calls = %#v, want false", got)

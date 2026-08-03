@@ -294,6 +294,9 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 	if compatKind == "doubao" {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoEffort, doubaoThinkingDisabled)
 	}
+	if compatKind == "deepseek" && endpoint == "chat" {
+		payload = normalizeDeepSeekChatAliases(payload)
+	}
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
 	if endpoint != "responses" {
@@ -1991,6 +1994,84 @@ func scrubDeepSeekThinkingBudgetForCompat(payload []byte, model string, baseURL 
 	}
 
 	return payload
+}
+
+func normalizeDeepSeekChatAliases(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	deletePaths := make([]string, 0, 2)
+	sets := make(map[string]any, 2)
+	enableThinking := gjson.GetBytes(payload, "enable_thinking")
+	if enableThinking.Exists() {
+		if gjson.GetBytes(payload, "thinking.type").Exists() {
+			deletePaths = append(deletePaths, "enable_thinking")
+		} else if enabled, ok := deepSeekEnableThinkingAliasValue(enableThinking); ok {
+			thinkingType := "disabled"
+			if enabled {
+				thinkingType = "enabled"
+			}
+			sets["thinking.type"] = thinkingType
+			deletePaths = append(deletePaths, "enable_thinking")
+		}
+	}
+
+	maxCompletionTokens := gjson.GetBytes(payload, "max_completion_tokens")
+	if maxCompletionTokens.Exists() {
+		if gjson.GetBytes(payload, "max_tokens").Exists() {
+			deletePaths = append(deletePaths, "max_completion_tokens")
+		} else if maxCompletionTokens.Type == gjson.Null {
+			sets["max_tokens"] = nil
+			deletePaths = append(deletePaths, "max_completion_tokens")
+		} else if tokens, ok := deepSeekMaxCompletionTokensAliasValue(maxCompletionTokens); ok {
+			sets["max_tokens"] = tokens
+			deletePaths = append(deletePaths, "max_completion_tokens")
+		}
+	}
+
+	return mutateOpenAICompatJSON(payload, deletePaths, sets)
+}
+
+func deepSeekEnableThinkingAliasValue(value gjson.Result) (bool, bool) {
+	switch value.Type {
+	case gjson.True:
+		return true, true
+	case gjson.False:
+		return false, true
+	case gjson.Number:
+		switch strings.TrimSpace(value.Raw) {
+		case "0":
+			return false, true
+		case "1":
+			return true, true
+		}
+	case gjson.String:
+		switch strings.ToLower(strings.TrimSpace(value.String())) {
+		case "enabled", "enable", "on", "true", "1":
+			return true, true
+		case "disabled", "disable", "off", "false", "0":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func deepSeekMaxCompletionTokensAliasValue(value gjson.Result) (int64, bool) {
+	var raw string
+	switch value.Type {
+	case gjson.Number:
+		raw = value.Raw
+	case gjson.String:
+		raw = value.String()
+	default:
+		return 0, false
+	}
+	tokens, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return tokens, true
 }
 
 func deepSeekReasoningEffortPath(payload []byte) (string, string) {

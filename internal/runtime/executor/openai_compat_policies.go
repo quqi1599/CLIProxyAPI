@@ -28,6 +28,7 @@ const (
 	openAICompatProviderPostQuirkPolicy      = "openai_compat.provider_post_quirk_scrub"
 
 	openAICompatDeepSeekThinkingDowngrade   = "openai_compat.deepseek.thinking_controls_normalized"
+	openAICompatDeepSeekChatAliasDowngrade  = "openai_compat.deepseek.chat_aliases_normalized"
 	openAICompatDeepSeekToolChoiceDowngrade = "openai_compat.deepseek.tool_choice_removed"
 	openAICompatDeepSeekStrictDowngrade     = "openai_compat.deepseek.strict_schema_removed"
 	openAICompatDoubaoFieldsDowngrade       = "openai_compat.doubao.unsupported_fields_removed"
@@ -223,6 +224,7 @@ func openAICompatPostConfigRevalidatePolicy() compat.Policy {
 			openAICompatReasoningRemovedDowngrade,
 			openAICompatStreamUsageRemovedDowngrade,
 			openAICompatDeepSeekThinkingDowngrade,
+			openAICompatDeepSeekChatAliasDowngrade,
 			openAICompatDeepSeekToolChoiceDowngrade,
 			openAICompatDeepSeekStrictDowngrade,
 			openAICompatDoubaoFieldsDowngrade,
@@ -308,11 +310,14 @@ func openAICompatDeepSeekPolicy() compat.Policy {
 		Lifecycle: compat.LifecycleMetadata{
 			IntroducedVersion: "git:2e769c78",
 			Fixture:           "internal/runtime/executor/testdata/compat/deepseek_request_quirks.json",
-			UpstreamEvidence:  "DeepSeek requires bounded thinking controls and endpoint-specific strict tool schemas.",
+			UpstreamEvidence:  "DeepSeek Chat uses thinking.type, max_tokens, bounded thinking controls, and endpoint-specific strict tool schemas.",
 			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
 			ReviewDate:        "2026-10-22",
 		},
 		MutatedFields: []string{
+			"body.enable_thinking",
+			"body.max_completion_tokens",
+			"body.max_tokens",
 			"body.messages",
 			"body.reasoning",
 			"body.reasoning_effort",
@@ -323,6 +328,7 @@ func openAICompatDeepSeekPolicy() compat.Policy {
 		},
 		DowngradeIDs: []string{
 			openAICompatDeepSeekThinkingDowngrade,
+			openAICompatDeepSeekChatAliasDowngrade,
 			openAICompatDeepSeekToolChoiceDowngrade,
 			openAICompatDeepSeekStrictDowngrade,
 		},
@@ -582,7 +588,11 @@ func openAICompatXiaomiPolicy() compat.Policy {
 
 func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
 	state := openAICompatPolicyState(ctx, input)
-	output := scrubDeepSeekThinkingBudgetForCompat(input, state.model, state.baseURL, "deepseek")
+	output := input
+	if state.endpoint == "chat" {
+		output = normalizeDeepSeekChatAliases(output)
+	}
+	output = scrubDeepSeekThinkingBudgetForCompat(output, state.model, state.baseURL, "deepseek")
 	if state.endpoint == "responses" {
 		return compat.TransformResult{
 			Payload:    output,
@@ -661,7 +671,7 @@ func openAICompatPolicyModel(ctx context.Context, payload []byte) string {
 }
 
 func openAICompatDeepSeekPolicyDowngrades(input, output []byte) []string {
-	downgrades := make([]string, 0, 3)
+	downgrades := make([]string, 0, 4)
 	for _, path := range []string{
 		"reasoning",
 		"reasoning_effort",
@@ -670,6 +680,12 @@ func openAICompatDeepSeekPolicyDowngrades(input, output []byte) []string {
 	} {
 		if gjson.GetBytes(input, path).Raw != gjson.GetBytes(output, path).Raw {
 			downgrades = append(downgrades, openAICompatDeepSeekThinkingDowngrade)
+			break
+		}
+	}
+	for _, path := range []string{"enable_thinking", "max_completion_tokens", "max_tokens"} {
+		if openAICompatJSONValueChanged(input, output, path) {
+			downgrades = append(downgrades, openAICompatDeepSeekChatAliasDowngrade)
 			break
 		}
 	}

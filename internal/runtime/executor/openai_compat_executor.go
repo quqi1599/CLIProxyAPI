@@ -356,6 +356,41 @@ func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOut
 	return largeOpenAICompatToolHistoryPayloadBytes, largeOpenAICompatToolOutputMessages
 }
 
+func rejectDeepSeekUnsupportedChatResponseFormat(ctx context.Context, sourceBody, body []byte, profile openAICompatProfile, model, endpoint, path string) error {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" || endpoint != "/chat/completions" {
+		return nil
+	}
+	responseFormatType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "response_format.type").String()))
+	if responseFormatType == "" {
+		responseFormatType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(sourceBody, "response_format.type").String()))
+	}
+	if responseFormatType == "" {
+		responseFormatType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(sourceBody, "text.format.type").String()))
+	}
+	if responseFormatType != "json_schema" {
+		return nil
+	}
+	fields := log.Fields{
+		"event":                "openai_compat_response_format_guard",
+		"model":                model,
+		"compat_kind":          "deepseek",
+		"request_path":         path,
+		"upstream_endpoint":    endpoint,
+		"payload_bytes":        len(body),
+		"response_format_type": responseFormatType,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek Chat rejected unsupported response format before upstream request")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       deepSeekChatJSONSchemaUserMessage(),
+	}
+}
+
+func deepSeekChatJSONSchemaUserMessage() string {
+	return "request_feature_unsupported: deepseek_chat_json_schema. DeepSeek 官方 Chat Completions 仅支持 response_format.type=text 或 json_object，不支持 json_schema。如果必须保证 JSON Schema，请改用 deepseek-v4-flash 的 /v1/responses；否则请将 Chat 请求改为 response_format={\"type\":\"json_object\"}，并在提示词中明确要求输出 JSON。CPA 不会静默降级 json_schema。"
+}
+
 func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return nil
@@ -576,6 +611,7 @@ type openAICompatRequestPlan struct {
 	responseFormat   sdktranslator.Format
 	endpoint         string
 	requestPath      string
+	requestSource    []byte
 	body             []byte
 	logBody          []byte
 	diagnosticSource []byte
@@ -635,6 +671,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		originalPayloadSource = downgradeClaudeToolSearchForCompat(baseURL, originalPayloadSource)
 		payloadSource = downgradeClaudeToolSearchForCompat(baseURL, payloadSource)
 	}
+	plan.requestSource = payloadSource
 
 	translationStream := opts.Stream || stream
 	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.openai_compat", from, plan.upstreamFormat, baseModel, originalPayloadSource, payloadSource, translationStream, internalpayload.AmplificationOverride{})
@@ -770,6 +807,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.failureCtx = cliproxyusage.WithFailureDiagnostic(ctx, diagnostic.failureDiagnostic())
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
+	if err = rejectDeepSeekUnsupportedChatResponseFormat(ctx, plan.requestSource, body, profile, baseModel, plan.endpoint, plan.requestPath); err != nil {
+		return plan, err
+	}
 	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
 		return plan, err
 	}

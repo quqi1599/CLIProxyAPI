@@ -83,6 +83,114 @@ func TestOpenAICompatExecutorDeepSeekOfficialAllowsMaxReasoningEffort(t *testing
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekChatNormalizesOpenAIAliases(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":    server.URL + "/v1",
+			"api_key":     "test",
+			"compat_kind": "deepseek",
+		},
+	}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[{"role":"user","content":"return json"}],
+			"enable_thinking":false,
+			"max_completion_tokens":4096,
+			"response_format":{"type":"json_object"}
+		}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "max_tokens").Int(); got != 4096 {
+		t.Fatalf("max_tokens = %d, want 4096; body=%s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "enable_thinking").Exists() || gjson.GetBytes(gotBody, "max_completion_tokens").Exists() {
+		t.Fatalf("unsupported Chat aliases reached upstream: %s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "response_format.type").String(); got != "json_object" {
+		t.Fatalf("response_format.type = %q, want json_object; body=%s", got, gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekChatRejectsJSONSchemaBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name         string
+		sourceFormat string
+		payload      []byte
+	}{
+		{
+			name:         "chat response format",
+			sourceFormat: "openai",
+			payload:      []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"result","schema":{"type":"object"}}}}`),
+		},
+		{
+			name:         "pro responses chat fallback",
+			sourceFormat: "openai-response",
+			payload:      []byte(`{"model":"deepseek-v4-pro","input":[{"role":"user","content":"hi"}],"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}}}`),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider: "openai-compatibility",
+				Attributes: map[string]string{
+					"base_url":    server.URL + "/v1",
+					"api_key":     "test",
+					"compat_kind": "deepseek",
+				},
+			}
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "deepseek-v4-pro",
+				Payload: test.payload,
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(test.sourceFormat)})
+			if err == nil {
+				t.Fatal("expected request_feature_unsupported error")
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+			}
+			status, ok := err.(interface {
+				StatusCode() int
+				ErrorCode() string
+			})
+			if !ok {
+				t.Fatalf("error type %T does not expose status/error code", err)
+			}
+			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
+				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
+			}
+			if !strings.Contains(err.Error(), "deepseek_chat_json_schema") || !strings.Contains(err.Error(), "CPA 不会静默降级 json_schema") {
+				t.Fatalf("error = %q, want stable marker and explicit no-downgrade guidance", err.Error())
+			}
+		})
+	}
+}
+
 func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 	registerThinkingModelForProvider(t, "deepseek-flash-responses", "deepseek", "deepseek-v4-flash", []string{"low", "high", "max"})
 
