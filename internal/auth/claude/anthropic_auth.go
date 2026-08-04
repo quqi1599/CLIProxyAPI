@@ -27,9 +27,11 @@ const (
 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI = "http://localhost:54545/callback"
 
-	claudeRefreshMinBackoff = 5 * time.Second
-	claudeRefreshMaxBackoff = 5 * time.Minute
-	maxClaudeTokenResponse  = 1 << 20
+	claudeRefreshMinBackoff    = 5 * time.Second
+	claudeRefreshMaxBackoff    = 5 * time.Minute
+	claudeRefreshTimeout       = 30 * time.Second
+	claudeAuthHandshakeTimeout = 10 * time.Second
+	maxClaudeTokenResponse     = 1 << 20
 )
 
 var (
@@ -323,6 +325,9 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if blockedUntil := claudeRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
 		return nil, &refreshHTTPError{
 			status:    http.StatusTooManyRequests,
@@ -332,7 +337,9 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	}
 
 	result, err, _ := claudeRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), claudeRefreshTimeout)
+		defer cancelRefresh()
+		return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
 	})
 	if err != nil {
 		return nil, err

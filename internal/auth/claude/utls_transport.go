@@ -3,8 +3,10 @@
 package claude
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/transport/http2pool"
@@ -19,8 +21,9 @@ import (
 // to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
 type utlsRoundTripper struct {
 	// dialer is used to create network connections, supporting proxies
-	dialer proxy.Dialer
-	pool   *http2pool.Pool
+	dialer           proxy.Dialer
+	handshakeTimeout time.Duration
+	pool             *http2pool.Pool
 }
 
 // newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
@@ -35,7 +38,9 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		}
 	}
 
-	rt := &utlsRoundTripper{dialer: dialer}
+	// This transport is only used for Anthropic credential acquisition, so every
+	// new TLS connection can safely use a bounded handshake deadline.
+	rt := &utlsRoundTripper{dialer: dialer, handshakeTimeout: claudeAuthHandshakeTimeout}
 	rt.pool = http2pool.New(http2pool.DefaultMaxConnsPerHost, rt.createConnection)
 	return rt
 }
@@ -44,24 +49,37 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 // Chrome's TLS fingerprint is closer to Node.js/OpenSSL (which real Claude Code uses)
 // than Firefox, reducing the mismatch between TLS layer and HTTP headers.
 func (t *utlsRoundTripper) createConnection(host, addr string) (http2pool.ClientConn, error) {
-	conn, err := t.dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
+	conn, errDial := t.dialer.Dial("tcp", addr)
+	if errDial != nil {
+		return nil, errDial
+	}
+
+	if t.handshakeTimeout > 0 {
+		if errSetDeadline := conn.SetDeadline(time.Now().Add(t.handshakeTimeout)); errSetDeadline != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to set TLS handshake deadline: %w", errSetDeadline)
+		}
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
 
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
+	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+		_ = conn.Close()
+		return nil, errHandshake
+	}
+	if t.handshakeTimeout > 0 {
+		if errClearDeadline := conn.SetDeadline(time.Time{}); errClearDeadline != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to clear TLS handshake deadline: %w", errClearDeadline)
+		}
 	}
 
 	tr := &http2.Transport{DisableCompression: true}
-	h2Conn, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
+	h2Conn, errClientConn := tr.NewClientConn(tlsConn)
+	if errClientConn != nil {
+		_ = tlsConn.Close()
+		return nil, errClientConn
 	}
 
 	return h2Conn, nil

@@ -35,6 +35,29 @@ func TestPatchCodexCompletedOutputKeepsExistingOutput(t *testing.T) {
 	}
 }
 
+func TestPatchCodexCompletedOutputHydratesMissingItemIDs(t *testing.T) {
+	event := []byte(`{"type":"response.completed","response":{"output":[{"id":null,"type":"function_call","name":"terminal-null"},{"id":"","type":"function_call","name":"terminal-empty"},{"type":"function_call","name":"terminal-missing"},{"id":"fc_preserved","type":"function_call","name":"terminal-preserved"}]}}`)
+	indexed := map[int64][]byte{
+		0: []byte(`{"id":"fc_null","name":"stream-null"}`),
+		1: []byte(`{"id":"fc_empty","name":"stream-empty"}`),
+		2: []byte(`{"id":"fc_missing","name":"stream-missing"}`),
+		3: []byte(`{"id":"fc_replacement","name":"stream-preserved"}`),
+	}
+
+	got := patchCodexCompletedOutput(event, indexed, nil)
+	items := gjson.GetBytes(got, "response.output").Array()
+	for idx, want := range []string{"fc_null", "fc_empty", "fc_missing", "fc_preserved"} {
+		if id := items[idx].Get("id").String(); id != want {
+			t.Fatalf("response.output[%d].id = %q, want %q; payload=%s", idx, id, want, got)
+		}
+	}
+	for idx, want := range []string{"terminal-null", "terminal-empty", "terminal-missing", "terminal-preserved"} {
+		if name := items[idx].Get("name").String(); name != want {
+			t.Fatalf("response.output[%d].name = %q, want terminal value %q; payload=%s", idx, name, want, got)
+		}
+	}
+}
+
 func BenchmarkPatchCodexCompletedOutput(b *testing.B) {
 	for _, count := range []int{16, 64, 256, 1024} {
 		b.Run(fmt.Sprintf("items_%d", count), func(b *testing.B) {

@@ -196,6 +196,10 @@ func TestConvertClaudeResponseToOpenAIResponses_ReportsCacheTokens(t *testing.T)
 	if got := completed.Get("response.usage.output_tokens").Int(); got != 4 {
 		t.Fatalf("response usage output_tokens = %d, want %d", got, 4)
 	}
+	reasoningTokens := completed.Get("response.usage.output_tokens_details.reasoning_tokens")
+	if !reasoningTokens.Exists() || reasoningTokens.Int() != 0 {
+		t.Fatalf("response usage reasoning_tokens = %s, want explicit 0", reasoningTokens.Raw)
+	}
 	if got := completed.Get("response.usage.total_tokens").Int(); got != 22048 {
 		t.Fatalf("response usage total_tokens = %d, want %d", got, 22048)
 	}

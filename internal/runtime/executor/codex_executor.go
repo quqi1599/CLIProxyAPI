@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,8 +122,39 @@ func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][
 	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
 }
 
+func hydrateCodexCompletedOutputItemIDs(eventData []byte, outputItems []gjson.Result, outputItemsByIndex map[int64][]byte) []byte {
+	patchedData := eventData
+	for outputIndex, outputItem := range outputItems {
+		itemData := []byte(outputItem.Raw)
+		itemID := gjson.GetBytes(itemData, "id")
+		if itemID.Exists() && itemID.Type != gjson.Null && (itemID.Type != gjson.String || strings.TrimSpace(itemID.String()) != "") {
+			continue
+		}
+
+		completedItem, ok := outputItemsByIndex[int64(outputIndex)]
+		if !ok {
+			continue
+		}
+		completedID := gjson.GetBytes(completedItem, "id")
+		if completedID.Type != gjson.String || strings.TrimSpace(completedID.String()) == "" {
+			continue
+		}
+
+		updatedData, errSet := sjson.SetRawBytes(patchedData, "response.output."+strconv.Itoa(outputIndex)+".id", []byte(completedID.Raw))
+		if errSet != nil {
+			continue
+		}
+		patchedData = updatedData
+	}
+	return patchedData
+}
+
 func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
+	if outputResult.Exists() && outputResult.IsArray() && len(outputResult.Array()) > 0 {
+		eventData = hydrateCodexCompletedOutputItemIDs(eventData, outputResult.Array(), outputItemsByIndex)
+		outputResult = gjson.GetBytes(eventData, "response.output")
+	}
 	collectedItemCount := len(outputItemsByIndex) + len(outputItemsFallback)
 	shouldPatchOutput := collectedItemCount > 0 && (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) < collectedItemCount)
 	if !shouldPatchOutput {
