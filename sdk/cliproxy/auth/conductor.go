@@ -102,55 +102,56 @@ type selectorRouteSelection struct {
 }
 
 type requestAttemptTrace struct {
-	mu                         sync.Mutex
-	requestID                  string
-	attempts                   int
-	fallbacks                  int
-	maxAttempts                int
-	maxFallbacks               int
-	translatorRuns             int
-	finalProvider              string
-	finalModel                 string
-	finalExecutor              string
-	finalStatus                int
-	emptyResponses             int
-	emptyRetries               int
-	emptyUpstreams             map[string]struct{}
-	sessionBinding             pendingSessionBinding
-	gptChannels                map[string]struct{}
-	failedChannels             map[string]struct{}
-	gptModels                  map[string]string
-	gptRound                   int
-	gptThirdRound              map[string]struct{}
-	gptRoute                   bool
-	gptRouteSet                bool
-	selection                  selectorRouteSelection
-	gptFirstEventObserved      bool
-	gptFirstEventTimeouts      int
-	gptFirstEventWait          time.Duration
-	gptFirstEventShadowTimeout time.Duration
-	gptFirstEventShadowState   string
+	mu                           sync.Mutex
+	requestID                    string
+	attempts                     int
+	fallbacks                    int
+	maxAttempts                  int
+	maxFallbacks                 int
+	translatorRuns               int
+	finalProvider                string
+	finalModel                   string
+	finalExecutor                string
+	finalStatus                  int
+	emptyResponses               int
+	emptyRetries                 int
+	emptyUpstreams               map[string]struct{}
+	sessionBinding               pendingSessionBinding
+	gptChannels                  map[string]struct{}
+	failedChannels               map[string]struct{}
+	gptModels                    map[string]string
+	gptRound                     int
+	gptThirdRound                map[string]struct{}
+	gptRoute                     bool
+	gptRouteSet                  bool
+	selection                    selectorRouteSelection
+	gptFirstEventObserved        bool
+	gptFirstEventTimeouts        int
+	gptFirstEventWait            time.Duration
+	gptFirstEventPolicySet       bool
+	gptFirstEventPolicy          GPTFirstEventPolicySnapshot
+	gptFirstEventBudgetExhausted bool
 }
 
 type requestExecutionSummary struct {
-	RequestID                  string
-	AttemptCount               int
-	FallbackCount              int
-	MaxAttempts                int
-	MaxFallbacks               int
-	TranslatorRuns             int
-	FinalProvider              string
-	FinalModel                 string
-	FinalExecutor              string
-	FinalStatus                int
-	GPTRoundCount              int
-	EmptyResponses             int
-	EmptyRetries               int
-	EmptyUpstreams             int
-	GPTFirstEventTimeouts      int
-	GPTFirstEventWait          time.Duration
-	GPTFirstEventShadowTimeout time.Duration
-	GPTFirstEventShadowState   string
+	RequestID                    string
+	AttemptCount                 int
+	FallbackCount                int
+	MaxAttempts                  int
+	MaxFallbacks                 int
+	TranslatorRuns               int
+	FinalProvider                string
+	FinalModel                   string
+	FinalExecutor                string
+	FinalStatus                  int
+	GPTRoundCount                int
+	EmptyResponses               int
+	EmptyRetries                 int
+	EmptyUpstreams               int
+	GPTFirstEventTimeouts        int
+	GPTFirstEventWait            time.Duration
+	GPTFirstEventPolicy          GPTFirstEventPolicySnapshot
+	GPTFirstEventBudgetExhausted bool
 }
 
 type routePlanSummary struct {
@@ -298,13 +299,64 @@ func (t *requestAttemptTrace) recordGPTFirstEventAttempt(wait time.Duration, tim
 	t.mu.Unlock()
 }
 
-func (t *requestAttemptTrace) recordGPTFirstEventShadow(snapshot GPTFirstEventPolicySnapshot) {
+func (t *requestAttemptTrace) configureGPTFirstEventPolicy(snapshot GPTFirstEventPolicySnapshot) GPTFirstEventPolicySnapshot {
+	if t == nil {
+		return snapshot
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.gptFirstEventPolicySet {
+		t.gptFirstEventPolicy = snapshot
+		t.gptFirstEventPolicySet = true
+	}
+	return t.gptFirstEventPolicy
+}
+
+func (t *requestAttemptTrace) gptFirstEventPolicyValue() (GPTFirstEventPolicySnapshot, bool) {
+	if t == nil {
+		return GPTFirstEventPolicySnapshot{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gptFirstEventPolicy, t.gptFirstEventPolicySet
+}
+
+func (t *requestAttemptTrace) gptFirstEventRetryLimits() (maxChannels, maxRounds int) {
+	policy, configured := t.gptFirstEventPolicyValue()
+	if !configured {
+		return gptImmediateFailoverMaxChannels, gptImmediateFailoverMaxRounds
+	}
+	if policy.MaxChannels <= 0 {
+		policy.MaxChannels = gptImmediateFailoverMaxChannels
+	}
+	if policy.MaxRounds <= 0 {
+		policy.MaxRounds = gptImmediateFailoverMaxRounds
+	}
+	return policy.MaxChannels, policy.MaxRounds
+}
+
+func (t *requestAttemptTrace) gptFirstEventRemainingBudget() (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.gptFirstEventPolicySet || t.gptFirstEventPolicy.WaitBudgetMs <= 0 {
+		return 0, false
+	}
+	remaining := time.Duration(t.gptFirstEventPolicy.WaitBudgetMs)*time.Millisecond - t.gptFirstEventWait
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, true
+}
+
+func (t *requestAttemptTrace) markGPTFirstEventBudgetExhausted() {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
-	t.gptFirstEventShadowTimeout = time.Duration(snapshot.SuggestedTimeoutMs) * time.Millisecond
-	t.gptFirstEventShadowState = snapshot.ShadowState
+	t.gptFirstEventBudgetExhausted = true
 	t.mu.Unlock()
 }
 
@@ -572,24 +624,24 @@ func (t *requestAttemptTrace) summary() requestExecutionSummary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return requestExecutionSummary{
-		RequestID:                  t.requestID,
-		AttemptCount:               t.attempts,
-		FallbackCount:              t.fallbacks,
-		MaxAttempts:                t.maxAttempts,
-		MaxFallbacks:               t.maxFallbacks,
-		TranslatorRuns:             t.translatorRuns,
-		FinalProvider:              t.finalProvider,
-		FinalModel:                 t.finalModel,
-		FinalExecutor:              t.finalExecutor,
-		FinalStatus:                t.finalStatus,
-		GPTRoundCount:              t.gptRound,
-		EmptyResponses:             t.emptyResponses,
-		EmptyRetries:               t.emptyRetries,
-		EmptyUpstreams:             len(t.emptyUpstreams),
-		GPTFirstEventTimeouts:      t.gptFirstEventTimeouts,
-		GPTFirstEventWait:          t.gptFirstEventWait,
-		GPTFirstEventShadowTimeout: t.gptFirstEventShadowTimeout,
-		GPTFirstEventShadowState:   t.gptFirstEventShadowState,
+		RequestID:                    t.requestID,
+		AttemptCount:                 t.attempts,
+		FallbackCount:                t.fallbacks,
+		MaxAttempts:                  t.maxAttempts,
+		MaxFallbacks:                 t.maxFallbacks,
+		TranslatorRuns:               t.translatorRuns,
+		FinalProvider:                t.finalProvider,
+		FinalModel:                   t.finalModel,
+		FinalExecutor:                t.finalExecutor,
+		FinalStatus:                  t.finalStatus,
+		GPTRoundCount:                t.gptRound,
+		EmptyResponses:               t.emptyResponses,
+		EmptyRetries:                 t.emptyRetries,
+		EmptyUpstreams:               len(t.emptyUpstreams),
+		GPTFirstEventTimeouts:        t.gptFirstEventTimeouts,
+		GPTFirstEventWait:            t.gptFirstEventWait,
+		GPTFirstEventPolicy:          t.gptFirstEventPolicy,
+		GPTFirstEventBudgetExhausted: t.gptFirstEventBudgetExhausted,
 	}
 }
 
@@ -727,11 +779,17 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	if summary.GPTFirstEventTimeouts > 0 {
 		fields["first_event_timeout_count"] = summary.GPTFirstEventTimeouts
 	}
-	if summary.GPTFirstEventShadowTimeout > 0 {
-		fields["first_event_shadow_timeout_ms"] = summary.GPTFirstEventShadowTimeout.Milliseconds()
+	if summary.GPTFirstEventPolicy.PolicyState != "" {
+		fields["first_event_policy_state"] = summary.GPTFirstEventPolicy.PolicyState
+		fields["first_event_policy_reason"] = summary.GPTFirstEventPolicy.DecisionReason
+		fields["first_event_policy_source"] = summary.GPTFirstEventPolicy.DecisionSource
+		fields["first_event_timeout_ms"] = summary.GPTFirstEventPolicy.EnforcedTimeoutMs
+		fields["first_event_max_channels"] = summary.GPTFirstEventPolicy.MaxChannels
+		fields["first_event_max_rounds"] = summary.GPTFirstEventPolicy.MaxRounds
+		fields["first_event_wait_budget_ms"] = summary.GPTFirstEventPolicy.WaitBudgetMs
 	}
-	if summary.GPTFirstEventShadowState != "" {
-		fields["first_event_shadow_state"] = summary.GPTFirstEventShadowState
+	if summary.GPTFirstEventBudgetExhausted {
+		fields["first_event_wait_budget_exhausted"] = true
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
@@ -3757,6 +3815,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	var lastErr error
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
+				trace.markGPTFirstEventBudgetExhausted()
+				return nil, newGPTFirstEventWaitBudgetError()
+			}
+		}
 		if idx > 0 && isGPTRetryRoute(routeProviders, routeModel) &&
 			!m.reserveGPTChannelAttempt(ctx, auth, provider, routeModel, time.Now()) {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
@@ -3783,7 +3847,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 		}
 		attemptCtx, attemptCancel := context.WithCancelCause(ctx)
-		firstEventTimeout := m.firstEventTimeoutForRoute(routeProviders, routeModel)
+		firstEventTimeout := m.firstEventTimeoutForRoute(ctx, routeProviders, routeModel)
 		firstEventDeadline := newStreamFirstEventDeadline(firstEventTimeout, attemptCancel)
 		var streamResult *cliproxyexecutor.StreamResult
 		var cleanupOnce sync.Once
@@ -4248,9 +4312,18 @@ func (m *Manager) SetGPTFirstEventTimeout(timeout time.Duration) {
 	m.gptFirstEventTimeout.Store(timeout.Nanoseconds())
 }
 
-func (m *Manager) firstEventTimeoutForRoute(providers []string, model string) time.Duration {
+func (m *Manager) firstEventTimeoutForRoute(ctx context.Context, providers []string, model string) time.Duration {
 	if m == nil || !isGPTRetryRoute(providers, model) {
 		return 0
+	}
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		if policy, configured := trace.gptFirstEventPolicyValue(); configured {
+			timeout := time.Duration(policy.EnforcedTimeoutMs) * time.Millisecond
+			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining < timeout {
+				timeout = remaining
+			}
+			return timeout
+		}
 	}
 	timeout := time.Duration(m.gptFirstEventTimeout.Load())
 	if timeout < 0 {
@@ -4870,19 +4943,26 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	trace := requestAttemptTraceFromContext(ctx)
 	if isGPTRetryRoute(providers, routeModel) {
-		maxRetryCredentials = gptImmediateFailoverMaxChannels - 1
+		maxChannels, _ := trace.gptFirstEventRetryLimits()
+		maxRetryCredentials = maxChannels - 1
 	}
 	maxRetryCredentials = fallbackGuard.effectiveMaxRetryCredentials(maxRetryCredentials)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
-	trace := requestAttemptTraceFromContext(ctx)
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
 	for {
+		if isGPTRetryRoute(providers, routeModel) {
+			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
+				trace.markGPTFirstEventBudgetExhausted()
+				return nil, newGPTFirstEventWaitBudgetError()
+			}
+		}
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
 			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
 			if lastErr != nil {
@@ -5941,7 +6021,8 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 }
 
 func shouldRetryGPTRound(err error, completedRound int, providers []string, model string, trace *requestAttemptTrace) (time.Duration, bool) {
-	if err == nil || completedRound < 0 || completedRound >= gptImmediateFailoverMaxRounds-1 {
+	_, maxRounds := trace.gptFirstEventRetryLimits()
+	if err == nil || completedRound < 0 || completedRound >= maxRounds-1 {
 		return 0, false
 	}
 	if isRequestInvalidError(err) {

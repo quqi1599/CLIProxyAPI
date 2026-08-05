@@ -24,10 +24,11 @@ type managerAttemptOutcome[T any] struct {
 }
 
 type managerAttemptRunner[T any] struct {
-	manager  *Manager
-	runOnce  managerAttemptRunFunc[T]
-	fallback managerAttemptFallbackFunc[T]
-	recovery managerAttemptRecoveryFunc[T]
+	manager                      *Manager
+	runOnce                      managerAttemptRunFunc[T]
+	fallback                     managerAttemptFallbackFunc[T]
+	recovery                     managerAttemptRecoveryFunc[T]
+	configureGPTFirstEventPolicy bool
 }
 
 func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration) managerAttemptOutcome[T] {
@@ -128,6 +129,9 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 	if gptRoute {
 		if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
 			trace.configureBudget(gptLargeToolHistoryMaxRetryCredentials+1, gptLargeToolHistoryMaxRetryCredentials)
+		} else if runner.configureGPTFirstEventPolicy {
+			policy := trace.configureGPTFirstEventPolicy(manager.selectGPTFirstEventPolicy(req.Model))
+			trace.configureBudget(policy.MaxChannels*policy.MaxRounds, policy.MaxChannels*policy.MaxRounds-1)
 		} else {
 			trace.configureBudget(gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds, gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds-1)
 		}
@@ -162,8 +166,9 @@ func (m *Manager) runCountAttempts(ctx context.Context, providers []string, req 
 
 func (m *Manager) runStreamAttempts(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	runner := managerAttemptRunner[*cliproxyexecutor.StreamResult]{
-		manager: m,
-		runOnce: m.executeStreamMixedOnce,
+		manager:                      m,
+		runOnce:                      m.executeStreamMixedOnce,
+		configureGPTFirstEventPolicy: true,
 		fallback: func(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, lastErr error) (*cliproxyexecutor.StreamResult, bool, error) {
 			if !hasAntigravityProvider(providers) || !shouldAttemptAntigravityCreditsFallback(m, lastErr, providers) {
 				return nil, false, nil

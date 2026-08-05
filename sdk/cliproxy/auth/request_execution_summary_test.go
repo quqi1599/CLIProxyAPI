@@ -194,18 +194,25 @@ func TestLogRequestExecutionSummaryIncludesGPTFirstEventMetrics(t *testing.T) {
 
 	ctx := logging.WithRequestID(context.Background(), "req-summary-gpt-first-event")
 	trace := &requestAttemptTrace{
-		requestID:                  "req-summary-gpt-first-event",
-		attempts:                   2,
-		maxAttempts:                24,
-		translatorRuns:             2,
-		finalStatus:                http.StatusOK,
-		finalProvider:              "codex",
-		finalModel:                 "gpt-5.6-sol",
-		finalExecutor:              "CodexExecutor",
-		gptFirstEventTimeouts:      1,
-		gptFirstEventWait:          27 * time.Second,
-		gptFirstEventShadowTimeout: 30 * time.Second,
-		gptFirstEventShadowState:   "slow",
+		requestID:             "req-summary-gpt-first-event",
+		attempts:              2,
+		maxAttempts:           12,
+		translatorRuns:        2,
+		finalStatus:           http.StatusOK,
+		finalProvider:         "codex",
+		finalModel:            "gpt-5.6-sol",
+		finalExecutor:         "CodexExecutor",
+		gptFirstEventTimeouts: 1,
+		gptFirstEventWait:     27 * time.Second,
+		gptFirstEventPolicy: GPTFirstEventPolicySnapshot{
+			DecisionSource:    "gpt-5.6-sol",
+			PolicyState:       gptFirstEventPolicyStateSlow30,
+			DecisionReason:    "first_event_rate_below_90_percent",
+			EnforcedTimeoutMs: 30000,
+			MaxChannels:       6,
+			MaxRounds:         2,
+			WaitBudgetMs:      300000,
+		},
 	}
 
 	logRequestExecutionSummary(ctx, trace, true, nil)
@@ -217,11 +224,11 @@ func TestLogRequestExecutionSummaryIncludesGPTFirstEventMetrics(t *testing.T) {
 	if got := entry.Data["first_event_wait_ms"]; got != int64(27000) {
 		t.Fatalf("first_event_wait_ms = %#v, want 27000", got)
 	}
-	if got := entry.Data["first_event_shadow_timeout_ms"]; got != int64(30000) {
-		t.Fatalf("first_event_shadow_timeout_ms = %#v, want 30000", got)
+	if got := entry.Data["first_event_timeout_ms"]; got != int64(30000) {
+		t.Fatalf("first_event_timeout_ms = %#v, want 30000", got)
 	}
-	if got := entry.Data["first_event_shadow_state"]; got != "slow" {
-		t.Fatalf("first_event_shadow_state = %#v, want slow", got)
+	if got := entry.Data["first_event_policy_state"]; got != gptFirstEventPolicyStateSlow30 {
+		t.Fatalf("first_event_policy_state = %#v, want %q", got, gptFirstEventPolicyStateSlow30)
 	}
 }
 
