@@ -82,6 +82,59 @@ func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 	}
 }
 
+func TestLogFormatterIncludesGPTFirstEventPolicyFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 6, 4, 20, 0, 0, time.Local)
+	entry.Level = log.InfoLevel
+	entry.Message = "gpt_first_event_observation"
+	entry.Data["event"] = "gpt_first_event_observation"
+	entry.Data["model"] = "gpt-5.6-sol"
+	entry.Data["outcome"] = "deliverable"
+	entry.Data["eligible"] = true
+	entry.Data["delay_ms"] = 4200
+	entry.Data["enforced_timeout_ms"] = 30000
+	entry.Data["policy_state"] = "slow_30s"
+	entry.Data["decision_source"] = "model"
+	entry.Data["decision_reason"] = "f25_below_90"
+	entry.Data["window_seconds"] = 300
+	entry.Data["eligible_first_attempts"] = 120
+	entry.Data["first_event_success_rate_25"] = 0.88
+	entry.Data["failure_rate"] = 0.06
+	entry.Data["first_event_wait_ms"] = 4200
+	entry.Data["first_event_timeout_count"] = 1
+	entry.Data["first_event_policy_state"] = "slow_30s"
+	entry.Data["first_event_wait_budget_ms"] = 300000
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"event=gpt_first_event_observation",
+		"outcome=deliverable",
+		"eligible=true",
+		"delay_ms=4200",
+		"enforced_timeout_ms=30000",
+		"policy_state=slow_30s",
+		"decision_source=model",
+		"decision_reason=f25_below_90",
+		"window_seconds=300",
+		"eligible_first_attempts=120",
+		"first_event_success_rate_25=0.88",
+		"failure_rate=0.06",
+		"first_event_wait_ms=4200",
+		"first_event_timeout_count=1",
+		"first_event_policy_state=slow_30s",
+		"first_event_wait_budget_ms=300000",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %q", line, want)
+		}
+	}
+}
+
 func TestLogFormatterIncludesCompatibilityDiagnosticFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 7, 6, 2, 14, 0, 0, time.Local)
