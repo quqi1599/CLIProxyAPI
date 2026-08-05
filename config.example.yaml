@@ -130,7 +130,11 @@ retry-queue-delay: 0
 
 # GPT-only deadline for receiving the first downstream-deliverable stream event.
 # The timer stops after that event, so it never limits the remaining stream duration.
-# Set to 0 for the 25-second default, or a negative value to disable it.
+# At the 25-second default, the runtime can adapt to 30/40/50 seconds after
+# sustained evidence that additional waiting recovers requests. Collective outages
+# stay at 25 seconds with a smaller channel budget instead of expanding to 50 seconds.
+# A non-default positive value is treated as a fixed manual override; a negative
+# value disables the deadline.
 gpt-first-event-timeout: 25
 
 # Detect HTTP 2xx responses that complete without downstream-deliverable output.

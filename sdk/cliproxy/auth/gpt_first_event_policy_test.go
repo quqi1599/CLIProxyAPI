@@ -180,6 +180,25 @@ func TestGPTFirstEventObserverExpiresOldSamples(t *testing.T) {
 	}
 }
 
+func TestGPTFirstEventObserverBuildsDailySnapshots(t *testing.T) {
+	observer := newGPTFirstEventObserver()
+	dayOne := time.Date(2026, 8, 5, 0, 0, 0, 0, time.Local)
+	dayTwo := dayOne.AddDate(0, 0, 1)
+
+	observePolicyWindow(observer, "gpt-5.6-sol", dayOne, 80, 0, 0, 0, 20)
+	observePolicyWindow(observer, "gpt-5.6-sol", dayTwo, 90, 5, 0, 0, 5)
+	daily := observer.dailySnapshot("gpt-5.6-sol", 2, dayTwo)
+	if len(daily) != 2 {
+		t.Fatalf("daily snapshots = %d, want 2", len(daily))
+	}
+	if daily[0].Date != "2026-08-05" || daily[0].FirstEventSuccessRate25 != 0.8 || daily[0].Timeouts != 20 {
+		t.Fatalf("unexpected first day: %+v", daily[0])
+	}
+	if daily[1].Date != "2026-08-06" || daily[1].FirstEventSuccessRate25 != 0.9 || daily[1].FirstEventSuccessRate30 != 0.95 {
+		t.Fatalf("unexpected second day: %+v", daily[1])
+	}
+}
+
 func TestGPTFirstEventRequestPolicyIsFixedAndBudgeted(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetGPTFirstEventTimeout(25 * time.Second)

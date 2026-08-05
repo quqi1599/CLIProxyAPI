@@ -678,6 +678,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/custom/monitor/key-stats", s.mgmt.GetMonitorKeyStats)
 		mgmt.GET("/custom/monitor/client-gone-stats", s.mgmt.GetMonitorClientGoneStats)
 		mgmt.GET("/custom/monitor/request-details", s.mgmt.GetMonitorRequestDetails)
+		mgmt.GET("/custom/monitor/gpt-first-event-policy", s.mgmt.GetMonitorGPTFirstEventPolicy)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)

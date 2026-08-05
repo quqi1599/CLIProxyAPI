@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ const (
 	gptFirstEventPolicyOutageFailureRate  = 0.90
 	gptFirstEventPolicyWaitBudget         = 300 * time.Second
 	gptFirstEventPolicyOutageWaitBudget   = 75 * time.Second
+	gptFirstEventPolicyDailyRetention     = 31
 	gptFirstEventPolicyGlobalModel        = "*"
 	gptFirstEventPolicyStateNormal        = "normal"
 	gptFirstEventPolicyStateSlow30        = "slow_30s"
@@ -106,6 +108,37 @@ type gptFirstEventPolicyState struct {
 	recoveryWindows        int
 }
 
+type gptFirstEventDailyBucket struct {
+	Date           string
+	Eligible       int
+	Within25       int
+	Within30       int
+	Within40       int
+	Within50       int
+	Timeouts       int
+	Upstream5xx    int
+	NetworkFailure int
+	Transitions    map[string]int
+}
+
+type GPTFirstEventDailySnapshot struct {
+	Date                    string         `json:"date"`
+	EligibleFirstAttempts   int            `json:"eligible_first_attempts"`
+	DeliverableWithin25     int            `json:"deliverable_within_25"`
+	DeliverableWithin30     int            `json:"deliverable_within_30"`
+	DeliverableWithin40     int            `json:"deliverable_within_40"`
+	DeliverableWithin50     int            `json:"deliverable_within_50"`
+	FirstEventSuccessRate25 float64        `json:"first_event_success_rate_25"`
+	FirstEventSuccessRate30 float64        `json:"first_event_success_rate_30"`
+	FirstEventSuccessRate40 float64        `json:"first_event_success_rate_40"`
+	FirstEventSuccessRate50 float64        `json:"first_event_success_rate_50"`
+	FailureRate             float64        `json:"failure_rate"`
+	Timeouts                int            `json:"timeouts"`
+	Upstream5xx             int            `json:"upstream_5xx"`
+	NetworkFailures         int            `json:"network_failures"`
+	Transitions             map[string]int `json:"transitions"`
+}
+
 type GPTFirstEventPolicySnapshot struct {
 	Model                    string    `json:"model"`
 	DecisionSource           string    `json:"decision_source"`
@@ -143,6 +176,7 @@ type gptFirstEventObserver struct {
 	mu       sync.Mutex
 	samples  map[string][]gptFirstEventSample
 	policies map[string]*gptFirstEventPolicyState
+	daily    map[string]map[string]*gptFirstEventDailyBucket
 	sequence uint64
 	now      func() time.Time
 }
@@ -151,6 +185,7 @@ func newGPTFirstEventObserver() *gptFirstEventObserver {
 	return &gptFirstEventObserver{
 		samples:  make(map[string][]gptFirstEventSample),
 		policies: make(map[string]*gptFirstEventPolicyState),
+		daily:    make(map[string]map[string]*gptFirstEventDailyBucket),
 		now:      time.Now,
 	}
 }
@@ -172,11 +207,82 @@ func (o *gptFirstEventObserver) observe(model string, sample gptFirstEventSample
 	sample.sequence = o.sequence
 	o.appendLocked(model, sample)
 	o.evaluateLocked(model, sample.at)
+	o.recordDailyLocked(model, sample)
 	if model != gptFirstEventPolicyGlobalModel {
 		o.appendLocked(gptFirstEventPolicyGlobalModel, sample)
 		o.evaluateLocked(gptFirstEventPolicyGlobalModel, sample.at)
+		o.recordDailyLocked(gptFirstEventPolicyGlobalModel, sample)
 	}
 	return o.snapshotLocked(model, sample.at, sample.sequence)
+}
+
+func (o *gptFirstEventObserver) dailySnapshot(model string, days int, now time.Time) []GPTFirstEventDailySnapshot {
+	if o == nil {
+		return []GPTFirstEventDailySnapshot{}
+	}
+	model = canonicalModelKey(model)
+	if model == "" {
+		model = gptFirstEventPolicyGlobalModel
+	}
+	if days <= 0 {
+		days = 7
+	}
+	if days > gptFirstEventPolicyDailyRetention {
+		days = gptFirstEventPolicyDailyRetention
+	}
+	if now.IsZero() {
+		now = o.now()
+	}
+	cutoff := now.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	buckets := o.daily[model]
+	dates := make([]string, 0, len(buckets))
+	for date := range buckets {
+		if date >= cutoff {
+			dates = append(dates, date)
+		}
+	}
+	sort.Strings(dates)
+	out := make([]GPTFirstEventDailySnapshot, 0, len(dates))
+	for _, date := range dates {
+		bucket := buckets[date]
+		if bucket == nil {
+			continue
+		}
+		window := gptFirstEventWindow{
+			Eligible:       bucket.Eligible,
+			Within25:       bucket.Within25,
+			Within30:       bucket.Within30,
+			Within40:       bucket.Within40,
+			Within50:       bucket.Within50,
+			Timeouts:       bucket.Timeouts,
+			Upstream5xx:    bucket.Upstream5xx,
+			NetworkFailure: bucket.NetworkFailure,
+		}
+		transitions := make(map[string]int, len(bucket.Transitions))
+		for state, count := range bucket.Transitions {
+			transitions[state] = count
+		}
+		out = append(out, GPTFirstEventDailySnapshot{
+			Date:                    date,
+			EligibleFirstAttempts:   bucket.Eligible,
+			DeliverableWithin25:     bucket.Within25,
+			DeliverableWithin30:     bucket.Within30,
+			DeliverableWithin40:     bucket.Within40,
+			DeliverableWithin50:     bucket.Within50,
+			FirstEventSuccessRate25: window.successRate(25 * time.Second),
+			FirstEventSuccessRate30: window.successRate(30 * time.Second),
+			FirstEventSuccessRate40: window.successRate(40 * time.Second),
+			FirstEventSuccessRate50: window.successRate(50 * time.Second),
+			FailureRate:             window.failureRate(),
+			Timeouts:                bucket.Timeouts,
+			Upstream5xx:             bucket.Upstream5xx,
+			NetworkFailures:         bucket.NetworkFailure,
+			Transitions:             transitions,
+		})
+	}
+	return out
 }
 
 func (o *gptFirstEventObserver) snapshot(model string, now time.Time) GPTFirstEventPolicySnapshot {
@@ -207,6 +313,51 @@ func (o *gptFirstEventObserver) appendLocked(model string, sample gptFirstEventS
 	}
 	current = append(current, sample)
 	o.samples[model] = current
+}
+
+func (o *gptFirstEventObserver) recordDailyLocked(model string, sample gptFirstEventSample) {
+	if o.daily[model] == nil {
+		o.daily[model] = make(map[string]*gptFirstEventDailyBucket)
+	}
+	date := sample.at.Format("2006-01-02")
+	bucket := o.daily[model][date]
+	if bucket == nil {
+		bucket = &gptFirstEventDailyBucket{Date: date, Transitions: make(map[string]int)}
+		o.daily[model][date] = bucket
+	}
+	bucket.Eligible++
+	if sample.deliverable {
+		if sample.delay <= 25*time.Second {
+			bucket.Within25++
+		}
+		if sample.delay <= 30*time.Second {
+			bucket.Within30++
+		}
+		if sample.delay <= 40*time.Second {
+			bucket.Within40++
+		}
+		if sample.delay <= 50*time.Second {
+			bucket.Within50++
+		}
+	}
+	if sample.timedOut {
+		bucket.Timeouts++
+	}
+	if sample.upstream5xx {
+		bucket.Upstream5xx++
+	}
+	if sample.network {
+		bucket.NetworkFailure++
+	}
+	if policy := o.policies[model]; policy != nil && policy.lastTransitionSequence == sample.sequence {
+		bucket.Transitions[policy.name]++
+	}
+	cutoff := sample.at.AddDate(0, 0, -gptFirstEventPolicyDailyRetention).Format("2006-01-02")
+	for storedDate := range o.daily[model] {
+		if storedDate < cutoff {
+			delete(o.daily[model], storedDate)
+		}
+	}
 }
 
 func (o *gptFirstEventObserver) policyLocked(model string) *gptFirstEventPolicyState {
@@ -494,6 +645,13 @@ func (m *Manager) GPTFirstEventPolicySnapshot(model string) GPTFirstEventPolicyS
 	return m.gptFirstEventObserver.snapshot(model, time.Now())
 }
 
+func (m *Manager) GPTFirstEventDailySnapshots(model string, days int) []GPTFirstEventDailySnapshot {
+	if m == nil || m.gptFirstEventObserver == nil {
+		return []GPTFirstEventDailySnapshot{}
+	}
+	return m.gptFirstEventObserver.dailySnapshot(model, days, time.Now())
+}
+
 func (m *Manager) selectGPTFirstEventPolicy(model string) GPTFirstEventPolicySnapshot {
 	snapshot := m.GPTFirstEventPolicySnapshot(model)
 	configured := time.Duration(m.gptFirstEventTimeout.Load())
@@ -603,7 +761,7 @@ func classifyGPTFirstEventObservation(deliverable, timedOut bool, err error) (el
 	}
 	status := statusCodeFromError(err)
 	upstream5xx = status >= 500 && status <= 599
-	network = isTransientNetworkError(err)
+	network = !upstream5xx && isTransientNetworkError(err)
 	if !upstream5xx && !network {
 		return false, "", false, false
 	}
