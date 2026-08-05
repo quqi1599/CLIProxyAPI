@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
-	"golang.org/x/net/context"
 )
 
 // ErrorResponse represents a standard error response format for the API.
@@ -793,7 +793,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
-	newCtx, cancel := context.WithCancel(parentCtx)
+	if requestCtx != nil && logging.GetClientRequestID(parentCtx) == "" {
+		if requestID := logging.GetClientRequestID(requestCtx); requestID != "" {
+			parentCtx = logging.WithClientRequestID(parentCtx, requestID)
+		}
+	}
+	newCtx, cancel := context.WithCancelCause(parentCtx)
 
 	endpointMethod := ""
 	endpointPath := ""
@@ -821,7 +826,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		go func() {
 			select {
 			case <-requestCtx.Done():
-				cancel()
+				origin := logging.CancelOriginDownstreamDisconnected
+				if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+					origin = logging.CancelOriginDownstreamDeadline
+				}
+				cancel(logging.NewCancellationCause(origin, requestCtx.Err()))
 			case <-cancelCtx.Done():
 			}
 		}()
@@ -836,7 +845,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if captured, exists := c.Get(logging.APIResponseCapturedContextKey); exists {
 				if capturedBool, ok := captured.(bool); ok && capturedBool {
-					cancel()
+					cancel(logging.NewCancellationCause(logging.CancelOriginInternalAbort, context.Canceled))
 					return
 				}
 			}
@@ -844,7 +853,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
 					switch params[0].(type) {
 					case error, string:
-						cancel()
+						cancel(logging.NewCancellationCause(logging.CancelOriginInternalAbort, context.Canceled))
 						return
 					}
 				}
@@ -865,7 +874,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 				if existingBytes := currentAPIResponse(c); len(existingBytes) > 0 {
 					trimmedPayload := bytes.TrimSpace(payload)
 					if len(trimmedPayload) > 0 && bytes.Contains(existingBytes, trimmedPayload) {
-						cancel()
+						cancel(logging.NewCancellationCause(logging.CancelOriginInternalAbort, context.Canceled))
 						return
 					}
 				}
@@ -873,7 +882,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			}
 		}
 
-		cancel()
+		cancel(logging.NewCancellationCause(logging.CancelOriginInternalAbort, context.Canceled))
 	}
 }
 

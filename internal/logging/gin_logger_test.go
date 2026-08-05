@@ -123,3 +123,44 @@ func TestGinLogrusLoggerAddsRequestIDForCodexBackend(t *testing.T) {
 		t.Fatalf("expected Gin request ID %q to match context request ID %q", requestIDFromGin, requestIDFromContext)
 	}
 }
+
+func TestGinLogrusLoggerCorrelatesDownstreamRequestID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+
+	var internalRequestID string
+	var clientRequestID string
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		internalRequestID = GetRequestID(c.Request.Context())
+		clientRequestID = GetClientRequestID(c.Request.Context())
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Oneapi-Request-Id", "202608050919554314155358268d9d6TTdvlM5y")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	if internalRequestID == "" {
+		t.Fatal("expected CPA request ID")
+	}
+	if got := recorder.Header().Get("X-Request-Id"); got != internalRequestID {
+		t.Fatalf("response X-Request-Id = %q, want %q", got, internalRequestID)
+	}
+	if clientRequestID != "202608050919554314155358268d9d6TTdvlM5y" {
+		t.Fatalf("client request ID = %q", clientRequestID)
+	}
+}
+
+func TestNormalizeClientRequestIDRejectsUnsafeValues(t *testing.T) {
+	if got := NormalizeClientRequestID("safe-id_123:abc/def"); got != "safe-id_123:abc/def" {
+		t.Fatalf("safe request ID = %q", got)
+	}
+	for _, value := range []string{"bad id", "bad\nvalue", "bad=value"} {
+		if got := NormalizeClientRequestID(value); got != "" {
+			t.Fatalf("unsafe request ID %q normalized to %q", value, got)
+		}
+	}
+}

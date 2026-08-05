@@ -85,6 +85,42 @@ func TestFailureMetadataLoggerLogsOnlySafeFields(t *testing.T) {
 	requireJSONField(t, payload, "routing_group", "codex-primary")
 }
 
+func TestFailureMetadataLoggerClassifiesDownstreamDisconnect(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOut := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.WarnLevel)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	}()
+
+	ctx := internallogging.WithRequestID(context.Background(), "cpa-1d5a3d3c")
+	ctx = internallogging.WithClientRequestID(ctx, "202608050919554314155358268d9d6TTdvlM5y")
+	ctx, cancel := context.WithCancelCause(ctx)
+	cancel(internallogging.NewCancellationCause(internallogging.CancelOriginDownstreamDisconnected, context.Canceled))
+
+	(&FailureMetadataLogger{}).HandleUsage(ctx, coreusage.Record{
+		Model:   "gpt-5.6-sol",
+		Failed:  true,
+		Latency: 59 * time.Second,
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
+	}
+	requireJSONField(t, payload, "failure_class", "downstream_disconnected")
+	requireJSONField(t, payload, "cancel_origin", "downstream_disconnected")
+	requireJSONField(t, payload, "request_id", "cpa-1d5a3d3c")
+	requireJSONField(t, payload, "client_request_id", "202608050919554314155358268d9d6TTdvlM5y")
+}
+
 func TestFailureMetadataLoggerNormalizesContentSafetyFields(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.StandardLogger()

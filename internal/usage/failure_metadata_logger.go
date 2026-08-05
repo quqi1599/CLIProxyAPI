@@ -59,10 +59,11 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 		model = safeFailureMetadataString(record.Model)
 	}
 
+	cancelOrigin := safeFailureMetadataString(internallogging.CancellationOriginFromContext(ctx))
 	normalizedStatus, normalizedErrorType, normalizedErrorCode := normalizeFailureMetadataError(status, errorCode)
 	fields := log.Fields{
 		"event":            "failure_metadata",
-		"failure_class":    classifyFailureMetadata(status, errorCode),
+		"failure_class":    classifyFailureMetadata(status, errorCode, cancelOrigin),
 		"model":            model,
 		"endpoint_method":  safeFailureMetadataString(internallogging.GetEndpointMethod(ctx)),
 		"endpoint_path":    safeFailureMetadataString(internallogging.GetEndpointPath(ctx)),
@@ -88,8 +89,14 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 	if errorCode != "" {
 		fields["upstream_error_code"] = errorCode
 	}
+	if cancelOrigin != "" {
+		fields["cancel_origin"] = cancelOrigin
+	}
 	if requestID := safeFailureMetadataString(resolveFailureMetadataRequestID(ctx, record, attempt)); requestID != "" {
 		fields["request_id"] = requestID
+	}
+	if clientRequestID := safeFailureMetadataString(internallogging.GetClientRequestID(ctx)); clientRequestID != "" {
+		fields["client_request_id"] = clientRequestID
 	}
 	if authIndex := safeFailureMetadataString(record.AuthIndex); authIndex != "" {
 		fields["auth_index"] = authIndex
@@ -299,7 +306,19 @@ func durationMilliseconds(latency time.Duration) int64 {
 	return latency.Milliseconds()
 }
 
-func classifyFailureMetadata(status int, code string) string {
+func classifyFailureMetadata(status int, code, cancelOrigin string) string {
+	switch cancelOrigin {
+	case internallogging.CancelOriginDownstreamDisconnected:
+		return "downstream_disconnected"
+	case internallogging.CancelOriginDownstreamDeadline:
+		return "downstream_deadline"
+	case internallogging.CancelOriginGatewayDeadline:
+		return "gateway_deadline"
+	case internallogging.CancelOriginUpstreamTimeout:
+		return "upstream_timeout"
+	case internallogging.CancelOriginInternalAbort:
+		return "internal_abort"
+	}
 	normalizedCode := strings.ToLower(strings.TrimSpace(code))
 	switch {
 	case strings.Contains(normalizedCode, "empty"):

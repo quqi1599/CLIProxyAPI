@@ -128,6 +128,11 @@ max-retry-interval: 30
 # The runtime adds jitter up to the same duration to avoid retry bursts.
 retry-queue-delay: 0
 
+# GPT-only deadline for receiving the first downstream-deliverable stream event.
+# The timer stops after that event, so it never limits the remaining stream duration.
+# Set to 0 for the 25-second default, or a negative value to disable it.
+gpt-first-event-timeout: 25
+
 # Detect HTTP 2xx responses that complete without downstream-deliverable output.
 # Start with audit-only=true, then disable audit-only after validating the
 # targeted model/client traffic. The default target lists below are also used

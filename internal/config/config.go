@@ -115,6 +115,9 @@ type Config struct {
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 	// RetryQueueDelay defines the base delay in seconds before falling back to another credential.
 	RetryQueueDelay int `yaml:"retry-queue-delay" json:"retry-queue-delay"`
+	// GPTFirstEventTimeout defines how many seconds a GPT stream may spend before
+	// its first downstream-deliverable event. Zero uses 25 seconds; negative disables it.
+	GPTFirstEventTimeout int `yaml:"gpt-first-event-timeout" json:"gpt-first-event-timeout"`
 
 	// EmptyResponseRetry detects successful upstream responses that contain no
 	// downstream-deliverable output before allowing the request to complete.

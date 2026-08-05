@@ -31,7 +31,7 @@ type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
 var logFieldOrder = []string{
-	"event", "provider", "model", "requested_model", "upstream_model",
+	"event", "client_request_id", "provider", "model", "requested_model", "upstream_model",
 	"auth_index", "routing_strategy", "routing_scope", "routing_group", "prefix", "base_url", "token_hash",
 	"status", "status_code", "success", "error_code", "retryable", "retry_after_ms", "reset_ms", "providers",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "version", "error",
@@ -59,7 +59,7 @@ var logFieldOrder = []string{
 	"stream_duration_ms", "total_duration_ms", "downstream_write_ms", "downstream_write_calls",
 	"downstream_flush_ms", "downstream_flush_calls", "chunks_count", "bytes_out",
 	"stream_output_tokens", "stream_output_tokens_observed", "output_tokens", "tokens_per_second",
-	"client_gone", "finish_reason",
+	"client_gone", "cancel_origin", "finish_reason",
 	"normalized_status", "error_type", "upstream_status", "upstream_error_code", "route_plan",
 }
 

@@ -594,6 +594,7 @@ func (h *Handler) syncRuntimeConfigLocked(ctx context.Context) {
 
 	h.authManager.SetConfig(h.cfg)
 	h.authManager.SetRetryConfig(h.cfg.RequestRetry, time.Duration(h.cfg.MaxRetryInterval)*time.Second, h.cfg.MaxRetryCredentials)
+	h.authManager.SetGPTFirstEventTimeout(time.Duration(h.cfg.GPTFirstEventTimeout) * time.Second)
 	coreauth.SetQuotaCooldownDisabled(h.cfg.DisableCooling)
 
 	sctx := &synthesizer.SynthesisContext{

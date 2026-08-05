@@ -362,6 +362,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		authManager.SetGPTFirstEventTimeout(time.Duration(cfg.GPTFirstEventTimeout) * time.Second)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
@@ -1819,6 +1820,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		s.handlers.AuthManager.SetGPTFirstEventTimeout(time.Duration(cfg.GPTFirstEventTimeout) * time.Second)
 	}
 
 	// Update log level dynamically when debug flag changes

@@ -1049,6 +1049,7 @@ const (
 	gptImmediateFailoverMaxChannels  = 8
 	gptImmediateFailoverMaxRounds    = 3
 	gptChannelProbeLease             = 10 * time.Minute
+	defaultGPTFirstEventTimeout      = 25 * time.Second
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1230,12 +1231,13 @@ type Manager struct {
 	providerOffsets map[string]int
 
 	// Retry controls request retry behavior.
-	requestRetry        atomic.Int32
-	maxRetryCredentials atomic.Int32
-	maxRetryInterval    atomic.Int64
-	retryQueueDelay     atomic.Int64
-	schedulerHotSyncDue atomic.Int64
-	translatorRegistry  atomic.Pointer[sdktranslator.Registry]
+	requestRetry         atomic.Int32
+	maxRetryCredentials  atomic.Int32
+	maxRetryInterval     atomic.Int64
+	retryQueueDelay      atomic.Int64
+	gptFirstEventTimeout atomic.Int64
+	schedulerHotSyncDue  atomic.Int64
+	translatorRegistry   atomic.Pointer[sdktranslator.Registry]
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -1307,6 +1309,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
+	manager.gptFirstEventTimeout.Store(defaultGPTFirstEventTimeout.Nanoseconds())
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
 }
@@ -3327,6 +3330,48 @@ type streamBootstrapReadResult struct {
 	bufferLimitReached bool
 }
 
+type streamFirstEventDeadline struct {
+	timeout time.Duration
+	timer   *time.Timer
+	state   atomic.Int32
+}
+
+func newStreamFirstEventDeadline(timeout time.Duration, cancel context.CancelCauseFunc) *streamFirstEventDeadline {
+	if timeout <= 0 || cancel == nil {
+		return nil
+	}
+	deadline := &streamFirstEventDeadline{timeout: timeout}
+	deadline.timer = time.AfterFunc(timeout, func() {
+		if deadline.state.CompareAndSwap(0, 2) {
+			cancel(logging.NewCancellationCause(logging.CancelOriginUpstreamTimeout, context.DeadlineExceeded))
+		}
+	})
+	return deadline
+}
+
+func (d *streamFirstEventDeadline) complete() bool {
+	if d == nil {
+		return true
+	}
+	if d.state.CompareAndSwap(0, 1) {
+		d.timer.Stop()
+		return true
+	}
+	return d.state.Load() != 2
+}
+
+func (d *streamFirstEventDeadline) timeoutError(err error) error {
+	if d == nil || d.state.Load() != 2 {
+		return err
+	}
+	return &Error{
+		Code:       "gpt_first_event_timeout",
+		Message:    fmt.Sprintf("GPT upstream produced no deliverable event within %s", d.timeout),
+		Retryable:  true,
+		HTTPStatus: http.StatusGatewayTimeout,
+	}
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, startedAt time.Time) ([]cliproxyexecutor.StreamChunk, bool, time.Duration, error) {
 	result := readStreamBootstrapWithDelivery(ctx, ch, startedAt, nil, emptyResponsePolicy{})
 	return result.buffered, result.closed, result.firstPayloadDelay, result.err
@@ -3673,17 +3718,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 		}
-		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		attemptCtx, attemptCancel := context.WithCancelCause(ctx)
+		firstEventDeadline := newStreamFirstEventDeadline(m.firstEventTimeoutForRoute(routeProviders, routeModel), attemptCancel)
 		var streamResult *cliproxyexecutor.StreamResult
 		var cleanupOnce sync.Once
 		cleanupAttempt := func() {
 			cleanupOnce.Do(func() {
-				attemptCancel()
+				firstEventDeadline.complete()
+				attemptCancel(logging.NewCancellationCause(logging.CancelOriginInternalAbort, context.Canceled))
 				closeStreamResult(streamResult)
 				releaseSlot()
 			})
 		}
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+		errStream = firstEventDeadline.timeoutError(errStream)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				cleanupAttempt()
@@ -3696,6 +3744,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				auth = refreshed
 				didRefreshOnUnauthorized = true
 				streamResult, errStream = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+				errStream = firstEventDeadline.timeoutError(errStream)
 				if errStream != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
 						cleanupAttempt()
@@ -3777,7 +3826,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		buffered := bootstrapRead.buffered
 		closed := bootstrapRead.closed
 		firstPayloadDelay := bootstrapRead.firstPayloadDelay
-		bootstrapErr := bootstrapRead.err
+		bootstrapErr := firstEventDeadline.timeoutError(bootstrapRead.err)
+		if bootstrapErr != nil && firstPayloadDelay <= 0 {
+			firstPayloadDelay = time.Since(startedAt)
+		}
 		if bootstrapRead.emptyResponse {
 			m.logEmptyResponseDetected(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, false, false, 0)
 			bootstrapErr = newEmptyUpstreamResponseFailure()
@@ -3792,6 +3844,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				auth = refreshed
 				didRefreshOnUnauthorized = true
 				streamResult, bootstrapErr = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
+				bootstrapErr = firstEventDeadline.timeoutError(bootstrapErr)
 				buffered = nil
 				closed = false
 				firstPayloadDelay = time.Since(startedAt)
@@ -3811,7 +3864,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						buffered = bootstrapRead.buffered
 						closed = bootstrapRead.closed
 						firstPayloadDelay = bootstrapRead.firstPayloadDelay
-						bootstrapErr = bootstrapRead.err
+						bootstrapErr = firstEventDeadline.timeoutError(bootstrapRead.err)
+						if bootstrapErr != nil && firstPayloadDelay <= 0 {
+							firstPayloadDelay = time.Since(startedAt)
+						}
 						if bootstrapRead.emptyResponse {
 							m.logEmptyResponseDetected(attemptCtx, auth, provider, routeModel, opts, deliveryTracker, false, false, 0)
 							bootstrapErr = newEmptyUpstreamResponseFailure()
@@ -3822,6 +3878,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						}
 					}
 				}
+			}
+		}
+		if bootstrapErr == nil && !firstEventDeadline.complete() {
+			bootstrapErr = firstEventDeadline.timeoutError(nil)
+			if firstPayloadDelay <= 0 {
+				firstPayloadDelay = time.Since(startedAt)
 			}
 		}
 		if bootstrapErr != nil {
@@ -4101,6 +4163,31 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	m.requestRetry.Store(int32(retry))
 	m.maxRetryCredentials.Store(int32(maxRetryCredentials))
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
+// SetGPTFirstEventTimeout updates the GPT stream bootstrap deadline.
+// Zero uses the safe default and a negative value disables the deadline.
+func (m *Manager) SetGPTFirstEventTimeout(timeout time.Duration) {
+	if m == nil {
+		return
+	}
+	if timeout == 0 {
+		timeout = defaultGPTFirstEventTimeout
+	} else if timeout < 0 {
+		timeout = 0
+	}
+	m.gptFirstEventTimeout.Store(timeout.Nanoseconds())
+}
+
+func (m *Manager) firstEventTimeoutForRoute(providers []string, model string) time.Duration {
+	if m == nil || !isGPTRetryRoute(providers, model) {
+		return 0
+	}
+	timeout := time.Duration(m.gptFirstEventTimeout.Load())
+	if timeout < 0 {
+		return 0
+	}
+	return timeout
 }
 
 // SetRetryQueueDelay updates the delay inserted before fallback credential retries.
@@ -5991,7 +6078,7 @@ func shouldFailoverGPTChannel(err error, providers []string, model string) bool 
 		return false
 	}
 	switch statusCodeFromError(err) {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false
@@ -10839,10 +10926,14 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 	if ctx == nil {
 		return log.NewEntry(log.StandardLogger())
 	}
+	entry := log.NewEntry(log.StandardLogger())
 	if reqID := logging.GetRequestID(ctx); reqID != "" {
-		return log.WithField("request_id", reqID)
+		entry = entry.WithField("request_id", reqID)
 	}
-	return log.NewEntry(log.StandardLogger())
+	if clientRequestID := logging.GetClientRequestID(ctx); clientRequestID != "" {
+		entry = entry.WithField("client_request_id", clientRequestID)
+	}
+	return entry
 }
 
 func authMetricIndex(auth *Auth) string {
