@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -179,6 +180,48 @@ func TestLogRequestExecutionSummaryNormalizesContentSafetyError(t *testing.T) {
 	}
 	if got := entry.Data["final_error_code"]; got != "content_policy_violation" {
 		t.Fatalf("final_error_code = %#v, want content_policy_violation", got)
+	}
+}
+
+func TestLogRequestExecutionSummaryIncludesGPTFirstEventMetrics(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-gpt-first-event")
+	trace := &requestAttemptTrace{
+		requestID:                  "req-summary-gpt-first-event",
+		attempts:                   2,
+		maxAttempts:                24,
+		translatorRuns:             2,
+		finalStatus:                http.StatusOK,
+		finalProvider:              "codex",
+		finalModel:                 "gpt-5.6-sol",
+		finalExecutor:              "CodexExecutor",
+		gptFirstEventTimeouts:      1,
+		gptFirstEventWait:          27 * time.Second,
+		gptFirstEventShadowTimeout: 30 * time.Second,
+		gptFirstEventShadowState:   "slow",
+	}
+
+	logRequestExecutionSummary(ctx, trace, true, nil)
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["first_event_timeout_count"]; got != 1 {
+		t.Fatalf("first_event_timeout_count = %#v, want 1", got)
+	}
+	if got := entry.Data["first_event_wait_ms"]; got != int64(27000) {
+		t.Fatalf("first_event_wait_ms = %#v, want 27000", got)
+	}
+	if got := entry.Data["first_event_shadow_timeout_ms"]; got != int64(30000) {
+		t.Fatalf("first_event_shadow_timeout_ms = %#v, want 30000", got)
+	}
+	if got := entry.Data["first_event_shadow_state"]; got != "slow" {
+		t.Fatalf("first_event_shadow_state = %#v, want slow", got)
 	}
 }
 

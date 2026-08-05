@@ -102,46 +102,55 @@ type selectorRouteSelection struct {
 }
 
 type requestAttemptTrace struct {
-	mu             sync.Mutex
-	requestID      string
-	attempts       int
-	fallbacks      int
-	maxAttempts    int
-	maxFallbacks   int
-	translatorRuns int
-	finalProvider  string
-	finalModel     string
-	finalExecutor  string
-	finalStatus    int
-	emptyResponses int
-	emptyRetries   int
-	emptyUpstreams map[string]struct{}
-	sessionBinding pendingSessionBinding
-	gptChannels    map[string]struct{}
-	failedChannels map[string]struct{}
-	gptModels      map[string]string
-	gptRound       int
-	gptThirdRound  map[string]struct{}
-	gptRoute       bool
-	gptRouteSet    bool
-	selection      selectorRouteSelection
+	mu                         sync.Mutex
+	requestID                  string
+	attempts                   int
+	fallbacks                  int
+	maxAttempts                int
+	maxFallbacks               int
+	translatorRuns             int
+	finalProvider              string
+	finalModel                 string
+	finalExecutor              string
+	finalStatus                int
+	emptyResponses             int
+	emptyRetries               int
+	emptyUpstreams             map[string]struct{}
+	sessionBinding             pendingSessionBinding
+	gptChannels                map[string]struct{}
+	failedChannels             map[string]struct{}
+	gptModels                  map[string]string
+	gptRound                   int
+	gptThirdRound              map[string]struct{}
+	gptRoute                   bool
+	gptRouteSet                bool
+	selection                  selectorRouteSelection
+	gptFirstEventObserved      bool
+	gptFirstEventTimeouts      int
+	gptFirstEventWait          time.Duration
+	gptFirstEventShadowTimeout time.Duration
+	gptFirstEventShadowState   string
 }
 
 type requestExecutionSummary struct {
-	RequestID      string
-	AttemptCount   int
-	FallbackCount  int
-	MaxAttempts    int
-	MaxFallbacks   int
-	TranslatorRuns int
-	FinalProvider  string
-	FinalModel     string
-	FinalExecutor  string
-	FinalStatus    int
-	GPTRoundCount  int
-	EmptyResponses int
-	EmptyRetries   int
-	EmptyUpstreams int
+	RequestID                  string
+	AttemptCount               int
+	FallbackCount              int
+	MaxAttempts                int
+	MaxFallbacks               int
+	TranslatorRuns             int
+	FinalProvider              string
+	FinalModel                 string
+	FinalExecutor              string
+	FinalStatus                int
+	GPTRoundCount              int
+	EmptyResponses             int
+	EmptyRetries               int
+	EmptyUpstreams             int
+	GPTFirstEventTimeouts      int
+	GPTFirstEventWait          time.Duration
+	GPTFirstEventShadowTimeout time.Duration
+	GPTFirstEventShadowState   string
 }
 
 type routePlanSummary struct {
@@ -259,6 +268,43 @@ func (t *requestAttemptTrace) recordFallback() {
 	}
 	t.mu.Lock()
 	t.fallbacks++
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) claimGPTFirstEventObservation() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gptFirstEventObserved {
+		return false
+	}
+	t.gptFirstEventObserved = true
+	return true
+}
+
+func (t *requestAttemptTrace) recordGPTFirstEventAttempt(wait time.Duration, timedOut bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	if wait > 0 {
+		t.gptFirstEventWait += wait
+	}
+	if timedOut {
+		t.gptFirstEventTimeouts++
+	}
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) recordGPTFirstEventShadow(snapshot GPTFirstEventPolicySnapshot) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.gptFirstEventShadowTimeout = time.Duration(snapshot.SuggestedTimeoutMs) * time.Millisecond
+	t.gptFirstEventShadowState = snapshot.ShadowState
 	t.mu.Unlock()
 }
 
@@ -526,20 +572,24 @@ func (t *requestAttemptTrace) summary() requestExecutionSummary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return requestExecutionSummary{
-		RequestID:      t.requestID,
-		AttemptCount:   t.attempts,
-		FallbackCount:  t.fallbacks,
-		MaxAttempts:    t.maxAttempts,
-		MaxFallbacks:   t.maxFallbacks,
-		TranslatorRuns: t.translatorRuns,
-		FinalProvider:  t.finalProvider,
-		FinalModel:     t.finalModel,
-		FinalExecutor:  t.finalExecutor,
-		FinalStatus:    t.finalStatus,
-		GPTRoundCount:  t.gptRound,
-		EmptyResponses: t.emptyResponses,
-		EmptyRetries:   t.emptyRetries,
-		EmptyUpstreams: len(t.emptyUpstreams),
+		RequestID:                  t.requestID,
+		AttemptCount:               t.attempts,
+		FallbackCount:              t.fallbacks,
+		MaxAttempts:                t.maxAttempts,
+		MaxFallbacks:               t.maxFallbacks,
+		TranslatorRuns:             t.translatorRuns,
+		FinalProvider:              t.finalProvider,
+		FinalModel:                 t.finalModel,
+		FinalExecutor:              t.finalExecutor,
+		FinalStatus:                t.finalStatus,
+		GPTRoundCount:              t.gptRound,
+		EmptyResponses:             t.emptyResponses,
+		EmptyRetries:               t.emptyRetries,
+		EmptyUpstreams:             len(t.emptyUpstreams),
+		GPTFirstEventTimeouts:      t.gptFirstEventTimeouts,
+		GPTFirstEventWait:          t.gptFirstEventWait,
+		GPTFirstEventShadowTimeout: t.gptFirstEventShadowTimeout,
+		GPTFirstEventShadowState:   t.gptFirstEventShadowState,
 	}
 }
 
@@ -670,6 +720,18 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 		fields["empty_response_recovered"] = logFinalSuccess
 		fields["empty_response_exhausted"] = !logFinalSuccess && finalEmptyResponse
 		fields["final_empty_response"] = finalEmptyResponse
+	}
+	if summary.GPTFirstEventWait > 0 {
+		fields["first_event_wait_ms"] = summary.GPTFirstEventWait.Milliseconds()
+	}
+	if summary.GPTFirstEventTimeouts > 0 {
+		fields["first_event_timeout_count"] = summary.GPTFirstEventTimeouts
+	}
+	if summary.GPTFirstEventShadowTimeout > 0 {
+		fields["first_event_shadow_timeout_ms"] = summary.GPTFirstEventShadowTimeout.Milliseconds()
+	}
+	if summary.GPTFirstEventShadowState != "" {
+		fields["first_event_shadow_state"] = summary.GPTFirstEventShadowState
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
@@ -1276,9 +1338,10 @@ type Manager struct {
 	codexModelLoadMu sync.Mutex
 	codexModelLoads  map[string]int
 
-	requestPrepareLocks sync.Map
-	refreshLocks        sync.Map
-	activeStreams       *activeStreamTracker
+	requestPrepareLocks   sync.Map
+	refreshLocks          sync.Map
+	activeStreams         *activeStreamTracker
+	gptFirstEventObserver *gptFirstEventObserver
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -1305,6 +1368,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		gptChannelBreakers:       make(map[string]*codexChannelBreakerState),
 		codexModelLoads:          make(map[string]int),
 		activeStreams:            newActiveStreamTracker(),
+		gptFirstEventObserver:    newGPTFirstEventObserver(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -3719,7 +3783,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 		}
 		attemptCtx, attemptCancel := context.WithCancelCause(ctx)
-		firstEventDeadline := newStreamFirstEventDeadline(m.firstEventTimeoutForRoute(routeProviders, routeModel), attemptCancel)
+		firstEventTimeout := m.firstEventTimeoutForRoute(routeProviders, routeModel)
+		firstEventDeadline := newStreamFirstEventDeadline(firstEventTimeout, attemptCancel)
 		var streamResult *cliproxyexecutor.StreamResult
 		var cleanupOnce sync.Once
 		cleanupAttempt := func() {
@@ -3766,6 +3831,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			cleanupAttempt()
 			rerr := resultErrorFromCause(errStream)
 			elapsed := time.Since(startedAt)
+			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, elapsed, false, errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: elapsed, TTFT: elapsed, Error: rerr, Cause: errStream}
 			result.RetryAfter = retryAfterFromError(errStream)
 			channelFailover := shouldFailoverGPTChannel(errStream, routeProviders, routeModel)
@@ -3893,6 +3959,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, errCtx
 			}
+			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
 			rerr := resultErrorFromCause(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: bootstrapErr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
@@ -3948,6 +4015,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, false, emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: emptyErr}
 			result.keepSelectorLease = idx < len(execModels)-1
 			m.MarkResult(ctx, result)
@@ -3995,6 +4063,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
 			toolShape:        toolShapeFromOptions(opts),
 		}
+		m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, true, nil)
 		return m.wrapStreamResult(
 			attemptCtx,
 			auth.Clone(),
