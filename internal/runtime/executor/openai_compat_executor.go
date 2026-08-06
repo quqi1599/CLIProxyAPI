@@ -423,7 +423,11 @@ func deepSeekOfficialImageInputUserMessage() string {
 }
 
 func rejectDeepSeekUnsupportedResponsesTools(ctx context.Context, body []byte, profile openAICompatProfile, model, path, endpoint, sourceFormat string) error {
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" ||
+	return rejectDeepSeekUnsupportedResponsesToolsForKind(ctx, body, profile.Kind, model, path, endpoint, sourceFormat, "OpenAICompatExecutor")
+}
+
+func rejectDeepSeekUnsupportedResponsesToolsForKind(ctx context.Context, body []byte, compatKind, model, path, endpoint, sourceFormat, executor string) error {
+	if config.NormalizeOpenAICompatibilityKind(compatKind) != "deepseek" ||
 		!strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") {
 		return nil
 	}
@@ -432,7 +436,8 @@ func rejectDeepSeekUnsupportedResponsesTools(ctx context.Context, body []byte, p
 		return nil
 	}
 	fields := log.Fields{
-		"event":                  "openai_compat_responses_tool_guard",
+		"event":                  "deepseek_responses_tool_guard",
+		"executor":               executor,
 		"model":                  model,
 		"compat_kind":            "deepseek",
 		"request_path":           path,

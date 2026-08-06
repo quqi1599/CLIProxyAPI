@@ -305,6 +305,18 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	if err = rejectDeepSeekUnsupportedResponsesToolsForKind(
+		ctx,
+		originalPayloadSource,
+		plan.providerIdentity.Kind,
+		baseModel,
+		helps.PayloadRequestPath(opts),
+		"/v1/messages",
+		from.String(),
+		"ClaudeExecutor",
+	); err != nil {
+		return plan, err
+	}
 	payloadSource := req.Payload
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(originalPayloadSource); ok {
 		originalPayloadSource = repaired

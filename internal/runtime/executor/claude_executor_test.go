@@ -122,6 +122,86 @@ func TestClaudeExecutorExecutePreservesConfiguredFullMessagesEndpoint(t *testing
 	}
 }
 
+func TestClaudeExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+	mixedTools := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[{"role":"user","content":"Inspect the repository."}],
+		"tools":[
+			{"type":"function","name":"lookup","parameters":{"type":"object"}},
+			{"type":"namespace","name":"workspace"},
+			{"type":"web_search"}
+		]
+	}`)
+	functionOnly := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[{"role":"user","content":"Inspect the repository."}],
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+	}`)
+
+	for _, test := range []struct {
+		name            string
+		payload         []byte
+		originalRequest []byte
+		stream          bool
+	}{
+		{name: "non-stream payload", payload: mixedTools},
+		{name: "stream payload", payload: mixedTools, stream: true},
+		{name: "original request before translation", payload: functionOnly, originalRequest: mixedTools},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+			auth := &cliproxyauth.Auth{
+				Provider: "claude",
+				Attributes: map[string]string{
+					"api_key":     "test-key",
+					"base_url":    server.URL,
+					"compat_kind": "deepseek",
+				},
+			}
+			req := cliproxyexecutor.Request{Model: "deepseek-v4-flash", Payload: test.payload}
+			opts := cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FromString("openai-response"),
+				OriginalRequest: test.originalRequest,
+			}
+
+			var err error
+			if test.stream {
+				_, err = executor.ExecuteStream(context.Background(), auth, req, opts)
+			} else {
+				_, err = executor.Execute(context.Background(), auth, req, opts)
+			}
+			if err == nil {
+				t.Fatal("expected request_feature_unsupported error")
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+			}
+			status, ok := err.(interface {
+				StatusCode() int
+				ErrorCode() string
+			})
+			if !ok {
+				t.Fatalf("error type %T does not expose status/error code", err)
+			}
+			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
+				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
+			}
+			for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+				if !strings.Contains(err.Error(), marker) {
+					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
+				}
+			}
+		})
+	}
+}
+
 func TestPrepareClaudeRequest_StreamAndNonStreamShareCommonFixture(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
 	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
