@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -217,9 +218,7 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"model":"deepseek-v4-flash",
 		"input":[{"role":"developer","content":"Be concise."},{"role":"user","content":"Inspect the repository."}],
 		"tools":[
-			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true},
-			{"type":"custom","name":"apply_patch","description":"Apply a patch"},
-			{"type":"web_search"}
+			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true}
 		],
 		"tool_choice":"auto",
 		"reasoning":{"effort":"low"},
@@ -246,9 +245,6 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"input.0.role":     "developer",
 		"tools.0.type":     "function",
 		"tools.0.name":     "lookup",
-		"tools.1.type":     "custom",
-		"tools.1.name":     "apply_patch",
-		"tools.2.type":     "web_search",
 		"tool_choice":      "auto",
 		"reasoning.effort": "low",
 		"text.format.type": "json_schema",
@@ -259,6 +255,107 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 	}
 	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
 		t.Fatalf("response object = %q, want response; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+	for _, model := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+		t.Run(model, func(t *testing.T) {
+			upstreamCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider: "openai-compatibility",
+				Attributes: map[string]string{
+					"base_url":    server.URL + "/v1",
+					"api_key":     "test",
+					"compat_kind": "deepseek",
+				},
+			}
+			payload := []byte(fmt.Sprintf(`{
+				"model":%q,
+				"input":[{"role":"user","content":"Inspect the repository."}],
+				"tools":[
+					{"type":"function","name":"lookup","parameters":{"type":"object"}},
+					{"type":"namespace","name":"workspace"},
+					{"type":"web_search"}
+				]
+			}`, model))
+
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   model,
+				Payload: payload,
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("openai-response"),
+			})
+			if err == nil {
+				t.Fatal("expected request_feature_unsupported error")
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+			}
+			status, ok := err.(interface {
+				StatusCode() int
+				ErrorCode() string
+			})
+			if !ok {
+				t.Fatalf("error type %T does not expose status/error code", err)
+			}
+			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
+				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
+			}
+			for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+				if !strings.Contains(err.Error(), marker) {
+					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAICompatExecutorHTTPDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+	upstreamCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"api_key":     "test",
+			"compat_kind": "deepseek",
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{
+		"model":"deepseek-v4-flash",
+		"input":"Search the web.",
+		"tools":[{"type":"web_search"}]
+	}`))
+
+	_, err := exec.HttpRequest(context.Background(), auth, req)
+	if err == nil {
+		t.Fatal("expected request_feature_unsupported error")
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+	}
+	status, ok := err.(interface {
+		StatusCode() int
+		ErrorCode() string
+	})
+	if !ok {
+		t.Fatalf("error type %T does not expose status/error code", err)
+	}
+	if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
+		t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
 	}
 }
 

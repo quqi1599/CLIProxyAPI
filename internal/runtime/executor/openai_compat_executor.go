@@ -282,6 +282,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if req.URL != nil {
 		path = req.URL.Path
 	}
+	if errReject := rejectDeepSeekUnsupportedResponsesTools(req.Context(), body, profile, model, path, path, openAICompatSourceFormatForPath(path)); errReject != nil {
+		return errReject
+	}
 	if errReject := rejectLargeOpenAICompatToolHistory(req.Context(), body, profile, model, path); errReject != nil {
 		return errReject
 	}
@@ -417,6 +420,90 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 
 func deepSeekOfficialImageInputUserMessage() string {
 	return "request_feature_unsupported: deepseek_official_image_input. DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
+}
+
+func rejectDeepSeekUnsupportedResponsesTools(ctx context.Context, body []byte, profile openAICompatProfile, model, path, endpoint, sourceFormat string) error {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" ||
+		!strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") {
+		return nil
+	}
+	toolCount, unsupportedCount, unsupportedTypes := deepSeekUnsupportedResponsesToolTypes(body)
+	if unsupportedCount == 0 {
+		return nil
+	}
+	fields := log.Fields{
+		"event":                  "openai_compat_responses_tool_guard",
+		"model":                  model,
+		"compat_kind":            "deepseek",
+		"request_path":           path,
+		"upstream_endpoint":      endpoint,
+		"source_format":          sourceFormat,
+		"tool_definition_count":  toolCount,
+		"unsupported_tool_count": unsupportedCount,
+		"unsupported_tool_types": unsupportedTypes,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek route rejected unsupported Responses tool types before upstream request")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       deepSeekResponsesToolsUserMessage(unsupportedTypes),
+	}
+}
+
+func deepSeekUnsupportedResponsesToolTypes(body []byte) (toolCount, unsupportedCount int, unsupportedTypes []string) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0, 0, nil
+	}
+	seen := make(map[string]struct{})
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		toolCount++
+		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+		if toolType == "function" {
+			continue
+		}
+		unsupportedCount++
+		toolType = safeDeepSeekToolTypeLabel(toolType)
+		if _, ok := seen[toolType]; ok {
+			continue
+		}
+		seen[toolType] = struct{}{}
+		if len(unsupportedTypes) < 8 {
+			unsupportedTypes = append(unsupportedTypes, toolType)
+		}
+	}
+	return toolCount, unsupportedCount, unsupportedTypes
+}
+
+func safeDeepSeekToolTypeLabel(toolType string) string {
+	if toolType == "" {
+		return "missing"
+	}
+	if len(toolType) > 64 {
+		return "other"
+	}
+	for _, char := range toolType {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return "other"
+	}
+	return toolType
+}
+
+func deepSeekResponsesToolsUserMessage(unsupportedTypes []string) string {
+	typeSummary := "non-function"
+	if len(unsupportedTypes) > 0 {
+		typeSummary = strings.Join(unsupportedTypes, ", ")
+	}
+	return fmt.Sprintf("request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：%s。CPA 不会静默删除、降级或改写这些工具。请仅保留 function 工具，或切换到原生支持这些 Responses 工具的模型/渠道；原样重复提交不会提高成功率。", typeSummary)
+}
+
+func openAICompatSourceFormatForPath(path string) string {
+	normalized := strings.TrimSuffix(strings.TrimSpace(path), "/")
+	if normalized == "/responses" || strings.HasSuffix(normalized, "/v1/responses") {
+		return "openai-response"
+	}
+	return ""
 }
 
 func hasOpenAICompatToolOutputMarker(body []byte) bool {
@@ -808,6 +895,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
 	if err = rejectDeepSeekUnsupportedChatResponseFormat(ctx, plan.requestSource, body, profile, baseModel, plan.endpoint, plan.requestPath); err != nil {
+		return plan, err
+	}
+	if err = rejectDeepSeekUnsupportedResponsesTools(ctx, plan.requestSource, profile, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
 		return plan, err
 	}
 	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
