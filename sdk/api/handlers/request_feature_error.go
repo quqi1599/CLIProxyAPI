@@ -22,12 +22,72 @@ func userFacingOpenAICompatToolHistoryMessage() string {
 	return "当前 GPT/OpenAI-compatible 路由检测到历史工具调用过多、文件工具结果过多或上下文过大，继续原样转发会显著拖慢或中断请求。请新开会话，或将历史工具调用/文件结果压缩成普通文本摘要，减少重复文件提交；也可以切换到更适合长文件上下文的模型后重试。原样重复提交不会提高成功率。"
 }
 
-func userFacingDeepSeekOfficialImageInputMessage() string {
-	return "当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容，包括历史消息里的 image_url / input_image。请移除图片输入与图片历史，仅保留文本内容，或切换到原生支持图像输入的模型/路由后重试。原样重复提交不会提高成功率。"
+func userFacingDeepSeekChatJSONSchemaMessage() string {
+	return "当前选择的 DeepSeek Chat 接口不支持本次 Codex 请求使用的“结构化 JSON 输出”。这是 DeepSeek 对该输出方式的兼容性限制，不是账号或余额问题。请在 Codex 的模型选择器中切换到原生 GPT 模型后重试；如果继续使用 DeepSeek，请改用普通 JSON 输出。原样重试不会成功。"
 }
 
-func userFacingDeepSeekResponsesNonFunctionToolsMessage() string {
-	return "request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，不支持 namespace、web_search 等非 function Responses 工具。CPA 不会静默删除、降级或改写这些工具。请仅保留 function 工具，或切换到原生支持这些 Responses 工具的模型/渠道；原样重复提交不会提高成功率。"
+func userFacingDeepSeekOfficialImageInputMessage() string {
+	return "当前选择的 DeepSeek 模型不支持本次 Codex 请求中的图片输入（包括对话历史里的图片）。这是模型能力兼容限制，不是账号或余额问题。请在 Codex 的模型选择器中切换到支持图片的原生 GPT 模型后重试；如果继续使用 DeepSeek，请移除当前和历史消息中的图片，仅保留文字。原样重试不会成功。"
+}
+
+func userFacingDeepSeekResponsesNonFunctionToolsMessage(errText string) string {
+	toolNames := deepSeekUnsupportedToolChineseNames(errText)
+	return "当前选择的 DeepSeek 模型无法完整支持 Codex 正在使用的工具：" + strings.Join(toolNames, "、") + "。这是 DeepSeek 对 Codex 扩展工具协议的兼容性限制，不是账号、余额或网络问题。请在 Codex 的模型选择器中切换到原生 GPT 模型后重试；如果必须继续使用 DeepSeek，请关闭这些扩展工具，仅保留普通函数调用。原样重试不会成功。"
+}
+
+func deepSeekUnsupportedToolChineseNames(errText string) []string {
+	const marker = "工具类型："
+	seen := make(map[string]struct{})
+	toolNames := make([]string, 0, 4)
+	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
+		start := strings.Index(candidate, marker)
+		if start < 0 {
+			continue
+		}
+		typeSummary := candidate[start+len(marker):]
+		if end := strings.IndexAny(typeSummary, "。;\n\r"); end >= 0 {
+			typeSummary = typeSummary[:end]
+		}
+		for _, toolType := range strings.Split(typeSummary, ",") {
+			name := deepSeekToolChineseName(toolType)
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			toolNames = append(toolNames, name)
+		}
+	}
+	if len(toolNames) == 0 {
+		return []string{"联网搜索、工具分组等扩展工具"}
+	}
+	return toolNames
+}
+
+func deepSeekToolChineseName(toolType string) string {
+	switch strings.ToLower(strings.TrimSpace(toolType)) {
+	case "namespace":
+		return "工具分组"
+	case "web_search", "web_search_preview":
+		return "联网搜索"
+	case "file_search":
+		return "文件搜索"
+	case "computer", "computer_use", "computer_use_preview":
+		return "电脑操作"
+	case "code_interpreter":
+		return "代码执行"
+	case "mcp":
+		return "MCP 外部工具"
+	case "image_generation":
+		return "图片生成"
+	case "local_shell":
+		return "本地命令"
+	case "custom":
+		return "自定义工具"
+	case "missing":
+		return "未标注类型的工具"
+	default:
+		return "其他扩展工具"
+	}
 }
 
 func userFacingMiMoV25ProImageInputMessage() string {
@@ -64,10 +124,12 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 		switch {
 		case hasOpenAICompatToolHistorySignal(candidate):
 			message = userFacingOpenAICompatToolHistoryMessage()
+		case hasDeepSeekChatJSONSchemaSignal(candidate):
+			message = userFacingDeepSeekChatJSONSchemaMessage()
 		case hasDeepSeekOfficialImageInputSignal(candidate):
 			message = userFacingDeepSeekOfficialImageInputMessage()
 		case hasDeepSeekResponsesNonFunctionToolsSignal(candidate):
-			message = userFacingDeepSeekResponsesNonFunctionToolsMessage()
+			message = userFacingDeepSeekResponsesNonFunctionToolsMessage(errText)
 		case hasMiMoV25ProImageInputSignal(candidate):
 			message = userFacingMiMoV25ProImageInputMessage()
 		}
@@ -153,6 +215,11 @@ func hasRequestFeatureUnsupportedSignal(text string) bool {
 func hasOpenAICompatToolHistorySignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "large_openai_tool_history")
+}
+
+func hasDeepSeekChatJSONSchemaSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "deepseek_chat_json_schema")
 }
 
 func hasDeepSeekOfficialImageInputSignal(text string) bool {

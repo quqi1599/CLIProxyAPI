@@ -425,23 +425,51 @@ func TestBuildErrorResponseBody_NormalizesDeepSeekOfficialImageRequestFeatureUns
 	}
 }
 
-func TestBuildErrorResponseBody_PreservesDeepSeekResponsesNonFunctionToolsMeaning(t *testing.T) {
-	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：namespace, web_search。CPA 不会静默删除、降级或改写这些工具。","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+func TestBuildErrorResponseBody_NormalizesDeepSeekChatJSONSchemaRequestFeatureUnsupported(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: deepseek_chat_json_schema. DeepSeek 官方 Chat Completions 不支持 json_schema","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
 
 	var payload ErrorResponse
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if payload.Error.Message != userFacingDeepSeekResponsesNonFunctionToolsMessage() {
-		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekResponsesNonFunctionToolsMessage())
+	if payload.Error.Message != userFacingDeepSeekChatJSONSchemaMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekChatJSONSchemaMessage())
 	}
-	for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+	for _, marker := range []string{"Codex", "结构化 JSON 输出", "原生 GPT 模型"} {
 		if !strings.Contains(payload.Error.Message, marker) {
 			t.Fatalf("message = %q, want marker %q", payload.Error.Message, marker)
 		}
 	}
-	if strings.Contains(payload.Error.Message, "历史工具调用过多") {
-		t.Fatalf("message contains unrelated tool history guidance: %q", payload.Error.Message)
+	for _, internalTerm := range []string{"request_feature_unsupported", "deepseek_chat_json_schema", "CPA", "json_schema"} {
+		if strings.Contains(payload.Error.Message, internalTerm) {
+			t.Fatalf("message = %q, contains internal term %q", payload.Error.Message, internalTerm)
+		}
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_ExplainsDeepSeekResponsesToolsInCustomerLanguage(t *testing.T) {
+	errText := `{"error":{"message":"request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：namespace, web_search。CPA 不会静默删除、降级或改写这些工具。","type":"invalid_request_error","code":"request_feature_unsupported"}}`
+	body := BuildErrorResponseBody(http.StatusBadRequest, errText)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingDeepSeekResponsesNonFunctionToolsMessage(errText) {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekResponsesNonFunctionToolsMessage(errText))
+	}
+	for _, marker := range []string{"Codex", "工具分组", "联网搜索", "原生 GPT 模型"} {
+		if !strings.Contains(payload.Error.Message, marker) {
+			t.Fatalf("message = %q, want marker %q", payload.Error.Message, marker)
+		}
+	}
+	for _, internalTerm := range []string{"request_feature_unsupported", "deepseek_responses_non_function_tools", "namespace", "web_search", "CPA", "Responses", "function"} {
+		if strings.Contains(payload.Error.Message, internalTerm) {
+			t.Fatalf("message = %q, contains internal term %q", payload.Error.Message, internalTerm)
+		}
 	}
 	if payload.Error.Type != requestFeatureUnsupportedErrorType {
 		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)

@@ -67,10 +67,10 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		message = UserFacingContextWindowMessage()
 		code = contextWindowExceededErrorCode
 	}
-	_, isRequestFeatureUnsupported := requestFeatureUnsupportedErrorDetail(status, errText)
+	requestFeatureDetail, isRequestFeatureUnsupported := requestFeatureUnsupportedErrorDetail(status, errText)
 	if isRequestFeatureUnsupported {
-		message = UserFacingRequestFeatureUnsupportedMessage()
-		code = requestFeatureUnsupportedErrorCode
+		message = requestFeatureDetail.Message
+		code = requestFeatureDetail.Code
 	}
 	isNormalizedError := isContentSafety || isContextWindowExceeded || isRequestFeatureUnsupported
 	if !isNormalizedError {
