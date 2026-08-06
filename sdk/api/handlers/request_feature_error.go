@@ -26,6 +26,10 @@ func userFacingDeepSeekOfficialImageInputMessage() string {
 	return "当前 DeepSeek 官方 OpenAI Chat 路由不支持 image_url 图片内容，包括历史消息里的 image_url / input_image。请移除图片输入与图片历史，仅保留文本内容，或切换到原生支持图像输入的模型/路由后重试。原样重复提交不会提高成功率。"
 }
 
+func userFacingDeepSeekResponsesNonFunctionToolsMessage() string {
+	return "request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，不支持 namespace、web_search 等非 function Responses 工具。CPA 不会静默删除、降级或改写这些工具。请仅保留 function 工具，或切换到原生支持这些 Responses 工具的模型/渠道；原样重复提交不会提高成功率。"
+}
+
 func userFacingMiMoV25ProImageInputMessage() string {
 	return "mimo-v2.5-pro 不支持图片输入，请将请求中的 model 明确改为 mimo-v2.5 后重试。系统不会自动替换模型，也不会重试或切换其他渠道。"
 }
@@ -62,6 +66,8 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 			message = userFacingOpenAICompatToolHistoryMessage()
 		case hasDeepSeekOfficialImageInputSignal(candidate):
 			message = userFacingDeepSeekOfficialImageInputMessage()
+		case hasDeepSeekResponsesNonFunctionToolsSignal(candidate):
+			message = userFacingDeepSeekResponsesNonFunctionToolsMessage()
 		case hasMiMoV25ProImageInputSignal(candidate):
 			message = userFacingMiMoV25ProImageInputMessage()
 		}
@@ -152,6 +158,11 @@ func hasOpenAICompatToolHistorySignal(text string) bool {
 func hasDeepSeekOfficialImageInputSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "deepseek_official_image_input")
+}
+
+func hasDeepSeekResponsesNonFunctionToolsSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "deepseek_responses_non_function_tools")
 }
 
 func hasMiMoV25ProImageInputSignal(text string) bool {

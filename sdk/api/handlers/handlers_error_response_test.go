@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -415,6 +416,32 @@ func TestBuildErrorResponseBody_NormalizesDeepSeekOfficialImageRequestFeatureUns
 	}
 	if payload.Error.Message != userFacingDeepSeekOfficialImageInputMessage() {
 		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekOfficialImageInputMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
+	}
+	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_PreservesDeepSeekResponsesNonFunctionToolsMeaning(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：namespace, web_search。CPA 不会静默删除、降级或改写这些工具。","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingDeepSeekResponsesNonFunctionToolsMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekResponsesNonFunctionToolsMessage())
+	}
+	for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+		if !strings.Contains(payload.Error.Message, marker) {
+			t.Fatalf("message = %q, want marker %q", payload.Error.Message, marker)
+		}
+	}
+	if strings.Contains(payload.Error.Message, "历史工具调用过多") {
+		t.Fatalf("message contains unrelated tool history guidance: %q", payload.Error.Message)
 	}
 	if payload.Error.Type != requestFeatureUnsupportedErrorType {
 		t.Fatalf("type = %q, want %q", payload.Error.Type, requestFeatureUnsupportedErrorType)
