@@ -202,7 +202,8 @@ var oauthToolRenameMap = map[string]string{
 const defaultModelMaxTokens = 1024
 
 const (
-	largeClaudeCompatToolHistoryLimitMultiplier  = 3
+	largeClaudeCompatToolHistoryLimitMultiplier  = 15
+	largeClaudeCompatStepLimitMultiplier         = 5
 	largeClaudeCompatSonnet46PayloadBytes        = largeClaudeCompatToolHistoryLimitMultiplier * 512 * 1024
 	largeClaudeCompatToolHistoryPayloadBytes     = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
 	largeClaudeCompatToolResultPilePayloadBytes  = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
@@ -211,9 +212,9 @@ const (
 	largeClaudeCompatToolHistoryOnlyInteractions = largeClaudeCompatToolHistoryLimitMultiplier * 700
 	largeClaudeCompatToolHistoryMCPTools         = largeClaudeCompatToolHistoryLimitMultiplier * 80
 	largeClaudeCompatToolResultOnlyMessages      = largeClaudeCompatToolHistoryLimitMultiplier * 40
-	largeClaudeCompatStepPayloadBytes            = 1 * 1024 * 1024
-	largeClaudeCompatStepMessages                = 250
-	largeClaudeCompatStepInteractions            = 500
+	largeClaudeCompatStepPayloadBytes            = largeClaudeCompatStepLimitMultiplier * 1 * 1024 * 1024
+	largeClaudeCompatStepMessages                = largeClaudeCompatStepLimitMultiplier * 250
+	largeClaudeCompatStepInteractions            = largeClaudeCompatStepLimitMultiplier * 500
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }

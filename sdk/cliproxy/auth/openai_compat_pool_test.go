@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -340,8 +341,8 @@ func TestManagerExecute_OpenAICompatLargeToolHistorySkipsMiniMaxM3Highspeed(t *t
 		Model:   alias,
 		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":1024}`),
 	}, cliproxyexecutor.Options{Metadata: map[string]any{
-		cliproxyexecutor.MessageCountMetadataKey: "327",
-		cliproxyexecutor.ToolCountMetadataKey:    "129",
+		cliproxyexecutor.MessageCountMetadataKey: strconv.Itoa(miniMaxLargeToolHistoryMessages + 1),
+		cliproxyexecutor.ToolCountMetadataKey:    strconv.Itoa(miniMaxLargeToolHistoryTools + 1),
 	}})
 	if err != nil {
 		t.Fatalf("execute: %v", err)

@@ -12,7 +12,7 @@ const (
 	miniMaxM2SafeTotalTokens          int64 = 180000
 	miniMaxM3RequiredMetadataKey            = "__cliproxy_minimax_m3_required"
 	miniMaxM3StandardModel                  = "MiniMax-M3"
-	miniMaxLargeToolHistoryMultiplier       = 3
+	miniMaxLargeToolHistoryMultiplier       = 15
 	miniMaxLargeToolHistoryMessages         = miniMaxLargeToolHistoryMultiplier * 100
 	miniMaxLargeToolHistoryTools            = miniMaxLargeToolHistoryMultiplier * 40
 )
