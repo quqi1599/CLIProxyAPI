@@ -202,19 +202,21 @@ var oauthToolRenameMap = map[string]string{
 const defaultModelMaxTokens = 1024
 
 const (
-	largeClaudeCompatToolHistoryLimitMultiplier  = 15
-	largeClaudeCompatStepLimitMultiplier         = 5
-	largeClaudeCompatSonnet46PayloadBytes        = largeClaudeCompatToolHistoryLimitMultiplier * 512 * 1024
-	largeClaudeCompatToolHistoryPayloadBytes     = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
-	largeClaudeCompatToolResultPilePayloadBytes  = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
-	largeClaudeCompatToolHistoryMessages         = largeClaudeCompatToolHistoryLimitMultiplier * 800
-	largeClaudeCompatToolHistoryInteractions     = largeClaudeCompatToolHistoryLimitMultiplier * 500
-	largeClaudeCompatToolHistoryOnlyInteractions = largeClaudeCompatToolHistoryLimitMultiplier * 700
-	largeClaudeCompatToolHistoryMCPTools         = largeClaudeCompatToolHistoryLimitMultiplier * 80
-	largeClaudeCompatToolResultOnlyMessages      = largeClaudeCompatToolHistoryLimitMultiplier * 40
-	largeClaudeCompatStepPayloadBytes            = largeClaudeCompatStepLimitMultiplier * 1 * 1024 * 1024
-	largeClaudeCompatStepMessages                = largeClaudeCompatStepLimitMultiplier * 250
-	largeClaudeCompatStepInteractions            = largeClaudeCompatStepLimitMultiplier * 500
+	largeClaudeCompatToolHistoryLimitMultiplier    = 15
+	largeClaudeCompatStepLimitMultiplier           = 5
+	largeClaudeCompatSonnet46PayloadBytes          = largeClaudeCompatToolHistoryLimitMultiplier * 512 * 1024
+	largeClaudeCompatSonnet46MiniMaxPayloadBytes   = 12 * 1024 * 1024
+	largeClaudeCompatSonnet46MiniMaxM3PayloadBytes = 20 * 1024 * 1024
+	largeClaudeCompatToolHistoryPayloadBytes       = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
+	largeClaudeCompatToolResultPilePayloadBytes    = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
+	largeClaudeCompatToolHistoryMessages           = largeClaudeCompatToolHistoryLimitMultiplier * 800
+	largeClaudeCompatToolHistoryInteractions       = largeClaudeCompatToolHistoryLimitMultiplier * 500
+	largeClaudeCompatToolHistoryOnlyInteractions   = largeClaudeCompatToolHistoryLimitMultiplier * 700
+	largeClaudeCompatToolHistoryMCPTools           = largeClaudeCompatToolHistoryLimitMultiplier * 80
+	largeClaudeCompatToolResultOnlyMessages        = largeClaudeCompatToolHistoryLimitMultiplier * 40
+	largeClaudeCompatStepPayloadBytes              = 20 * 1024 * 1024
+	largeClaudeCompatStepMessages                  = largeClaudeCompatStepLimitMultiplier * 250
+	largeClaudeCompatStepInteractions              = largeClaudeCompatStepLimitMultiplier * 500
 )
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
@@ -2533,7 +2535,17 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 		mcpToolCount = preflight.mcpToolCount
 	}
 	payloadBytes := len(body)
-	if payloadBytes >= largeClaudeCompatSonnet46PayloadBytes && interactions > 0 {
+	sonnet46PayloadLimit := largeClaudeCompatSonnet46PayloadBytes
+	isMiniMaxCompat := strings.EqualFold(strings.TrimSpace(meta.compatKind), "minimax")
+	if isMiniMaxCompat {
+		sonnet46PayloadLimit = largeClaudeCompatSonnet46MiniMaxPayloadBytes
+		if isMiniMaxM3CompatModel(meta.upstreamModel) {
+			sonnet46PayloadLimit = largeClaudeCompatSonnet46MiniMaxM3PayloadBytes
+		}
+	} else if strings.EqualFold(strings.TrimSpace(meta.compatKind), "step") {
+		sonnet46PayloadLimit = largeClaudeCompatSonnet46MiniMaxM3PayloadBytes
+	}
+	if payloadBytes >= sonnet46PayloadLimit && interactions > 0 {
 		return "payload_bytes", true
 	}
 	if strings.EqualFold(strings.TrimSpace(meta.compatKind), "step") {
@@ -2569,6 +2581,18 @@ func isClaudeSonnet46CompatModel(model string) bool {
 		base = model
 	}
 	return strings.EqualFold(base, "claude-sonnet-4-6")
+}
+
+func isMiniMaxM3CompatModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	base := strings.TrimSpace(thinking.ParseSuffix(model).ModelName)
+	if base == "" {
+		base = model
+	}
+	return strings.EqualFold(base, "minimax-m3")
 }
 
 func isMiniMaxStepClaudeCompatKind(kind string) bool {

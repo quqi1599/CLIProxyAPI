@@ -259,7 +259,7 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsHeavyStepHistoryEarlier(t *te
 	hook := logtest.NewGlobal()
 	hook.Reset()
 
-	body := []byte(strings.Repeat("x", largeClaudeCompatStepPayloadBytes+1024))
+	body := []byte(strings.Repeat("x", 10*1024*1024))
 	meta := compatRepairLogMeta{
 		requestedModel: "claude-sonnet-4-6",
 		upstreamModel:  "step-3.7-flash",
@@ -267,7 +267,7 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsHeavyStepHistoryEarlier(t *te
 		executor:       "ClaudeExecutor",
 		requestPath:    "/v1/messages",
 		compatKind:     "step",
-		messageCount:   307,
+		messageCount:   largeClaudeCompatStepMessages + 1,
 		toolCount:      largeClaudeCompatStepInteractions + 1,
 		toolShape: coreusage.ToolShape{
 			InteractionCount: largeClaudeCompatStepInteractions + 1,
@@ -286,11 +286,30 @@ func TestRejectLargeClaudeCompatToolHistory_RejectsHeavyStepHistoryEarlier(t *te
 	if got := entry.Data["reason"]; got != "step_tool_history" {
 		t.Fatalf("reason = %#v, want step_tool_history", got)
 	}
-	if got := entry.Data["message_count"]; got != 307 {
-		t.Fatalf("message_count = %#v, want 307", got)
+	if got := entry.Data["message_count"]; got != largeClaudeCompatStepMessages+1 {
+		t.Fatalf("message_count = %#v, want %d", got, largeClaudeCompatStepMessages+1)
 	}
 	if got := entry.Data["tool_interaction_count"]; got != largeClaudeCompatStepInteractions+1 {
 		t.Fatalf("tool_interaction_count = %#v, want %d", got, largeClaudeCompatStepInteractions+1)
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_AllowsStepPayloadBelowTwentyMiBLimit(t *testing.T) {
+	body := []byte(strings.Repeat("x", largeClaudeCompatSonnet46PayloadBytes+1024))
+	meta := compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "step-3.7-flash",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "step",
+		toolShape: coreusage.ToolShape{
+			InteractionCount: 1,
+		},
+	}
+
+	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, claudeCompatPreflight{hasToolUse: true}); err != nil {
+		t.Fatalf("unexpected Step payload rejection below 20 MiB: %v", err)
 	}
 }
 
@@ -298,7 +317,7 @@ func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46Paylo
 	hook := logtest.NewGlobal()
 	hook.Reset()
 
-	body := buildClaudeCompatToolHistoryBody(200, strings.Repeat("x", 40*1024))
+	body := buildClaudeCompatToolHistoryBody(200, strings.Repeat("x", 120*1024))
 	preflight := newClaudeCompatPreflight(body)
 	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
 		requestedModel: "claude-sonnet-4-6",
@@ -333,8 +352,8 @@ func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46Paylo
 	}
 }
 
-func TestRejectLargeClaudeCompatToolHistory_AllowsAgentSessionBelowRaisedSonnet46PayloadLimit(t *testing.T) {
-	body := buildClaudeCompatToolHistoryBody(34, strings.Repeat("x", 86*1024))
+func TestRejectLargeClaudeCompatToolHistory_AllowsAgentSessionBelowTwentyMiBSonnet46PayloadLimit(t *testing.T) {
+	body := buildClaudeCompatToolHistoryBody(68, strings.Repeat("x", 140*1024))
 	preflight := newClaudeCompatPreflight(body)
 	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
 		requestedModel: "claude-sonnet-4-6",
@@ -344,14 +363,33 @@ func TestRejectLargeClaudeCompatToolHistory_AllowsAgentSessionBelowRaisedSonnet4
 		requestPath:    "/v1/messages",
 		compatKind:     "minimax",
 	}, preflight)
-	if len(body) < 2*1024*1024 || len(body) >= largeClaudeCompatSonnet46PayloadBytes {
-		t.Fatalf("fixture payload size = %d, want 2 MiB through %d bytes", len(body), largeClaudeCompatSonnet46PayloadBytes-1)
+	if len(body) < 9*1024*1024 || len(body) >= largeClaudeCompatSonnet46MiniMaxM3PayloadBytes {
+		t.Fatalf("fixture payload size = %d, want 9 MiB through %d bytes", len(body), largeClaudeCompatSonnet46MiniMaxM3PayloadBytes-1)
 	}
-	if got := preflight.interactionCount(); got != 68 {
-		t.Fatalf("tool interactions = %d, want 68", got)
+	if got := preflight.interactionCount(); got != 136 {
+		t.Fatalf("tool interactions = %d, want 136", got)
 	}
 	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, preflight); err != nil {
 		t.Fatalf("unexpected rejection below raised Sonnet 4.6 payload limit: %v", err)
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_AllowsMiniMaxM27PayloadBelowTwelveMiBLimit(t *testing.T) {
+	body := buildClaudeCompatToolHistoryBody(68, strings.Repeat("x", 140*1024))
+	preflight := newClaudeCompatPreflight(body)
+	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M2.7",
+		provider:       "claude",
+		executor:       "ClaudeExecutor",
+		requestPath:    "/v1/messages",
+		compatKind:     "minimax",
+	}, preflight)
+	if len(body) < 9*1024*1024 || len(body) >= largeClaudeCompatSonnet46MiniMaxPayloadBytes {
+		t.Fatalf("fixture payload size = %d, want 9 MiB through %d bytes", len(body), largeClaudeCompatSonnet46MiniMaxPayloadBytes-1)
+	}
+	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, preflight); err != nil {
+		t.Fatalf("unexpected MiniMax M2.7 payload rejection below 12 MiB: %v", err)
 	}
 }
 
