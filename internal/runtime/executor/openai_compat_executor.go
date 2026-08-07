@@ -792,10 +792,21 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 
 	historyStarted := time.Now()
+	historyInput := body
+	var xiaomiHistoryDowngraded bool
+	body, xiaomiHistoryDowngraded, err = normalizeXiaomiMimoThinkingHistory(body, profile.Kind, baseModel)
+	if err != nil {
+		return plan, err
+	}
 	var historyReport thinkingHistoryTransformReport
 	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReport(body, "openai", baseModel)
 	if err != nil {
 		return plan, err
+	}
+	if xiaomiHistoryDowngraded {
+		historyReport.InputBytes = len(historyInput)
+		historyReport.OutputBytes = len(body)
+		historyReport.DowngradeReason = thinkingHistoryUnrepairableReason
 	}
 	if err = enforceThinkingHistoryTransform(ctx, "openai", historyReport, time.Since(historyStarted)); err != nil {
 		return plan, err
@@ -869,6 +880,10 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
+	body, _, err = normalizeXiaomiMimoThinkingHistory(body, profile.Kind, baseModel)
+	if err != nil {
+		return plan, err
+	}
 	if stream {
 		if profile.SupportsStreamUsage && plan.endpoint == "/chat/completions" {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)

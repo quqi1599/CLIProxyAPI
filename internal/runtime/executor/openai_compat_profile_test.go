@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -91,6 +92,25 @@ func TestNewOpenAICompatStatusErr_ParsesSSEDataErrorBody(t *testing.T) {
 	}
 	if got := err.Error(); strings.Contains(got, secret) || !strings.Contains(got, "error_code=invalid_function_arguments") || !strings.Contains(got, `"sha256":`) || !strings.Contains(got, `"content_type":"text/event-stream"`) {
 		t.Fatalf("Error() = %q, want safe parsed classification and metadata", got)
+	}
+}
+
+func TestNewOpenAICompatStatusErr_ClassifiesMiMoIncompleteReasoningSSE(t *testing.T) {
+	t.Parallel()
+
+	const secret = "private-history-sentinel"
+	body := []byte("event: error\ndata: {\"error\":{\"message\":\"reasoning_content is required for assistant messages with tool_calls " + secret + "\",\"type\":\"invalid_request_error\"}}\n\n")
+	err := newOpenAICompatStatusErr(openAICompatProfileForKind("xiaomi"), nil, "mimo-v2.5", http.StatusBadRequest, nil, "text/event-stream", body)
+
+	if err.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("StatusCode() = %d, want %d", err.StatusCode(), http.StatusBadRequest)
+	}
+	if got := err.Error(); strings.Contains(got, secret) || !strings.Contains(got, "reason=invalid_thinking_history reasoning_content incomplete") || !strings.Contains(got, `"content_type":"text/event-stream"`) {
+		t.Fatalf("Error() = %q, want safe MiMo reasoning-history category and metadata", got)
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidRequest || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped invalid request", typed)
 	}
 }
 

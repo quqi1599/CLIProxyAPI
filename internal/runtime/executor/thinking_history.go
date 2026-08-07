@@ -2,13 +2,18 @@ package executor
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	compathistory "github.com/router-for-me/CLIProxyAPI/v7/internal/compat/history"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -23,7 +28,10 @@ const (
 	claudeThinkingHistoryTransformStage   = "normalize.thinking_history.claude"
 	openAIReasoningUnavailablePlaceholder = compathistory.OpenAIUnavailableValue
 	claudeThinkingUnavailablePlaceholder  = compathistory.ClaudeUnavailableValue
+	xiaomiMimoInvalidThinkingHistoryCode  = "mimo_incomplete_reasoning_history"
 )
+
+const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少真实 reasoning_content，CPA 无法可靠还原。请新建会话、关闭思考或清理工具历史后重试；系统不会伪造思考内容、删除工具或跨渠道重试。"
 
 type thinkingHistoryTransformReport = compathistory.Report
 
@@ -110,7 +118,97 @@ func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, mo
 }
 
 func preservesOnlyRealReasoningHistory(model string) bool {
-	return strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "qwen")
+	modelName := normalizedOpenAICompatPolicyModelName(model)
+	return strings.HasPrefix(modelName, "qwen") || isXiaomiMimoV25Model(modelName)
+}
+
+func isXiaomiMimoV25Model(model string) bool {
+	modelName := normalizedOpenAICompatPolicyModelName(model)
+	return modelName == "mimo-v2.5" || strings.HasPrefix(modelName, "mimo-v2.5-pro")
+}
+
+func normalizeXiaomiMimoThinkingHistory(body []byte, compatKind string, model string) ([]byte, bool, error) {
+	if config.NormalizeOpenAICompatibilityKind(compatKind) != "xiaomi" || !isXiaomiMimoV25Model(model) {
+		return body, false, nil
+	}
+	if countXiaomiMimoToolCallsMissingReasoning(body) == 0 {
+		return body, false, nil
+	}
+
+	switch xiaomiMimoThinkingIntent(body) {
+	case "enabled":
+		return body, false, &failurecontract.Failure{
+			Kind:          failurecontract.InvalidThinkingHistory,
+			Scope:         failurecontract.ScopeRequest,
+			HTTPStatus:    http.StatusBadRequest,
+			ProviderCode:  xiaomiMimoInvalidThinkingHistoryCode,
+			Retryable:     false,
+			PublicMessage: xiaomiMimoInvalidThinkingHistoryMessage,
+		}
+	case "disabled":
+		updated, err := setXiaomiMimoThinkingDisabled(body)
+		return updated, false, err
+	default:
+		updated, err := setXiaomiMimoThinkingDisabled(body)
+		return updated, err == nil, err
+	}
+}
+
+func countXiaomiMimoToolCallsMissingReasoning(body []byte) int {
+	missing := 0
+	for _, message := range gjson.GetBytes(body, "messages").Array() {
+		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "assistant") {
+			continue
+		}
+		toolCalls := message.Get("tool_calls")
+		if !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+			continue
+		}
+		reasoning := message.Get("reasoning_content")
+		if reasoning.Type != gjson.String || strings.TrimSpace(reasoning.String()) == "" {
+			missing++
+		}
+	}
+	return missing
+}
+
+func xiaomiMimoThinkingIntent(body []byte) string {
+	if thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())); thinkingType != "" {
+		if isDisabledThinkingType(thinkingType) {
+			return "disabled"
+		}
+		return "enabled"
+	}
+	if reasoningIntent := xiaomiThinkingTypeFromReasoning(body); reasoningIntent != "" {
+		if isDisabledThinkingType(reasoningIntent) {
+			return "disabled"
+		}
+		return "enabled"
+	}
+	for _, path := range []string{"thinking_budget", "thinking.budget_tokens"} {
+		if gjson.GetBytes(body, path).Exists() {
+			return "enabled"
+		}
+	}
+	return "default"
+}
+
+func isDisabledThinkingType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "none", "off", "false", "disabled", "disable":
+		return true
+	default:
+		return false
+	}
+}
+
+func setXiaomiMimoThinkingDisabled(body []byte) ([]byte, error) {
+	out := thinking.StripThinkingConfig(body, "openai")
+	updated, err := sjson.SetBytes(out, "thinking.type", "disabled")
+	if err != nil {
+		return body, fmt.Errorf("set MiMo thinking.type disabled: %w", err)
+	}
+	return updated, nil
 }
 
 func openAIHistoryNeedsThinkingNormalization(body []byte) bool {

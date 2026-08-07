@@ -347,7 +347,8 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 		payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	}
 	if profile.NormalizeToolHistory {
-		if normalized, err := normalizeOpenAICompatToolMessageLinks(payload, "openai compat executor"); err == nil {
+		repairMissingReasoning := compatKind != "xiaomi" || !isXiaomiMimoV25Model(model)
+		if normalized, err := normalizeOpenAICompatToolMessageLinksWithReasoningRepair(payload, "openai compat executor", repairMissingReasoning); err == nil {
 			payload = normalized
 		} else {
 			log.WithError(err).WithField("compat_kind", config.NormalizeOpenAICompatibilityKind(profile.Kind)).Warn("openai compat executor: failed to normalize tool message history")

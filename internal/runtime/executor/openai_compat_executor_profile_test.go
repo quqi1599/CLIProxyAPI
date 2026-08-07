@@ -1629,7 +1629,7 @@ func TestOpenAICompatPayloadXiaomiScrubsUnsupportedOpenAIExtras(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatPayloadXiaomiRepairsAssistantToolCallReasoning(t *testing.T) {
+func TestOpenAICompatPayloadXiaomiDoesNotSynthesizeAssistantToolCallReasoning(t *testing.T) {
 	payload := []byte(`{
 		"model":"mimo-v2.5-pro",
 		"messages":[
@@ -1642,8 +1642,190 @@ func TestOpenAICompatPayloadXiaomiRepairsAssistantToolCallReasoning(t *testing.T
 
 	out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("xiaomi"), "mimo-v2.5-pro", "https://token-plan-cn.xiaomimimo.com/v1")
 
-	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != "r1" {
-		t.Fatalf("messages.1.reasoning_content = %q, want inherited r1: %s", got, string(out))
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "r1" {
+		t.Fatalf("messages.0.reasoning_content = %q, want preserved r1: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "messages.1.reasoning_content").Exists() {
+		t.Fatalf("messages.1.reasoning_content must not be synthesized: %s", string(out))
+	}
+}
+
+func TestOpenAICompatExecutorXiaomiStreamsAndReplaysRealReasoningWithImageTools(t *testing.T) {
+	var requestCount int
+	var replayBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		body, _ := io.ReadAll(r.Body)
+		if requestCount == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-mimo\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"plan alpha \"},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-mimo\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan beta\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"inspect\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		replayBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-mimo-replay","object":"chat.completion","model":"mimo-v2.5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("xiaomi-test", &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "xiaomi-test", Kind: "xiaomi"}}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":    server.URL + "/v1",
+		"api_key":     "test",
+		"compat_name": "xiaomi-test",
+		"compat_kind": "xiaomi",
+	}}
+
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "mimo-v2.5",
+		Payload: []byte(`{"model":"mimo-v2.5","messages":[{"role":"user","content":"start"}],"thinking":{"type":"enabled"},"stream":true}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamed bytes.Buffer
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		streamed.Write(chunk.Payload)
+	}
+	for _, want := range []string{`"reasoning_content":"plan alpha "`, `"reasoning_content":"plan beta"`} {
+		if !strings.Contains(streamed.String(), want) {
+			t.Fatalf("stream did not preserve %s: %s", want, streamed.String())
+		}
+	}
+
+	replayPayload := []byte(`{
+		"model":"mimo-v2.5",
+		"messages":[
+			{"role":"user","content":"start"},
+			{"role":"assistant","content":"","reasoning_content":"plan alpha plan beta","tool_calls":[{"id":"call_1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"done"},
+			{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}
+		],
+		"tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object","properties":{}}}}],
+		"thinking":{"type":"enabled"}
+	}`)
+	if _, err = executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "mimo-v2.5", Payload: replayPayload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}); err != nil {
+		t.Fatalf("Execute() replay error = %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("upstream request count = %d, want 2", requestCount)
+	}
+	if got := gjson.GetBytes(replayBody, "messages.1.reasoning_content").String(); got != "plan alpha plan beta" {
+		t.Fatalf("replayed reasoning_content = %q, want exact history: %s", got, string(replayBody))
+	}
+	if got := gjson.GetBytes(replayBody, "messages.3.content.1.type").String(); got != "image_url" {
+		t.Fatalf("image type = %q, want image_url: %s", got, string(replayBody))
+	}
+	if got := gjson.GetBytes(replayBody, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, string(replayBody))
+	}
+}
+
+func TestOpenAICompatExecutorXiaomiDisablesDefaultThinkingForMissingRealHistory(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-mimo","object":"chat.completion","model":"mimo-v2.5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("xiaomi-test", &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "xiaomi-test", Kind: "xiaomi"}}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test", "compat_name": "xiaomi-test", "compat_kind": "xiaomi"}}
+	payload := []byte(`{
+		"model":"mimo-v2.5",
+		"messages":[
+			{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"done"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "mimo-v2.5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("missing reasoning_content was synthesized: %s", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorXiaomiRejectsMissingRealHistoryWithExplicitEffort(t *testing.T) {
+	upstreamCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("xiaomi-test", &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "xiaomi-test", Kind: "xiaomi"}}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test", "compat_name": "xiaomi-test", "compat_kind": "xiaomi"}}
+	payload := []byte(`{
+		"model":"mimo-v2.5",
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"done"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "mimo-v2.5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() should reject incomplete MiMo thinking history")
+	}
+	if upstreamCalled {
+		t.Fatal("upstream should not be called for incomplete MiMo thinking history")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.HTTPStatus != http.StatusBadRequest || typed.ProviderCode != xiaomiMimoInvalidThinkingHistoryCode || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped MiMo thinking history error", typed)
+	}
+	for _, want := range []string{"新建会话", "关闭思考", "清理工具历史"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want guidance %q", err.Error(), want)
+		}
+	}
+}
+
+func TestOpenAICompatExecutorXiaomiRechecksMissingHistoryAfterPayloadConfig(t *testing.T) {
+	upstreamCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("xiaomi-test", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{Name: "xiaomi-test", Kind: "xiaomi"}},
+		Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "mimo-v2.5", Protocol: "openai"}},
+			Params: map[string]any{"thinking.type": "enabled"},
+		}}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test", "compat_name": "xiaomi-test", "compat_kind": "xiaomi"}}
+	payload := []byte(`{
+		"model":"mimo-v2.5",
+		"messages":[
+			{"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"done"},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "mimo-v2.5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() should reject payload config that re-enables MiMo thinking with incomplete history")
+	}
+	if upstreamCalled {
+		t.Fatal("upstream should not be called after payload config re-enables unsafe MiMo thinking")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped MiMo thinking history error", typed)
 	}
 }
 

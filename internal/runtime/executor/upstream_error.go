@@ -16,7 +16,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"empty_upstream_response": {}, "failed_precondition": {}, "insufficient_balance": {},
 	"insufficient_quota": {}, "invalid_api_key": {}, "invalid_function_arguments": {},
 	"invalid_grant": {}, "invalid_request": {}, "invalid_request_error": {},
-	"invalidargument": {}, "invalid_parameter": {}, "model_not_found": {},
+	"invalid_thinking_history": {}, "invalidargument": {}, "invalid_parameter": {}, "model_not_found": {},
 	"model_not_supported": {}, "not_found": {}, "overloaded": {}, "overloaded_error": {},
 	"permission_denied": {}, "permission_error": {}, "policy_denied": {},
 	"previous_response_not_found": {}, "rate_limit": {}, "rate_limit_error": {},
@@ -184,6 +184,13 @@ func safeUpstreamFailureReasons(body []byte, errorCode, errorType, errorStatus s
 	}
 	if identifierIs("invalidargument", "invalid_parameter") || contains("invalidparameter", "invalid parameter") {
 		add("invalidparameter")
+	}
+	if identifierIs("invalid_thinking_history") || contains("reasoning_content") && contains(
+		"must be fully passed back", "must completely pass back", "must be completely returned",
+		"must be included", "must include", "is required", "required field", "missing", "incomplete",
+		"必须完整回传", "必须传回", "缺少", "不完整",
+	) {
+		add("invalid_thinking_history reasoning_content incomplete")
 	}
 	if contains("out of supported range") {
 		for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {

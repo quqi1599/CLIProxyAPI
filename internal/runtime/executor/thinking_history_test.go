@@ -256,6 +256,37 @@ func TestNormalizeOpenAIThinkingHistoryQwenPreservesOnlyRealReasoning(t *testing
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryMiMoPreservesOnlyRealReasoning(t *testing.T) {
+	body := []byte(`{
+		"reasoning_effort":"high",
+		"messages":[
+			{"role":"assistant","content":"first answer","reasoning_content":"real reasoning"},
+			{"role":"assistant","content":"tool answer","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		]
+	}`)
+	for _, model := range []string{"mimo-v2.5", "provider/mimo-v2.5-pro(high)", "mimo-v2.5-pro-ultraspeed"} {
+		t.Run(model, func(t *testing.T) {
+			out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReport(body, "openai", model)
+			if err != nil {
+				t.Fatalf("normalizeThinkingHistoryForModelWithReport() error = %v", err)
+			}
+			if changed || downgraded || !bytes.Equal(out, body) {
+				t.Fatalf("MiMo history should remain unchanged: changed=%v downgraded=%v body=%s", changed, downgraded, string(out))
+			}
+			if report.PatchedCount != 0 || report.SyntheticBytes != 0 || report.PlaceholderCount != 0 {
+				t.Fatalf("MiMo history report = %+v", report)
+			}
+			if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "real reasoning" {
+				t.Fatalf("real reasoning_content = %q, want preserved", got)
+			}
+			if gjson.GetBytes(out, "messages.1.reasoning_content").Exists() {
+				t.Fatalf("missing MiMo reasoning_content must not be synthesized: %s", string(out))
+			}
+		})
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryModelCapabilityBoundaries(t *testing.T) {
 	body := []byte(`{
 		"reasoning_effort":"high",
@@ -273,7 +304,6 @@ func TestNormalizeOpenAIThinkingHistoryModelCapabilityBoundaries(t *testing.T) {
 	}{
 		{name: "deepseek complete history", model: "deepseek-v4-pro", wantPatched: 2, wantFirstReasoning: "first answer", wantToolReasoning: "first answer"},
 		{name: "doubao legacy history", model: "deepseek-r1", wantPatched: 1, wantToolReasoning: "second answer"},
-		{name: "xiaomi legacy history", model: "mimo-v2.5", wantPatched: 1, wantToolReasoning: "second answer"},
 		{name: "kimi legacy history", model: "kimi-k2.6", wantPatched: 1, wantToolReasoning: "second answer"},
 		{name: "unknown legacy history", model: "route-alias", wantPatched: 1, wantToolReasoning: "second answer"},
 	}

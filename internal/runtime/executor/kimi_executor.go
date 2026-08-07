@@ -974,6 +974,10 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 }
 
 func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte, error) {
+	return normalizeOpenAICompatToolMessageLinksWithReasoningRepair(body, logScope, true)
+}
+
+func normalizeOpenAICompatToolMessageLinksWithReasoningRepair(body []byte, logScope string, repairMissingReasoning bool) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body, nil
 	}
@@ -1043,7 +1047,7 @@ func normalizeOpenAICompatToolMessageLinks(body []byte, logScope string) ([]byte
 				continue
 			}
 
-			if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
+			if repairMissingReasoning && (!reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "") {
 				reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
 				next, err := sjson.SetBytes(msgRaw, "reasoning_content", reasoningText)
 				if err != nil {

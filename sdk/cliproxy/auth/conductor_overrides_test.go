@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -3644,6 +3645,30 @@ func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
 		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
 			t.Fatalf("expected deepseek official image input to stop fallback for %s", model)
 		}
+	}
+}
+
+func TestMiMoIncompleteThinkingHistoryDoesNotRetryOrFallback(t *testing.T) {
+	err := &failurecontract.Failure{
+		Kind:          failurecontract.InvalidThinkingHistory,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    http.StatusBadRequest,
+		ProviderCode:  "mimo_incomplete_reasoning_history",
+		Retryable:     false,
+		PublicMessage: "MiMo tool history is missing real reasoning_content",
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected incomplete MiMo thinking history to be request invalid")
+	}
+	if shouldFallbackRequestScopedRouteErrorForRequest("mimo-v2.5", cliproxyexecutor.Options{}, err) {
+		t.Fatal("expected incomplete MiMo thinking history to stop cross-provider fallback")
+	}
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(5, 30*time.Second, 0)
+	_, _, maxWait := manager.retrySettings()
+	if wait, retry := manager.shouldRetryAfterError(err, 0, []string{"xiaomi-primary", "xiaomi-backup"}, "mimo-v2.5", maxWait); retry {
+		t.Fatalf("expected no retry for deterministic MiMo 400, got wait=%v", wait)
 	}
 }
 
