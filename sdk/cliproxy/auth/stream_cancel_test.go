@@ -117,7 +117,7 @@ func TestManagerExecuteStreamCancelReleasesSelectorAndHalfOpenProbe(t *testing.T
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
 
-	channelKey := routingChannelBaseKey(auth)
+	channelKey := gptChannelBreakerKey(auth, model)
 	manager.mu.Lock()
 	if manager.gptChannelBreakers == nil {
 		manager.gptChannelBreakers = make(map[string]*codexChannelBreakerState)
@@ -150,7 +150,8 @@ func TestManagerExecuteStreamCancelReleasesSelectorAndHalfOpenProbe(t *testing.T
 		t.Fatal("timed out waiting for first chunk")
 	}
 
-	if inFlight := streamCancelSpreadInflight(selector, model, channelKey); inFlight != 1 {
+	loadRecordKey := routingChannelBaseKey(auth)
+	if inFlight := streamCancelSpreadInflight(selector, model, loadRecordKey); inFlight != 1 {
 		cancel()
 		t.Fatalf("selector inflight before cancel = %d, want 1", inFlight)
 	}
@@ -179,7 +180,7 @@ func TestManagerExecuteStreamCancelReleasesSelectorAndHalfOpenProbe(t *testing.T
 		t.Fatal("timed out waiting for wrapped stream to close")
 	}
 
-	if inFlight := streamCancelSpreadInflight(selector, model, channelKey); inFlight != 0 {
+	if inFlight := streamCancelSpreadInflight(selector, model, loadRecordKey); inFlight != 0 {
 		t.Fatalf("selector inflight after cancel = %d, want 0", inFlight)
 	}
 	manager.mu.RLock()

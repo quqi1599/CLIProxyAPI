@@ -736,8 +736,9 @@ func TestManagerEmptyResponseRetryReturnsTypedFailureWhenAllChannelsAreEmpty(t *
 		if !ok {
 			t.Fatalf("auth %s not found", authID)
 		}
-		if auth.Health.BreakerState != HealthBreakerOpen {
-			t.Fatalf("auth %s breaker = %+v, want open after repeated empty responses", authID, auth.Health)
+		state := auth.ModelStates["gpt-5.6-sol"]
+		if state == nil || state.Health.BreakerState != HealthBreakerOpen {
+			t.Fatalf("auth %s model breaker = %+v, want open after repeated empty responses", authID, state)
 		}
 	}
 }

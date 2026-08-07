@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/tidwall/gjson"
 )
 
@@ -107,6 +108,70 @@ func TestNewCodexStatusErrTreatsTransientRateLimitAsRetryableRateLimit(t *testin
 	}
 	if err.RetryAfter() != nil {
 		t.Fatalf("expected nil explicit retryAfter for transient rate limit, got %v", *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrAssignsFailureScope(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		wantKind   failurecontract.Kind
+		wantScope  failurecontract.Scope
+		retryable  bool
+	}{
+		{
+			name:       "model capacity",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`),
+			wantKind:   failurecontract.RateLimited,
+			wantScope:  failurecontract.ScopeModel,
+			retryable:  true,
+		},
+		{
+			name:       "credential usage limit",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"type":"usage_limit_reached","message":"usage limit","resets_in_seconds":60}}`),
+			wantKind:   failurecontract.QuotaExceeded,
+			wantScope:  failurecontract.ScopeCredential,
+			retryable:  true,
+		},
+		{
+			name:       "credential rate limit",
+			statusCode: http.StatusTooManyRequests,
+			body:       []byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"rate limit reached"}}`),
+			wantKind:   failurecontract.RateLimited,
+			wantScope:  failurecontract.ScopeCredential,
+			retryable:  true,
+		},
+		{
+			name:       "provider unavailable",
+			statusCode: http.StatusServiceUnavailable,
+			body:       []byte(`{"error":{"type":"server_error","code":"upstream_unavailable","message":"temporarily unavailable"}}`),
+			wantKind:   failurecontract.ProviderUnavailable,
+			wantScope:  failurecontract.ScopeProvider,
+			retryable:  true,
+		},
+		{
+			name:       "invalid request",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"type":"invalid_request_error","code":"invalid_request_error","message":"invalid payload"}}`),
+			wantKind:   failurecontract.InvalidRequest,
+			wantScope:  failurecontract.ScopeRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newCodexStatusErr(tc.statusCode, tc.body)
+			typed, ok := failurecontract.As(err)
+			if !ok {
+				t.Fatalf("newCodexStatusErr returned no typed failure: %v", err)
+			}
+			if typed.Kind != tc.wantKind || typed.Scope != tc.wantScope || typed.Retryable != tc.retryable {
+				t.Fatalf("typed failure = kind:%q scope:%q retryable:%v, want kind:%q scope:%q retryable:%v", typed.Kind, typed.Scope, typed.Retryable, tc.wantKind, tc.wantScope, tc.retryable)
+			}
+		})
 	}
 }
 

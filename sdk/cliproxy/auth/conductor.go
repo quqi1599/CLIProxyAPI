@@ -1390,6 +1390,8 @@ type Manager struct {
 	halfOpenProbeMu          sync.Mutex
 	halfOpenProbeNext        map[string]time.Time
 	halfOpenProbeActiveUntil map[string]time.Time
+	zeroEligibleProbeMu      sync.Mutex
+	zeroEligibleProbes       map[string]zeroEligibleProbeLease
 	channelBreakers          map[string]HealthState
 	gptChannelBreakers       map[string]*codexChannelBreakerState
 
@@ -1422,6 +1424,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		dynamicSelectors:         make(map[string]Selector),
 		halfOpenProbeNext:        make(map[string]time.Time),
 		halfOpenProbeActiveUntil: make(map[string]time.Time),
+		zeroEligibleProbes:       make(map[string]zeroEligibleProbeLease),
 		channelBreakers:          make(map[string]HealthState),
 		gptChannelBreakers:       make(map[string]*codexChannelBreakerState),
 		codexModelLoads:          make(map[string]int),
@@ -2714,6 +2717,12 @@ type cooldownFallbackCandidate struct {
 	quota    bool
 }
 
+type zeroEligibleProbeLease struct {
+	requestID   string
+	next        time.Time
+	activeUntil time.Time
+}
+
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
@@ -2777,7 +2786,8 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, checkModel)
 		blocked, reason, next := isAuthBlockedForModelRoute(candidate, checkModel, now, includeHealth)
 		if !blocked {
-			if m.halfOpenProbeActive(candidate.ID, checkModel, now) {
+			if m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
+				(!gptRoute || !m.zeroEligibleProbeBlocksRequest(ctx, routeModel, now)) {
 				activeFallbackAvailable = true
 				recordAvailable(candidate, checkModel, includeHealth)
 				continue
@@ -2794,7 +2804,8 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			continue
 		}
 		if (reason == blockReasonCooldown || reason == blockReasonOther) && !next.IsZero() {
-			if m.halfOpenProbeActive(candidate.ID, checkModel, now) {
+			if m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
+				(!gptRoute || !m.zeroEligibleProbeBlocksRequest(ctx, routeModel, now)) {
 				activeFallbackAvailable = true
 				recordAvailable(candidate, checkModel, includeHealth)
 				continue
@@ -2813,7 +2824,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	if spreadAcrossPriorities {
 		if len(availableAll) == 0 {
 			if cooldownCount == len(auths) && !earliest.IsZero() {
-				if fallback, probeNext := m.cooldownFallbackProbe(fallbackCandidates, now); fallback != nil {
+				if fallback, probeNext := m.zeroEligibleFallbackProbe(ctx, routeModel, fallbackCandidates, now, gptRoute); fallback != nil {
 					return []*Auth{fallback.auth}, nil
 				} else if !probeNext.IsZero() && probeNext.Before(earliest) {
 					earliest = probeNext
@@ -2838,7 +2849,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
-			if fallback, probeNext := m.cooldownFallbackProbe(fallbackCandidates, now); fallback != nil {
+			if fallback, probeNext := m.zeroEligibleFallbackProbe(ctx, routeModel, fallbackCandidates, now, gptRoute); fallback != nil {
 				return []*Auth{fallback.auth}, nil
 			} else if !probeNext.IsZero() && probeNext.Before(earliest) {
 				earliest = probeNext
@@ -2918,6 +2929,21 @@ func (m *Manager) cooldownFallbackProbe(candidates []cooldownFallbackCandidate, 
 	return nil, probeNext
 }
 
+func (m *Manager) zeroEligibleFallbackProbe(ctx context.Context, model string, candidates []cooldownFallbackCandidate, now time.Time, singleFlight bool) (*cooldownFallbackCandidate, time.Time) {
+	if !singleFlight {
+		return m.cooldownFallbackProbe(candidates, now)
+	}
+	ok, next := m.reserveZeroEligibleProbe(ctx, model, now)
+	if !ok {
+		return nil, next
+	}
+	fallback, probeNext := m.cooldownFallbackProbe(candidates, now)
+	if fallback == nil {
+		m.releaseZeroEligibleProbe(ctx, model)
+	}
+	return fallback, probeNext
+}
+
 func quotaCooldownForModel(auth *Auth, model string) bool {
 	if auth == nil {
 		return false
@@ -2950,6 +2976,83 @@ func copyTriedMap(src map[string]struct{}) map[string]struct{} {
 
 func halfOpenProbeKey(authID, model string) string {
 	return strings.TrimSpace(authID) + "\x00" + canonicalModelKey(model)
+}
+
+func zeroEligibleProbeKey(model string) string {
+	return canonicalModelKey(model)
+}
+
+func requestIDFromAttemptTrace(ctx context.Context) string {
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		return trace.requestIDValue()
+	}
+	return ""
+}
+
+func (m *Manager) reserveZeroEligibleProbe(ctx context.Context, model string, now time.Time) (bool, time.Time) {
+	if m == nil {
+		return true, time.Time{}
+	}
+	key := zeroEligibleProbeKey(model)
+	if key == "" {
+		return true, time.Time{}
+	}
+	requestID := requestIDFromAttemptTrace(ctx)
+	m.zeroEligibleProbeMu.Lock()
+	defer m.zeroEligibleProbeMu.Unlock()
+	lease := m.zeroEligibleProbes[key]
+	if lease.activeUntil.After(now) {
+		if requestID != "" && lease.requestID == requestID {
+			return true, lease.next
+		}
+		return false, lease.activeUntil
+	}
+	if lease.next.After(now) {
+		return false, lease.next
+	}
+	lease = zeroEligibleProbeLease{
+		requestID:   requestID,
+		next:        now.Add(healthHalfOpenInterval),
+		activeUntil: now.Add(healthHalfOpenActiveTTL),
+	}
+	m.zeroEligibleProbes[key] = lease
+	return true, lease.next
+}
+
+func (m *Manager) zeroEligibleProbeBlocksRequest(ctx context.Context, model string, now time.Time) bool {
+	if m == nil {
+		return false
+	}
+	key := zeroEligibleProbeKey(model)
+	if key == "" {
+		return false
+	}
+	requestID := requestIDFromAttemptTrace(ctx)
+	m.zeroEligibleProbeMu.Lock()
+	defer m.zeroEligibleProbeMu.Unlock()
+	lease := m.zeroEligibleProbes[key]
+	if !lease.activeUntil.After(now) {
+		return false
+	}
+	return requestID == "" || lease.requestID == "" || lease.requestID != requestID
+}
+
+func (m *Manager) releaseZeroEligibleProbe(ctx context.Context, model string) {
+	if m == nil {
+		return
+	}
+	key := zeroEligibleProbeKey(model)
+	requestID := requestIDFromAttemptTrace(ctx)
+	if key == "" || requestID == "" {
+		return
+	}
+	m.zeroEligibleProbeMu.Lock()
+	lease, ok := m.zeroEligibleProbes[key]
+	if ok && lease.requestID == requestID {
+		lease.activeUntil = time.Time{}
+		m.zeroEligibleProbes[key] = lease
+	}
+	m.zeroEligibleProbeMu.Unlock()
 }
 
 func (m *Manager) nextHalfOpenProbeAt(authID, model string) time.Time {
@@ -3087,7 +3190,7 @@ func (m *Manager) reserveGPTChannelAttempt(ctx context.Context, auth *Auth, prov
 	if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
 		return true
 	}
-	key := routingChannelBaseKey(auth)
+	key := gptChannelBreakerKey(auth, model)
 	requestID := ""
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		requestID = trace.requestIDValue()
@@ -3108,17 +3211,22 @@ func (m *Manager) releaseGPTChannelAttempt(ctx context.Context, auth *Auth) {
 	if requestID == "" {
 		return
 	}
+	baseKey := routingChannelBaseKey(auth)
 	m.mu.Lock()
-	releaseCodexChannelProbe(m.gptChannelBreakers[routingChannelBaseKey(auth)], requestID)
+	for key, state := range m.gptChannelBreakers {
+		if strings.HasPrefix(key, baseKey+"\x00model=") {
+			releaseCodexChannelProbe(state, requestID)
+		}
+	}
 	m.mu.Unlock()
 }
 
-func (m *Manager) gptChannelBreakerOpen(auth *Auth, now time.Time) bool {
+func (m *Manager) gptChannelBreakerOpen(auth *Auth, model string, now time.Time) bool {
 	if m == nil || auth == nil {
 		return false
 	}
 	m.mu.RLock()
-	state := m.gptChannelBreakers[routingChannelBaseKey(auth)]
+	state := m.gptChannelBreakers[gptChannelBreakerKey(auth, model)]
 	open := state != nil &&
 		state.Health.BreakerState == HealthBreakerOpen &&
 		state.Health.OpenUntil.After(now)
@@ -3909,7 +4017,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				(!requestInvalid || routeFallback)
 			m.MarkResult(ctx, result)
 			channelFailover = channelFailover ||
-				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4038,7 +4146,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				(!requestInvalid || routeFallback)
 			m.MarkResult(ctx, result)
 			channelFailover = channelFailover ||
-				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4083,7 +4191,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: emptyErr}
 			result.keepSelectorLease = idx < len(execModels)-1
 			m.MarkResult(ctx, result)
-			channelFailover := isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, time.Now())
+			channelFailover := isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now())
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4859,7 +4967,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					(!requestInvalid || routeFallback)
 				m.MarkResult(execCtx, result)
 				channelFailover = channelFailover ||
-					(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+					(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 				if channelFailover && result.keepSelectorLease {
 					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 				}
@@ -4906,7 +5014,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 		if authErr != nil {
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
-				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(authErr) {
 				m.markRetryChannelTried(ctx, tried, auth, authErr)
 			}
@@ -5056,7 +5164,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errCtx
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
-				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, time.Now()))
+				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
 				m.markRetryChannelTried(ctx, tried, auth, errStream)
 			}
@@ -6335,6 +6443,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	probeModel := coreusage.RequestedModelAliasFromContext(ctx)
+	if probeModel == "" {
+		probeModel = result.Model
+	}
+	defer m.releaseZeroEligibleProbe(ctx, probeModel)
 	selectorResult := result
 	if requestedModel := coreusage.RequestedModelAliasFromContext(ctx); requestedModel != "" {
 		selectorResult.Model = requestedModel
@@ -6471,14 +6584,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				} else {
 					clearAuthStateOnSuccess(auth, now)
 				}
-			} else if codexAPIKeyHealthOnly {
-				applyCodexAPIKeyFailureState(auth, result, now)
 			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeCredential {
 				disableCooling := m.cooldownDisabledForAuth(auth)
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				applyTypedCredentialFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeProvider {
 				// Provider failures feed the provider/channel breaker below. They must
 				// not be attributed to a single credential or model.
+			} else if codexAPIKeyHealthOnly {
+				applyCodexAPIKeyFailureState(auth, result, now)
 			} else if managedModel != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) &&
 					!isRequestScopedFeatureUnsupportedResultError(result.Error) &&
@@ -6861,7 +6974,7 @@ func (m *Manager) applyChannelBreakerResultLocked(ctx context.Context, auth *Aut
 		if isCodexAuth(auth) && !isCodexAPIKeyAuth(auth) {
 			return nil
 		}
-		return m.applyGPTChannelBreakerResultLocked(ctx, auth, result, now)
+		return m.applyGPTChannelBreakerResultLocked(ctx, auth, result, routeModel, now)
 	}
 	aliasScoped := openAICompatAvailabilityAliasForResult(auth, requestedModelAlias, result) != ""
 	breakerModel := channelBreakerModelKeyForResult(auth, result, requestedModelAlias)
@@ -6925,8 +7038,8 @@ func (m *Manager) recordChannelBreakerSuccessLocked(key string, now time.Time) {
 	m.channelBreakers[key] = health
 }
 
-func (m *Manager) applyGPTChannelBreakerResultLocked(ctx context.Context, auth *Auth, result Result, now time.Time) []*Auth {
-	key := routingChannelBaseKey(auth)
+func (m *Manager) applyGPTChannelBreakerResultLocked(ctx context.Context, auth *Auth, result Result, routeModel string, now time.Time) []*Auth {
+	key := gptChannelBreakerKey(auth, routeModel)
 	if key == "" {
 		return nil
 	}
@@ -6965,13 +7078,13 @@ func (m *Manager) applyGPTChannelBreakerResultLocked(ctx context.Context, auth *
 	}
 
 	snapshots := make([]*Auth, 0)
+	baseKey := routingChannelBaseKey(auth)
 	for _, peer := range m.auths {
-		if peer == nil || peer.Disabled || peer.Status == StatusDisabled || routingChannelBaseKey(peer) != key {
+		if peer == nil || peer.Disabled || peer.Status == StatusDisabled || routingChannelBaseKey(peer) != baseKey {
 			continue
 		}
-		peer.Health = state.Health
-		if !result.Success && result.Model != "" && isCodexAPIKeyAuth(peer) {
-			if modelState := ensureModelState(peer, result.Model); modelState != nil && modelState.Status != StatusDisabled {
+		if routeModel != "" {
+			if modelState := ensureModelState(peer, routeModel); modelState != nil && modelState.Status != StatusDisabled {
 				modelState.Health = state.Health
 				modelState.UpdatedAt = now
 			}
@@ -7227,6 +7340,15 @@ func routingChannelBaseKey(auth *Auth) string {
 		return ""
 	}
 	return "auth\x00" + strings.TrimSpace(auth.ID)
+}
+
+func gptChannelBreakerKey(auth *Auth, model string) string {
+	baseKey := routingChannelBaseKey(auth)
+	modelKey := canonicalModelKey(model)
+	if baseKey == "" || modelKey == "" {
+		return ""
+	}
+	return baseKey + "\x00model=" + modelKey
 }
 
 func channelBreakerKey(auth *Auth, model string) string {
@@ -8861,11 +8983,19 @@ func isRequestInvalidError(err error) bool {
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {
+	applyAuthFailureStateWithCodexScope(auth, resultErr, retryAfter, now, disableCooling, false)
+}
+
+func applyTypedCredentialFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {
+	applyAuthFailureStateWithCodexScope(auth, resultErr, retryAfter, now, disableCooling, true)
+}
+
+func applyAuthFailureStateWithCodexScope(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling, typedCredential bool) {
 	if auth == nil {
 		return
 	}
 	statusCode := statusCodeFromResult(resultErr)
-	if isCodexAuth(auth) && statusCode != http.StatusUnauthorized {
+	if isCodexAuth(auth) && statusCode != http.StatusUnauthorized && !typedCredential {
 		clearAuthStateOnSuccess(auth, now)
 		return
 	}
@@ -11235,7 +11365,137 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 		fields["error_code"] = "model_cooldown"
 		fields["reset_ms"] = cooldownErr.resetIn.Milliseconds()
 	}
+	for key, value := range m.authAvailabilityMetricFields(providers, model, time.Now()) {
+		fields[key] = value
+	}
 	logEntryWithRequestID(ctx).WithFields(fields).Warn("auth_selection_failed")
+}
+
+func (m *Manager) authAvailabilityMetricFields(providers []string, model string, now time.Time) log.Fields {
+	fields := log.Fields{}
+	if m == nil {
+		return fields
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range normalizeProviderKeys(providers) {
+		providerSet[provider] = struct{}{}
+	}
+	registryRef := registry.GetGlobalRegistry()
+	candidateRoutes := make(map[string]struct{})
+	eligibleRoutes := make(map[string]struct{})
+	blockedRoutes := make(map[string]string)
+	breakerRoutes := make(map[string]int)
+	var earliestRecovery time.Time
+
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if auth == nil || executorKeyForProviderSet(auth, providerSet, m.executors) == "" {
+			continue
+		}
+		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+			continue
+		}
+		routeKey := routingChannelBaseKey(auth)
+		if routeKey == "" {
+			continue
+		}
+		candidateRoutes[routeKey] = struct{}{}
+		checkModel := m.selectionModelForAuth(auth, model)
+		blocked, reason, next := isAuthBlockedForModelRoute(auth, checkModel, now, true)
+		if !blocked {
+			eligibleRoutes[routeKey] = struct{}{}
+			continue
+		}
+		if _, exists := blockedRoutes[routeKey]; !exists {
+			blockedRoutes[routeKey] = blockReasonLabel(reason)
+		}
+		if !next.IsZero() && next.After(now) && (earliestRecovery.IsZero() || next.Before(earliestRecovery)) {
+			earliestRecovery = next
+		}
+		health := resolveHealthState(auth, checkModel)
+		if health.BreakerState == HealthBreakerOpen && health.OpenUntil.After(now) {
+			breakerRoutes[routeKey] = health.LastStatusCode
+			if earliestRecovery.IsZero() || health.OpenUntil.Before(earliestRecovery) {
+				earliestRecovery = health.OpenUntil
+			}
+		}
+	}
+	m.mu.RUnlock()
+
+	for routeKey := range eligibleRoutes {
+		delete(blockedRoutes, routeKey)
+		delete(breakerRoutes, routeKey)
+	}
+	fields["candidate_route_count"] = len(candidateRoutes)
+	fields["eligible_route_count"] = len(eligibleRoutes)
+	fields["blocked_route_count"] = len(blockedRoutes)
+	fields["breaker_open_count"] = len(breakerRoutes)
+	if len(blockedRoutes) > 0 {
+		counts := make(map[string]int)
+		for _, reason := range blockedRoutes {
+			counts[reason]++
+		}
+		fields["blocked_reasons"] = formatReasonCounts(counts)
+	}
+	if len(breakerRoutes) > 0 {
+		breakerStatuses := make(map[int]struct{}, len(breakerRoutes))
+		for _, status := range breakerRoutes {
+			if status > 0 {
+				breakerStatuses[status] = struct{}{}
+			}
+		}
+		statuses := make([]int, 0, len(breakerStatuses))
+		for status := range breakerStatuses {
+			statuses = append(statuses, status)
+		}
+		sort.Ints(statuses)
+		parts := make([]string, 0, len(statuses))
+		for _, status := range statuses {
+			parts = append(parts, strconv.Itoa(status))
+		}
+		fields["breaker_statuses"] = strings.Join(parts, ",")
+	}
+	if len(breakerRoutes) > 0 {
+		counts := make(map[string]int)
+		for _, status := range breakerRoutes {
+			reason := "status_unknown"
+			if status > 0 {
+				reason = "status_" + strconv.Itoa(status)
+			}
+			counts[reason]++
+		}
+		fields["breaker_reasons"] = formatReasonCounts(counts)
+	}
+	if !earliestRecovery.IsZero() && earliestRecovery.After(now) {
+		fields["earliest_recovery_ms"] = earliestRecovery.Sub(now).Milliseconds()
+	}
+	return fields
+}
+
+func blockReasonLabel(reason blockReason) string {
+	switch reason {
+	case blockReasonDisabled:
+		return "disabled"
+	case blockReasonCooldown:
+		return "cooldown"
+	case blockReasonOther:
+		return "health_or_unavailable"
+	default:
+		return "unknown"
+	}
+}
+
+func formatReasonCounts(counts map[string]int) string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+":"+strconv.Itoa(counts[key]))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Result) {

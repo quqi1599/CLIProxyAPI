@@ -2016,28 +2016,81 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	originalBody := body
 	body = sanitizeCodexStatusErrorBody(body)
 	errCode := statusCode
-	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) || isCodexTransientRateLimitError(body) {
+	modelCapacity := isCodexModelCapacityError(body)
+	usageLimit := isCodexUsageLimitError(body)
+	transientRateLimit := isCodexTransientRateLimitError(body)
+	if modelCapacity || usageLimit || transientRateLimit {
 		errCode = http.StatusTooManyRequests
 	}
 	if isCodexCloudflareTimeoutError(statusCode, body) {
 		body = codexCloudflareTimeoutErrorBody(statusCode)
 		body = safeCodexStatusErrorBody(originalBody, body, "upstream Cloudflare timeout")
+		failure := newCodexFailure(http.StatusGatewayTimeout, statusCode, "upstream_timeout", string(body), nil, false, false, false)
 		return statusErr{
 			code:               http.StatusGatewayTimeout,
 			providerStatusCode: statusCode,
 			msg:                string(body),
 			errorCode:          "upstream_timeout",
+			failure:            failure,
 		}
 	}
 	body = classifyCodexStatusError(errCode, body)
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		safeBody := safeCodexStatusErrorBody(originalBody, body, "")
 		errorCode, _, _ := safeUpstreamIdentifiers(body)
-		return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, retryAfter: retryAfter}
+		failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), retryAfter, modelCapacity, usageLimit, transientRateLimit)
+		return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, retryAfter: retryAfter, failure: failure}
 	}
 	safeBody := safeCodexStatusErrorBody(originalBody, body, "")
 	errorCode, _, _ := safeUpstreamIdentifiers(body)
-	return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode}
+	failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), nil, modelCapacity, usageLimit, transientRateLimit)
+	return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, failure: failure}
+}
+
+func newCodexFailure(statusCode, providerStatusCode int, providerCode, message string, retryAfter *time.Duration, modelCapacity, usageLimit, transientRateLimit bool) *failurecontract.Failure {
+	failure := &failurecontract.Failure{
+		HTTPStatus:    statusCode,
+		ProviderCode:  providerCode,
+		RetryAfter:    retryAfter,
+		PublicMessage: message,
+	}
+	switch {
+	case modelCapacity:
+		failure.Kind = failurecontract.RateLimited
+		failure.Scope = failurecontract.ScopeModel
+		failure.Retryable = true
+	case usageLimit:
+		failure.Kind = failurecontract.QuotaExceeded
+		failure.Scope = failurecontract.ScopeCredential
+		failure.Retryable = true
+	case transientRateLimit:
+		failure.Kind = failurecontract.RateLimited
+		failure.Scope = failurecontract.ScopeCredential
+		failure.Retryable = true
+	case statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity:
+		failure.Kind = failurecontract.InvalidRequest
+		failure.Scope = failurecontract.ScopeRequest
+	case statusCode == http.StatusRequestEntityTooLarge:
+		failure.Kind = failurecontract.RequestTooLarge
+		failure.Scope = failurecontract.ScopeRequest
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		failure.Kind = failurecontract.AuthenticationFailed
+		failure.Scope = failurecontract.ScopeCredential
+	case statusCode == http.StatusNotFound:
+		failure.Kind = failurecontract.InvalidRequest
+		failure.Scope = failurecontract.ScopeRequest
+	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusBadGateway || statusCode == http.StatusGatewayTimeout || providerStatusCode == 524:
+		failure.Kind = failurecontract.TransportError
+		failure.Scope = failurecontract.ScopeProvider
+		failure.Retryable = true
+	case statusCode >= http.StatusInternalServerError:
+		failure.Kind = failurecontract.ProviderUnavailable
+		failure.Scope = failurecontract.ScopeProvider
+		failure.Retryable = true
+	default:
+		return nil
+	}
+	return failure
 }
 
 func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReason string) []byte {

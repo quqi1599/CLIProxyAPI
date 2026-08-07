@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -10,7 +9,7 @@ import (
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 )
 
-func TestManagerGPTChannelBreaker_Three5xxAcrossModelsOpenWholeChannel(t *testing.T) {
+func TestManagerGPTChannelBreaker_Provider5xxIsolatedByModel(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -21,32 +20,32 @@ func TestManagerGPTChannelBreaker_Three5xxAcrossModelsOpenWholeChannel(t *testin
 	manager.auths[sameChannel.ID] = sameChannel
 	manager.auths[backup.ID] = backup
 
-	for i, model := range []string{"gpt-5.4", "gpt-5.5", "gpt-5.6-sol"} {
+	for range codexChannelBreakerOpen5xxFailures {
+		failure := gptTypedChannelBreakerFailure(failurecontract.ScopeProvider, http.StatusServiceUnavailable)
 		manager.MarkResult(context.Background(), Result{
 			AuthID:   failing.ID,
 			Provider: "codex",
-			Model:    model,
+			Model:    "gpt-5.6-terra",
 			Success:  false,
-			Error: &Error{
-				HTTPStatus: http.StatusServiceUnavailable,
-				Code:       fmt.Sprintf("upstream_unavailable_%d", i),
-				Message:    "upstream unavailable",
-				Retryable:  true,
-			},
+			Error:    failure.Error,
+			Cause:    failure.Cause,
 		})
 	}
 
 	for _, authID := range []string{failing.ID, sameChannel.ID} {
-		health := manager.auths[authID].Health
+		health := manager.auths[authID].ModelStates["gpt-5.6-terra"].Health
 		if health.BreakerState != HealthBreakerOpen {
-			t.Fatalf("auth %s channel breaker = %+v, want open", authID, health)
+			t.Fatalf("auth %s Terra breaker = %+v, want open", authID, health)
 		}
 		if health.OpenUntil.IsZero() || !health.OpenUntil.After(time.Now()) {
-			t.Fatalf("auth %s channel OpenUntil = %v, want future time", authID, health.OpenUntil)
+			t.Fatalf("auth %s Terra OpenUntil = %v, want future time", authID, health.OpenUntil)
+		}
+		if state := manager.auths[authID].ModelStates["gpt-5.4"]; state != nil && state.Health.BreakerState == HealthBreakerOpen {
+			t.Fatalf("auth %s Terra breaker leaked into gpt-5.4: %+v", authID, state.Health)
 		}
 	}
-	if health := manager.auths[backup.ID].Health; health.Observed || health.BreakerState == HealthBreakerOpen {
-		t.Fatalf("backup channel health = %+v, want unaffected", health)
+	if state := manager.auths[backup.ID].ModelStates["gpt-5.6-terra"]; state != nil && state.Health.Observed {
+		t.Fatalf("backup route Terra health = %+v, want unaffected", state.Health)
 	}
 }
 
@@ -78,33 +77,33 @@ func TestGPTChannelBreaker_ThirtySecondWindowRequiresTenSamplesAtEightyPercent(t
 	}
 }
 
-func TestGPTChannelBreaker_TypedCredential429CountsWithoutRequestOrModelFailures(t *testing.T) {
+func TestGPTChannelBreaker_TypedFailuresRespectScope(t *testing.T) {
 	t.Parallel()
 
 	start := time.Unix(1_750_000_000, 0)
-	state := codexChannelBreakerState{}
-	applyCodexChannelBreakerResult(&state, Result{Success: true}, start, "")
-	applyCodexChannelBreakerResult(&state, Result{Success: true}, start.Add(time.Second), "")
-	for i := 0; i < 7; i++ {
-		at := start.Add(time.Duration(i+2) * time.Second)
-		applyCodexChannelBreakerResult(&state, gptTypedChannelBreakerFailure(failurecontract.ScopeCredential, http.StatusTooManyRequests), at, "")
+	ignoredState := codexChannelBreakerState{}
+	for i := 0; i < 8; i++ {
+		at := start.Add(time.Duration(i) * time.Second)
+		applyCodexChannelBreakerResult(&ignoredState, gptTypedChannelBreakerFailure(failurecontract.ScopeCredential, http.StatusTooManyRequests), at, "")
 	}
-	applyCodexChannelBreakerResult(&state, gptTypedChannelBreakerFailure(failurecontract.ScopeRequest, http.StatusTooManyRequests), start.Add(9*time.Second), "")
-	applyCodexChannelBreakerResult(&state, gptTypedChannelBreakerFailure(failurecontract.ScopeModel, http.StatusTooManyRequests), start.Add(10*time.Second), "")
-	if state.Health.BreakerState == HealthBreakerOpen {
-		t.Fatalf("request/model-scoped 429s opened breaker: %+v", state.Health)
-	}
-	if state.recentCount != 9 {
-		t.Fatalf("counted samples = %d, want 9 before the eighth credential-scoped 429", state.recentCount)
+	applyCodexChannelBreakerResult(&ignoredState, gptTypedChannelBreakerFailure(failurecontract.ScopeRequest, http.StatusTooManyRequests), start.Add(9*time.Second), "")
+	if ignoredState.Health.Observed || ignoredState.recentCount != 0 {
+		t.Fatalf("request/credential failures affected channel breaker: %+v count=%d", ignoredState.Health, ignoredState.recentCount)
 	}
 
-	applyCodexChannelBreakerResult(&state, gptTypedChannelBreakerFailure(failurecontract.ScopeCredential, http.StatusTooManyRequests), start.Add(11*time.Second), "")
-	if state.Health.BreakerState != HealthBreakerOpen {
-		t.Fatalf("typed credential 429 window health = %+v, want open at 8/10 failures", state.Health)
+	modelState := codexChannelBreakerState{}
+	applyCodexChannelBreakerResult(&modelState, Result{Success: true}, start, "")
+	applyCodexChannelBreakerResult(&modelState, Result{Success: true}, start.Add(time.Second), "")
+	for i := 0; i < 8; i++ {
+		at := start.Add(time.Duration(i+2) * time.Second)
+		applyCodexChannelBreakerResult(&modelState, gptTypedChannelBreakerFailure(failurecontract.ScopeModel, http.StatusTooManyRequests), at, "")
+	}
+	if modelState.Health.BreakerState != HealthBreakerOpen {
+		t.Fatalf("typed model 429 window health = %+v, want open at 8/10 failures", modelState.Health)
 	}
 
 	providerState := codexChannelBreakerState{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < codexChannelBreakerOpen5xxFailures; i++ {
 		at := start.Add(time.Duration(i) * time.Second)
 		applyCodexChannelBreakerResult(&providerState, gptTypedChannelBreakerFailure(failurecontract.ScopeProvider, http.StatusServiceUnavailable), at, "")
 	}
@@ -119,11 +118,11 @@ func TestGPTChannelBreaker_SingleHalfOpenProbeAndEscalatingCooldown(t *testing.T
 	start := time.Unix(1_750_000_000, 0)
 	state := codexChannelBreakerState{}
 	failure := gptChannelBreakerFailure(http.StatusServiceUnavailable)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < codexChannelBreakerOpen5xxFailures; i++ {
 		at := start.Add(time.Duration(i) * time.Second)
 		applyCodexChannelBreakerResult(&state, failure, at, "")
 	}
-	assertGPTChannelCooldown(t, state, start.Add(2*time.Second), 30*time.Second, 1)
+	assertGPTChannelCooldown(t, state, start.Add(time.Duration(codexChannelBreakerOpen5xxFailures-1)*time.Second), 30*time.Second, 1)
 
 	firstProbeAt := state.Health.OpenUntil
 	if !reserveCodexChannelProbe(&state, "request-a", firstProbeAt) {

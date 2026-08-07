@@ -8,12 +8,15 @@ import (
 )
 
 const (
-	codexChannelBreakerWindow          = 30 * time.Second
-	codexChannelBreakerSampleLimit     = 20
-	codexChannelBreakerMinimumSamples  = 10
-	codexChannelBreakerFailurePercent  = 80
-	codexChannelBreakerOpen5xxFailures = 3
-	codexChannelBreakerMaxBackoffLevel = 3
+	codexChannelBreakerWindow         = 30 * time.Second
+	codexChannelBreakerSampleLimit    = 20
+	codexChannelBreakerMinimumSamples = 10
+	codexChannelBreakerFailurePercent = 80
+	// Production incident data showed that three isolated 5xx responses were too
+	// eager and amplified short upstream bursts into route-wide outages.
+	codexChannelBreakerOpen5xxFailures      = 5
+	codexChannelBreakerOpenProtocolFailures = 3
+	codexChannelBreakerMaxBackoffLevel      = 3
 )
 
 type codexChannelOutcome struct {
@@ -86,7 +89,7 @@ func applyCodexChannelBreakerResult(state *codexChannelBreakerState, result Resu
 		state.consecutive5xx = 0
 	}
 	applyHealthFailure(&state.Health, now, statusCode)
-	if state.consecutive5xx >= codexChannelBreakerOpen5xxFailures || codexChannelBreakerWindowExceeded(state, now) {
+	if state.consecutive5xx >= codexChannelBreaker5xxThreshold(result) || codexChannelBreakerWindowExceeded(state, now) {
 		openCodexChannelBreaker(state, now)
 		return
 	}
@@ -95,11 +98,23 @@ func applyCodexChannelBreakerResult(state *codexChannelBreakerState, result Resu
 	state.Health.HalfOpenSuccesses = 0
 }
 
+func codexChannelBreaker5xxThreshold(result Result) uint8 {
+	kind := failurecontract.Kind("")
+	if typed, ok := failurecontract.As(result.Cause); ok {
+		kind = typed.Kind
+	} else if result.Error != nil {
+		kind = failurecontract.Kind(result.Error.Kind)
+	}
+	if kind == failurecontract.UpstreamProtocolError {
+		return codexChannelBreakerOpenProtocolFailures
+	}
+	return codexChannelBreakerOpen5xxFailures
+}
+
 func shouldCountCodexChannelBreakerFailure(result Result) bool {
-	if scope, ok := failureScopeFromResult(result); ok && scope == failurecontract.ScopeCredential {
-		return result.Error != nil &&
-			result.Error.Retryable &&
-			statusCodeFromResult(result.Error) == http.StatusTooManyRequests
+	if scope, ok := failureScopeFromResult(result); ok {
+		return result.Error != nil && result.Error.Retryable &&
+			(scope == failurecontract.ScopeModel || scope == failurecontract.ScopeProvider)
 	}
 	return shouldCountChannelBreakerFailure(result)
 }

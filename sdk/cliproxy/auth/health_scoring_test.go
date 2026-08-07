@@ -503,7 +503,7 @@ func TestManagerMarkResult_CodexAPIKeyFailuresOpenModelHealthBreaker(t *testing.
 	manager.auths[sameBase.ID] = sameBase
 	manager.auths[stable.ID] = stable
 
-	for i := 0; i < channelBreakerOpenFailures; i++ {
+	for i := 0; i < codexChannelBreakerOpen5xxFailures; i++ {
 		manager.MarkResult(context.Background(), Result{
 			AuthID:   bad.ID,
 			Provider: bad.Provider,

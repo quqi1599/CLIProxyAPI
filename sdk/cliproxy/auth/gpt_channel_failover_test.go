@@ -229,13 +229,15 @@ func TestManagerGPTChannelFailoverDoesNotSwitchModelsAcrossRounds(t *testing.T) 
 	}
 }
 
-func TestManagerGPTChannelBreakerStopsModelPoolAfterThree5xx(t *testing.T) {
+func TestManagerGPTChannelBreakerStopsModelPoolAfterFive5xx(t *testing.T) {
 	const alias = "gpt-breaker-pool"
 	models := []internalconfig.CodexModel{
 		{Name: "gpt-breaker-a", Alias: alias},
 		{Name: "gpt-breaker-b", Alias: alias},
 		{Name: "gpt-breaker-c", Alias: alias},
 		{Name: "gpt-breaker-d", Alias: alias},
+		{Name: "gpt-breaker-e", Alias: alias},
+		{Name: "gpt-breaker-f", Alias: alias},
 	}
 	failure := &Error{
 		HTTPStatus: http.StatusInternalServerError,
@@ -247,6 +249,8 @@ func TestManagerGPTChannelBreakerStopsModelPoolAfterThree5xx(t *testing.T) {
 		models[0].Name: failure,
 		models[1].Name: failure,
 		models[2].Name: failure,
+		models[3].Name: failure,
+		models[4].Name: failure,
 	}
 	tests := []struct {
 		name     string
@@ -296,9 +300,9 @@ func TestManagerGPTChannelBreakerStopsModelPoolAfterThree5xx(t *testing.T) {
 			manager := newCodexAPIKeyPoolTestManager(t, alias, models, test.executor)
 			manager.SetRetryConfig(10, 30*time.Second, 10)
 			if err := test.invoke(context.Background(), manager); err == nil {
-				t.Fatalf("%s unexpectedly reached the fourth model", test.name)
+				t.Fatalf("%s unexpectedly reached the sixth model", test.name)
 			}
-			want := []string{models[0].Name, models[1].Name, models[2].Name}
+			want := []string{models[0].Name, models[1].Name, models[2].Name, models[3].Name, models[4].Name}
 			if got := test.calls(test.executor); !stringSlicesEqual(got, want) {
 				t.Fatalf("%s models = %v, want %v", test.name, got, want)
 			}
@@ -478,7 +482,7 @@ func TestManagerGPTChannelFailoverDoesNotGateCodexOAuth(t *testing.T) {
 	registerGPTChannelFailoverAuths(t, manager, provider, model, []*Auth{oauth})
 
 	now := time.Now()
-	manager.gptChannelBreakers[routingChannelBaseKey(oauth)] = &codexChannelBreakerState{
+	manager.gptChannelBreakers[gptChannelBreakerKey(oauth, model)] = &codexChannelBreakerState{
 		Health: HealthState{
 			BreakerState: HealthBreakerOpen,
 			OpenUntil:    now.Add(time.Minute),
@@ -524,7 +528,7 @@ func TestManagerGPTChannelFailoverSkipsOpenChannelsWithoutSpendingBudget(t *test
 
 	now := time.Now()
 	for _, auth := range auths[:5] {
-		manager.gptChannelBreakers[routingChannelBaseKey(auth)] = &codexChannelBreakerState{
+		manager.gptChannelBreakers[gptChannelBreakerKey(auth, model)] = &codexChannelBreakerState{
 			Health: HealthState{
 				BreakerState: HealthBreakerOpen,
 				OpenUntil:    now.Add(time.Minute),

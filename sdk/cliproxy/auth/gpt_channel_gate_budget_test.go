@@ -119,7 +119,7 @@ func newGPTChannelGateBudgetTestManager(t *testing.T, model string) (*Manager, *
 	now := time.Now()
 	manager.mu.Lock()
 	for _, auth := range auths[:2] {
-		manager.gptChannelBreakers[routingChannelBaseKey(auth)] = &codexChannelBreakerState{
+		manager.gptChannelBreakers[gptChannelBreakerKey(auth, model)] = &codexChannelBreakerState{
 			Health:          HealthState{BreakerState: HealthBreakerHalfOpen},
 			ProbeRequestID:  auth.ID + "-other-request",
 			ProbeLeaseUntil: now.Add(time.Minute),
