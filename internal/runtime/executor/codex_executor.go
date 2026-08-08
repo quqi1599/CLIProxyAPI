@@ -2108,9 +2108,15 @@ func isCodexTransientServerError(statusCode int, body []byte) bool {
 	}
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	if errorCode == "" {
+		errorCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "body.error.code").String()))
+	}
+	if errorCode == "" {
 		errorCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "code").String()))
 	}
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	if errorType == "" {
+		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "body.error.type").String()))
+	}
 	if errorType == "" {
 		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "type").String()))
 	}
