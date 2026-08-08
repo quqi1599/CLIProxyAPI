@@ -185,6 +185,22 @@ func TestNewCodexStatusErrAssignsFailureScope(t *testing.T) {
 			retryable:  true,
 		},
 		{
+			name:       "provider server error in top level error code",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"type":"invalid_request_error","message":"internal error"},"error_code":"server_error"}`),
+			wantKind:   failurecontract.ProviderUnavailable,
+			wantScope:  failurecontract.ScopeProvider,
+			retryable:  true,
+		},
+		{
+			name:       "provider server error in alternate nested code",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"type":"invalid_request_error","err_code":"server_error","message":"internal error"}}`),
+			wantKind:   failurecontract.ProviderUnavailable,
+			wantScope:  failurecontract.ScopeProvider,
+			retryable:  true,
+		},
+		{
 			name:       "invalid request",
 			statusCode: http.StatusBadRequest,
 			body:       []byte(`{"error":{"type":"invalid_request_error","code":"invalid_request_error","message":"invalid payload"}}`),

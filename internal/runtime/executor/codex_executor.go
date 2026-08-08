@@ -2106,24 +2106,27 @@ func isCodexTransientServerError(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest || len(body) == 0 {
 		return false
 	}
-	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
-	if errorCode == "" {
-		errorCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "body.error.code").String()))
-	}
-	if errorCode == "" {
-		errorCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "code").String()))
-	}
-	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
-	if errorType == "" {
-		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "body.error.type").String()))
-	}
-	if errorType == "" {
-		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "type").String()))
-	}
+	errorCode := firstCodexUpstreamIdentifier(body,
+		"error.code", "body.error.code", "code", "error.err_code", "error_code")
+	errorType := firstCodexUpstreamIdentifier(body,
+		"error.type", "body.error.type", "type")
 	if errorCode != "" {
 		return errorCode == "server_error"
 	}
 	return errorType == "server_error"
+}
+
+func firstCodexUpstreamIdentifier(body []byte, paths ...string) string {
+	for _, path := range paths {
+		value := gjson.GetBytes(body, path)
+		if !value.Exists() {
+			continue
+		}
+		if identifier := strings.ToLower(strings.TrimSpace(value.String())); identifier != "" {
+			return identifier
+		}
+	}
+	return ""
 }
 
 func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReason string) []byte {
