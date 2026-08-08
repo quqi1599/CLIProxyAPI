@@ -2114,13 +2114,10 @@ func isCodexTransientServerError(statusCode int, body []byte) bool {
 	if errorType == "" {
 		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "type").String()))
 	}
-	if errorCode != "" && errorCode != "server_error" {
-		return false
+	if errorCode != "" {
+		return errorCode == "server_error"
 	}
-	if errorType != "" && errorType != "server_error" {
-		return false
-	}
-	return errorCode == "server_error" || errorType == "server_error"
+	return errorType == "server_error"
 }
 
 func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReason string) []byte {
