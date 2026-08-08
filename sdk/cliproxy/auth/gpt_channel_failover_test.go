@@ -98,6 +98,7 @@ func TestManagerGPTChannelFailoverSwitchesBaseURLImmediately(t *testing.T) {
 		provider = "gpt-channel-failover"
 	)
 	statuses := []int{
+		http.StatusBadRequest,
 		http.StatusTooManyRequests,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
@@ -418,6 +419,7 @@ func TestShouldRetryGPTRoundPolicy(t *testing.T) {
 		want  bool
 	}{
 		{name: "first 429", err: retryableGPTChannelFailure(http.StatusTooManyRequests), round: 0, want: true},
+		{name: "first retryable provider 400", err: retryableGPTChannelFailure(http.StatusBadRequest), round: 0, want: true},
 		{name: "third 429 blocked", err: retryableGPTChannelFailure(http.StatusTooManyRequests), round: 1, want: false},
 		{name: "third 502 blocked", err: retryableGPTChannelFailure(http.StatusBadGateway), round: 1, want: false},
 		{name: "third 503", err: retryableGPTChannelFailure(http.StatusServiceUnavailable), round: 1, want: true},

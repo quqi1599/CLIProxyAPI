@@ -6332,8 +6332,13 @@ func shouldFailoverGPTChannel(err error, providers []string, model string) bool 
 	if errors.As(err, &cooldownErr) {
 		return false
 	}
-	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
-		return false
+	if failure, ok := failurecontract.As(err); ok {
+		if failure.Scope == failurecontract.ScopeRequest {
+			return false
+		}
+		if failure.Scope == failurecontract.ScopeProvider && failure.Retryable {
+			return true
+		}
 	}
 	switch statusCodeFromError(err) {
 	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:

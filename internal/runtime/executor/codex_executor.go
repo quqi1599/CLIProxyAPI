@@ -2019,13 +2019,14 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	modelCapacity := isCodexModelCapacityError(body)
 	usageLimit := isCodexUsageLimitError(body)
 	transientRateLimit := isCodexTransientRateLimitError(body)
+	transientServerError := isCodexTransientServerError(statusCode, body)
 	if modelCapacity || usageLimit || transientRateLimit {
 		errCode = http.StatusTooManyRequests
 	}
 	if isCodexCloudflareTimeoutError(statusCode, body) {
 		body = codexCloudflareTimeoutErrorBody(statusCode)
 		body = safeCodexStatusErrorBody(originalBody, body, "upstream Cloudflare timeout")
-		failure := newCodexFailure(http.StatusGatewayTimeout, statusCode, "upstream_timeout", string(body), nil, false, false, false)
+		failure := newCodexFailure(http.StatusGatewayTimeout, statusCode, "upstream_timeout", string(body), nil, false, false, false, false)
 		return statusErr{
 			code:               http.StatusGatewayTimeout,
 			providerStatusCode: statusCode,
@@ -2038,16 +2039,16 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		safeBody := safeCodexStatusErrorBody(originalBody, body, "")
 		errorCode, _, _ := safeUpstreamIdentifiers(body)
-		failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), retryAfter, modelCapacity, usageLimit, transientRateLimit)
+		failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), retryAfter, modelCapacity, usageLimit, transientRateLimit, transientServerError)
 		return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, retryAfter: retryAfter, failure: failure}
 	}
 	safeBody := safeCodexStatusErrorBody(originalBody, body, "")
 	errorCode, _, _ := safeUpstreamIdentifiers(body)
-	failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), nil, modelCapacity, usageLimit, transientRateLimit)
+	failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), nil, modelCapacity, usageLimit, transientRateLimit, transientServerError)
 	return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, failure: failure}
 }
 
-func newCodexFailure(statusCode, providerStatusCode int, providerCode, message string, retryAfter *time.Duration, modelCapacity, usageLimit, transientRateLimit bool) *failurecontract.Failure {
+func newCodexFailure(statusCode, providerStatusCode int, providerCode, message string, retryAfter *time.Duration, modelCapacity, usageLimit, transientRateLimit, transientServerError bool) *failurecontract.Failure {
 	failure := &failurecontract.Failure{
 		HTTPStatus:    statusCode,
 		ProviderCode:  providerCode,
@@ -2066,6 +2067,10 @@ func newCodexFailure(statusCode, providerStatusCode int, providerCode, message s
 	case transientRateLimit:
 		failure.Kind = failurecontract.RateLimited
 		failure.Scope = failurecontract.ScopeCredential
+		failure.Retryable = true
+	case transientServerError:
+		failure.Kind = failurecontract.ProviderUnavailable
+		failure.Scope = failurecontract.ScopeProvider
 		failure.Retryable = true
 	case statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity:
 		failure.Kind = failurecontract.InvalidRequest
@@ -2091,6 +2096,31 @@ func newCodexFailure(statusCode, providerStatusCode int, providerCode, message s
 		return nil
 	}
 	return failure
+}
+
+// isCodexTransientServerError recognizes provider failures that were returned
+// with HTTP 400 before a response stream started. Some Codex-compatible
+// upstreams use 400 for transient server-side failures, so the explicit
+// server_error identifier is required and any more specific code wins.
+func isCodexTransientServerError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest || len(body) == 0 {
+		return false
+	}
+	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	if errorCode == "" {
+		errorCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "code").String()))
+	}
+	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	if errorType == "" {
+		errorType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "type").String()))
+	}
+	if errorCode != "" && errorCode != "server_error" {
+		return false
+	}
+	if errorType != "" && errorType != "server_error" {
+		return false
+	}
+	return errorCode == "server_error" || errorType == "server_error"
 }
 
 func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReason string) []byte {
