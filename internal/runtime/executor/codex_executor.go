@@ -2106,9 +2106,10 @@ func isCodexTransientServerError(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest || len(body) == 0 {
 		return false
 	}
-	errorCode := firstCodexUpstreamIdentifier(body,
+	jsonBody := upstreamJSONErrorBody(body)
+	errorCode := firstCodexUpstreamIdentifier(jsonBody,
 		"error.code", "body.error.code", "code", "error.err_code", "error_code")
-	errorType := firstCodexUpstreamIdentifier(body,
+	errorType := firstCodexUpstreamIdentifier(jsonBody,
 		"error.type", "body.error.type", "type")
 	if errorCode != "" {
 		return errorCode == "server_error"
