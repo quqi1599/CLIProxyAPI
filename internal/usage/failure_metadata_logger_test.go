@@ -121,6 +121,69 @@ func TestFailureMetadataLoggerClassifiesDownstreamDisconnect(t *testing.T) {
 	requireJSONField(t, payload, "client_request_id", "202608050919554314155358268d9d6TTdvlM5y")
 }
 
+func TestFailureMetadataLoggerUsesCanonicalFailureContract(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOut := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.WarnLevel)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	}()
+
+	retryAfter := 1750 * time.Millisecond
+	ctx := coreusage.WithFailureDiagnostic(context.Background(), coreusage.FailureDiagnostic{
+		UpstreamRequestID: "diagnostic-request-id-must-not-win",
+		PayloadBytes:      163,
+	})
+	(&FailureMetadataLogger{}).HandleUsage(ctx, coreusage.Record{
+		Model:              "gpt-5.6-sol",
+		Failed:             true,
+		ProviderStatusCode: http.StatusBadRequest,
+		ErrorCode:          "server_error",
+		Fail: coreusage.Failure{
+			Canonical:         true,
+			StatusCode:        http.StatusServiceUnavailable,
+			OuterStatus:       http.StatusBadRequest,
+			ErrorCode:         "server_error",
+			SemanticCode:      "server_error",
+			SemanticType:      "server_error",
+			Kind:              "provider_unavailable",
+			Scope:             "provider",
+			Retryable:         true,
+			StreamPhase:       "before_output",
+			OutputCommitted:   false,
+			UpstreamRequestID: "upstream-request-id",
+			RetryAfter:        &retryAfter,
+		},
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("unmarshal log payload: %v; raw=%s", err, buf.String())
+	}
+	requireJSONField(t, payload, "failure_class", "upstream_api_error")
+	requireJSONNumberField(t, payload, "normalized_status", http.StatusServiceUnavailable)
+	requireJSONNumberField(t, payload, "outer_status", http.StatusBadRequest)
+	requireJSONNumberField(t, payload, "upstream_status", http.StatusBadRequest)
+	requireJSONField(t, payload, "semantic_code", "server_error")
+	requireJSONField(t, payload, "semantic_type", "server_error")
+	requireJSONField(t, payload, "failure_kind", "provider_unavailable")
+	requireJSONField(t, payload, "failure_scope", "provider")
+	requireJSONField(t, payload, "scope", "provider")
+	requireJSONField(t, payload, "stream_phase", "before_output")
+	requireJSONField(t, payload, "upstream_request_id", "upstream-request-id")
+	requireJSONNumberField(t, payload, "retry_after_ms", 1750)
+	requireJSONBoolField(t, payload, "retryable", true)
+	requireJSONBoolField(t, payload, "output_committed", false)
+	requireJSONNumberField(t, payload, "payload_bytes", 163)
+}
+
 func TestFailureMetadataLoggerNormalizesContentSafetyFields(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.StandardLogger()
@@ -365,5 +428,13 @@ func requireJSONNumberField(t *testing.T, payload map[string]any, key string, wa
 	got, ok := payload[key].(float64)
 	if !ok || int(got) != want {
 		t.Fatalf("%s = %v, want %d", key, payload[key], want)
+	}
+}
+
+func requireJSONBoolField(t *testing.T, payload map[string]any, key string, want bool) {
+	t.Helper()
+	got, ok := payload[key].(bool)
+	if !ok || got != want {
+		t.Fatalf("%s = %v, want %t", key, payload[key], want)
 	}
 }

@@ -8,12 +8,12 @@ import (
 	"io"
 	"net/http"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -21,8 +21,6 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
-var failureStatusPattern = regexp.MustCompile(`(?i)(?:status_code|status code|status|http status)[=:\s]+([1-5][0-9]{2})`)
 
 var (
 	streamUsageMarker                 = []byte(`"usage"`)
@@ -288,8 +286,12 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures .
 }
 
 func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, failed bool, fail usage.Failure) usage.Record {
+	providerStatusCode := fail.OuterStatus
+	if providerStatusCode == 0 {
+		providerStatusCode = fail.StatusCode
+	}
 	if r == nil {
-		return usage.Record{Model: model, Detail: detail, Failed: failed, ProviderStatusCode: fail.StatusCode, ErrorCode: fail.ErrorCode, Fail: fail}
+		return usage.Record{Model: model, Detail: detail, Failed: failed, ProviderStatusCode: providerStatusCode, ErrorCode: fail.ErrorCode, Fail: fail}
 	}
 	return usage.Record{
 		Provider:           r.provider,
@@ -312,7 +314,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Latency:            r.latency(),
 		TTFT:               r.ttftDuration(),
 		Failed:             failed,
-		ProviderStatusCode: fail.StatusCode,
+		ProviderStatusCode: providerStatusCode,
 		ErrorCode:          fail.ErrorCode,
 		Fail:               fail,
 		Detail:             detail,
@@ -337,19 +339,27 @@ func failFromErrors(errs ...error) usage.Failure {
 		if err == nil {
 			continue
 		}
-		status, code := failureMetadataFromError(err)
-		fail := usage.Failure{
-			StatusCode: status,
-			ErrorCode:  code,
-			Body:       strings.TrimSpace(err.Error()),
-		}
-		var se interface{ StatusCode() int }
-		if errors.As(err, &se) && se != nil {
-			if status := normalizeFailureStatus(se.StatusCode()); status != 0 {
-				fail.StatusCode = status
+		if _, ok := failurecontract.As(err); ok {
+			classified := failurecontract.Classify(err)
+			return usage.Failure{
+				Canonical:         true,
+				StatusCode:        normalizeFailureStatus(classified.HTTPStatus),
+				OuterStatus:       normalizeFailureStatus(classified.OuterStatus),
+				ErrorCode:         sanitizeFailureErrorCode(classified.SemanticCode),
+				SemanticCode:      sanitizeFailureErrorCode(classified.SemanticCode),
+				SemanticType:      sanitizeFailureErrorCode(classified.SemanticType),
+				Kind:              string(classified.Kind),
+				Scope:             string(classified.Scope),
+				Retryable:         classified.Retryable,
+				StreamPhase:       string(classified.StreamPhase),
+				OutputCommitted:   classified.OutputCommitted,
+				UpstreamRequestID: strings.TrimSpace(classified.UpstreamRequestID),
+				RetryAfter:        cloneFailureRetryAfter(classified.RetryAfter),
+				Body:              strings.TrimSpace(err.Error()),
 			}
 		}
-		return fail
+		status, code := failureMetadataFromError(err)
+		return usage.Failure{StatusCode: status, OuterStatus: status, ErrorCode: code, SemanticCode: code, Body: strings.TrimSpace(err.Error())}
 	}
 	return usage.Failure{}
 }
@@ -398,13 +408,6 @@ func failureMetadataFromError(err error) (int, string) {
 		code = sanitizeFailureErrorCode(codeProvider.ErrorCode())
 	}
 
-	message := strings.TrimSpace(err.Error())
-	if status == 0 {
-		status = parseFailureStatusFromText(message)
-	}
-	if code == "" {
-		code = parseFailureErrorCodeFromText(message)
-	}
 	return status, code
 }
 
@@ -415,85 +418,12 @@ func normalizeFailureStatus(status int) int {
 	return 0
 }
 
-func parseFailureStatusFromText(text string) int {
-	match := failureStatusPattern.FindStringSubmatch(text)
-	if len(match) != 2 {
-		return 0
+func cloneFailureRetryAfter(retryAfter *time.Duration) *time.Duration {
+	if retryAfter == nil {
+		return nil
 	}
-	status := 0
-	for _, ch := range match[1] {
-		status = status*10 + int(ch-'0')
-	}
-	return normalizeFailureStatus(status)
-}
-
-func parseFailureErrorCodeFromText(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-	if gjson.Valid(text) {
-		if code := firstFailureJSONValue([]byte(text), "error.code", "code", "error.type", "type", "error.err_code"); code != "" {
-			return sanitizeFailureErrorCode(code)
-		}
-	}
-	if payload := firstFailureSSEDataJSONPayload(text); payload != "" {
-		if code := firstFailureJSONValue([]byte(payload), "error.code", "code", "error.type", "type", "error.err_code"); code != "" {
-			return sanitizeFailureErrorCode(code)
-		}
-	}
-	if idx := strings.Index(text, ":"); idx > 0 {
-		prefix := strings.TrimSpace(text[:idx])
-		if comma := strings.LastIndex(prefix, ","); comma >= 0 {
-			prefix = strings.TrimSpace(prefix[comma+1:])
-		}
-		if code := sanitizeFailureErrorCode(prefix); code != "" {
-			return code
-		}
-	}
-	for _, token := range strings.FieldsFunc(text, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == ',' || r == ';'
-	}) {
-		code := sanitizeFailureErrorCode(token)
-		if code == "" {
-			continue
-		}
-		lower := strings.ToLower(code)
-		if strings.Contains(lower, "_") || strings.Contains(lower, "error") || strings.Contains(lower, "quota") || strings.Contains(lower, "limit") || strings.Contains(lower, "unavailable") {
-			return code
-		}
-	}
-	return ""
-}
-
-func firstFailureSSEDataJSONPayload(text string) string {
-	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
-		line = strings.TrimSpace(line)
-		idx := strings.Index(strings.ToLower(line), "data:")
-		if idx < 0 {
-			continue
-		}
-		payload := strings.TrimSpace(line[idx+len("data:"):])
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		if gjson.Valid(payload) {
-			return payload
-		}
-	}
-	return ""
-}
-
-func firstFailureJSONValue(body []byte, paths ...string) string {
-	for _, path := range paths {
-		value := gjson.GetBytes(body, path)
-		if value.Exists() && value.Type == gjson.String {
-			if s := strings.TrimSpace(value.String()); s != "" {
-				return s
-			}
-		}
-	}
-	return ""
+	cloned := *retryAfter
+	return &cloned
 }
 
 func sanitizeFailureErrorCode(code string) string {

@@ -70,6 +70,52 @@ func TestClassifyTypedFailure(t *testing.T) {
 	}
 }
 
+func TestClassifyPreservesCanonicalUpstreamMetadata(t *testing.T) {
+	err := fmt.Errorf("executor: %w", &Failure{
+		Kind:              ProviderUnavailable,
+		Scope:             ScopeProvider,
+		HTTPStatus:        http.StatusBadGateway,
+		OuterStatus:       http.StatusBadRequest,
+		ProviderCode:      "legacy_server_error",
+		SemanticCode:      "server_error",
+		SemanticType:      "server_error",
+		StreamPhase:       StreamPhaseBeforeOutput,
+		OutputCommitted:   false,
+		UpstreamRequestID: "upstream-request-1",
+		Retryable:         true,
+		PublicMessage:     "upstream request failed",
+	})
+
+	classified := Classify(err)
+	if classified == nil {
+		t.Fatal("Classify() = nil")
+	}
+	if classified.HTTPStatus != http.StatusBadGateway || classified.OuterStatus != http.StatusBadRequest {
+		t.Fatalf("statuses = %d/%d, want %d/%d", classified.HTTPStatus, classified.OuterStatus, http.StatusBadGateway, http.StatusBadRequest)
+	}
+	if classified.SemanticCode != "server_error" || classified.SemanticType != "server_error" {
+		t.Fatalf("semantic error = %q/%q", classified.SemanticCode, classified.SemanticType)
+	}
+	if classified.StreamPhase != StreamPhaseBeforeOutput || classified.OutputCommitted {
+		t.Fatalf("stream metadata = %q/%t", classified.StreamPhase, classified.OutputCommitted)
+	}
+	if classified.UpstreamRequestID != "upstream-request-1" {
+		t.Fatalf("UpstreamRequestID = %q", classified.UpstreamRequestID)
+	}
+	if got := classified.ErrorCode(); got != "server_error" {
+		t.Fatalf("ErrorCode() = %q, want server_error", got)
+	}
+	if got := classified.ProviderStatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("ProviderStatusCode() = %d, want %d", got, http.StatusBadRequest)
+	}
+	if got := OuterStatusOf(err); got != http.StatusBadRequest {
+		t.Fatalf("OuterStatusOf() = %d, want %d", got, http.StatusBadRequest)
+	}
+	if got := SemanticCodeOf(err); got != "server_error" {
+		t.Fatalf("SemanticCodeOf() = %q, want server_error", got)
+	}
+}
+
 func TestClassifyLegacyFallbackParity(t *testing.T) {
 	retryAfter := 12 * time.Second
 	legacy := &legacyFailure{

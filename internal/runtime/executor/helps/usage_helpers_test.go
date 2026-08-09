@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -28,6 +29,34 @@ func (e metadataStatusError) Error() string {
 func (e metadataStatusError) ProviderStatusCode() int { return e.status }
 
 func (e metadataStatusError) ErrorCode() string { return e.code }
+
+func TestFailFromErrorsUsesCanonicalFailureContract(t *testing.T) {
+	retryAfter := 17 * time.Second
+	err := &failurecontract.Failure{
+		HTTPStatus:        http.StatusBadGateway,
+		OuterStatus:       http.StatusBadRequest,
+		SemanticCode:      "server_error",
+		SemanticType:      "server_error",
+		Kind:              failurecontract.ProviderUnavailable,
+		Scope:             failurecontract.ScopeProvider,
+		Retryable:         true,
+		StreamPhase:       failurecontract.StreamPhaseBeforeOutput,
+		UpstreamRequestID: "upstream-123",
+		RetryAfter:        &retryAfter,
+		PublicMessage:     "safe failure",
+	}
+	fail := failFromErrors(err)
+	if !fail.Canonical || fail.StatusCode != http.StatusBadGateway || fail.OuterStatus != http.StatusBadRequest ||
+		fail.SemanticCode != "server_error" || fail.SemanticType != "server_error" || fail.Kind != string(failurecontract.ProviderUnavailable) ||
+		fail.Scope != string(failurecontract.ScopeProvider) || !fail.Retryable || fail.StreamPhase != string(failurecontract.StreamPhaseBeforeOutput) ||
+		fail.UpstreamRequestID != "upstream-123" || fail.RetryAfter == nil || *fail.RetryAfter != retryAfter {
+		t.Fatalf("usage failure = %+v", fail)
+	}
+	record := (&UsageReporter{}).buildRecordForModel("gpt-5", usage.Detail{}, true, fail)
+	if record.ProviderStatusCode != http.StatusBadRequest {
+		t.Fatalf("provider status = %d, want outer 400", record.ProviderStatusCode)
+	}
+}
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)

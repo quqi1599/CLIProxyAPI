@@ -6136,8 +6136,10 @@ func shouldRetryGPTRound(err error, completedRound int, providers []string, mode
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
-	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
-		return 0, false
+	if failure, ok := failurecontract.As(err); ok {
+		if failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest {
+			return 0, false
+		}
 	}
 	if completedRound == 0 {
 		return 0, shouldFailoverGPTChannel(err, providers, model) ||
@@ -6179,8 +6181,10 @@ func isGPTThirdRoundFailure(err error) bool {
 	if err == nil || isRequestInvalidError(err) {
 		return false
 	}
-	if failure, ok := failurecontract.As(err); ok && failure.Scope == failurecontract.ScopeRequest {
-		return false
+	if failure, ok := failurecontract.As(err); ok {
+		if failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest {
+			return false
+		}
 	}
 	return statusCodeFromError(err) == http.StatusServiceUnavailable ||
 		isGPTAuthUnavailableError(err) ||
@@ -6245,7 +6249,8 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 }
 
 func (m *Manager) shouldRetryTypedFailure(failure *failurecontract.Failure, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
-	if failure == nil || !failure.Retryable || maxWait <= 0 || !m.retryAllowed(attempt, providers) {
+	if failure == nil || failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest ||
+		!failure.Retryable || maxWait <= 0 || !m.retryAllowed(attempt, providers) {
 		return 0, false
 	}
 	if failure.RetryAfter != nil {
@@ -6333,7 +6338,7 @@ func shouldFailoverGPTChannel(err error, providers []string, model string) bool 
 		return false
 	}
 	if failure, ok := failurecontract.As(err); ok {
-		if failure.Scope == failurecontract.ScopeRequest {
+		if failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest {
 			return false
 		}
 		if failure.Scope == failurecontract.ScopeProvider && failure.Retryable {
@@ -6448,6 +6453,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	result = normalizeResultFailureContract(result)
 	probeModel := coreusage.RequestedModelAliasFromContext(ctx)
 	if probeModel == "" {
 		probeModel = result.Model
@@ -6490,6 +6496,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		codexBypassCooling := isCodexAuth(auth) &&
 			!codexAPIKeyHealthOnly &&
 			!codexOAuthUnauthorized
+		typedFailure, hasTypedFailure := typedFailureFromResult(result)
 		failureScope, hasTypedFailureScope := failureScopeFromResult(result)
 		slowPenalty := 0
 		if result.Success && m.slowRequestPenaltyEnabledLocked(auth) {
@@ -6568,6 +6575,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if hasTypedFailureScope && failureScope == failurecontract.ScopeRequest {
 				// Request failures are terminal for this payload and must not alter
 				// credential, model, or provider availability.
+			} else if hasTypedFailure && hasTypedFailureScope && failureScope == failurecontract.ScopeCredential {
+				disableCooling := m.cooldownDisabledForAuth(auth)
+				applyTypedCredentialFailureState(auth, typedFailure, result.Error, now, disableCooling)
 			} else if codexOAuthUnauthorized {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
@@ -6589,9 +6599,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				} else {
 					clearAuthStateOnSuccess(auth, now)
 				}
-			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeCredential {
-				disableCooling := m.cooldownDisabledForAuth(auth)
-				applyTypedCredentialFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			} else if hasTypedFailureScope && failureScope == failurecontract.ScopeProvider {
 				// Provider failures feed the provider/channel breaker below. They must
 				// not be attributed to a single credential or model.
@@ -7171,8 +7178,8 @@ func shouldCountChannelBreakerFailure(result Result) bool {
 	if result.Success || result.Error == nil {
 		return false
 	}
-	if scope, ok := failureScopeFromResult(result); ok {
-		return scope == failurecontract.ScopeProvider && result.Error.Retryable
+	if failure, ok := typedFailureFromResult(result); ok {
+		return !failure.OutputCommitted && failure.Scope == failurecontract.ScopeProvider && failure.Retryable
 	}
 	if isRequestScopedNotFoundResultError(result.Error) ||
 		isRequestScopedFeatureUnsupportedResultError(result.Error) ||
@@ -7895,6 +7902,39 @@ func resultErrorFromCause(err error) *Error {
 	return resultErr
 }
 
+func normalizeResultFailureContract(result Result) Result {
+	if result.Success || result.Cause == nil {
+		return result
+	}
+	typed, ok := failurecontract.As(result.Cause)
+	if !ok || typed == nil {
+		return result
+	}
+	classified := failurecontract.Classify(result.Cause)
+	if classified == nil {
+		return result
+	}
+	result.Error = resultErrorFromCause(classified)
+	if classified.RetryAfter == nil {
+		result.RetryAfter = nil
+	} else {
+		retryAfter := *classified.RetryAfter
+		result.RetryAfter = &retryAfter
+	}
+	return result
+}
+
+func typedFailureFromResult(result Result) (*failurecontract.Failure, bool) {
+	if result.Cause == nil {
+		return nil, false
+	}
+	if _, ok := failurecontract.As(result.Cause); !ok {
+		return nil, false
+	}
+	classified := failurecontract.Classify(result.Cause)
+	return classified, classified != nil
+}
+
 func isExecutorRequestScopedError(err error) bool {
 	if err == nil {
 		return false
@@ -7904,7 +7944,7 @@ func isExecutorRequestScopedError(err error) bool {
 }
 
 func failureScopeFromResult(result Result) (failurecontract.Scope, bool) {
-	if typed, ok := failurecontract.As(result.Cause); ok {
+	if typed, ok := typedFailureFromResult(result); ok {
 		if scope, valid := controlledFailureScope(string(typed.Scope)); valid {
 			return scope, true
 		}
@@ -7995,7 +8035,50 @@ func isAccountQuotaExhaustedMessage(message string) bool {
 }
 
 func shouldDisableAuthForBalanceExhausted(result Result) bool {
-	return !result.Success && isBalanceExhaustedResultError(result.Error)
+	if result.Success {
+		return false
+	}
+	if failure, ok := typedFailureFromResult(result); ok {
+		return isTypedBalanceExhaustedFailure(failure)
+	}
+	return isBalanceExhaustedResultError(result.Error)
+}
+
+func typedFailureHasSemanticIdentifier(failure *failurecontract.Failure, identifiers ...string) bool {
+	if failure == nil {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(failure.SemanticCode))
+	typeID := strings.ToLower(strings.TrimSpace(failure.SemanticType))
+	for _, identifier := range identifiers {
+		identifier = strings.ToLower(strings.TrimSpace(identifier))
+		if identifier != "" && (code == identifier || typeID == identifier) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTypedBalanceExhaustedFailure(failure *failurecontract.Failure) bool {
+	return failure != nil &&
+		failure.Kind == failurecontract.QuotaExceeded &&
+		failure.Scope == failurecontract.ScopeCredential &&
+		typedFailureHasSemanticIdentifier(failure,
+			"insufficient_balance",
+			"balance_insufficient",
+			"balance_not_enough",
+		)
+}
+
+func isTypedAccountQuotaExhaustedFailure(failure *failurecontract.Failure) bool {
+	return failure != nil &&
+		failure.Kind == failurecontract.QuotaExceeded &&
+		failure.Scope == failurecontract.ScopeCredential &&
+		typedFailureHasSemanticIdentifier(failure,
+			"usage_limit_reached",
+			"billing_cycle_quota",
+			"insufficient_quota",
+		)
 }
 
 func isBalanceExhaustedResultError(err *Error) bool {
@@ -8991,8 +9074,120 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	applyAuthFailureStateWithCodexScope(auth, resultErr, retryAfter, now, disableCooling, false)
 }
 
-func applyTypedCredentialFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {
-	applyAuthFailureStateWithCodexScope(auth, resultErr, retryAfter, now, disableCooling, true)
+func applyTypedCredentialFailureState(auth *Auth, failure *failurecontract.Failure, resultErr *Error, now time.Time, disableCooling bool) {
+	if auth == nil || failure == nil {
+		return
+	}
+	statusCode := failure.HTTPStatus
+	if statusCode <= 0 {
+		statusCode = statusCodeFromResult(resultErr)
+	}
+	retryAfter := failure.RetryAfter
+	applyHealthFailure(&auth.Health, now, statusCode)
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.UpdatedAt = now
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	}
+
+	if isTypedAccountQuotaExhaustedFailure(failure) {
+		applyAccountQuotaFailureState(auth, nil, resultErr, retryAfter, now)
+		return
+	}
+	if typedFailureHasSemanticIdentifier(failure, "invalid_grant") {
+		auth.StatusMessage = "invalid_grant"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 30*time.Minute, disableCooling)
+		return
+	}
+
+	switch failure.Kind {
+	case failurecontract.AuthenticationFailed:
+		auth.StatusMessage = "authentication failed"
+		if statusCode == http.StatusUnauthorized {
+			auth.StatusMessage = "unauthorized"
+		}
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 30*time.Minute, disableCooling)
+	case failurecontract.QuotaExceeded, failurecontract.RateLimited:
+		applyTypedCredentialQuotaFailureState(auth, retryAfter, now, disableCooling)
+	default:
+		applyTypedCredentialStatusFailureState(auth, statusCode, retryAfter, now, disableCooling)
+	}
+}
+
+func typedCredentialRetryAt(now time.Time, retryAfter *time.Duration, fallback time.Duration, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	if retryAfter != nil {
+		if *retryAfter <= 0 {
+			return time.Time{}
+		}
+		return now.Add(*retryAfter)
+	}
+	if fallback <= 0 {
+		return time.Time{}
+	}
+	return now.Add(fallback)
+}
+
+func applyTypedCredentialQuotaFailureState(auth *Auth, retryAfter *time.Duration, now time.Time, disableCooling bool) {
+	if auth == nil {
+		return
+	}
+	auth.StatusMessage = "quota exhausted"
+	auth.Quota.Exceeded = true
+	auth.Quota.Reason = "quota"
+	var next time.Time
+	if !disableCooling && retryAfter != nil {
+		if *retryAfter > 0 {
+			next = now.Add(*retryAfter)
+		}
+		next = laterTime(next, auth.Health.OpenUntil)
+	} else if !disableCooling && shouldHardCooldownQuotaForAuth(auth, auth.Health, nil) {
+		cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+		if cooldown > 0 {
+			next = now.Add(cooldown)
+		}
+		auth.Quota.BackoffLevel = nextLevel
+		next = laterTime(next, auth.Health.OpenUntil)
+	}
+	auth.Quota.NextRecoverAt = next
+	auth.NextRetryAfter = next
+}
+
+func applyTypedCredentialStatusFailureState(auth *Auth, statusCode int, retryAfter *time.Duration, now time.Time, disableCooling bool) {
+	if auth == nil {
+		return
+	}
+	switch statusCode {
+	case http.StatusUnauthorized:
+		auth.StatusMessage = "unauthorized"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 30*time.Minute, disableCooling)
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		auth.StatusMessage = "payment_required"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 30*time.Minute, disableCooling)
+	case http.StatusNotFound:
+		auth.StatusMessage = "not_found"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 12*time.Hour, disableCooling)
+	case http.StatusTooManyRequests:
+		applyTypedCredentialQuotaFailureState(auth, retryAfter, now, disableCooling)
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		auth.StatusMessage = "transient upstream error"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, nextTransientErrorRetryAfter(now).Sub(now), disableCooling)
+	default:
+		if isTransientUpstreamStatus(statusCode) {
+			auth.StatusMessage = "transient upstream error"
+			fallback := time.Duration(0)
+			if next := transientHardCooldownUntil(auth.Health); !next.IsZero() {
+				fallback = next.Sub(now)
+			}
+			auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, fallback, disableCooling)
+			return
+		}
+		auth.StatusMessage = "request failed"
+		auth.NextRetryAfter = typedCredentialRetryAt(now, retryAfter, 0, disableCooling)
+	}
 }
 
 func applyAuthFailureStateWithCodexScope(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling, typedCredential bool) {
@@ -11504,6 +11699,7 @@ func formatReasonCounts(counts map[string]int) string {
 }
 
 func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Result) {
+	result = normalizeResultFailureContract(result)
 	fields := m.authMetricFields(auth, result.Provider, result.Model)
 	fields["event"] = "auth_result"
 	fields["success"] = result.Success
@@ -11522,7 +11718,37 @@ func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Re
 		fields["status"] = status
 		fields["status_code"] = status
 	}
-	if result.Error != nil {
+	if failure, ok := typedFailureFromResult(result); ok {
+		fields["retryable"] = failure.Retryable
+		fields["output_committed"] = failure.OutputCommitted
+		if failure.HTTPStatus > 0 {
+			fields["normalized_status"] = failure.HTTPStatus
+		}
+		if failure.Kind != "" {
+			fields["failure_kind"] = string(failure.Kind)
+		}
+		if failure.Scope != "" {
+			fields["failure_scope"] = string(failure.Scope)
+			fields["scope"] = string(failure.Scope)
+		}
+		if failure.OuterStatus > 0 {
+			fields["outer_status"] = failure.OuterStatus
+			fields["upstream_status"] = failure.OuterStatus
+		}
+		if semanticCode := strings.TrimSpace(failure.SemanticCode); semanticCode != "" {
+			fields["semantic_code"] = semanticCode
+			fields["error_code"] = semanticCode
+		}
+		if semanticType := strings.TrimSpace(failure.SemanticType); semanticType != "" {
+			fields["semantic_type"] = semanticType
+		}
+		if failure.StreamPhase != "" {
+			fields["stream_phase"] = string(failure.StreamPhase)
+		}
+		if upstreamRequestID := strings.TrimSpace(failure.UpstreamRequestID); upstreamRequestID != "" {
+			fields["upstream_request_id"] = upstreamRequestID
+		}
+	} else if result.Error != nil {
 		if result.Error.Kind != "" {
 			fields["failure_kind"] = result.Error.Kind
 		}
@@ -11532,9 +11758,7 @@ func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Re
 		if result.Error.Code != "" {
 			fields["error_code"] = result.Error.Code
 		}
-		if result.Error.Retryable {
-			fields["retryable"] = true
-		}
+		fields["retryable"] = result.Error.Retryable
 	}
 	if result.RetryAfter != nil {
 		fields["retry_after_ms"] = result.RetryAfter.Milliseconds()

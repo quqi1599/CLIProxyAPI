@@ -9,6 +9,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -620,7 +621,13 @@ func TestManagerEmptyResponseRetryDoesNotReplayAfterDeliverableOutput(t *testing
 		streamChunks: map[string][]cliproxyexecutor.StreamChunk{
 			"aa-partial": {
 				{Payload: []byte(`data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}` + "\n\n")},
-				{Err: &Error{Code: "upstream_closed", Message: "upstream closed", HTTPStatus: http.StatusBadGateway, Retryable: true}},
+				{Err: &failurecontract.Failure{
+					Kind: failurecontract.ProviderUnavailable, Scope: failurecontract.ScopeProvider,
+					HTTPStatus: http.StatusBadGateway, OuterStatus: http.StatusBadRequest,
+					SemanticCode: "server_error", SemanticType: "server_error",
+					StreamPhase: failurecontract.StreamPhaseAfterOutput, OutputCommitted: true,
+					Retryable: true, PublicMessage: "upstream closed after output",
+				}},
 			},
 		},
 		streamPayloads: map[string][]string{
@@ -651,8 +658,12 @@ func TestManagerEmptyResponseRetryDoesNotReplayAfterDeliverableOutput(t *testing
 			finalErr = chunk.Err
 		}
 	}
-	if !strings.Contains(response.String(), "partial") || finalErr == nil {
+	if !strings.Contains(response.String(), "partial") || strings.Contains(response.String(), "duplicate") || finalErr == nil {
 		t.Fatalf("stream response = %q error=%v, want partial output followed by error", response.String(), finalErr)
+	}
+	classified := failurecontract.Classify(finalErr)
+	if classified == nil || !classified.OutputCommitted || classified.StreamPhase != failurecontract.StreamPhaseAfterOutput {
+		t.Fatalf("final stream failure = %+v, want committed after-output failure", classified)
 	}
 	if got, want := executor.StreamCalls(), []string{"aa-partial"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("stream calls = %v, want no replay after output", got)

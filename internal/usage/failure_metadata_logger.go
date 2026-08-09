@@ -61,9 +61,19 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 
 	cancelOrigin := safeFailureMetadataString(internallogging.CancellationOriginFromContext(ctx))
 	normalizedStatus, normalizedErrorType, normalizedErrorCode := normalizeFailureMetadataError(status, errorCode)
+	failureClass := classifyFailureMetadata(status, errorCode, cancelOrigin)
+	if record.Fail.Canonical {
+		normalizedStatus = record.Fail.StatusCode
+		normalizedErrorType = safeFailureMetadataString(record.Fail.SemanticType)
+		normalizedErrorCode = safeFailureMetadataString(record.Fail.SemanticCode)
+		if normalizedErrorCode == "" {
+			normalizedErrorCode = errorCode
+		}
+		failureClass = classifyCanonicalFailureMetadata(record.Fail, cancelOrigin)
+	}
 	fields := log.Fields{
 		"event":            "failure_metadata",
-		"failure_class":    classifyFailureMetadata(status, errorCode, cancelOrigin),
+		"failure_class":    failureClass,
 		"model":            model,
 		"endpoint_method":  safeFailureMetadataString(internallogging.GetEndpointMethod(ctx)),
 		"endpoint_path":    safeFailureMetadataString(internallogging.GetEndpointPath(ctx)),
@@ -81,6 +91,35 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 	}
 	if normalizedErrorCode != "" {
 		fields["error_code"] = normalizedErrorCode
+	}
+	if record.Fail.Canonical {
+		fields["retryable"] = record.Fail.Retryable
+		fields["output_committed"] = record.Fail.OutputCommitted
+		if kind := safeFailureMetadataString(record.Fail.Kind); kind != "" {
+			fields["failure_kind"] = kind
+		}
+		if scope := safeFailureMetadataString(record.Fail.Scope); scope != "" {
+			fields["failure_scope"] = scope
+			fields["scope"] = scope
+		}
+		if semanticType := safeFailureMetadataString(record.Fail.SemanticType); semanticType != "" {
+			fields["semantic_type"] = semanticType
+		}
+		if semanticCode := safeFailureMetadataString(record.Fail.SemanticCode); semanticCode != "" {
+			fields["semantic_code"] = semanticCode
+		}
+		if phase := safeFailureMetadataString(record.Fail.StreamPhase); phase != "" {
+			fields["stream_phase"] = phase
+		}
+		if record.Fail.OuterStatus > 0 {
+			fields["outer_status"] = record.Fail.OuterStatus
+		}
+		if upstreamRequestID := safeFailureMetadataString(record.Fail.UpstreamRequestID); upstreamRequestID != "" {
+			fields["upstream_request_id"] = upstreamRequestID
+		}
+		if record.Fail.RetryAfter != nil {
+			fields["retry_after_ms"] = record.Fail.RetryAfter.Milliseconds()
+		}
 	}
 	if status > 0 {
 		fields["upstream_status"] = status
@@ -150,6 +189,34 @@ func isFailureMetadataContentSafetyCode(code string) bool {
 	}
 }
 
+func classifyCanonicalFailureMetadata(failure coreusage.Failure, cancelOrigin string) string {
+	if cancelOrigin != "" {
+		return classifyFailureMetadata(failure.OuterStatus, failure.SemanticCode, cancelOrigin)
+	}
+	switch strings.ToLower(strings.TrimSpace(failure.Kind)) {
+	case "invalid_request", "request_too_large", "unsupported_feature", "context_length_exceeded", "content_safety_blocked", "invalid_thinking_history", "invalid_signature":
+		return "request_4xx"
+	case "authentication_failed":
+		return "auth"
+	case "quota_exceeded":
+		return "quota"
+	case "rate_limited":
+		return "rate_limit"
+	case "model_unavailable":
+		return "model_unavailable"
+	case "provider_unavailable", "upstream_protocol_error":
+		return "upstream_api_error"
+	case "transport_error":
+		return "transport"
+	case "cancelled":
+		return "cancelled"
+	case "internal_transform_error":
+		return "internal_transform"
+	default:
+		return classifyFailureMetadata(failure.OuterStatus, failure.SemanticCode, "")
+	}
+}
+
 func addFailureToolShapeFields(fields log.Fields, shape coreusage.ToolShape) {
 	if len(fields) == 0 || !shape.HasData() {
 		return
@@ -194,7 +261,9 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 		fields["compat_mapping"] = safeFailureMetadataString(diag.CompatMapping)
 	}
 	if diag.UpstreamRequestID != "" {
-		fields["upstream_request_id"] = safeFailureMetadataString(diag.UpstreamRequestID)
+		if _, exists := fields["upstream_request_id"]; !exists {
+			fields["upstream_request_id"] = safeFailureMetadataString(diag.UpstreamRequestID)
+		}
 	}
 	if diag.PayloadBytes > 0 {
 		fields["payload_bytes"] = diag.PayloadBytes
@@ -282,6 +351,9 @@ func addFailureDiagnosticFields(fields log.Fields, diag coreusage.FailureDiagnos
 func failureMetadataStatus(record coreusage.Record) int {
 	if record.ProviderStatusCode > 0 {
 		return record.ProviderStatusCode
+	}
+	if record.Fail.OuterStatus > 0 {
+		return record.Fail.OuterStatus
 	}
 	if record.Fail.StatusCode > 0 {
 		return record.Fail.StatusCode

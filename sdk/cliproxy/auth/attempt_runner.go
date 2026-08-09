@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -53,6 +54,7 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 					var cooldownErr *modelCooldownError
 					if !errors.As(errRun, &cooldownErr) || !shouldRetry {
 						wait, shouldRetry = shouldRetryGPTRound(errRun, attempt, providers, req.Model, trace)
+						wait, shouldRetry = preserveCanonicalGPTRoundRetryAfter(errRun, wait, shouldRetry, maxWait)
 					}
 				}
 			}
@@ -89,6 +91,24 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 		}
 	}
 	return managerAttemptOutcome[T]{returnErr: lastErr, finalErr: lastErr}
+}
+
+func preserveCanonicalGPTRoundRetryAfter(err error, wait time.Duration, shouldRetry bool, maxWait time.Duration) (time.Duration, bool) {
+	if !shouldRetry {
+		return wait, false
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.RetryAfter == nil {
+		return wait, true
+	}
+	if _, controlled := controlledFailureScope(string(typed.Scope)); !controlled {
+		return wait, true
+	}
+	retryAfter := *typed.RetryAfter
+	if retryAfter < 0 || (retryAfter > 0 && (maxWait <= 0 || retryAfter > maxWait)) {
+		return 0, false
+	}
+	return retryAfter, true
 }
 
 func recordManagerAttemptSuccess(ctx context.Context) {

@@ -58,11 +58,25 @@ type Record struct {
 	ResponseHeaders http.Header
 }
 
-// Failure holds HTTP failure metadata for an upstream request attempt.
+// Failure holds the canonical failure metadata for an upstream request attempt.
 type Failure struct {
+	// Canonical reports whether the fields below came from the typed failure contract.
+	Canonical bool
+	// StatusCode is the client-facing normalized HTTP status.
 	StatusCode int
-	ErrorCode  string
-	Body       string
+	// OuterStatus is the HTTP status returned by the immediate upstream.
+	OuterStatus       int
+	ErrorCode         string
+	SemanticCode      string
+	SemanticType      string
+	Kind              string
+	Scope             string
+	Retryable         bool
+	StreamPhase       string
+	OutputCommitted   bool
+	UpstreamRequestID string
+	RetryAfter        *time.Duration
+	Body              string
 }
 
 // Detail holds the token usage breakdown.

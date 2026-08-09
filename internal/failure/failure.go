@@ -40,15 +40,37 @@ const (
 	ScopeProvider   Scope = "provider"
 )
 
+// StreamPhase identifies whether an upstream failure happened before or after
+// semantic output was committed to the downstream client.
+type StreamPhase string
+
+const (
+	StreamPhaseUnknown      StreamPhase = "unknown"
+	StreamPhaseBeforeOutput StreamPhase = "before_output"
+	StreamPhaseAfterOutput  StreamPhase = "after_output"
+)
+
 // Failure is the canonical execution failure contract.
 //
 // Cause is retained for diagnostics and legacy metadata fallback. PublicMessage
 // is the only field intended for a client response.
 type Failure struct {
-	Kind         Kind
-	Scope        Scope
-	HTTPStatus   int
+	Kind  Kind
+	Scope Scope
+	// HTTPStatus is the normalized status returned to the downstream client.
+	HTTPStatus int
+	// OuterStatus preserves the status received from the immediate upstream.
+	OuterStatus int
+	// ProviderCode is kept for compatibility with legacy callers. New code
+	// should populate SemanticCode as the canonical structured error code.
 	ProviderCode string
+	SemanticCode string
+	SemanticType string
+	StreamPhase  StreamPhase
+	// OutputCommitted is true only after semantic output was delivered to the
+	// downstream client. Such failures must never be replayed automatically.
+	OutputCommitted   bool
+	UpstreamRequestID string
 	// RetryAfter is nil when no delay was supplied; a non-nil zero requests an immediate retry.
 	RetryAfter    *time.Duration
 	Retryable     bool
@@ -97,10 +119,32 @@ func (f *Failure) ErrorCode() string {
 	if f == nil {
 		return ""
 	}
+	if code := strings.TrimSpace(f.SemanticCode); code != "" {
+		return code
+	}
 	if code := strings.TrimSpace(f.ProviderCode); code != "" {
 		return code
 	}
 	return legacyProviderCode(f.Cause)
+}
+
+// ProviderStatusCode returns the raw status received from the immediate
+// upstream, falling back to the normalized downstream status for legacy
+// failures that do not distinguish the two.
+func (f *Failure) ProviderStatusCode() int {
+	if f == nil {
+		return 0
+	}
+	if f.OuterStatus > 0 {
+		return f.OuterStatus
+	}
+	if f.HTTPStatus > 0 {
+		return f.HTTPStatus
+	}
+	if status := legacyProviderStatus(f.Cause); status > 0 {
+		return status
+	}
+	return legacyHTTPStatus(f.Cause)
 }
 
 // As returns the first typed Failure in err's unwrap chain.
@@ -127,8 +171,21 @@ func Classify(err error) *Failure {
 		if classified.HTTPStatus <= 0 {
 			classified.HTTPStatus = legacyHTTPStatus(err)
 		}
+		if classified.OuterStatus <= 0 {
+			classified.OuterStatus = legacyProviderStatus(err)
+		}
+		if classified.OuterStatus <= 0 {
+			classified.OuterStatus = classified.HTTPStatus
+		}
+		if strings.TrimSpace(classified.SemanticCode) == "" {
+			classified.SemanticCode = strings.TrimSpace(classified.ProviderCode)
+		}
+		if strings.TrimSpace(classified.ProviderCode) == "" {
+			classified.ProviderCode = strings.TrimSpace(classified.SemanticCode)
+		}
 		if strings.TrimSpace(classified.ProviderCode) == "" {
 			classified.ProviderCode = legacyProviderCode(err)
+			classified.SemanticCode = classified.ProviderCode
 		}
 		if classified.RetryAfter == nil {
 			if retryAfter, okRetry := legacyRetryAfter(err); okRetry {
@@ -145,10 +202,15 @@ func Classify(err error) *Failure {
 
 	classified := &Failure{
 		HTTPStatus:    legacyHTTPStatus(err),
+		OuterStatus:   legacyProviderStatus(err),
 		ProviderCode:  legacyProviderCode(err),
 		Cause:         err,
 		PublicMessage: err.Error(),
 	}
+	if classified.OuterStatus <= 0 {
+		classified.OuterStatus = classified.HTTPStatus
+	}
+	classified.SemanticCode = classified.ProviderCode
 	if retryAfter, ok := legacyRetryAfter(err); ok {
 		classified.RetryAfter = durationPointer(retryAfter)
 	}
@@ -171,6 +233,24 @@ func ProviderCodeOf(err error) string {
 		return ""
 	}
 	return classified.ProviderCode
+}
+
+// OuterStatusOf returns the raw immediate-upstream status when available.
+func OuterStatusOf(err error) int {
+	classified := Classify(err)
+	if classified == nil {
+		return 0
+	}
+	return classified.OuterStatus
+}
+
+// SemanticCodeOf returns the canonical structured upstream error code.
+func SemanticCodeOf(err error) string {
+	classified := Classify(err)
+	if classified == nil {
+		return ""
+	}
+	return strings.TrimSpace(classified.SemanticCode)
 }
 
 // RetryAfterOf returns the typed retry delay or the legacy RetryAfter fallback.
@@ -219,6 +299,22 @@ func legacyProviderCode(err error) string {
 		return strings.TrimSpace(provider.ErrorCode())
 	}
 	return ""
+}
+
+func legacyProviderStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	type providerStatusCoder interface {
+		ProviderStatusCode() int
+	}
+	var provider providerStatusCoder
+	if errors.As(err, &provider) && provider != nil {
+		if status := provider.ProviderStatusCode(); status > 0 {
+			return status
+		}
+	}
+	return 0
 }
 
 func legacyRetryAfter(err error) (time.Duration, bool) {

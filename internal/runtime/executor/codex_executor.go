@@ -228,6 +228,10 @@ func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 }
 
 func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
+	return codexTerminalStreamErrWithMetadata(eventData, nil, false)
+}
+
+func codexTerminalStreamErrWithMetadata(eventData []byte, headers http.Header, outputCommitted bool) (statusErr, []byte, bool) {
 	eventType := gjson.GetBytes(eventData, "type").String()
 	var body []byte
 	switch eventType {
@@ -259,26 +263,100 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 	if len(body) == 0 {
 		return statusErr{}, nil, false
 	}
-	if eventType != "error" && eventType != "response.failed" && !codexTerminalStreamErrShouldHandle(body) {
-		return statusErr{}, nil, false
+	phase := failurecontract.StreamPhaseBeforeOutput
+	if outputCommitted {
+		phase = failurecontract.StreamPhaseAfterOutput
 	}
-	return newCodexStatusErr(http.StatusBadRequest, body), body, true
+	return newCodexStatusErrWithMetadata(http.StatusOK, headers, body, phase, outputCommitted), body, true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
-	if codexTerminalErrorIsContextLength(body) {
+	failure, _ := canonicalCodexFailure(codexFailureInput{
+		outerStatus: http.StatusOK,
+		body:        body,
+		streamPhase: failurecontract.StreamPhaseBeforeOutput,
+	})
+	return failure != nil && (failure.SemanticCode != "" || failure.SemanticType != "")
+}
+
+func codexEventCommitsOutput(eventType string, eventData []byte) bool {
+	eventType = strings.TrimSpace(eventType)
+	switch eventType {
+	case "", "response.queued", "response.created", "response.in_progress", "response.usage":
+		return false
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done":
+		return false
+	case "response.output_text.delta", "response.refusal.delta":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "delta").String()) != ""
+	case "response.output_text.done", "response.refusal.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "text").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "refusal").String()) != ""
+	case "response.function_call_arguments.delta":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "delta").String()) != ""
+	case "response.function_call_arguments.done":
+		return strings.TrimSpace(gjson.GetBytes(eventData, "arguments").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(eventData, "name").String()) != ""
+	case "response.output_item.added", "response.output_item.done":
+		return codexOutputItemCommitsOutput(gjson.GetBytes(eventData, "item"))
+	case "response.content_part.added", "response.content_part.done":
+		part := gjson.GetBytes(eventData, "part")
+		if strings.Contains(strings.ToLower(part.Get("type").String()), "reasoning") {
+			return false
+		}
+		return strings.TrimSpace(part.Get("text").String()) != "" ||
+			strings.TrimSpace(part.Get("refusal").String()) != "" ||
+			strings.TrimSpace(part.Get("image_url").String()) != ""
+	case "response.image_generation_call.partial_image":
 		return true
+	case "response.completed", "response.done":
+		for _, item := range gjson.GetBytes(eventData, "response.output").Array() {
+			if codexOutputItemCommitsOutput(item) {
+				return true
+			}
+		}
+		return false
 	}
-	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) || isCodexTransientRateLimitError(body) {
-		return true
+	return true
+}
+
+func codexOutputItemCommitsOutput(item gjson.Result) bool {
+	if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "reasoning") {
+		return false
 	}
-	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
-	return ok && code == "thinking_signature_invalid"
+	return codexOutputItemHasUsableContent(item)
+}
+
+func codexSSEChunkCommitsOutput(chunk []byte) bool {
+	normalized := bytes.ReplaceAll(chunk, []byte("\r\n"), []byte("\n"))
+	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	for _, block := range bytes.Split(normalized, []byte("\n\n")) {
+		var eventType string
+		var dataParts [][]byte
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			switch {
+			case bytes.HasPrefix(line, []byte("event:")):
+				eventType = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+			case bytes.HasPrefix(line, dataTag):
+				dataParts = append(dataParts, bytes.TrimSpace(bytes.TrimPrefix(line, dataTag)))
+			}
+		}
+		data := bytes.Join(dataParts, []byte("\n"))
+		if eventType == "" {
+			eventType = gjson.GetBytes(data, "type").String()
+		}
+		if codexEventCommitsOutput(eventType, data) {
+			return true
+		}
+	}
+	return false
 }
 
 func codexTerminalErrorBody(eventData []byte, path string) []byte {
 	errorResult := gjson.GetBytes(eventData, path)
-	if !errorResult.Exists() {
+	if !errorResult.Exists() || errorResult.Type == gjson.Null || strings.EqualFold(strings.TrimSpace(errorResult.Raw), "null") {
 		return nil
 	}
 	body := []byte(`{"error":{}}`)
@@ -309,6 +387,12 @@ func codexTerminalTopLevelErrorBody(eventData []byte) []byte {
 	message := strings.TrimSpace(gjson.GetBytes(eventData, "message").String())
 	code := strings.TrimSpace(gjson.GetBytes(eventData, "code").String())
 	errorType := strings.TrimSpace(gjson.GetBytes(eventData, "error_type").String())
+	if errorType == "" {
+		candidate := strings.TrimSpace(gjson.GetBytes(eventData, "type").String())
+		if !isCodexEventEnvelopeType(candidate) {
+			errorType = candidate
+		}
+	}
 	param := strings.TrimSpace(gjson.GetBytes(eventData, "param").String())
 	if message == "" && code == "" && errorType == "" && param == "" {
 		return nil
@@ -937,8 +1021,12 @@ func clearCodexReasoningReplayOnInvalidSignature(ctx context.Context, scope code
 	if !scope.valid() {
 		return nil
 	}
-	code, _, ok := codexStatusErrorClassification(statusCode, body)
-	if ok && code == "thinking_signature_invalid" {
+	failure, _ := canonicalCodexFailure(codexFailureInput{
+		outerStatus: statusCode,
+		body:        body,
+		streamPhase: failurecontract.StreamPhaseBeforeOutput,
+	})
+	if failure != nil && failure.SemanticCode == "thinking_signature_invalid" {
 		return internalcache.DeleteCodexReasoningReplayItemRequired(ctx, scope.modelName, scope.sessionKey)
 	}
 	return nil
@@ -1147,8 +1235,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, err, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return resp, transportErr
 	}
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
@@ -1157,7 +1246,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			return resp, errClearReplay
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamData))
-		err = newCodexStatusErr(httpResp.StatusCode, upstreamData)
+		err = newCodexStatusErrWithMetadata(httpResp.StatusCode, httpResp.Header, upstreamData, failurecontract.StreamPhaseBeforeOutput, false)
 		return resp, err
 	}
 
@@ -1188,7 +1277,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if eventType == "response.completed" || eventType == "response.done" {
 			eventData = patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		}
-		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
+		if streamErr, terminalBody, ok := codexTerminalStreamErrWithMetadata(eventData, httpResp.Header, false); ok {
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
 			}
@@ -1285,14 +1374,15 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	data, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+		transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, err, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return resp, transportErr
 	}
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), upstreamData))
-		err = newCodexStatusErr(httpResp.StatusCode, upstreamData)
+		err = newCodexStatusErrWithMetadata(httpResp.StatusCode, httpResp.Header, upstreamData, failurecontract.StreamPhaseBeforeOutput, false)
 		return resp, err
 	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
@@ -1387,8 +1477,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
+			transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, readErr, false)
+			helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+			return nil, transportErr
 		}
 		if retryBody, retryResp, retried, retryErr := e.retryCodexRequestWithoutEncryptedState(requestCtx, auth, from, url, req, body, apiKey, true, httpClient, httpResp.StatusCode, data); retryErr != nil {
 			return nil, retryErr
@@ -1398,15 +1489,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		} else {
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-			err = newCodexStatusErr(httpResp.StatusCode, data)
+			err = newCodexStatusErrWithMetadata(httpResp.StatusCode, httpResp.Header, data, failurecontract.StreamPhaseBeforeOutput, false)
 			return nil, err
 		}
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
+			transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, readErr, false)
+			helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+			return nil, transportErr
 		}
 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
@@ -1414,13 +1506,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = newCodexStatusErrWithMetadata(httpResp.StatusCode, httpResp.Header, data, failurecontract.StreamPhaseBeforeOutput, false)
 		return nil, err
 	}
 	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
 	if errStream != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
-		return nil, errStream
+		transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, errStream, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return nil, transportErr
 	}
 	closeResponse := closeHTTPResponseBodyOnce(cancelRequest, sseStream, "codex executor")
 	handedOff = true
@@ -1434,6 +1527,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var capacityProbeText strings.Builder
 		var capacityProbePending [][]byte
 		capacityProbeResolved := false
+		outputCommitted := false
 		for {
 			event, readErr := sseStream.ReadEvent()
 			if readErr != nil {
@@ -1442,7 +1536,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 				if errors.Is(readErr, io.EOF) {
 					if !capacityProbeResolved && isCodexModelCapacityError([]byte(capacityProbeText.String())) {
-						streamErr := newCodexStatusErr(http.StatusBadRequest, []byte(codexModelCapacityErrorJSON))
+						streamErr := newCodexStatusErrWithMetadata(http.StatusOK, httpResp.Header, []byte(codexModelCapacityErrorJSON), failurecontract.StreamPhaseBeforeOutput, false)
 						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 						reporter.PublishFailure(ctx, streamErr)
 						select {
@@ -1460,10 +1554,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
-				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-				reporter.PublishFailure(ctx, readErr)
+				transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, readErr, outputCommitted)
+				helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+				reporter.PublishFailure(ctx, transportErr)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: readErr}:
+				case out <- cliproxyexecutor.StreamChunk{Err: transportErr}:
 				case <-requestCtx.Done():
 				}
 				return
@@ -1485,7 +1580,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 						translatedLine = append([]byte("data: "), data...)
 					}
-					if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
+					if streamErr, terminalBody, ok := codexTerminalStreamErrWithMetadata(data, httpResp.Header, outputCommitted); ok {
 						if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 							helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
 							reporter.PublishFailure(ctx, errClearReplay)
@@ -1565,9 +1660,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					chunks = capacityProbePending
 					capacityProbePending = nil
 				}
+				eventCommitsOutput := codexEventCommitsOutput(eventType, data)
 				for i := range chunks {
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						if len(chunks[i]) > 0 && eventCommitsOutput {
+							outputCommitted = true
+						}
 					case <-requestCtx.Done():
 						return
 					}
@@ -2013,133 +2112,51 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
+	return newCodexStatusErrWithMetadata(statusCode, nil, body, failurecontract.StreamPhaseBeforeOutput, false)
+}
+
+func newCodexHTTPStatusErr(statusCode int, headers http.Header, body []byte) statusErr {
+	return newCodexStatusErrWithMetadata(statusCode, headers, body, failurecontract.StreamPhaseBeforeOutput, false)
+}
+
+func newCodexStatusErrWithMetadata(statusCode int, headers http.Header, body []byte, streamPhase failurecontract.StreamPhase, outputCommitted bool) statusErr {
 	originalBody := body
-	body = sanitizeCodexStatusErrorBody(body)
-	errCode := statusCode
-	modelCapacity := isCodexModelCapacityError(body)
-	usageLimit := isCodexUsageLimitError(body)
-	transientRateLimit := isCodexTransientRateLimitError(body)
-	transientServerError := isCodexTransientServerError(statusCode, body)
-	if modelCapacity || usageLimit || transientRateLimit {
-		errCode = http.StatusTooManyRequests
-	}
+	preferredReason := ""
 	if isCodexCloudflareTimeoutError(statusCode, body) {
 		body = codexCloudflareTimeoutErrorBody(statusCode)
-		body = safeCodexStatusErrorBody(originalBody, body, "upstream Cloudflare timeout")
-		failure := newCodexFailure(http.StatusGatewayTimeout, statusCode, "upstream_timeout", string(body), nil, false, false, false, false)
-		return statusErr{
-			code:               http.StatusGatewayTimeout,
-			providerStatusCode: statusCode,
-			msg:                string(body),
-			errorCode:          "upstream_timeout",
-			failure:            failure,
-		}
+		preferredReason = "upstream Cloudflare timeout"
 	}
-	body = classifyCodexStatusError(errCode, body)
-	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
-		safeBody := safeCodexStatusErrorBody(originalBody, body, "")
-		errorCode, _, _ := safeUpstreamIdentifiers(body)
-		failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), retryAfter, modelCapacity, usageLimit, transientRateLimit, transientServerError)
-		return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, retryAfter: retryAfter, failure: failure}
+	failure, classifiedBody := canonicalCodexFailure(codexFailureInput{
+		outerStatus:     statusCode,
+		headers:         headers,
+		body:            body,
+		streamPhase:     streamPhase,
+		outputCommitted: outputCommitted,
+		now:             time.Now(),
+	})
+	safeBody := safeCodexStatusErrorBody(originalBody, classifiedBody, failure, preferredReason)
+	failure.PublicMessage = string(safeBody)
+	var clonedHeaders http.Header
+	if headers != nil {
+		clonedHeaders = headers.Clone()
 	}
-	safeBody := safeCodexStatusErrorBody(originalBody, body, "")
-	errorCode, _, _ := safeUpstreamIdentifiers(body)
-	failure := newCodexFailure(errCode, statusCode, errorCode, string(safeBody), nil, modelCapacity, usageLimit, transientRateLimit, transientServerError)
-	return statusErr{code: errCode, providerStatusCode: statusCode, msg: string(safeBody), errorCode: errorCode, failure: failure}
+	return statusErr{
+		code:               failure.HTTPStatus,
+		providerStatusCode: failure.OuterStatus,
+		msg:                failure.PublicMessage,
+		errorCode:          failure.SemanticCode,
+		retryAfter:         failure.RetryAfter,
+		headers:            clonedHeaders,
+		failure:            failure,
+	}
 }
 
-func newCodexFailure(statusCode, providerStatusCode int, providerCode, message string, retryAfter *time.Duration, modelCapacity, usageLimit, transientRateLimit, transientServerError bool) *failurecontract.Failure {
-	failure := &failurecontract.Failure{
-		HTTPStatus:    statusCode,
-		ProviderCode:  providerCode,
-		RetryAfter:    retryAfter,
-		PublicMessage: message,
-	}
-	switch {
-	case modelCapacity:
-		failure.Kind = failurecontract.RateLimited
-		failure.Scope = failurecontract.ScopeModel
-		failure.Retryable = true
-	case usageLimit:
-		failure.Kind = failurecontract.QuotaExceeded
-		failure.Scope = failurecontract.ScopeCredential
-		failure.Retryable = true
-	case transientRateLimit:
-		failure.Kind = failurecontract.RateLimited
-		failure.Scope = failurecontract.ScopeCredential
-		failure.Retryable = true
-	case transientServerError:
-		failure.Kind = failurecontract.ProviderUnavailable
-		failure.Scope = failurecontract.ScopeProvider
-		failure.Retryable = true
-	case statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity:
-		failure.Kind = failurecontract.InvalidRequest
-		failure.Scope = failurecontract.ScopeRequest
-	case statusCode == http.StatusRequestEntityTooLarge:
-		failure.Kind = failurecontract.RequestTooLarge
-		failure.Scope = failurecontract.ScopeRequest
-	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
-		failure.Kind = failurecontract.AuthenticationFailed
-		failure.Scope = failurecontract.ScopeCredential
-	case statusCode == http.StatusNotFound:
-		failure.Kind = failurecontract.InvalidRequest
-		failure.Scope = failurecontract.ScopeRequest
-	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusBadGateway || statusCode == http.StatusGatewayTimeout || providerStatusCode == 524:
-		failure.Kind = failurecontract.TransportError
-		failure.Scope = failurecontract.ScopeProvider
-		failure.Retryable = true
-	case statusCode >= http.StatusInternalServerError:
-		failure.Kind = failurecontract.ProviderUnavailable
-		failure.Scope = failurecontract.ScopeProvider
-		failure.Retryable = true
-	default:
-		return nil
-	}
-	return failure
-}
-
-// isCodexTransientServerError recognizes provider failures that were returned
-// with HTTP 400 before a response stream started. Some Codex-compatible
-// upstreams use 400 for transient server-side failures, so the explicit
-// server_error identifier is required and any more specific code wins.
-func isCodexTransientServerError(statusCode int, body []byte) bool {
-	if statusCode != http.StatusBadRequest || len(body) == 0 {
-		return false
-	}
-	jsonBody := upstreamJSONErrorBody(body)
-	errorCode := firstCodexUpstreamIdentifier(jsonBody,
-		"error.code", "body.error.code", "code", "error.err_code", "error_code")
-	errorType := firstCodexUpstreamIdentifier(jsonBody,
-		"error.type", "body.error.type", "type")
-	if errorCode != "" {
-		return errorCode == "server_error"
-	}
-	return errorType == "server_error"
-}
-
-func firstCodexUpstreamIdentifier(body []byte, paths ...string) string {
-	for _, path := range paths {
-		value := gjson.GetBytes(body, path)
-		if !value.Exists() {
-			continue
-		}
-		if identifier := strings.ToLower(strings.TrimSpace(value.String())); identifier != "" {
-			return identifier
-		}
-	}
-	return ""
-}
-
-func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReason string) []byte {
-	errorCode, errorType, _ := safeUpstreamIdentifiers(classifiedBody)
-	if errorCode == "" || errorType == "" {
-		originalCode, originalType, _ := safeUpstreamIdentifiers(originalBody)
-		if errorCode == "" {
-			errorCode = originalCode
-		}
-		if errorType == "" {
-			errorType = originalType
-		}
+func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, failure *failurecontract.Failure, preferredReason string) []byte {
+	errorCode := ""
+	errorType := ""
+	if failure != nil {
+		errorCode = strings.TrimSpace(failure.SemanticCode)
+		errorType = strings.TrimSpace(failure.SemanticType)
 	}
 	if preferredReason == "" {
 		switch errorCode {
@@ -2155,25 +2172,25 @@ func safeCodexStatusErrorBody(originalBody, classifiedBody []byte, preferredReas
 			preferredReason = "upstream websocket connection limit reached"
 		}
 	}
-	summary, _ := safeUpstreamFailureMessage("", originalBody)
-	message := summary
+	message := "upstream request failed " + helps.SummarizeErrorBody("", originalBody)
 	if preferredReason != "" {
-		message = preferredReason + "; " + summary
-	}
-	if errorType == "" {
-		errorType = "server_error"
+		message = preferredReason + "; " + message
 	}
 	out := []byte(`{"error":{}}`)
 	if status := gjson.GetBytes(classifiedBody, "status").Int(); status > 0 && status <= 999 {
 		out, _ = sjson.SetBytes(out, "status", status)
 	}
 	out, _ = sjson.SetBytes(out, "error.message", message)
-	out, _ = sjson.SetBytes(out, "error.type", errorType)
+	if errorType != "" {
+		out, _ = sjson.SetBytes(out, "error.type", errorType)
+	}
 	if errorCode != "" {
 		out, _ = sjson.SetBytes(out, "error.code", errorCode)
 	}
 	if gjson.GetBytes(classifiedBody, "body.error").Exists() {
-		out, _ = sjson.SetBytes(out, "body.error.type", errorType)
+		if errorType != "" {
+			out, _ = sjson.SetBytes(out, "body.error.type", errorType)
+		}
 		if errorCode != "" {
 			out, _ = sjson.SetBytes(out, "body.error.code", errorCode)
 		}
@@ -2186,11 +2203,11 @@ func sanitizeCodexStatusErrorBody(body []byte) []byte {
 	if len(trimmed) == 0 || json.Valid(trimmed) {
 		return body
 	}
-	if jsonBody, ok := firstJSONValueFromMixedCodexErrorBody(trimmed); ok {
-		return jsonBody
-	}
 	if sseBody, ok := codexSSEErrorBody(trimmed); ok {
 		return sseBody
+	}
+	if jsonBody, ok := firstJSONValueFromMixedCodexErrorBody(trimmed); ok {
+		return jsonBody
 	}
 	return body
 }
@@ -2216,7 +2233,9 @@ func firstJSONValueFromMixedCodexErrorBody(body []byte) ([]byte, bool) {
 }
 
 func codexSSEErrorBody(body []byte) ([]byte, bool) {
-	blocks := bytes.Split(body, []byte("\n\n"))
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	blocks := bytes.Split(normalized, []byte("\n\n"))
 	for _, block := range blocks {
 		eventType := ""
 		dataParts := make([][]byte, 0, 1)
@@ -2257,6 +2276,17 @@ func codexSSEErrorBody(body []byte) ([]byte, bool) {
 			if errorBody := codexTerminalTopLevelErrorBody(eventData); len(errorBody) > 0 {
 				return errorBody, true
 			}
+		case "response.completed", "response.done":
+			if errorBody := codexTerminalErrorBody(eventData, "response.error"); len(errorBody) > 0 {
+				return errorBody, true
+			}
+			if errorBody := codexTerminalErrorBody(eventData, "error"); len(errorBody) > 0 {
+				return errorBody, true
+			}
+		default:
+			if gjson.GetBytes(eventData, "error").Exists() || gjson.GetBytes(eventData, "body.error").Exists() || gjson.GetBytes(eventData, "response.error").Exists() {
+				return eventData, true
+			}
 		}
 	}
 	return nil, false
@@ -2280,57 +2310,6 @@ func codexCloudflareTimeoutErrorBody(providerStatusCode int) []byte {
 	body := []byte(`{"error":{"message":"","type":"server_error","code":"upstream_timeout"}}`)
 	body, _ = sjson.SetBytes(body, "error.message", fmt.Sprintf("upstream Cloudflare timeout from Codex provider (provider status %d)", providerStatusCode))
 	return body
-}
-
-func classifyCodexStatusError(statusCode int, body []byte) []byte {
-	code, errType, ok := codexStatusErrorClassification(statusCode, body)
-	if !ok {
-		return body
-	}
-	message := gjson.GetBytes(body, "error.message").String()
-	if message == "" {
-		message = gjson.GetBytes(body, "message").String()
-	}
-	if message == "" {
-		message = strings.TrimSpace(string(body))
-	}
-	if message == "" {
-		message = http.StatusText(statusCode)
-	}
-	out := []byte(`{"error":{}}`)
-	out, _ = sjson.SetBytes(out, "error.message", message)
-	out, _ = sjson.SetBytes(out, "error.type", errType)
-	out, _ = sjson.SetBytes(out, "error.code", code)
-	return out
-}
-
-func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
-	errorMessage := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
-	if errorMessage == "" {
-		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
-	}
-	lower := strings.ToLower(strings.TrimSpace(string(body)))
-	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
-	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
-	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
-	isMissingPreviousResponse := upstreamCode == "previous_response_not_found" ||
-		strings.Contains(lower, "previous_response_not_found") ||
-		strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found") ||
-		strings.Contains(lower, "items are not persisted") ||
-		strings.Contains(lower, "item with id") && strings.Contains(lower, "not found")
-
-	switch {
-	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens")):
-		return "context_too_large", "invalid_request_error", true
-	case strings.Contains(lower, "invalid signature in thinking block") || isCodexInvalidEncryptedContentError(statusCode, body):
-		return "thinking_signature_invalid", "invalid_request_error", true
-	case isMissingPreviousResponse:
-		return "previous_response_not_found", "invalid_request_error", true
-	case statusCode == http.StatusUnauthorized || upstreamType == "authentication_error" || upstreamCode == "invalid_api_key" || strings.Contains(lower, "invalid or expired token") || strings.Contains(lower, "refresh_token_reused"):
-		return "auth_unavailable", "authentication_error", true
-	default:
-		return "", "", false
-	}
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

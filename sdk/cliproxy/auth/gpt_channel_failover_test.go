@@ -76,6 +76,23 @@ func retryableGPTChannelFailure(status int) error {
 	}
 }
 
+func canonicalProvider400Failure() error {
+	retryNow := time.Duration(0)
+	return &failurecontract.Failure{
+		Kind:            failurecontract.ProviderUnavailable,
+		Scope:           failurecontract.ScopeProvider,
+		HTTPStatus:      http.StatusBadGateway,
+		OuterStatus:     http.StatusBadRequest,
+		SemanticCode:    "server_error",
+		SemanticType:    "server_error",
+		StreamPhase:     failurecontract.StreamPhaseBeforeOutput,
+		OutputCommitted: false,
+		RetryAfter:      &retryNow,
+		Retryable:       true,
+		PublicMessage:   "upstream request failed",
+	}
+}
+
 func registerGPTChannelFailoverAuths(t *testing.T, manager *Manager, provider, model string, auths []*Auth) {
 	t.Helper()
 	modelRegistry := registry.GetGlobalRegistry()
@@ -147,6 +164,103 @@ func TestManagerGPTChannelFailoverSwitchesBaseURLImmediately(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestManagerCanonicalProvider400FailoverDeliversOnlyRecoveredResult(t *testing.T) {
+	const (
+		model    = "gpt-5.6-sol"
+		provider = "canonical-provider-400"
+	)
+	failure := canonicalProvider400Failure()
+	executor := &authFallbackExecutor{
+		id:            provider,
+		executeErrors: map[string]error{"aa-bad-primary": failure},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, 30*time.Second, 10)
+	manager.RegisterExecutor(executor)
+	registerGPTChannelFailoverAuths(t, manager, provider, model, []*Auth{
+		openAICompatChannelBreakerAuth("aa-bad-primary", provider, "https://bad.example/v1", 10),
+		openAICompatChannelBreakerAuth("ba-good-backup", provider, "https://good.example/v1", 1),
+	})
+
+	response, errExecute := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got, want := string(response.Payload), "ba-good-backup"; got != want {
+		t.Fatalf("Execute() payload = %q, want %q", got, want)
+	}
+	if got, want := executor.ExecuteCalls(), []string{"aa-bad-primary", "ba-good-backup"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("Execute() calls = %v, want %v", got, want)
+	}
+
+	streamExecutor := &authFallbackExecutor{
+		id:                provider,
+		streamFirstErrors: map[string]error{"aa-stream-bad": failure},
+	}
+	streamManager := NewManager(nil, nil, nil)
+	streamManager.SetRetryConfig(3, 30*time.Second, 10)
+	streamManager.RegisterExecutor(streamExecutor)
+	registerGPTChannelFailoverAuths(t, streamManager, provider, model, []*Auth{
+		openAICompatChannelBreakerAuth("aa-stream-bad", provider, "https://stream-bad.example/v1", 10),
+		openAICompatChannelBreakerAuth("ba-stream-good", provider, "https://stream-good.example/v1", 1),
+	})
+
+	streamResult, errStream := streamManager.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	var delivered []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("ExecuteStream() chunk error = %v", chunk.Err)
+		}
+		delivered = append(delivered, chunk.Payload...)
+	}
+	if got, want := string(delivered), "ba-stream-good"; got != want {
+		t.Fatalf("ExecuteStream() payload = %q, want only %q", got, want)
+	}
+	if got, want := streamExecutor.StreamCalls(), []string{"aa-stream-bad", "ba-stream-good"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("ExecuteStream() calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerCanonicalProvider400ExhaustionPreservesOuterStatus(t *testing.T) {
+	const (
+		model    = "gpt-5.6-sol"
+		provider = "canonical-provider-400-exhausted"
+	)
+	failure := canonicalProvider400Failure()
+	executor := &authFallbackExecutor{
+		id: provider,
+		executeErrors: map[string]error{
+			"aa-channel": failure,
+			"ba-channel": failure,
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 30*time.Second, 10)
+	manager.RegisterExecutor(executor)
+	registerGPTChannelFailoverAuths(t, manager, provider, model, []*Auth{
+		openAICompatChannelBreakerAuth("aa-channel", provider, "https://a.example/v1", 10),
+		openAICompatChannelBreakerAuth("ba-channel", provider, "https://b.example/v1", 10),
+	})
+
+	_, errExecute := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("Execute() unexpectedly succeeded")
+	}
+	classified := failurecontract.Classify(errExecute)
+	if classified == nil {
+		t.Fatalf("Execute() error has no canonical failure: %v", errExecute)
+	}
+	if classified.HTTPStatus != http.StatusBadGateway || classified.OuterStatus != http.StatusBadRequest {
+		t.Fatalf("final statuses = normalized:%d outer:%d, want %d/%d", classified.HTTPStatus, classified.OuterStatus, http.StatusBadGateway, http.StatusBadRequest)
+	}
+	if classified.SemanticCode != "server_error" || classified.Scope != failurecontract.ScopeProvider || !classified.Retryable {
+		t.Fatalf("final canonical failure = %+v", classified)
 	}
 }
 
@@ -435,6 +549,63 @@ func TestShouldRetryGPTRoundPolicy(t *testing.T) {
 				t.Fatalf("shouldRetryGPTRound() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestCommittedProviderFailureIsNeverReplayed(t *testing.T) {
+	retryNow := time.Duration(0)
+	failure := &failurecontract.Failure{
+		Kind:            failurecontract.ProviderUnavailable,
+		Scope:           failurecontract.ScopeProvider,
+		HTTPStatus:      http.StatusServiceUnavailable,
+		OuterStatus:     http.StatusBadRequest,
+		SemanticCode:    "server_error",
+		SemanticType:    "server_error",
+		StreamPhase:     failurecontract.StreamPhaseAfterOutput,
+		OutputCommitted: true,
+		RetryAfter:      &retryNow,
+		Retryable:       true,
+		PublicMessage:   "provider failed after output",
+	}
+
+	if shouldFailoverGPTChannel(failure, []string{"codex"}, "gpt-5.6-sol") {
+		t.Fatal("committed provider failure was marked for channel failover")
+	}
+	for _, completedRound := range []int{0, 1} {
+		if wait, retry := shouldRetryGPTRound(failure, completedRound, []string{"codex"}, "gpt-5.6-sol", nil); retry || wait != 0 {
+			t.Fatalf("committed provider failure round %d retry = %t wait = %v, want false/0", completedRound, retry, wait)
+		}
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, time.Second, 3)
+	if wait, retry := manager.shouldRetryAfterError(failure, 0, []string{"codex"}, "gpt-5.6-sol", time.Second); retry || wait != 0 {
+		t.Fatalf("committed provider failure retry = %t wait = %v, want false/0", retry, wait)
+	}
+	result := Result{Success: false, Error: resultErrorFromCause(failure), Cause: failure}
+	if shouldCountCodexChannelBreakerFailure(result) {
+		t.Fatal("committed provider failure was counted by the channel breaker")
+	}
+}
+
+func TestRequestScopedFailureCannotBecomeRetryable(t *testing.T) {
+	failure := &failurecontract.Failure{
+		Kind:          failurecontract.ContextLengthExceeded,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    http.StatusBadRequest,
+		OuterStatus:   http.StatusBadRequest,
+		SemanticCode:  "context_length_exceeded",
+		SemanticType:  "invalid_request_error",
+		StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
+		Retryable:     true,
+		PublicMessage: "context too large",
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, time.Second, 3)
+	if wait, retry := manager.shouldRetryAfterError(failure, 0, []string{"codex"}, "gpt-5.6-sol", time.Second); retry || wait != 0 {
+		t.Fatalf("request-scoped failure retry = %t wait = %v, want false/0", retry, wait)
+	}
+	if shouldFailoverGPTChannel(failure, []string{"codex"}, "gpt-5.6-sol") {
+		t.Fatal("request-scoped failure was marked for channel failover")
 	}
 }
 

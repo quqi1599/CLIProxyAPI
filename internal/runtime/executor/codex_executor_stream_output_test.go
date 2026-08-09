@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -223,7 +224,11 @@ func TestCodexExecutorExecuteStreamWithholdsTerminalRateLimitEvent(t *testing.T)
 	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusTooManyRequests, streamErr)
 	}
-	assertCodexErrorCode(t, streamErr.Error(), "rate_limit_error", "rate_limit_exceeded")
+	assertCodexErrorCode(t, streamErr.Error(), "server_error", "model_at_capacity")
+	typed, ok := failurecontract.As(streamErr)
+	if !ok || typed.Scope != failurecontract.ScopeModel {
+		t.Fatalf("failure = %+v, want model-scoped capacity", typed)
+	}
 }
 
 func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {

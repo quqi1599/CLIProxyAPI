@@ -208,16 +208,25 @@ func TestAuthResultLogIncludesTypedFailureMetadata(t *testing.T) {
 	t.Cleanup(func() { log.SetLevel(previousLevel) })
 
 	manager := NewManager(nil, nil, nil)
+	retryAfter := 1750 * time.Millisecond
 	typed := &failurecontract.Failure{
 		Kind: failurecontract.ProviderUnavailable, Scope: failurecontract.ScopeProvider,
-		HTTPStatus: http.StatusServiceUnavailable, Retryable: true,
+		HTTPStatus: http.StatusServiceUnavailable, OuterStatus: http.StatusBadRequest,
+		SemanticCode: "server_error", SemanticType: "server_error",
+		StreamPhase: failurecontract.StreamPhaseBeforeOutput, OutputCommitted: false,
+		UpstreamRequestID: "upstream-request-id", RetryAfter: &retryAfter, Retryable: true,
 		PublicMessage: "provider unavailable",
 	}
 	manager.logAuthResultMetric(context.Background(), &Auth{ID: "typed-log", Provider: "failure-matrix"}, Result{
 		Provider: "failure-matrix",
 		Model:    "failure-matrix-model",
-		Error:    resultErrorFromCause(typed),
-		Cause:    typed,
+		Error: &Error{
+			Kind:       string(failurecontract.InvalidRequest),
+			Scope:      string(failurecontract.ScopeRequest),
+			Code:       "stale_text_derived_code",
+			HTTPStatus: http.StatusBadRequest,
+		},
+		Cause: typed,
 	})
 
 	entries := hook.AllEntries()
@@ -229,5 +238,41 @@ func TestAuthResultLogIncludesTypedFailureMetadata(t *testing.T) {
 	}
 	if got := entries[0].Data["failure_scope"]; got != string(failurecontract.ScopeProvider) {
 		t.Fatalf("failure_scope = %#v", got)
+	}
+	if got := entries[0].Data["scope"]; got != string(failurecontract.ScopeProvider) {
+		t.Fatalf("scope = %#v", got)
+	}
+	if got := entries[0].Data["status_code"]; got != http.StatusServiceUnavailable {
+		t.Fatalf("status_code = %#v", got)
+	}
+	if got := entries[0].Data["normalized_status"]; got != http.StatusServiceUnavailable {
+		t.Fatalf("normalized_status = %#v", got)
+	}
+	if got := entries[0].Data["outer_status"]; got != http.StatusBadRequest {
+		t.Fatalf("outer_status = %#v", got)
+	}
+	if got := entries[0].Data["upstream_status"]; got != http.StatusBadRequest {
+		t.Fatalf("upstream_status = %#v", got)
+	}
+	if got := entries[0].Data["semantic_code"]; got != "server_error" {
+		t.Fatalf("semantic_code = %#v", got)
+	}
+	if got := entries[0].Data["semantic_type"]; got != "server_error" {
+		t.Fatalf("semantic_type = %#v", got)
+	}
+	if got := entries[0].Data["stream_phase"]; got != string(failurecontract.StreamPhaseBeforeOutput) {
+		t.Fatalf("stream_phase = %#v", got)
+	}
+	if got := entries[0].Data["upstream_request_id"]; got != "upstream-request-id" {
+		t.Fatalf("upstream_request_id = %#v", got)
+	}
+	if got := entries[0].Data["retryable"]; got != true {
+		t.Fatalf("retryable = %#v", got)
+	}
+	if got := entries[0].Data["output_committed"]; got != false {
+		t.Fatalf("output_committed = %#v", got)
+	}
+	if got := entries[0].Data["retry_after_ms"]; got != int64(1750) {
+		t.Fatalf("retry_after_ms = %#v", got)
 	}
 }

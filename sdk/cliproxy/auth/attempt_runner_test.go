@@ -51,6 +51,62 @@ func TestManagerAttemptRunnerRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestManagerAttemptRunnerGPTPreservesCanonicalRetryAfter(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, time.Second, 0)
+	manager.SetRetryQueueDelay(0)
+
+	retryAfter := 200 * time.Millisecond
+	failure := &failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		Retryable:     true,
+		RetryAfter:    &retryAfter,
+		PublicMessage: "provider unavailable",
+	}
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(true)
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Millisecond)
+	defer cancel()
+
+	calls := 0
+	runner := managerAttemptRunner[int]{
+		manager: manager,
+		runOnce: func(context.Context, []string, cliproxyexecutor.Request, cliproxyexecutor.Options, int) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, failure
+			}
+			return 42, nil
+		},
+	}
+
+	outcome := runner.run(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.6-sol"}, cliproxyexecutor.Options{}, 0, time.Second)
+	if calls != 1 {
+		t.Fatalf("run calls = %d, want 1 while waiting for canonical RetryAfter", calls)
+	}
+	if !errors.Is(outcome.returnErr, context.DeadlineExceeded) || !errors.Is(outcome.finalErr, context.DeadlineExceeded) {
+		t.Fatalf("outcome errors = %v/%v, want context deadline exceeded", outcome.returnErr, outcome.finalErr)
+	}
+}
+
+func TestCanonicalGPTRoundRetryAfterCannotExceedRetryBudget(t *testing.T) {
+	retryAfter := 200 * time.Millisecond
+	failure := &failurecontract.Failure{
+		Kind:       failurecontract.ProviderUnavailable,
+		Scope:      failurecontract.ScopeProvider,
+		HTTPStatus: http.StatusServiceUnavailable,
+		Retryable:  true,
+		RetryAfter: &retryAfter,
+	}
+
+	wait, retry := preserveCanonicalGPTRoundRetryAfter(failure, 0, true, 50*time.Millisecond)
+	if retry || wait != 0 {
+		t.Fatalf("retry/wait = %t/%v, want false/0 when RetryAfter exceeds budget", retry, wait)
+	}
+}
+
 func TestManagerAttemptRunnerFallbackAndRecoveryOutcomes(t *testing.T) {
 	primaryErr := errors.New("primary failure")
 	fallbackErr := errors.New("fallback failure")

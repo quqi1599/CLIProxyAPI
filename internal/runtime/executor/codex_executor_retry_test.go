@@ -134,7 +134,7 @@ func TestNewCodexStatusErrAssignsFailureScope(t *testing.T) {
 			body:       []byte(`{"error":{"type":"usage_limit_reached","message":"usage limit","resets_in_seconds":60}}`),
 			wantKind:   failurecontract.QuotaExceeded,
 			wantScope:  failurecontract.ScopeCredential,
-			retryable:  true,
+			retryable:  false,
 		},
 		{
 			name:       "credential rate limit",
@@ -373,12 +373,12 @@ func TestNewCodexStatusErrSummarizesUnclassifiedErrors(t *testing.T) {
 
 	err := newCodexStatusErr(http.StatusBadGateway, body)
 
-	if got := err.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
+	if got := err.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
 	}
 	got := err.Error()
-	if strings.Contains(got, secret) || strings.Contains(got, "billing_config_error") || !strings.Contains(got, "[BODY METADATA v1]") || !strings.Contains(got, "sha256") {
-		t.Fatalf("error body = %s, want metadata without upstream body", got)
+	if strings.Contains(got, secret) || !strings.Contains(got, `"code":"billing_config_error"`) || !strings.Contains(got, "[BODY METADATA v1]") || !strings.Contains(got, "sha256") {
+		t.Fatalf("error body = %s, want canonical code and metadata without upstream body", got)
 	}
 }
 

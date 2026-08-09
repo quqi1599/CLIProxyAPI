@@ -100,7 +100,7 @@ func applyCodexChannelBreakerResult(state *codexChannelBreakerState, result Resu
 
 func codexChannelBreaker5xxThreshold(result Result) uint8 {
 	kind := failurecontract.Kind("")
-	if typed, ok := failurecontract.As(result.Cause); ok {
+	if typed, ok := typedFailureFromResult(result); ok {
 		kind = typed.Kind
 	} else if result.Error != nil {
 		kind = failurecontract.Kind(result.Error.Kind)
@@ -112,9 +112,9 @@ func codexChannelBreaker5xxThreshold(result Result) uint8 {
 }
 
 func shouldCountCodexChannelBreakerFailure(result Result) bool {
-	if scope, ok := failureScopeFromResult(result); ok {
-		return result.Error != nil && result.Error.Retryable &&
-			(scope == failurecontract.ScopeModel || scope == failurecontract.ScopeProvider)
+	if failure, ok := typedFailureFromResult(result); ok {
+		return !failure.OutputCommitted && failure.Retryable &&
+			(failure.Scope == failurecontract.ScopeModel || failure.Scope == failurecontract.ScopeProvider)
 	}
 	return shouldCountChannelBreakerFailure(result)
 }

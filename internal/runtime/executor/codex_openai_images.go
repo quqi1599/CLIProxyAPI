@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -230,7 +231,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-			err = newCodexStatusErr(httpResp.StatusCode, data)
+			err = newCodexHTTPStatusErr(httpResp.StatusCode, httpResp.Header, data)
 			return resp, err
 		}
 
@@ -328,8 +329,8 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 			data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 			if errRead != nil {
-				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-				err = codexOpenAIImageStreamStatusErr(errRead)
+				err = newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, codexOpenAIImageStreamStatusErr(errRead), false)
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
 				if codexOpenAIImageShouldRetry(err, attempt) {
 					helps.LogWithRequestID(ctx).Warnf("codex openai images: retrying stream setup after upstream read failure: %v", err)
 					continue
@@ -339,7 +340,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			data = applyCodexIdentityConfuseResponsePayload(data, identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-			err = newCodexStatusErr(httpResp.StatusCode, data)
+			err = newCodexHTTPStatusErr(httpResp.StatusCode, httpResp.Header, data)
 			if codexOpenAIImageShouldRetry(err, attempt) {
 				helps.LogWithRequestID(ctx).Warnf("codex openai images: retrying stream setup after upstream status failure: %v", err)
 				continue
@@ -349,8 +350,8 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 
 		sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
 		if errStream != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errStream)
-			err = codexOpenAIImageStreamStatusErr(errStream)
+			err = newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, codexOpenAIImageStreamStatusErr(errStream), false)
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			if codexOpenAIImageShouldRetry(err, attempt) {
 				helps.LogWithRequestID(ctx).Warnf("codex openai images: retrying stream setup after upstream decode failure: %v", err)
 				continue
@@ -363,10 +364,14 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		go func(identityState codexIdentityConfuseState, upstreamBody []byte) {
 			defer close(out)
 			defer closeResponse()
+			outputCommitted := false
 
 			sendPayload := func(payload []byte) bool {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
+					if len(payload) > 0 {
+						outputCommitted = true
+					}
 					return true
 				case <-streamCtx.Done():
 					return false
@@ -389,10 +394,10 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 					if streamCtx.Err() != nil || errors.Is(errRead, io.EOF) {
 						return
 					}
-					errRead = codexOpenAIImageStreamStatusErr(errRead)
-					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-					reporter.PublishFailure(ctx, errRead)
-					sendError(errRead)
+					transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, codexOpenAIImageStreamStatusErr(errRead), outputCommitted)
+					helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+					reporter.PublishFailure(ctx, transportErr)
+					sendError(transportErr)
 					return
 				}
 				for _, rawLine := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
@@ -402,6 +407,12 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 						continue
 					}
 					eventData := bytes.TrimSpace(line[len(dataTag):])
+					if streamErr, _, ok := codexTerminalStreamErrWithMetadata(eventData, httpResp.Header, outputCommitted); ok {
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						reporter.PublishFailure(ctx, streamErr)
+						sendError(streamErr)
+						return
+					}
 					switch gjson.GetBytes(eventData, "type").String() {
 					case "response.output_item.done":
 						collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
@@ -487,7 +498,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = newCodexHTTPStatusErr(httpResp.StatusCode, httpResp.Header, data)
 		return resp, err
 	}
 
@@ -535,20 +546,22 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
 		if errRead != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-			return nil, errRead
+			transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, errRead, false)
+			helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+			return nil, transportErr
 		}
 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = newCodexHTTPStatusErr(httpResp.StatusCode, httpResp.Header, data)
 		return nil, err
 	}
 
 	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
 	if errStream != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
-		return nil, errStream
+		transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, errStream, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return nil, transportErr
 	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	closeResponse := closeHTTPResponseBodyOnce(cancelStream, sseStream, "codex direct openai images executor")
@@ -560,11 +573,26 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 			reporter.EnsurePublished(ctx)
 		}()
 
+		outputCommitted := false
 		for {
 			event, errRead := sseStream.ReadEvent()
 			if errRead == nil {
 				chunk := applyCodexIdentityConfuseResponsePayload(terminatedSSEEvent(event), identityState)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
+				if terminalBody, ok := codexSSEErrorBody(chunk); ok {
+					phase := failurecontract.StreamPhaseBeforeOutput
+					if outputCommitted {
+						phase = failurecontract.StreamPhaseAfterOutput
+					}
+					streamErr := newCodexStatusErrWithMetadata(http.StatusOK, httpResp.Header, terminalBody, phase, outputCommitted)
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-streamCtx.Done():
+					}
+					return
+				}
 				for _, line := range bytes.FieldsFunc(chunk, func(value rune) bool { return value == '\r' || value == '\n' }) {
 					if detail, ok := helps.ParseOpenAIStreamUsage(bytes.TrimSpace(line)); ok {
 						reporter.Publish(ctx, detail)
@@ -572,16 +600,20 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 				}
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					if len(chunk) > 0 && codexSSEChunkCommitsOutput(chunk) {
+						outputCommitted = true
+					}
 				case <-streamCtx.Done():
 					return
 				}
 			}
 			if errRead != nil {
 				if streamCtx.Err() == nil && !errors.Is(errRead, io.EOF) {
-					helps.RecordAPIResponseError(ctx, e.cfg, errRead)
-					reporter.PublishFailure(ctx, errRead)
+					transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, codexOpenAIImageStreamStatusErr(errRead), outputCommitted)
+					helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+					reporter.PublishFailure(ctx, transportErr)
 					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+					case out <- cliproxyexecutor.StreamChunk{Err: transportErr}:
 					case <-streamCtx.Done():
 					}
 				}

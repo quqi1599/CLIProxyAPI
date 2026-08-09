@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -466,6 +467,73 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error stream chunk")
 	}
+}
+
+func TestCodexWebsocketsExecuteStreamCallerDeadlineIsRequestCancellation(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		responseHeaders := http.Header{"X-Request-Id": []string{"ws-deadline-request"}}
+		conn, err := upgrader.Upgrade(w, r, responseHeaders)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+	}
+	ctx := deadlineWithoutDoneContext{Context: context.Background(), deadline: time.Now().Add(20 * time.Millisecond)}
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	select {
+	case chunk, ok := <-result.Chunks:
+		if !ok || chunk.Err == nil {
+			t.Fatalf("deadline chunk = %+v, open=%v", chunk, ok)
+		}
+		failure, okFailure := failurecontract.As(chunk.Err)
+		if !okFailure || failure.Kind != failurecontract.Cancelled || failure.Scope != failurecontract.ScopeRequest ||
+			failure.Retryable || failure.HTTPStatus != 499 || failure.OuterStatus != http.StatusSwitchingProtocols ||
+			failure.UpstreamRequestID != "ws-deadline-request" {
+			t.Fatalf("deadline failure = %+v", failure)
+		}
+		if !errors.Is(chunk.Err, context.DeadlineExceeded) {
+			t.Fatalf("deadline cause not preserved: %v", chunk.Err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for caller deadline failure")
+	}
+}
+
+type deadlineWithoutDoneContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (ctx deadlineWithoutDoneContext) Deadline() (time.Time, bool) { return ctx.deadline, true }
+func (deadlineWithoutDoneContext) Done() <-chan struct{}           { return nil }
+func (ctx deadlineWithoutDoneContext) Err() error {
+	if !time.Now().Before(ctx.deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) {
@@ -970,8 +1038,8 @@ func TestParseCodexWebsocketErrorMarksConnectionLimitRetryable(t *testing.T) {
 	if !ok || retryable.RetryAfter() == nil {
 		t.Fatalf("expected retryable websocket connection limit error")
 	}
-	if got := *retryable.RetryAfter(); got != 0 {
-		t.Fatalf("retryAfter = %v, want connection-limit fallback 0", got)
+	if got := *retryable.RetryAfter(); got != time.Second {
+		t.Fatalf("retryAfter = %v, want header delay 1s", got)
 	}
 	withHeaders, ok := err.(interface{ Headers() http.Header })
 	if !ok || withHeaders.Headers().Get("retry-after") != "1" {
