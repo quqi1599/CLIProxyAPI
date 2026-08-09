@@ -14,7 +14,7 @@ Usage:
   ./scripts/deploy-ghcr-release.sh fork/v7.10.48
 
 Environment overrides:
-  CLI_PROXY_IMAGE            Full image reference, for example ghcr.io/quqi1599/cliproxyapi:fork-v7.10.48
+  CLI_PROXY_IMAGE            Full image reference, for example ghcr.io/quqi1599/cliproxyapi@sha256:<digest>
   CLI_PROXY_SERVICE          Compose service name (default: cli-proxy-api)
   CLI_PROXY_COMPOSE_FILE     Compose file path (default: docker-compose.yml)
   CLI_PROXY_PORT             Local health port (default: 8317)
@@ -70,7 +70,8 @@ rewrite_compose_image_if_needed() {
     return
   fi
 
-  perl -0pi -e 's~(^\s*image:\s*).*$~${1}'"$image"'~m' "$COMPOSE_FILE"
+  CLI_PROXY_REWRITE_IMAGE="$image" \
+    perl -0pi -e 's~(^\s*image:\s*).*$~$1$ENV{CLI_PROXY_REWRITE_IMAGE}~m' "$COMPOSE_FILE"
 }
 
 extract_event_time() {
