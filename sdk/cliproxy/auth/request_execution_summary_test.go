@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -12,6 +13,61 @@ import (
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
+
+func TestLogRequestExecutionSummaryCanonicalizesOpaque500(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-opaque-500")
+	trace := &requestAttemptTrace{requestID: "req-summary-opaque-500", attempts: 1, maxAttempts: 1}
+	logRequestExecutionSummary(ctx, trace, false, errors.New("opaque failure"))
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["final_status"]; got != http.StatusInternalServerError {
+		t.Fatalf("final_status = %#v, want 500", got)
+	}
+	if got := entry.Data["final_error_type"]; got != "server_error" {
+		t.Fatalf("final_error_type = %#v, want server_error", got)
+	}
+	if got := entry.Data["final_error_code"]; got != "internal_server_error" {
+		t.Fatalf("final_error_code = %#v, want internal_server_error", got)
+	}
+}
+
+func TestLogRequestExecutionSummaryTerminalCancellationOverridesStale503(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-cancel-after-503")
+	trace := &requestAttemptTrace{
+		requestID:   "req-summary-cancel-after-503",
+		attempts:    1,
+		maxAttempts: 1,
+		finalStatus: http.StatusServiceUnavailable,
+	}
+	logRequestExecutionSummary(ctx, trace, false, newCallerRequestFailure(context.DeadlineExceeded))
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["final_status"]; got != 499 {
+		t.Fatalf("final_status = %#v, want 499", got)
+	}
+	if got := entry.Data["final_error_type"]; got != "cancelled" {
+		t.Fatalf("final_error_type = %#v, want cancelled", got)
+	}
+	if got := entry.Data["final_error_code"]; got != "request_canceled" {
+		t.Fatalf("final_error_code = %#v, want request_canceled", got)
+	}
+}
 
 func TestManager_Execute_LogsRequestExecutionSummary(t *testing.T) {
 	hook := logtest.NewGlobal()

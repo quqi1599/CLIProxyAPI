@@ -67,6 +67,10 @@ func canonicalCodexFailure(input codexFailureInput) (*failurecontract.Failure, [
 }
 
 func newCodexTransportStatusErr(outerStatus int, headers http.Header, cause error, outputCommitted bool) error {
+	return newCodexTransportStatusErrWithCancellation(outerStatus, headers, cause, outputCommitted, true)
+}
+
+func newCodexTransportStatusErrWithCancellation(outerStatus int, headers http.Header, cause error, outputCommitted, callerCancellation bool) error {
 	if outerStatus <= 0 {
 		outerStatus = http.StatusOK
 	}
@@ -111,7 +115,7 @@ func newCodexTransportStatusErr(outerStatus int, headers http.Header, cause erro
 	kind := failurecontract.TransportError
 	scope := failurecontract.ScopeProvider
 	retryable := !outputCommitted
-	if errors.Is(cause, context.Canceled) {
+	if callerCancellation && errors.Is(cause, context.Canceled) {
 		normalizedStatus = 499
 		semanticCode = "request_cancelled"
 		semanticType = "cancelled"
@@ -151,6 +155,26 @@ func newCodexTransportStatusErr(outerStatus int, headers http.Header, cause erro
 		headers:            clonedHeaders,
 		failure:            failure,
 	}
+}
+
+// newCodexHTTPDoStatusErr canonicalizes only errors returned by http.Client.Do.
+// Keeping this conversion at the transport boundary prevents unrelated plain
+// executor errors from becoming retryable provider failures.
+func newCodexHTTPDoStatusErr(ctx context.Context, cause error, outputCommitted bool) error {
+	if cause == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return newCodexCallerCancellationStatusErr(499, nil, ctx.Err(), outputCommitted)
+	}
+	if _, ok := failurecontract.As(cause); ok {
+		return cause
+	}
+	status := http.StatusBadGateway
+	if codexTransportFailureIsTimeout(cause, "") {
+		status = http.StatusGatewayTimeout
+	}
+	return newCodexTransportStatusErrWithCancellation(status, nil, cause, outputCommitted, false)
 }
 
 func enrichCodexEstablishedFailure(outerStatus int, headers http.Header, cause error, existing *failurecontract.Failure, phase failurecontract.StreamPhase, outputCommitted bool, requestID string, retryAfter *time.Duration) error {

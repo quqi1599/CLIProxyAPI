@@ -131,6 +131,7 @@ type requestAttemptTrace struct {
 	gptFirstEventPolicySet       bool
 	gptFirstEventPolicy          GPTFirstEventPolicySnapshot
 	gptFirstEventBudgetExhausted bool
+	zeroEligibleProbeKey         string
 }
 
 type requestExecutionSummary struct {
@@ -261,6 +262,27 @@ func (t *requestAttemptTrace) requestIDValue() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.requestID
+}
+
+func (t *requestAttemptTrace) swapZeroEligibleProbeKey(key string) string {
+	if t == nil {
+		return ""
+	}
+	key = strings.TrimSpace(key)
+	t.mu.Lock()
+	previous := t.zeroEligibleProbeKey
+	t.zeroEligibleProbeKey = key
+	t.mu.Unlock()
+	return previous
+}
+
+func (t *requestAttemptTrace) zeroEligibleProbeKeyValue() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.zeroEligibleProbeKey
 }
 
 func (t *requestAttemptTrace) recordFallback() {
@@ -798,16 +820,25 @@ func normalizeRequestExecutionFinalStatus(status int, err error) int {
 	if isRequestScopedContentSafetyError(err) {
 		return http.StatusBadRequest
 	}
+	// The trace status describes the latest upstream attempt, while err is the
+	// terminal result returned to the caller. Prefer a structured terminal
+	// error so a caller cancellation after a 503/probe wait is not logged as a
+	// stale upstream 503.
+	if err != nil {
+		if errStatus := statusCodeFromError(err); errStatus > 0 {
+			return errStatus
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return 499
+		}
+	}
 	if status > 0 {
 		return status
 	}
 	if err == nil {
 		return 0
 	}
-	if errStatus := statusCodeFromError(err); errStatus > 0 {
-		return errStatus
-	}
-	return 0
+	return http.StatusInternalServerError
 }
 
 func requestExecutionSummaryErrorFields(status int, err error) (string, string) {
@@ -819,6 +850,8 @@ func requestExecutionSummaryErrorFields(status int, err error) (string, string) 
 		return "", ""
 	}
 	switch status {
+	case 499:
+		return "cancelled", firstNonEmpty(code, "request_canceled")
 	case http.StatusUnauthorized:
 		return "authentication_error", firstNonEmpty(code, "invalid_api_key")
 	case http.StatusForbidden:
@@ -1170,6 +1203,12 @@ const (
 	gptImmediateFailoverMaxRounds    = 3
 	gptChannelProbeLease             = 10 * time.Minute
 	defaultGPTFirstEventTimeout      = 25 * time.Second
+	gptZeroEligibleProbeActiveTTL    = 6 * time.Minute
+	gptZeroEligibleProbeMinWait      = 15 * time.Second
+	gptZeroEligibleProbeWaitGrace    = 2 * time.Second
+	gptZeroEligibleProbeMaxWait      = 55 * time.Second
+	gptZeroEligibleProbeMaxWaiters   = 8
+	gptZeroEligibleProbeStateLimit   = 4096
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1402,6 +1441,7 @@ type Manager struct {
 	refreshLocks          sync.Map
 	activeStreams         *activeStreamTracker
 	gptFirstEventObserver *gptFirstEventObserver
+	gptPolicyPersistMu    sync.Mutex
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2021,6 +2061,17 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	if errLoad != nil {
 		return errLoad
 	}
+	var policyRecords []GPTFirstEventPolicyStateRecord
+	if policyStore, ok := store.(GPTFirstEventPolicyStateStore); ok {
+		var errPolicyLoad error
+		policyRecords, errPolicyLoad = policyStore.LoadGPTFirstEventPolicyStates(ctx)
+		if errPolicyLoad != nil {
+			return errPolicyLoad
+		}
+	}
+	if m.gptFirstEventObserver != nil {
+		m.gptFirstEventObserver.restorePolicyStates(policyRecords)
+	}
 	if len(records) == 0 {
 		return nil
 	}
@@ -2262,6 +2313,31 @@ func (m *Manager) persistCooldownStates(ctx context.Context) {
 	}
 	if errSave := store.Save(ctx, records); errSave != nil {
 		logEntryWithRequestID(ctx).Warnf("failed to persist cooldown state: %v", errSave)
+	}
+}
+
+func (m *Manager) persistGPTFirstEventPolicyStates(ctx context.Context) {
+	if m == nil || m.gptFirstEventObserver == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.gptPolicyPersistMu.Lock()
+	defer m.gptPolicyPersistMu.Unlock()
+	if errCtx := ctx.Err(); errCtx != nil {
+		return
+	}
+	m.mu.RLock()
+	store := m.cooldownStore
+	m.mu.RUnlock()
+	policyStore, ok := store.(GPTFirstEventPolicyStateStore)
+	if !ok {
+		return
+	}
+	records := m.gptFirstEventObserver.exportPolicyStates(time.Now())
+	if errSave := policyStore.SaveGPTFirstEventPolicyStates(ctx, records); errSave != nil {
+		logEntryWithRequestID(ctx).Warnf("failed to persist GPT first-event policy state: %v", errSave)
 	}
 }
 
@@ -2721,7 +2797,20 @@ type zeroEligibleProbeLease struct {
 	requestID   string
 	next        time.Time
 	activeUntil time.Time
+	done        chan struct{}
+	waiters     int
+	probeAuthID string
+	probeModel  string
 }
+
+type zeroEligibleProbeWaitState uint8
+
+const (
+	zeroEligibleProbeWaitNone zeroEligibleProbeWaitState = iota
+	zeroEligibleProbeWaitCompleted
+	zeroEligibleProbeWaitTimedOut
+	zeroEligibleProbeWaitRejected
+)
 
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
@@ -2753,6 +2842,9 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	}
 
 	gptRoute := isGPTRequestRoute(ctx, []string{provider}, routeModel)
+	if gptRoute {
+		m.configureZeroEligibleProbeScope(ctx, zeroEligibleProbeScopeKey(routeModel, auths))
+	}
 	spreadAcrossPriorities := selectorUsesSpread(m.selectorForAuths(auths))
 	availableAll := make([]*Auth, 0, len(auths))
 	availableByPriority := make(map[int][]*Auth)
@@ -2940,6 +3032,8 @@ func (m *Manager) zeroEligibleFallbackProbe(ctx context.Context, model string, c
 	fallback, probeNext := m.cooldownFallbackProbe(candidates, now)
 	if fallback == nil {
 		m.releaseZeroEligibleProbe(ctx, model)
+	} else {
+		m.bindZeroEligibleProbeRoute(ctx, model, fallback.auth.ID, fallback.model)
 	}
 	return fallback, probeNext
 }
@@ -2982,6 +3076,28 @@ func zeroEligibleProbeKey(model string) string {
 	return canonicalModelKey(model)
 }
 
+func zeroEligibleProbeScopeKey(model string, auths []*Auth) string {
+	modelKey := canonicalModelKey(model)
+	if modelKey == "" {
+		return ""
+	}
+	routeSet := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if routeKey := routingChannelBaseKey(auth); routeKey != "" {
+			routeSet[routeKey] = struct{}{}
+		}
+	}
+	if len(routeSet) == 0 {
+		return modelKey
+	}
+	routes := make([]string, 0, len(routeSet))
+	for routeKey := range routeSet {
+		routes = append(routes, routeKey)
+	}
+	sort.Strings(routes)
+	return modelKey + "\x00" + strings.Join(routes, "\x1f")
+}
+
 func requestIDFromAttemptTrace(ctx context.Context) string {
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		return trace.requestIDValue()
@@ -2989,17 +3105,38 @@ func requestIDFromAttemptTrace(ctx context.Context) string {
 	return ""
 }
 
+func zeroEligibleProbeKeyFromContext(ctx context.Context, model string) string {
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		if key := trace.zeroEligibleProbeKeyValue(); key != "" {
+			return key
+		}
+	}
+	return zeroEligibleProbeKey(model)
+}
+
+func (m *Manager) configureZeroEligibleProbeScope(ctx context.Context, key string) {
+	trace := requestAttemptTraceFromContext(ctx)
+	if m == nil || trace == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	previous := trace.swapZeroEligibleProbeKey(key)
+	if previous != "" && previous != key {
+		m.releaseZeroEligibleProbeKey(ctx, previous)
+	}
+}
+
 func (m *Manager) reserveZeroEligibleProbe(ctx context.Context, model string, now time.Time) (bool, time.Time) {
 	if m == nil {
 		return true, time.Time{}
 	}
-	key := zeroEligibleProbeKey(model)
+	key := zeroEligibleProbeKeyFromContext(ctx, model)
 	if key == "" {
 		return true, time.Time{}
 	}
 	requestID := requestIDFromAttemptTrace(ctx)
 	m.zeroEligibleProbeMu.Lock()
 	defer m.zeroEligibleProbeMu.Unlock()
+	m.pruneZeroEligibleProbesLocked(now)
 	lease := m.zeroEligibleProbes[key]
 	if lease.activeUntil.After(now) {
 		if requestID != "" && lease.requestID == requestID {
@@ -3007,23 +3144,86 @@ func (m *Manager) reserveZeroEligibleProbe(ctx context.Context, model string, no
 		}
 		return false, lease.activeUntil
 	}
+	if lease.done != nil {
+		close(lease.done)
+		lease.done = nil
+		lease.waiters = 0
+	}
 	if lease.next.After(now) {
+		m.zeroEligibleProbes[key] = lease
 		return false, lease.next
 	}
 	lease = zeroEligibleProbeLease{
 		requestID:   requestID,
 		next:        now.Add(healthHalfOpenInterval),
-		activeUntil: now.Add(healthHalfOpenActiveTTL),
+		activeUntil: now.Add(gptZeroEligibleProbeActiveTTL),
+		done:        make(chan struct{}),
 	}
 	m.zeroEligibleProbes[key] = lease
 	return true, lease.next
+}
+
+func (m *Manager) waitForZeroEligibleProbe(ctx context.Context, model string, maxWait time.Duration) (zeroEligibleProbeWaitState, error) {
+	if m == nil || maxWait <= 0 {
+		return zeroEligibleProbeWaitNone, nil
+	}
+	key := zeroEligibleProbeKeyFromContext(ctx, model)
+	if key == "" {
+		return zeroEligibleProbeWaitNone, nil
+	}
+	now := time.Now()
+	requestID := requestIDFromAttemptTrace(ctx)
+	m.zeroEligibleProbeMu.Lock()
+	lease, ok := m.zeroEligibleProbes[key]
+	if !ok || lease.done == nil || !lease.activeUntil.After(now) ||
+		(requestID != "" && lease.requestID == requestID) {
+		m.zeroEligibleProbeMu.Unlock()
+		return zeroEligibleProbeWaitNone, nil
+	}
+	if lease.waiters >= gptZeroEligibleProbeMaxWaiters {
+		m.zeroEligibleProbeMu.Unlock()
+		return zeroEligibleProbeWaitRejected, nil
+	}
+	wait := maxWait
+	if remaining := lease.activeUntil.Sub(now); remaining < wait {
+		wait = remaining
+	}
+	if wait <= 0 {
+		m.zeroEligibleProbeMu.Unlock()
+		return zeroEligibleProbeWaitTimedOut, nil
+	}
+	done := lease.done
+	lease.waiters++
+	m.zeroEligibleProbes[key] = lease
+	m.zeroEligibleProbeMu.Unlock()
+
+	defer func() {
+		m.zeroEligibleProbeMu.Lock()
+		current, exists := m.zeroEligibleProbes[key]
+		if exists && current.done == done && current.waiters > 0 {
+			current.waiters--
+			m.zeroEligibleProbes[key] = current
+		}
+		m.zeroEligibleProbeMu.Unlock()
+	}()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return zeroEligibleProbeWaitCompleted, nil
+	case <-timer.C:
+		return zeroEligibleProbeWaitTimedOut, nil
+	case <-ctx.Done():
+		return zeroEligibleProbeWaitTimedOut, ctx.Err()
+	}
 }
 
 func (m *Manager) zeroEligibleProbeBlocksRequest(ctx context.Context, model string, now time.Time) bool {
 	if m == nil {
 		return false
 	}
-	key := zeroEligibleProbeKey(model)
+	key := zeroEligibleProbeKeyFromContext(ctx, model)
 	if key == "" {
 		return false
 	}
@@ -3041,18 +3241,85 @@ func (m *Manager) releaseZeroEligibleProbe(ctx context.Context, model string) {
 	if m == nil {
 		return
 	}
-	key := zeroEligibleProbeKey(model)
+	key := zeroEligibleProbeKeyFromContext(ctx, model)
+	m.releaseZeroEligibleProbeKey(ctx, key)
+}
+
+func (m *Manager) bindZeroEligibleProbeRoute(ctx context.Context, model, authID, probeModel string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	key := zeroEligibleProbeKeyFromContext(ctx, model)
 	requestID := requestIDFromAttemptTrace(ctx)
 	if key == "" || requestID == "" {
 		return
 	}
 	m.zeroEligibleProbeMu.Lock()
 	lease, ok := m.zeroEligibleProbes[key]
-	if ok && lease.requestID == requestID {
-		lease.activeUntil = time.Time{}
+	if ok && lease.requestID == requestID && lease.done != nil {
+		lease.probeAuthID = strings.TrimSpace(authID)
+		lease.probeModel = strings.TrimSpace(probeModel)
 		m.zeroEligibleProbes[key] = lease
 	}
 	m.zeroEligibleProbeMu.Unlock()
+}
+
+func (m *Manager) releaseZeroEligibleProbeKey(ctx context.Context, key string) {
+	if m == nil {
+		return
+	}
+	requestID := requestIDFromAttemptTrace(ctx)
+	if key == "" || requestID == "" {
+		return
+	}
+	var done chan struct{}
+	probeAuthID, probeModel := "", ""
+	m.zeroEligibleProbeMu.Lock()
+	lease, ok := m.zeroEligibleProbes[key]
+	if ok && lease.requestID == requestID {
+		done = lease.done
+		probeAuthID = lease.probeAuthID
+		probeModel = lease.probeModel
+		lease.done = nil
+		lease.requestID = ""
+		lease.activeUntil = time.Time{}
+		lease.waiters = 0
+		lease.probeAuthID = ""
+		lease.probeModel = ""
+		m.zeroEligibleProbes[key] = lease
+	}
+	m.zeroEligibleProbeMu.Unlock()
+	// The half-open bypass must disappear before waiters are released. This
+	// also covers owner cancellation/early-return paths that never call
+	// MarkResult.
+	if probeAuthID != "" {
+		m.releaseHalfOpenProbe(probeAuthID, probeModel)
+	}
+	if done != nil {
+		close(done)
+	}
+}
+
+func (m *Manager) pruneZeroEligibleProbesLocked(now time.Time) {
+	if m == nil || len(m.zeroEligibleProbes) <= gptZeroEligibleProbeStateLimit {
+		return
+	}
+	for key, lease := range m.zeroEligibleProbes {
+		if lease.done == nil && !lease.activeUntil.After(now) && !lease.next.After(now) {
+			delete(m.zeroEligibleProbes, key)
+		}
+	}
+	for len(m.zeroEligibleProbes) > gptZeroEligibleProbeStateLimit {
+		for key, lease := range m.zeroEligibleProbes {
+			if lease.done == nil {
+				delete(m.zeroEligibleProbes, key)
+				break
+			}
+		}
+		if len(m.zeroEligibleProbes) > gptZeroEligibleProbeStateLimit {
+			break
+		}
+	}
 }
 
 func (m *Manager) nextHalfOpenProbeAt(authID, model string) time.Time {
@@ -3131,6 +3398,19 @@ func (m *Manager) halfOpenProbeActive(authID, model string, now time.Time) bool 
 		return false
 	}
 	return true
+}
+
+func (m *Manager) releaseHalfOpenProbe(authID, model string) {
+	if m == nil {
+		return
+	}
+	key := halfOpenProbeKey(authID, model)
+	if key == "\x00" {
+		return
+	}
+	m.halfOpenProbeMu.Lock()
+	delete(m.halfOpenProbeActiveUntil, key)
+	m.halfOpenProbeMu.Unlock()
 }
 
 func (m *Manager) pruneHalfOpenProbeStateLocked(now time.Time) {
@@ -3594,11 +3874,20 @@ func (d *streamFirstEventDeadline) timeoutError(err error) error {
 	if d == nil || d.state.Load() != 2 {
 		return err
 	}
-	return &Error{
-		Code:       "gpt_first_event_timeout",
-		Message:    fmt.Sprintf("GPT upstream produced no deliverable event within %s", d.timeout),
-		Retryable:  true,
-		HTTPStatus: http.StatusGatewayTimeout,
+	if err == nil {
+		err = context.DeadlineExceeded
+	}
+	return &failurecontract.Failure{
+		Kind:          failurecontract.TransportError,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusGatewayTimeout,
+		ProviderCode:  "gpt_first_event_timeout",
+		SemanticCode:  "gpt_first_event_timeout",
+		SemanticType:  "gateway_timeout",
+		StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
+		Retryable:     true,
+		Cause:         err,
+		PublicMessage: fmt.Sprintf("GPT upstream produced no deliverable event within %s", d.timeout),
 	}
 }
 
@@ -3833,6 +4122,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				if isGPTRetryRoute([]string{meta.provider}, meta.requestedModel) {
+					chunk.Err = normalizeOpaqueGPTAttemptFailure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
+				}
 				rerr := resultErrorFromCause(chunk.Err)
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: chunk.Err})
 				resultRecorded = true
@@ -3974,7 +4266,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				cleanupAttempt()
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 				m.releaseGPTChannelAttempt(ctx, auth)
-				return nil, errCtx
+				return nil, newCallerRequestFailure(errCtx)
 			}
 			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
 				closeStreamResult(streamResult)
@@ -3987,7 +4279,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						cleanupAttempt()
 						m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 						m.releaseGPTChannelAttempt(ctx, auth)
-						return nil, errCtx
+						return nil, newCallerRequestFailure(errCtx)
 					}
 				}
 			}
@@ -3998,6 +4290,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				Message:   "upstream returned an invalid stream result",
 				Retryable: true,
 			}
+		}
+		if errStream != nil && isGPTRetryRoute(routeProviders, routeModel) {
+			errStream = normalizeOpaqueGPTAttemptFailure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
 		}
 		if errStream != nil {
 			cleanupAttempt()
@@ -4124,12 +4419,15 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				firstPayloadDelay = time.Since(startedAt)
 			}
 		}
+		if bootstrapErr != nil && isGPTRetryRoute(routeProviders, routeModel) {
+			bootstrapErr = normalizeOpaqueGPTAttemptFailure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
+		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				cleanupAttempt()
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 				m.releaseGPTChannelAttempt(ctx, auth)
-				return nil, errCtx
+				return nil, newCallerRequestFailure(errCtx)
 			}
 			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
 			rerr := resultErrorFromCause(bootstrapErr)
@@ -4918,7 +5216,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				if errCtx := execCtx.Err(); errCtx != nil {
 					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 					m.releaseGPTChannelAttempt(execCtx, auth)
-					return cliproxyexecutor.Response{}, errCtx
+					return cliproxyexecutor.Response{}, newCallerRequestFailure(errCtx)
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
@@ -4944,13 +5242,16 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					}
 				}
 			}
+			if errExec != nil && isGPTRetryRoute(providers, routeModel) {
+				errExec = normalizeOpaqueGPTAttemptFailure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
+			}
 			elapsed := time.Since(startedAt)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 					m.releaseGPTChannelAttempt(execCtx, auth)
-					return cliproxyexecutor.Response{}, errCtx
+					return cliproxyexecutor.Response{}, newCallerRequestFailure(errCtx)
 				}
 				result.Error = resultErrorFromCause(errExec)
 				result.Cause = errExec
@@ -5161,7 +5462,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, providers, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
-				return nil, errCtx
+				return nil, newCallerRequestFailure(errCtx)
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
 				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
@@ -6454,11 +6755,23 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 	result = normalizeResultFailureContract(result)
+	if isGPTRequestRoute(ctx, []string{result.Provider}, result.Model) {
+		result = normalizeOpaqueGPTResultFailure(result)
+	}
 	probeModel := coreusage.RequestedModelAliasFromContext(ctx)
 	if probeModel == "" {
 		probeModel = result.Model
 	}
-	defer m.releaseZeroEligibleProbe(ctx, probeModel)
+	defer func() {
+		// Remove the temporary "probe in flight" bypass before waking the
+		// route-scope waiters. The next-probe interval remains intact, so a
+		// failed probe cannot release a herd back onto the same blocked route.
+		m.releaseHalfOpenProbe(result.AuthID, probeModel)
+		if canonicalModelKey(result.Model) != canonicalModelKey(probeModel) {
+			m.releaseHalfOpenProbe(result.AuthID, result.Model)
+		}
+		m.releaseZeroEligibleProbe(ctx, probeModel)
+	}()
 	selectorResult := result
 	if requestedModel := coreusage.RequestedModelAliasFromContext(ctx); requestedModel != "" {
 		selectorResult.Model = requestedModel
@@ -6823,7 +7136,7 @@ func applyCodexAPIKeyFailureState(auth *Auth, result Result, now time.Time) {
 	if auth == nil {
 		return
 	}
-	if isCodexAPIKeyRequestScopedResultError(result.Error) {
+	if isCodexAPIKeyRequestScopedResultError(result.Error) || isLocalGPTFirstEventTimeoutResult(result) {
 		return
 	}
 	statusCode := statusCodeFromResult(result.Error)
@@ -6872,6 +7185,9 @@ func applyCodexAPIKeyFailureState(auth *Auth, result Result, now time.Time) {
 
 func shouldCountCodexAPIKeyHealthFailure(result Result) bool {
 	if result.Success || result.Error == nil {
+		return false
+	}
+	if isLocalGPTFirstEventTimeoutResult(result) {
 		return false
 	}
 	if isCodexAPIKeyRequestScopedResultError(result.Error) {
@@ -7447,14 +7763,20 @@ func (m *Manager) markSelectorResult(ctx context.Context, result Result) {
 		ttft = result.Duration
 	}
 	recordOutcome := result.Success || shouldCountCodexChannelBreakerFailure(result)
+	softRouteOutcome := !result.Success && isLocalGPTFirstEventTimeoutResult(result)
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		release := !result.keepSelectorLease
 		if selection, ok := trace.selectorSelection(result.AuthID, release); ok {
-			if recordOutcome {
+			softSpreadOutcome := softRouteOutcome && selectorUsesSpread(selection.selector)
+			if recordOutcome || softSpreadOutcome {
 				if selector, routeAware := selection.selector.(routeResultAwareSelector); routeAware {
 					selector.MarkRouteResult(selection.provider, selection.authID, selection.model, result.Success, ttft, release)
-				} else if selector, resultAware := selection.selector.(resultAwareSelector); resultAware {
+				} else if selector, resultAware := selection.selector.(resultAwareSelector); resultAware && recordOutcome {
 					selector.MarkResult(selection.authID, selection.model, result.Success, ttft)
+				} else if release {
+					if selector, loadAware := selection.selector.(loadAwareSelector); loadAware {
+						selector.MarkDone(selection.authID, selection.model)
+					}
 				}
 			} else if release {
 				if selector, routeAware := selection.selector.(routeLoadAwareSelector); routeAware {
@@ -7467,6 +7789,12 @@ func (m *Manager) markSelectorResult(ctx context.Context, result Result) {
 		}
 	}
 	record := func(selector Selector) {
+		if softRouteOutcome && selectorUsesSpread(selector) {
+			if routeAware, ok := selector.(routeResultAwareSelector); ok && strings.TrimSpace(result.Provider) != "" {
+				routeAware.MarkRouteResult(result.Provider, result.AuthID, result.Model, false, ttft, !result.keepSelectorLease)
+				return
+			}
+		}
 		if resultAware, ok := selector.(resultAwareSelector); ok && recordOutcome {
 			resultAware.MarkResult(result.AuthID, result.Model, result.Success, ttft)
 			return
@@ -7922,6 +8250,131 @@ func normalizeResultFailureContract(result Result) Result {
 		result.RetryAfter = &retryAfter
 	}
 	return result
+}
+
+func normalizeOpaqueGPTResultFailure(result Result) Result {
+	if result.Success || result.Cause == nil {
+		return result
+	}
+	if _, ok := failurecontract.As(result.Cause); ok {
+		return result
+	}
+	status := statusCodeFromError(result.Cause)
+	code := errorCodeFromError(result.Cause)
+	if result.Error != nil {
+		if status <= 0 {
+			status = statusCodeFromResult(result.Error)
+		}
+		if code == "" {
+			code = strings.TrimSpace(result.Error.Code)
+		}
+	}
+	// A stable code is already useful structure even when a legacy executor did
+	// not attach an HTTP status. Only normalize truly opaque failures and the
+	// specific legacy shape "HTTP 500 with no code".
+	if code != "" || (status > 0 && status != http.StatusInternalServerError) {
+		return result
+	}
+	provider500 := status == http.StatusInternalServerError && code == ""
+	kind := failurecontract.InternalTransformError
+	scope := failurecontract.ScopeRequest
+	semanticCode := "internal_execution_error"
+	retryable := false
+	publicMessage := "internal execution error"
+	if provider500 {
+		kind = failurecontract.ProviderUnavailable
+		scope = failurecontract.ScopeProvider
+		semanticCode = "upstream_http_500"
+		retryable = true
+		publicMessage = "upstream request failed"
+	} else if message := strings.TrimSpace(result.Cause.Error()); message != "" {
+		// Preserve legacy SDK-visible diagnostics while adding the canonical
+		// status/kind/scope contract around the error.
+		publicMessage = message
+	}
+	failure := &failurecontract.Failure{
+		Kind:          kind,
+		Scope:         scope,
+		HTTPStatus:    http.StatusInternalServerError,
+		OuterStatus:   http.StatusInternalServerError,
+		ProviderCode:  semanticCode,
+		SemanticCode:  semanticCode,
+		SemanticType:  "server_error",
+		StreamPhase:   failurecontract.StreamPhaseUnknown,
+		Retryable:     retryable,
+		Cause:         result.Cause,
+		PublicMessage: publicMessage,
+	}
+	result.Cause = failure
+	result.Error = resultErrorFromCause(failure)
+	result.RetryAfter = nil
+	return result
+}
+
+func normalizeOpaqueGPTAttemptFailure(err error, phase failurecontract.StreamPhase, outputCommitted bool) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := failurecontract.As(err); ok {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		status := http.StatusBadGateway
+		code := "upstream_transport_error"
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+			code = "upstream_timeout"
+		}
+		return &failurecontract.Failure{
+			Kind:            failurecontract.TransportError,
+			Scope:           failurecontract.ScopeProvider,
+			HTTPStatus:      status,
+			OuterStatus:     status,
+			ProviderCode:    code,
+			SemanticCode:    code,
+			SemanticType:    "server_error",
+			StreamPhase:     phase,
+			OutputCommitted: outputCommitted,
+			Retryable:       !outputCommitted,
+			Cause:           err,
+			PublicMessage:   "upstream transport failed",
+		}
+	}
+	if isTransientNetworkError(err) {
+		status := http.StatusBadGateway
+		code := "upstream_transport_error"
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") {
+			status = http.StatusGatewayTimeout
+			code = "upstream_timeout"
+		}
+		return &failurecontract.Failure{
+			Kind:            failurecontract.TransportError,
+			Scope:           failurecontract.ScopeProvider,
+			HTTPStatus:      status,
+			OuterStatus:     status,
+			ProviderCode:    code,
+			SemanticCode:    code,
+			SemanticType:    "server_error",
+			StreamPhase:     phase,
+			OutputCommitted: outputCommitted,
+			Retryable:       !outputCommitted,
+			Cause:           err,
+			PublicMessage:   "upstream transport failed",
+		}
+	}
+	result := normalizeOpaqueGPTResultFailure(Result{
+		Success: false,
+		Error:   resultErrorFromCause(err),
+		Cause:   err,
+	})
+	failure, ok := failurecontract.As(result.Cause)
+	if !ok || failure == nil {
+		return result.Cause
+	}
+	failure.StreamPhase = phase
+	failure.OutputCommitted = outputCommitted
+	return failure
 }
 
 func typedFailureFromResult(result Result) (*failurecontract.Failure, bool) {

@@ -17,27 +17,38 @@ const (
 	gptFirstEventPolicyWindow             = 5 * time.Minute
 	gptFirstEventPolicyEvaluationInterval = time.Minute
 	gptFirstEventPolicyMinStateHold       = 5 * time.Minute
-	gptFirstEventPolicyMinSamples         = 100
-	gptFirstEventPolicyEnterWindows       = 3
-	gptFirstEventPolicyRecoveryWindows    = 10
-	gptFirstEventPolicySlowRate           = 0.90
-	gptFirstEventPolicyEscalationRate     = 0.50
-	gptFirstEventPolicyRecoveryRate       = 0.95
-	gptFirstEventPolicyLateSuccessGain    = 0.05
-	gptFirstEventPolicyOutageSuccessRate  = 0.10
-	gptFirstEventPolicyOutageFailureRate  = 0.90
-	gptFirstEventPolicyWaitBudget         = 300 * time.Second
-	gptFirstEventPolicyOutageWaitBudget   = 75 * time.Second
-	gptFirstEventPolicyDailyRetention     = 31
-	gptFirstEventPolicyGlobalModel        = "*"
-	gptFirstEventPolicyStateNormal        = "normal"
-	gptFirstEventPolicyStateSlow30        = "slow_30s"
-	gptFirstEventPolicyStateSlow40        = "slow_40s"
-	gptFirstEventPolicyStateSlow50        = "slow_50s"
-	gptFirstEventPolicyStateOutage        = "outage"
-	gptFirstEventOutcomeDeliverable       = "deliverable"
-	gptFirstEventOutcomeTimeout           = "timeout"
-	gptFirstEventOutcomeFailure           = "upstream_failure"
+	// Protective escalation intentionally needs fewer samples than recovery.
+	// This lets an individual model react to a latency burst without allowing a
+	// short healthy interval to lower the timeout just as quickly.
+	gptFirstEventPolicyEscalationMinSamples = 40
+	gptFirstEventPolicyRecoveryMinSamples   = 100
+	gptFirstEventPolicyLowSampleMinSamples  = 10
+	gptFirstEventPolicyLowSampleTimeoutRate = 0.80
+	gptFirstEventPolicyMinSamples           = gptFirstEventPolicyEscalationMinSamples
+	gptFirstEventPolicyEnterWindows         = 3
+	gptFirstEventPolicyRecoveryWindows      = 10
+	gptFirstEventPolicySlowRate             = 0.90
+	gptFirstEventPolicySlowTimeoutRate      = 0.10
+	gptFirstEventPolicyEscalationRate       = 0.50
+	gptFirstEventPolicyRecoveryRate         = 0.95
+	gptFirstEventPolicyLateSuccessGain      = 0.05
+	gptFirstEventPolicyOutageSuccessRate    = 0.10
+	gptFirstEventPolicyOutageFailureRate    = 0.90
+	gptFirstEventPolicyWaitBudget           = 300 * time.Second
+	gptFirstEventPolicyOutageWaitBudget     = 75 * time.Second
+	gptFirstEventPolicyPersistenceTTL       = 24 * time.Hour
+	gptFirstEventPolicyCheckpointInterval   = time.Hour
+	gptFirstEventPolicyPersistTimeout       = 2 * time.Second
+	gptFirstEventPolicyDailyRetention       = 31
+	gptFirstEventPolicyGlobalModel          = "*"
+	gptFirstEventPolicyStateNormal          = "normal"
+	gptFirstEventPolicyStateSlow30          = "slow_30s"
+	gptFirstEventPolicyStateSlow40          = "slow_40s"
+	gptFirstEventPolicyStateSlow50          = "slow_50s"
+	gptFirstEventPolicyStateOutage          = "outage"
+	gptFirstEventOutcomeDeliverable         = "deliverable"
+	gptFirstEventOutcomeTimeout             = "timeout"
+	gptFirstEventOutcomeFailure             = "upstream_failure"
 )
 
 type gptFirstEventSample struct {
@@ -96,16 +107,47 @@ func (w gptFirstEventWindow) failureRate() float64 {
 	return float64(w.Timeouts+w.Upstream5xx+w.NetworkFailure) / float64(w.Eligible)
 }
 
+func (w gptFirstEventWindow) hardFailureRate() float64 {
+	if w.Eligible == 0 {
+		return 0
+	}
+	return float64(w.Upstream5xx+w.NetworkFailure) / float64(w.Eligible)
+}
+
+func (w gptFirstEventWindow) timeoutRate() float64 {
+	if w.Eligible == 0 {
+		return 0
+	}
+	return float64(w.Timeouts) / float64(w.Eligible)
+}
+
 type gptFirstEventPolicyState struct {
-	name                   string
-	previousState          string
-	decisionReason         string
-	lastEvaluatedAt        time.Time
-	lastEvaluatedSequence  uint64
-	lastTransitionAt       time.Time
-	lastTransitionSequence uint64
-	enterWindows           int
-	recoveryWindows        int
+	name                    string
+	previousState           string
+	decisionReason          string
+	candidateTarget         string
+	candidateReason         string
+	lastEvaluatedAt         time.Time
+	lastEvaluatedSequence   uint64
+	lastTransitionAt        time.Time
+	updatedAt               time.Time
+	lastTransitionSequence  uint64
+	enterWindows            int
+	recoveryWindows         int
+	lowSampleTimeoutWindows int
+	lastEvaluationLowSample bool
+}
+
+// GPTFirstEventPolicyStateRecord is the durable state for one exact model.
+// Short-window samples and in-progress candidate counters are intentionally
+// excluded so a restart cannot replay stale evidence as a fresh transition.
+type GPTFirstEventPolicyStateRecord struct {
+	Model            string    `json:"model"`
+	PolicyState      string    `json:"policy_state"`
+	PreviousState    string    `json:"previous_state,omitempty"`
+	DecisionReason   string    `json:"decision_reason,omitempty"`
+	LastTransitionAt time.Time `json:"last_transition_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type gptFirstEventDailyBucket struct {
@@ -155,6 +197,7 @@ type GPTFirstEventPolicySnapshot struct {
 	FirstEventSuccessRate40  float64   `json:"first_event_success_rate_40"`
 	FirstEventSuccessRate50  float64   `json:"first_event_success_rate_50"`
 	FailureRate              float64   `json:"failure_rate"`
+	HardFailureRate          float64   `json:"hard_failure_rate"`
 	Timeouts                 int       `json:"timeouts"`
 	Upstream5xx              int       `json:"upstream_5xx"`
 	NetworkFailures          int       `json:"network_failures"`
@@ -169,7 +212,9 @@ type GPTFirstEventPolicySnapshot struct {
 	LastTransitionAt         time.Time `json:"last_transition_at,omitempty"`
 	UsedGlobalFallback       bool      `json:"used_global_fallback"`
 	MinimumSamples           int       `json:"minimum_samples"`
+	RecoveryMinimumSamples   int       `json:"recovery_minimum_samples"`
 	ObservationWindowSeconds int64     `json:"observation_window_seconds"`
+	stateCheckpointed        bool
 }
 
 type gptFirstEventObserver struct {
@@ -207,13 +252,16 @@ func (o *gptFirstEventObserver) observe(model string, sample gptFirstEventSample
 	sample.sequence = o.sequence
 	o.appendLocked(model, sample)
 	o.evaluateLocked(model, sample.at)
+	checkpointed := o.checkpointPolicyStateLocked(model, sample.at)
 	o.recordDailyLocked(model, sample)
 	if model != gptFirstEventPolicyGlobalModel {
 		o.appendLocked(gptFirstEventPolicyGlobalModel, sample)
 		o.evaluateLocked(gptFirstEventPolicyGlobalModel, sample.at)
 		o.recordDailyLocked(gptFirstEventPolicyGlobalModel, sample)
 	}
-	return o.snapshotLocked(model, sample.at, sample.sequence)
+	snapshot := o.snapshotLocked(model, sample.at, sample.sequence)
+	snapshot.stateCheckpointed = checkpointed
+	return snapshot
 }
 
 func (o *gptFirstEventObserver) dailySnapshot(model string, days int, now time.Time) []GPTFirstEventDailySnapshot {
@@ -298,7 +346,143 @@ func (o *gptFirstEventObserver) snapshot(model string, now time.Time) GPTFirstEv
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.snapshotLocked(model, now, 0)
+	transitioned := o.relaxStaleOutageLocked(model, now)
+	snapshot := o.snapshotLocked(model, now, 0)
+	snapshot.Transitioned = transitioned
+	return snapshot
+}
+
+func (o *gptFirstEventObserver) relaxStaleOutageLocked(model string, now time.Time) bool {
+	if model == "" || model == gptFirstEventPolicyGlobalModel {
+		return false
+	}
+	policy := o.policies[model]
+	if policy == nil || policy.name != gptFirstEventPolicyStateOutage || policy.lastTransitionAt.IsZero() || now.Sub(policy.lastTransitionAt) < gptFirstEventPolicyMinStateHold {
+		return false
+	}
+	window := o.windowLocked(model, now)
+	if window.Eligible >= gptFirstEventPolicyEscalationMinSamples && window.hardFailureRate() >= gptFirstEventPolicyOutageFailureRate {
+		return false
+	}
+	o.transitionLocked(policy, gptFirstEventPolicyStateSlow30, "outage_evidence_expired_to_slow", now, 0)
+	return true
+}
+
+func (o *gptFirstEventObserver) checkpointPolicyStateLocked(model string, now time.Time) bool {
+	if model == "" || model == gptFirstEventPolicyGlobalModel {
+		return false
+	}
+	policy := o.policies[model]
+	if policy == nil || !gptFirstEventSlowStateSupportedByWindow(policy.name, o.windowLocked(model, now)) {
+		return false
+	}
+	updatedAt := policy.updatedAt
+	if updatedAt.IsZero() {
+		updatedAt = policy.lastTransitionAt
+	}
+	if !updatedAt.IsZero() && now.Sub(updatedAt) < gptFirstEventPolicyCheckpointInterval {
+		return false
+	}
+	policy.updatedAt = now
+	return true
+}
+
+func gptFirstEventSlowStateSupportedByWindow(state string, window gptFirstEventWindow) bool {
+	if window.Eligible < gptFirstEventPolicyLowSampleMinSamples {
+		return false
+	}
+	if window.timeoutRate() >= gptFirstEventPolicySlowTimeoutRate {
+		return true
+	}
+	_, lowerTimeout, ok := gptFirstEventLowerState(state)
+	if !ok {
+		return false
+	}
+	return window.lateSuccessRate(lowerTimeout, gptFirstEventTimeoutForState(state)) >= gptFirstEventPolicyLateSuccessGain
+}
+
+func (o *gptFirstEventObserver) exportPolicyStates(now time.Time) []GPTFirstEventPolicyStateRecord {
+	if o == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = o.now()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	records := make([]GPTFirstEventPolicyStateRecord, 0, len(o.policies))
+	for model, policy := range o.policies {
+		model = canonicalModelKey(model)
+		if model == "" || model == gptFirstEventPolicyGlobalModel || policy == nil || !validGPTFirstEventPolicyState(policy.name) {
+			continue
+		}
+		updatedAt := policy.updatedAt
+		if updatedAt.IsZero() {
+			updatedAt = policy.lastTransitionAt
+		}
+		if updatedAt.IsZero() {
+			updatedAt = now
+		}
+		records = append(records, GPTFirstEventPolicyStateRecord{
+			Model:            model,
+			PolicyState:      policy.name,
+			PreviousState:    policy.previousState,
+			DecisionReason:   policy.decisionReason,
+			LastTransitionAt: policy.lastTransitionAt,
+			UpdatedAt:        updatedAt,
+		})
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Model < records[j].Model })
+	return records
+}
+
+func (o *gptFirstEventObserver) restorePolicyStates(records []GPTFirstEventPolicyStateRecord) {
+	if o == nil || len(records) == 0 {
+		return
+	}
+	now := o.now()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	for _, record := range records {
+		model := canonicalModelKey(record.Model)
+		state := strings.TrimSpace(record.PolicyState)
+		updatedAt := record.UpdatedAt
+		if model == "" || model == gptFirstEventPolicyGlobalModel || !validGPTFirstEventPolicyState(state) || updatedAt.IsZero() {
+			continue
+		}
+		if now.Sub(updatedAt) > gptFirstEventPolicyPersistenceTTL {
+			continue
+		}
+		previous := strings.TrimSpace(record.PreviousState)
+		if previous != "" && !validGPTFirstEventPolicyState(previous) {
+			previous = ""
+		}
+		lastTransitionAt := record.LastTransitionAt
+		decisionReason := strings.TrimSpace(record.DecisionReason)
+		// Persisted outage is a hard-failure snapshot, not a safe startup mode:
+		// without the prior observation window it would otherwise pin a model to
+		// 25 seconds and one round indefinitely. Resume conservatively at slow30
+		// and require fresh samples to classify a new outage.
+		if state == gptFirstEventPolicyStateOutage {
+			previous = gptFirstEventPolicyStateOutage
+			state = gptFirstEventPolicyStateSlow30
+			decisionReason = "restored_outage_as_slow_30s"
+			lastTransitionAt = now
+			updatedAt = now
+		}
+		if existing := o.policies[model]; existing != nil && existing.updatedAt.After(updatedAt) {
+			continue
+		}
+		o.policies[model] = &gptFirstEventPolicyState{
+			name:             state,
+			previousState:    previous,
+			decisionReason:   decisionReason,
+			lastTransitionAt: lastTransitionAt,
+			updatedAt:        updatedAt,
+		}
+	}
 }
 
 func (o *gptFirstEventObserver) appendLocked(model string, sample gptFirstEventSample) {
@@ -375,20 +559,47 @@ func (o *gptFirstEventObserver) policyLocked(model string) *gptFirstEventPolicyS
 func (o *gptFirstEventObserver) evaluateLocked(model string, now time.Time) {
 	window := o.windowLocked(model, now)
 	policy := o.policyLocked(model)
-	if window.Eligible < gptFirstEventPolicyMinSamples || window.latestSequence == policy.lastEvaluatedSequence {
+	if window.Eligible < gptFirstEventPolicyLowSampleMinSamples {
 		policy.decisionReason = "insufficient_samples"
+		o.clearCandidateLocked(policy)
 		return
 	}
-	if !policy.lastEvaluatedAt.IsZero() && now.Sub(policy.lastEvaluatedAt) < gptFirstEventPolicyEvaluationInterval {
+	if window.latestSequence == policy.lastEvaluatedSequence {
+		return
+	}
+	crossedFullSampleBoundary := policy.lastEvaluationLowSample && window.Eligible >= gptFirstEventPolicyEscalationMinSamples
+	if !crossedFullSampleBoundary && !policy.lastEvaluatedAt.IsZero() && now.Sub(policy.lastEvaluatedAt) < gptFirstEventPolicyEvaluationInterval {
 		return
 	}
 	policy.lastEvaluatedAt = now
 	policy.lastEvaluatedSequence = window.latestSequence
+	if window.Eligible < gptFirstEventPolicyEscalationMinSamples {
+		policy.lastEvaluationLowSample = true
+		if policy.name == gptFirstEventPolicyStateNormal && window.timeoutRate() >= gptFirstEventPolicyLowSampleTimeoutRate {
+			o.prepareCandidateLocked(policy, gptFirstEventPolicyStateSlow30, "low_sample_timeout_protection")
+			policy.lowSampleTimeoutWindows++
+			policy.decisionReason = "low_sample_timeout_candidate"
+			if policy.lowSampleTimeoutWindows >= gptFirstEventPolicyEnterWindows && o.canTransitionLocked(policy, now) {
+				o.transitionLocked(policy, gptFirstEventPolicyStateSlow30, "low_sample_timeout_protection", now, window.latestSequence)
+			}
+			return
+		}
+		o.clearCandidateLocked(policy)
+		policy.decisionReason = "insufficient_samples"
+		return
+	}
+	policy.lastEvaluationLowSample = false
+	if policy.lowSampleTimeoutWindows > 0 {
+		o.clearCandidateLocked(policy)
+	}
 
 	currentTimeout := gptFirstEventTimeoutForState(policy.name)
 	currentRate := window.successRate(currentTimeout)
-	failureRate := window.failureRate()
-	if currentRate < gptFirstEventPolicyOutageSuccessRate && failureRate >= gptFirstEventPolicyOutageFailureRate {
+	hardFailureRate := window.hardFailureRate()
+	// A local first-event deadline is a latency signal, not proof of a provider
+	// outage. Only explicit upstream 5xx and network failures can enter outage.
+	if currentRate < gptFirstEventPolicyOutageSuccessRate && hardFailureRate >= gptFirstEventPolicyOutageFailureRate {
+		o.prepareCandidateLocked(policy, gptFirstEventPolicyStateOutage, "collective_outage")
 		policy.enterWindows++
 		policy.recoveryWindows = 0
 		policy.decisionReason = "collective_outage_candidate"
@@ -399,32 +610,37 @@ func (o *gptFirstEventObserver) evaluateLocked(model string, now time.Time) {
 	}
 
 	if policy.name == gptFirstEventPolicyStateOutage {
+		if window.Eligible < gptFirstEventPolicyRecoveryMinSamples {
+			o.clearCandidateLocked(policy)
+			policy.decisionReason = "insufficient_recovery_samples"
+			return
+		}
+		if hardFailureRate < gptFirstEventPolicyOutageFailureRate && window.timeoutRate() >= gptFirstEventPolicyEscalationRate {
+			o.prepareCandidateLocked(policy, gptFirstEventPolicyStateSlow30, "hard_outage_cleared_to_slow")
+			policy.recoveryWindows++
+			policy.enterWindows = 0
+			policy.decisionReason = "hard_outage_cleared_to_slow_candidate"
+			if policy.recoveryWindows >= gptFirstEventPolicyEnterWindows && o.canTransitionLocked(policy, now) {
+				o.transitionLocked(policy, gptFirstEventPolicyStateSlow30, "hard_outage_cleared_to_slow", now, window.latestSequence)
+			}
+			return
+		}
 		if window.successRate(25*time.Second) >= gptFirstEventPolicyEscalationRate {
+			next := gptFirstEventPolicyStateSlow30
+			if window.successRate(25*time.Second) >= gptFirstEventPolicyRecoveryRate {
+				next = gptFirstEventPolicyStateNormal
+			}
+			o.prepareCandidateLocked(policy, next, "outage_recovered")
 			policy.recoveryWindows++
 			policy.enterWindows = 0
 			policy.decisionReason = "outage_recovery_candidate"
 			if policy.recoveryWindows >= gptFirstEventPolicyEnterWindows && o.canTransitionLocked(policy, now) {
-				next := gptFirstEventPolicyStateSlow30
-				if window.successRate(25*time.Second) >= gptFirstEventPolicyRecoveryRate {
-					next = gptFirstEventPolicyStateNormal
-				}
 				o.transitionLocked(policy, next, "outage_recovered", now, window.latestSequence)
 			}
 			return
 		}
-		policy.enterWindows = 0
-		policy.recoveryWindows = 0
+		o.clearCandidateLocked(policy)
 		policy.decisionReason = "collective_outage"
-		return
-	}
-
-	if lowerState, lowerTimeout, ok := gptFirstEventLowerState(policy.name); ok && window.successRate(lowerTimeout) >= gptFirstEventPolicyRecoveryRate {
-		policy.recoveryWindows++
-		policy.enterWindows = 0
-		policy.decisionReason = "recovery_candidate"
-		if policy.recoveryWindows >= gptFirstEventPolicyRecoveryWindows && o.canTransitionLocked(policy, now) {
-			o.transitionLocked(policy, lowerState, "sustained_recovery", now, window.latestSequence)
-		}
 		return
 	}
 
@@ -434,13 +650,19 @@ func (o *gptFirstEventObserver) evaluateLocked(model string, now time.Time) {
 		shouldEscalate := false
 		reason := "stable"
 		if policy.name == gptFirstEventPolicyStateNormal {
-			shouldEscalate = rate < gptFirstEventPolicySlowRate
+			shouldEscalate = rate < gptFirstEventPolicySlowRate && window.timeoutRate() >= gptFirstEventPolicySlowTimeoutRate
 			reason = "first_event_rate_below_90_percent"
 		} else {
-			shouldEscalate = rate < gptFirstEventPolicyEscalationRate && lateGain >= gptFirstEventPolicyLateSuccessGain
-			reason = "late_success_proves_more_wait_helps"
+			shouldEscalate = rate < gptFirstEventPolicyEscalationRate &&
+				(lateGain >= gptFirstEventPolicyLateSuccessGain || window.timeoutRate() >= gptFirstEventPolicyEscalationRate)
+			if window.timeoutRate() >= gptFirstEventPolicyEscalationRate {
+				reason = "local_timeout_pressure"
+			} else {
+				reason = "late_success_proves_more_wait_helps"
+			}
 		}
 		if shouldEscalate {
+			o.prepareCandidateLocked(policy, nextState, reason)
 			policy.enterWindows++
 			policy.recoveryWindows = 0
 			policy.decisionReason = reason
@@ -451,9 +673,46 @@ func (o *gptFirstEventObserver) evaluateLocked(model string, now time.Time) {
 		}
 	}
 
+	if lowerState, lowerTimeout, ok := gptFirstEventLowerState(policy.name); ok {
+		if window.Eligible < gptFirstEventPolicyRecoveryMinSamples {
+			o.clearCandidateLocked(policy)
+			policy.decisionReason = "insufficient_recovery_samples"
+			return
+		}
+		if window.successRate(lowerTimeout) >= gptFirstEventPolicyRecoveryRate {
+			o.prepareCandidateLocked(policy, lowerState, "sustained_recovery")
+			policy.recoveryWindows++
+			policy.enterWindows = 0
+			policy.decisionReason = "recovery_candidate"
+			if policy.recoveryWindows >= gptFirstEventPolicyRecoveryWindows && o.canTransitionLocked(policy, now) {
+				o.transitionLocked(policy, lowerState, "sustained_recovery", now, window.latestSequence)
+			}
+			return
+		}
+	}
+
+	o.clearCandidateLocked(policy)
+	policy.decisionReason = "stable"
+}
+
+func (o *gptFirstEventObserver) prepareCandidateLocked(policy *gptFirstEventPolicyState, target, reason string) {
+	if policy == nil || (policy.candidateTarget == target && policy.candidateReason == reason) {
+		return
+	}
+	o.clearCandidateLocked(policy)
+	policy.candidateTarget = target
+	policy.candidateReason = reason
+}
+
+func (o *gptFirstEventObserver) clearCandidateLocked(policy *gptFirstEventPolicyState) {
+	if policy == nil {
+		return
+	}
+	policy.candidateTarget = ""
+	policy.candidateReason = ""
 	policy.enterWindows = 0
 	policy.recoveryWindows = 0
-	policy.decisionReason = "stable"
+	policy.lowSampleTimeoutWindows = 0
 }
 
 func (o *gptFirstEventObserver) canTransitionLocked(policy *gptFirstEventPolicyState, now time.Time) bool {
@@ -468,24 +727,32 @@ func (o *gptFirstEventObserver) transitionLocked(policy *gptFirstEventPolicyStat
 	policy.name = next
 	policy.decisionReason = reason
 	policy.lastTransitionAt = now
+	policy.updatedAt = now
 	policy.lastTransitionSequence = sequence
-	policy.enterWindows = 0
-	policy.recoveryWindows = 0
+	o.clearCandidateLocked(policy)
+	policy.lastEvaluationLowSample = false
+}
+
+func validGPTFirstEventPolicyState(state string) bool {
+	switch strings.TrimSpace(state) {
+	case gptFirstEventPolicyStateNormal,
+		gptFirstEventPolicyStateSlow30,
+		gptFirstEventPolicyStateSlow40,
+		gptFirstEventPolicyStateSlow50,
+		gptFirstEventPolicyStateOutage:
+		return true
+	default:
+		return false
+	}
 }
 
 func (o *gptFirstEventObserver) snapshotLocked(model string, now time.Time, observationSequence uint64) GPTFirstEventPolicySnapshot {
 	window := o.windowLocked(model, now)
+	// Never apply the aggregate "*" state to a concrete model. Models have
+	// materially different latency distributions, and a hot/slow model must not
+	// change the deadline or retry shape of an unrelated cold-start model.
 	decisionSource := model
-	usedGlobal := false
-	if window.Eligible < gptFirstEventPolicyMinSamples && model != gptFirstEventPolicyGlobalModel {
-		globalWindow := o.windowLocked(gptFirstEventPolicyGlobalModel, now)
-		if globalWindow.Eligible >= gptFirstEventPolicyMinSamples {
-			window = globalWindow
-			decisionSource = gptFirstEventPolicyGlobalModel
-			usedGlobal = true
-		}
-	}
-	policy := o.policyLocked(decisionSource)
+	policy := o.policyLocked(model)
 	timeout, maxChannels, maxRounds, waitBudget := gptFirstEventPolicyLimits(policy.name)
 	return GPTFirstEventPolicySnapshot{
 		Model:                    model,
@@ -503,6 +770,7 @@ func (o *gptFirstEventObserver) snapshotLocked(model string, now time.Time, obse
 		FirstEventSuccessRate40:  window.successRate(40 * time.Second),
 		FirstEventSuccessRate50:  window.successRate(50 * time.Second),
 		FailureRate:              window.failureRate(),
+		HardFailureRate:          window.hardFailureRate(),
 		Timeouts:                 window.Timeouts,
 		Upstream5xx:              window.Upstream5xx,
 		NetworkFailures:          window.NetworkFailure,
@@ -515,8 +783,9 @@ func (o *gptFirstEventObserver) snapshotLocked(model string, now time.Time, obse
 		WaitBudgetMs:             waitBudget.Milliseconds(),
 		Transitioned:             observationSequence > 0 && policy.lastTransitionSequence == observationSequence,
 		LastTransitionAt:         policy.lastTransitionAt,
-		UsedGlobalFallback:       usedGlobal,
-		MinimumSamples:           gptFirstEventPolicyMinSamples,
+		UsedGlobalFallback:       false,
+		MinimumSamples:           gptFirstEventPolicyEscalationMinSamples,
+		RecoveryMinimumSamples:   gptFirstEventPolicyRecoveryMinSamples,
 		ObservationWindowSeconds: int64(gptFirstEventPolicyWindow / time.Second),
 	}
 }
@@ -579,6 +848,7 @@ func defaultGPTFirstEventPolicySnapshot(model string) GPTFirstEventPolicySnapsho
 		MaxRounds:                maxRounds,
 		WaitBudgetMs:             waitBudget.Milliseconds(),
 		MinimumSamples:           gptFirstEventPolicyMinSamples,
+		RecoveryMinimumSamples:   gptFirstEventPolicyRecoveryMinSamples,
 		ObservationWindowSeconds: int64(gptFirstEventPolicyWindow / time.Second),
 	}
 }
@@ -642,7 +912,12 @@ func (m *Manager) GPTFirstEventPolicySnapshot(model string) GPTFirstEventPolicyS
 	if m == nil || m.gptFirstEventObserver == nil {
 		return defaultGPTFirstEventPolicySnapshot(model)
 	}
-	return m.gptFirstEventObserver.snapshot(model, time.Now())
+	snapshot := m.gptFirstEventObserver.snapshot(model, time.Now())
+	if snapshot.Transitioned {
+		logGPTFirstEventPolicyTransition(context.Background(), snapshot)
+		m.persistGPTFirstEventPolicyUpdate(context.Background(), snapshot)
+	}
+	return snapshot
 }
 
 func (m *Manager) GPTFirstEventDailySnapshots(model string, days int) []GPTFirstEventDailySnapshot {
@@ -719,6 +994,7 @@ func (m *Manager) recordGPTFirstEventAttempt(ctx context.Context, model string, 
 		"first_event_success_rate_40": roundPolicyRate(snapshot.FirstEventSuccessRate40),
 		"first_event_success_rate_50": roundPolicyRate(snapshot.FirstEventSuccessRate50),
 		"failure_rate":                roundPolicyRate(snapshot.FailureRate),
+		"hard_failure_rate":           roundPolicyRate(snapshot.HardFailureRate),
 		"timeout_count":               snapshot.Timeouts,
 		"upstream_5xx_count":          snapshot.Upstream5xx,
 		"network_failure_count":       snapshot.NetworkFailures,
@@ -727,23 +1003,59 @@ func (m *Manager) recordGPTFirstEventAttempt(ctx context.Context, model string, 
 	addRequestAttemptLogFields(ctx, fields)
 	logEntryWithRequestID(ctx).WithFields(fields).Info("gpt_first_event_observation")
 	if snapshot.Transitioned {
-		transitionFields := log.Fields{
-			"event":                       "gpt_first_event_policy_transition",
-			"model":                       canonicalModelKey(model),
-			"decision_source":             snapshot.DecisionSource,
-			"previous_state":              snapshot.PreviousState,
-			"policy_state":                snapshot.PolicyState,
-			"decision_reason":             snapshot.DecisionReason,
-			"enforced_timeout_ms":         snapshot.EnforcedTimeoutMs,
-			"max_channels":                snapshot.MaxChannels,
-			"max_rounds":                  snapshot.MaxRounds,
-			"wait_budget_ms":              snapshot.WaitBudgetMs,
-			"eligible_first_attempts":     snapshot.EligibleFirstAttempts,
-			"first_event_success_rate_25": roundPolicyRate(snapshot.FirstEventSuccessRate25),
-			"failure_rate":                roundPolicyRate(snapshot.FailureRate),
-		}
-		logEntryWithRequestID(ctx).WithFields(transitionFields).Warn("gpt_first_event_policy_transition")
+		logGPTFirstEventPolicyTransition(ctx, snapshot)
 	}
+	if snapshot.stateCheckpointed {
+		checkpointFields := log.Fields{
+			"event":           "gpt_first_event_policy_checkpoint",
+			"model":           canonicalModelKey(model),
+			"policy_state":    snapshot.PolicyState,
+			"decision_reason": snapshot.DecisionReason,
+		}
+		logEntryWithRequestID(ctx).WithFields(checkpointFields).Info("gpt_first_event_policy_checkpoint")
+	}
+	if snapshot.Transitioned || snapshot.stateCheckpointed {
+		m.persistGPTFirstEventPolicyUpdate(ctx, snapshot)
+	}
+}
+
+func logGPTFirstEventPolicyTransition(ctx context.Context, snapshot GPTFirstEventPolicySnapshot) {
+	transitionFields := log.Fields{
+		"event":                       "gpt_first_event_policy_transition",
+		"model":                       canonicalModelKey(snapshot.Model),
+		"decision_source":             snapshot.DecisionSource,
+		"previous_state":              snapshot.PreviousState,
+		"policy_state":                snapshot.PolicyState,
+		"decision_reason":             snapshot.DecisionReason,
+		"enforced_timeout_ms":         snapshot.EnforcedTimeoutMs,
+		"max_channels":                snapshot.MaxChannels,
+		"max_rounds":                  snapshot.MaxRounds,
+		"wait_budget_ms":              snapshot.WaitBudgetMs,
+		"eligible_first_attempts":     snapshot.EligibleFirstAttempts,
+		"first_event_success_rate_25": roundPolicyRate(snapshot.FirstEventSuccessRate25),
+		"failure_rate":                roundPolicyRate(snapshot.FailureRate),
+		"hard_failure_rate":           roundPolicyRate(snapshot.HardFailureRate),
+	}
+	logEntryWithRequestID(ctx).WithFields(transitionFields).Warn("gpt_first_event_policy_transition")
+}
+
+func (m *Manager) persistGPTFirstEventPolicyUpdate(ctx context.Context, snapshot GPTFirstEventPolicySnapshot) {
+	if m == nil || (!snapshot.Transitioned && !snapshot.stateCheckpointed) {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	// Policy updates are infrequent, but persistence must not add disk or custom
+	// store latency to the customer request. The bounded background write still
+	// survives request cancellation while preventing an unbounded store call.
+	go func() {
+		persistCtx, cancel := context.WithTimeout(ctx, gptFirstEventPolicyPersistTimeout)
+		defer cancel()
+		m.persistGPTFirstEventPolicyStates(persistCtx)
+	}()
 }
 
 func classifyGPTFirstEventObservation(deliverable, timedOut bool, err error) (eligible bool, outcome string, upstream5xx, network bool) {

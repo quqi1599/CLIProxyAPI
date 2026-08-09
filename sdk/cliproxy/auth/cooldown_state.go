@@ -35,12 +35,31 @@ type CooldownStateStore interface {
 	Save(context.Context, []CooldownStateRecord) error
 }
 
+// GPTFirstEventPolicyStateStore is an optional extension implemented by
+// cooldown stores that can persist exact-model first-event policy state.
+// Custom CooldownStateStore implementations do not need to implement it.
+type GPTFirstEventPolicyStateStore interface {
+	LoadGPTFirstEventPolicyStates(context.Context) ([]GPTFirstEventPolicyStateRecord, error)
+	SaveGPTFirstEventPolicyStates(context.Context, []GPTFirstEventPolicyStateRecord) error
+}
+
 type cooldownStateFile struct {
 	Version   int                   `json:"version"`
 	AuthID    string                `json:"auth_id,omitempty"`
 	Provider  string                `json:"provider,omitempty"`
 	UpdatedAt time.Time             `json:"updated_at"`
 	Records   []CooldownStateRecord `json:"records"`
+}
+
+const (
+	gptFirstEventPolicyStateDirName  = ".runtime"
+	gptFirstEventPolicyStateFileName = "gpt-first-event-policy.json"
+)
+
+type gptFirstEventPolicyStateFile struct {
+	Version   int                              `json:"version"`
+	UpdatedAt time.Time                        `json:"updated_at"`
+	Records   []GPTFirstEventPolicyStateRecord `json:"records"`
 }
 
 // FileCooldownStateStore stores cooldown state as one .cds file per auth.
@@ -104,6 +123,44 @@ func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateRecor
 		return nil, fmt.Errorf("read cooldown state directory: %w", errWalk)
 	}
 	return records, nil
+}
+
+// LoadGPTFirstEventPolicyStates reads the independent exact-model policy state
+// document. The runtime subdirectory prevents credential scanners from
+// treating this JSON document as an auth file.
+func (s *FileCooldownStateStore) LoadGPTFirstEventPolicyStates(ctx context.Context) ([]GPTFirstEventPolicyStateRecord, error) {
+	if s == nil || s.dir == "" {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return nil, errCtx
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.gptFirstEventPolicyStatePath()
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		if errors.Is(errRead, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read GPT first-event policy state %s: %w", path, errRead)
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return nil, errCtx
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, nil
+	}
+	var envelope gptFirstEventPolicyStateFile
+	if errUnmarshal := json.Unmarshal(data, &envelope); errUnmarshal != nil {
+		return nil, fmt.Errorf("parse GPT first-event policy state %s: %w", path, errUnmarshal)
+	}
+	return envelope.Records, nil
 }
 
 func readCooldownStateFile(ctx context.Context, path string) ([]CooldownStateRecord, error) {
@@ -170,6 +227,81 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 		desired[filepath.Clean(path)] = struct{}{}
 	}
 	return s.removeStaleStateFiles(ctx, desired)
+}
+
+// SaveGPTFirstEventPolicyStates atomically writes an independent JSON state
+// document without modifying per-auth .cds files.
+func (s *FileCooldownStateStore) SaveGPTFirstEventPolicyStates(ctx context.Context, records []GPTFirstEventPolicyStateRecord) error {
+	if s == nil || s.dir == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.gptFirstEventPolicyStatePath()
+	if len(records) == 0 {
+		if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			return fmt.Errorf("remove GPT first-event policy state %s: %w", path, errRemove)
+		}
+		return nil
+	}
+
+	records = append([]GPTFirstEventPolicyStateRecord(nil), records...)
+	sort.Slice(records, func(i, j int) bool { return records[i].Model < records[j].Model })
+	envelope := gptFirstEventPolicyStateFile{
+		Version:   1,
+		UpdatedAt: time.Now().UTC(),
+		Records:   records,
+	}
+	data, errMarshal := json.MarshalIndent(envelope, "", "  ")
+	if errMarshal != nil {
+		return fmt.Errorf("marshal GPT first-event policy state: %w", errMarshal)
+	}
+	data = append(data, '\n')
+	return writeGPTFirstEventPolicyStateFile(ctx, path, data)
+}
+
+func writeGPTFirstEventPolicyStateFile(ctx context.Context, path string, data []byte) error {
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+	dir := filepath.Dir(path)
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		return fmt.Errorf("create GPT first-event policy state directory: %w", errMkdir)
+	}
+	tmpFile, errCreate := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if errCreate != nil {
+		return fmt.Errorf("create GPT first-event policy state temp file: %w", errCreate)
+	}
+	tmp := tmpFile.Name()
+	if _, errWrite := tmpFile.Write(data); errWrite != nil {
+		if errClose := tmpFile.Close(); errClose != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("write GPT first-event policy state temp file: %w; close temp file: %v", errWrite, errClose)
+		}
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write GPT first-event policy state temp file: %w", errWrite)
+	}
+	if errClose := tmpFile.Close(); errClose != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close GPT first-event policy state temp file: %w", errClose)
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		_ = os.Remove(tmp)
+		return errCtx
+	}
+	if errRename := os.Rename(tmp, path); errRename != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace GPT first-event policy state file: %w", errRename)
+	}
+	return nil
 }
 
 func writeCooldownStateGroup(ctx context.Context, path string, records []CooldownStateRecord) error {
@@ -266,6 +398,10 @@ func (s *FileCooldownStateStore) statePath(record CooldownStateRecord) (string, 
 		return "", fmt.Errorf("cooldown state path: missing auth identity")
 	}
 	return filepath.Join(s.dir, rel), nil
+}
+
+func (s *FileCooldownStateStore) gptFirstEventPolicyStatePath() string {
+	return filepath.Join(s.dir, gptFirstEventPolicyStateDirName, gptFirstEventPolicyStateFileName)
 }
 
 func (s *FileCooldownStateStore) stateRelativePath(record CooldownStateRecord) string {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -129,6 +130,189 @@ func TestManagerGPTChannelBreakerTypedCredential429DoesNotOpenChannel(t *testing
 	}
 }
 
+func TestManagerGPTFirstEventTimeoutDoesNotCoolCodexAPIKeyRoute(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := gptChannelBreakerTestAuth("local-first-event-timeout", "https://slow.example/v1")
+	manager.auths[auth.ID] = auth
+	model := "gpt-5.6-sol"
+	timeoutErr := &Error{
+		Code:       "gpt_first_event_timeout",
+		Message:    "local first-event deadline exceeded",
+		Retryable:  true,
+		HTTPStatus: http.StatusGatewayTimeout,
+	}
+
+	for i := 0; i < codexChannelBreakerSampleLimit*2; i++ {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:   auth.ID,
+			Provider: "codex",
+			Model:    model,
+			Success:  false,
+			Error:    resultErrorFromCause(timeoutErr),
+			Cause:    timeoutErr,
+		})
+	}
+
+	manager.mu.RLock()
+	breaker := manager.gptChannelBreakers[gptChannelBreakerKey(auth, model)]
+	state := manager.auths[auth.ID].ModelStates[model]
+	manager.mu.RUnlock()
+	if breaker != nil && (breaker.Health.Observed || breaker.recentCount > 0 || breaker.Health.BreakerState == HealthBreakerOpen) {
+		t.Fatalf("local timeout affected GPT route breaker: %+v", breaker)
+	}
+	if state != nil && (state.Health.Observed || state.Health.BreakerState == HealthBreakerOpen || state.Unavailable || !state.NextRetryAfter.IsZero()) {
+		t.Fatalf("local timeout cooled Codex API-key route: %+v", state)
+	}
+}
+
+func TestManagerLegacyGPT500BecomesProviderHealthEvidence(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := gptChannelBreakerTestAuth("opaque-500", "https://opaque.example/v1")
+	manager.auths[auth.ID] = auth
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(true)
+	cause := &Error{HTTPStatus: http.StatusInternalServerError, Message: "opaque failure"}
+
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.6-sol",
+		Error:    cause,
+		Cause:    cause,
+	})
+
+	breaker := manager.gptChannelBreakers[gptChannelBreakerKey(auth, "gpt-5.6-sol")]
+	if breaker == nil || breaker.recentCount != 1 || breaker.Health.BreakerState == HealthBreakerOpen {
+		t.Fatalf("provider 500 breaker = %+v, want one recorded failure without opening", breaker)
+	}
+	state := auth.ModelStates["gpt-5.6-sol"]
+	if state == nil || !state.Health.Observed || state.Unavailable || state.Health.BreakerState == HealthBreakerOpen {
+		t.Fatalf("provider 500 model state = %+v, want observed soft health without cooldown", state)
+	}
+}
+
+func TestManagerMarkResultClearsActiveHalfOpenBeforeReleasingWaiters(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := gptChannelBreakerTestAuth("half-open-owner", "https://half-open.example/v1")
+	manager.auths[auth.ID] = auth
+
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.requestID = "req-half-open-owner"
+	trace.configureGPTRoute(true)
+	now := time.Now()
+	if ok, _ := manager.reserveHalfOpenProbe(auth.ID, model, now); !ok {
+		t.Fatal("reserveHalfOpenProbe() = false, want owner")
+	}
+	if ok, _ := manager.reserveZeroEligibleProbe(ctx, model, now); !ok {
+		t.Fatal("reserveZeroEligibleProbe() = false, want owner")
+	}
+
+	failure := &failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusBadGateway,
+		SemanticCode:  "upstream_unavailable",
+		Retryable:     true,
+		PublicMessage: "upstream unavailable",
+	}
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    model,
+		Error:    resultErrorFromCause(failure),
+		Cause:    failure,
+	})
+
+	if manager.halfOpenProbeActive(auth.ID, model, time.Now()) {
+		t.Fatal("completed probe remained active and could bypass cooldown for waiters")
+	}
+	key := halfOpenProbeKey(auth.ID, model)
+	manager.halfOpenProbeMu.Lock()
+	next := manager.halfOpenProbeNext[key]
+	manager.halfOpenProbeMu.Unlock()
+	if next.IsZero() || !next.After(now) {
+		t.Fatalf("next probe interval = %v, want preserved future gate", next)
+	}
+
+	zeroKey := zeroEligibleProbeKey(model)
+	manager.zeroEligibleProbeMu.Lock()
+	lease := manager.zeroEligibleProbes[zeroKey]
+	manager.zeroEligibleProbeMu.Unlock()
+	if lease.done != nil || lease.requestID != "" {
+		t.Fatalf("zero-route lease = %+v, want released after active bypass cleared", lease)
+	}
+}
+
+func TestManagerCanceledProbeOwnerClearsActiveHalfOpenBeforeWake(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := gptChannelBreakerTestAuth("canceled-half-open-owner", "https://canceled-half-open.example/v1")
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.requestID = "req-canceled-half-open-owner"
+	trace.configureGPTRoute(true)
+
+	now := time.Now()
+	if ok, _ := manager.reserveHalfOpenProbe(auth.ID, model, now); !ok {
+		t.Fatal("reserveHalfOpenProbe() = false, want owner")
+	}
+	if ok, _ := manager.reserveZeroEligibleProbe(ctx, model, now); !ok {
+		t.Fatal("reserveZeroEligibleProbe() = false, want owner")
+	}
+	manager.bindZeroEligibleProbeRoute(ctx, model, auth.ID, model)
+	key := zeroEligibleProbeKey(model)
+	manager.zeroEligibleProbeMu.Lock()
+	done := manager.zeroEligibleProbes[key].done
+	manager.zeroEligibleProbeMu.Unlock()
+	if done == nil {
+		t.Fatal("zero-route owner has no completion channel")
+	}
+
+	// This is the common cleanup path when the owner returns on caller cancel
+	// before producing a Result/MarkResult call.
+	manager.releaseZeroEligibleProbe(ctx, model)
+	if manager.halfOpenProbeActive(auth.ID, model, time.Now()) {
+		t.Fatal("canceled owner left half-open bypass active")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("waiters were not released after the active bypass was cleared")
+	}
+	probeKey := halfOpenProbeKey(auth.ID, model)
+	manager.halfOpenProbeMu.Lock()
+	next := manager.halfOpenProbeNext[probeKey]
+	manager.halfOpenProbeMu.Unlock()
+	if next.IsZero() || !next.After(now) {
+		t.Fatalf("next probe interval = %v, want preserved future gate", next)
+	}
+}
+
+func TestManagerStatuslessGPTInternalFailureDoesNotPolluteRouteHealth(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := gptChannelBreakerTestAuth("statusless-internal", "https://internal.example/v1")
+	manager.auths[auth.ID] = auth
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(true)
+	cause := errors.New("opaque executor failure")
+
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.6-sol",
+		Error:    resultErrorFromCause(cause),
+		Cause:    cause,
+	})
+
+	if len(manager.gptChannelBreakers) != 0 {
+		t.Fatalf("statusless internal failure created GPT breaker state: %+v", manager.gptChannelBreakers)
+	}
+	state := auth.ModelStates["gpt-5.6-sol"]
+	if state != nil && (state.Unavailable || state.Health.Observed) {
+		t.Fatalf("statusless internal failure polluted model health: %+v", state)
+	}
+}
+
 func TestManagerGPTChannelBreakerIsolatedByModel(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	auth := gptChannelBreakerTestAuth("model-isolation", "https://model-isolation.example/v1")
@@ -182,6 +366,119 @@ func TestManagerZeroEligibleGPTProbeIsSingleFlightPerModel(t *testing.T) {
 	if second == nil || second.auth == nil {
 		t.Fatal("new probe was not allowed after the single-flight interval")
 	}
+}
+
+func TestManagerZeroEligibleGPTProbeIsolatedByCandidateRoutes(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.6-sol"
+	now := time.Now()
+	ctxA, _ := ensureRequestAttemptTrace(context.Background())
+	ctxB, _ := ensureRequestAttemptTrace(context.Background())
+	routeA := gptChannelBreakerTestAuth("route-a", "https://route-a.example/v1")
+	routeB := gptChannelBreakerTestAuth("route-b", "https://route-b.example/v1")
+
+	keyA := zeroEligibleProbeScopeKey(model, []*Auth{routeA})
+	keyB := zeroEligibleProbeScopeKey(model, []*Auth{routeB})
+	if keyA == keyB {
+		t.Fatalf("independent candidate sets produced the same probe key %q", keyA)
+	}
+	manager.configureZeroEligibleProbeScope(ctxA, keyA)
+	manager.configureZeroEligibleProbeScope(ctxB, keyB)
+	if ok, _ := manager.reserveZeroEligibleProbe(ctxA, model, now); !ok {
+		t.Fatal("route A did not acquire its probe")
+	}
+	if ok, _ := manager.reserveZeroEligibleProbe(ctxB, model, now); !ok {
+		t.Fatal("route B was incorrectly blocked by route A's probe")
+	}
+
+	manager.releaseZeroEligibleProbe(ctxA, model)
+	manager.releaseZeroEligibleProbe(ctxB, model)
+}
+
+func TestManagerZeroEligibleGPTProbeWaitersAreBoundedAndReleased(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.6-sol"
+	ownerCtx, _ := ensureRequestAttemptTrace(context.Background())
+	waiterCtx, _ := ensureRequestAttemptTrace(context.Background())
+
+	if ok, _ := manager.reserveZeroEligibleProbe(ownerCtx, model, time.Now()); !ok {
+		t.Fatal("probe owner did not acquire the zero-eligible lease")
+	}
+
+	type waitResult struct {
+		state zeroEligibleProbeWaitState
+		err   error
+	}
+	resultCh := make(chan waitResult, 1)
+	go func() {
+		state, errWait := manager.waitForZeroEligibleProbe(waiterCtx, model, time.Second)
+		resultCh <- waitResult{state: state, err: errWait}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	manager.releaseZeroEligibleProbe(ownerCtx, model)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil || result.state != zeroEligibleProbeWaitCompleted {
+			t.Fatalf("wait result = %+v, want a completed bounded wait", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter was not released when the single probe completed")
+	}
+
+	startedAt := time.Now()
+	waitState, errWait := manager.waitForZeroEligibleProbe(waiterCtx, model, 50*time.Millisecond)
+	if errWait != nil || waitState != zeroEligibleProbeWaitNone {
+		t.Fatalf("wait without an active probe = (%v, %v), want no wait", waitState, errWait)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 200*time.Millisecond {
+		t.Fatalf("inactive probe wait took %v, want immediate return", elapsed)
+	}
+
+	if ok, _ := manager.reserveZeroEligibleProbe(ownerCtx, model, time.Now().Add(healthHalfOpenInterval)); !ok {
+		t.Fatal("probe owner did not reacquire the lease for waiter-cap validation")
+	}
+	key := zeroEligibleProbeKey(model)
+	manager.zeroEligibleProbeMu.Lock()
+	lease := manager.zeroEligibleProbes[key]
+	lease.waiters = gptZeroEligibleProbeMaxWaiters
+	manager.zeroEligibleProbes[key] = lease
+	manager.zeroEligibleProbeMu.Unlock()
+	startedAt = time.Now()
+	waitState, errWait = manager.waitForZeroEligibleProbe(waiterCtx, model, 50*time.Millisecond)
+	if errWait != nil || waitState != zeroEligibleProbeWaitRejected {
+		t.Fatalf("capped waiter = (%v, %v), want immediate rejection", waitState, errWait)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 200*time.Millisecond {
+		t.Fatalf("capped waiter took %v, want immediate return", elapsed)
+	}
+	manager.releaseZeroEligibleProbe(ownerCtx, model)
+}
+
+func TestManagerZeroEligibleGPTProbeWaitCancellationReleasesCapacity(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "gpt-5.6-sol"
+	ownerCtx, _ := ensureRequestAttemptTrace(context.Background())
+	waiterBase, _ := ensureRequestAttemptTrace(context.Background())
+	if ok, _ := manager.reserveZeroEligibleProbe(ownerCtx, model, time.Now()); !ok {
+		t.Fatal("probe owner did not acquire the zero-eligible lease")
+	}
+	waiterCtx, cancel := context.WithTimeout(waiterBase, 20*time.Millisecond)
+	defer cancel()
+	waitState, errWait := manager.waitForZeroEligibleProbe(waiterCtx, model, time.Second)
+	if waitState != zeroEligibleProbeWaitTimedOut || !errors.Is(errWait, context.DeadlineExceeded) {
+		t.Fatalf("cancelled wait = (%v, %v), want timed-out caller deadline", waitState, errWait)
+	}
+
+	key := zeroEligibleProbeKey(model)
+	manager.zeroEligibleProbeMu.Lock()
+	waiters := manager.zeroEligibleProbes[key].waiters
+	manager.zeroEligibleProbeMu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("waiters after cancellation = %d, want 0", waiters)
+	}
+	manager.releaseZeroEligibleProbe(ownerCtx, model)
 }
 
 func TestManagerAuthAvailabilityMetricFieldsReportBreakerRecovery(t *testing.T) {

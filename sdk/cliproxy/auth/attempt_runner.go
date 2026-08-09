@@ -34,7 +34,9 @@ type managerAttemptRunner[T any] struct {
 
 func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration) managerAttemptOutcome[T] {
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	probeWaitUsed := false
+attempts:
+	for attempt := 0; ; {
 		trace := requestAttemptTraceFromContext(ctx)
 		if trace != nil {
 			trace.beginGPTRound(attempt + 1)
@@ -45,6 +47,26 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 			return managerAttemptOutcome[T]{result: result, success: true}
 		}
 		lastErr = errRun
+		if trace != nil && isGPTZeroEligibleSelectionError(errRun) {
+			if gptRoute, configured := trace.gptRouteValue(); configured && gptRoute {
+				if probeWaitUsed {
+					break attempts
+				}
+				waitState, errWait := runner.manager.waitForZeroEligibleProbe(ctx, req.Model, zeroEligibleProbeWaitForTrace(trace))
+				if errWait != nil {
+					return managerAttemptOutcome[T]{returnErr: errWait, finalErr: errWait}
+				}
+				switch waitState {
+				case zeroEligibleProbeWaitCompleted:
+					// Waiting for another request's probe does not consume a GPT
+					// upstream round. Re-select once with the same round budget.
+					probeWaitUsed = true
+					continue
+				case zeroEligibleProbeWaitTimedOut, zeroEligibleProbeWaitRejected:
+					break attempts
+				}
+			}
+		}
 		wait, shouldRetry := runner.manager.shouldRetryAfterError(errRun, attempt, providers, req.Model, maxWait)
 		if trace != nil {
 			if gptRoute, configured := trace.gptRouteValue(); configured && gptRoute {
@@ -69,6 +91,7 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return managerAttemptOutcome[T]{returnErr: errWait, finalErr: errWait}
 		}
+		attempt++
 	}
 
 	if lastErr == nil {
@@ -91,6 +114,42 @@ func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []strin
 		}
 	}
 	return managerAttemptOutcome[T]{returnErr: lastErr, finalErr: lastErr}
+}
+
+func zeroEligibleProbeWaitForTrace(trace *requestAttemptTrace) time.Duration {
+	wait := gptZeroEligibleProbeMinWait
+	if trace != nil {
+		if policy, configured := trace.gptFirstEventPolicyValue(); configured && policy.EnforcedTimeoutMs > 0 {
+			policyWait := time.Duration(policy.EnforcedTimeoutMs)*time.Millisecond + gptZeroEligibleProbeWaitGrace
+			if policyWait > wait {
+				wait = policyWait
+			}
+		}
+	}
+	if wait > gptZeroEligibleProbeMaxWait {
+		return gptZeroEligibleProbeMaxWait
+	}
+	return wait
+}
+
+func isGPTZeroEligibleSelectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) && cooldownErr != nil {
+		return true
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return false
+	}
+	switch authErr.Code {
+	case "auth_not_found", "auth_unavailable":
+		return true
+	default:
+		return false
+	}
 }
 
 func preserveCanonicalGPTRoundRetryAfter(err error, wait time.Duration, shouldRetry bool, maxWait time.Duration) (time.Duration, bool) {
@@ -120,6 +179,7 @@ func recordManagerAttemptSuccess(ctx context.Context) {
 func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, runner managerAttemptRunner[T]) (T, error) {
 	ctx = manager.translatorContext(ctx)
 	ctx, trace := ensureRequestAttemptTrace(ctx)
+	defer manager.releaseZeroEligibleProbe(ctx, req.Model)
 	outcome := managerAttemptOutcome[T]{}
 	defer func() {
 		coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
@@ -159,7 +219,101 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 		trace.configureBudget(requestRetry+1, maxRetryCredentials)
 	}
 	outcome = runner.run(ctx, providers, req, opts, maxRetryCredentials, maxWait)
+	outcome.returnErr = normalizeTerminalManagerError(ctx, outcome.returnErr)
+	outcome.finalErr = normalizeTerminalManagerError(ctx, outcome.finalErr)
 	return outcome.result, outcome.returnErr
+}
+
+func normalizeTerminalManagerError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return newCallerRequestFailure(ctx.Err())
+	}
+	if _, ok := failurecontract.As(err); ok {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		status := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		return &failurecontract.Failure{
+			Kind:          failurecontract.TransportError,
+			Scope:         failurecontract.ScopeProvider,
+			HTTPStatus:    status,
+			OuterStatus:   status,
+			ProviderCode:  "upstream_transport_error",
+			SemanticCode:  "upstream_transport_error",
+			SemanticType:  "server_error",
+			StreamPhase:   failurecontract.StreamPhaseUnknown,
+			Retryable:     true,
+			Cause:         err,
+			PublicMessage: "upstream transport failed",
+		}
+	}
+	status := statusCodeFromError(err)
+	if status > 0 && !(status == http.StatusInternalServerError && errorCodeFromError(err) == "") {
+		return err
+	}
+	classified := failurecontract.Classify(err)
+	if classified == nil {
+		classified = &failurecontract.Failure{}
+	}
+	provider500 := status == http.StatusInternalServerError && errorCodeFromError(err) == ""
+	if provider500 {
+		classified.Kind = failurecontract.ProviderUnavailable
+		classified.Scope = failurecontract.ScopeProvider
+		classified.ProviderCode = "upstream_http_500"
+		classified.SemanticCode = "upstream_http_500"
+		classified.SemanticType = "server_error"
+		classified.Retryable = true
+	} else {
+		if classified.Kind == "" {
+			classified.Kind = failurecontract.InternalTransformError
+		}
+		if classified.Scope == "" {
+			classified.Scope = failurecontract.ScopeRequest
+		}
+		classified.Retryable = false
+	}
+	classified.HTTPStatus = http.StatusInternalServerError
+	if classified.OuterStatus <= 0 {
+		classified.OuterStatus = http.StatusInternalServerError
+	}
+	if classified.SemanticCode == "" {
+		classified.SemanticCode = "internal_execution_error"
+	}
+	if classified.ProviderCode == "" {
+		classified.ProviderCode = classified.SemanticCode
+	}
+	classified.Cause = err
+	if provider500 {
+		classified.PublicMessage = "upstream request failed"
+	} else {
+		classified.PublicMessage = "internal execution error"
+	}
+	return classified
+}
+
+func newCallerRequestFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &failurecontract.Failure{
+		Kind:          failurecontract.Cancelled,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    499,
+		OuterStatus:   499,
+		ProviderCode:  "request_canceled",
+		SemanticCode:  "request_canceled",
+		SemanticType:  "canceled",
+		StreamPhase:   failurecontract.StreamPhaseUnknown,
+		Retryable:     false,
+		Cause:         err,
+		PublicMessage: "request canceled by client",
+	}
 }
 
 func (m *Manager) runExecuteAttempts(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

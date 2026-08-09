@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,7 @@ func TestLogFormatterIncludesGPTFirstEventPolicyFields(t *testing.T) {
 	entry.Data["eligible_first_attempts"] = 120
 	entry.Data["first_event_success_rate_25"] = 0.88
 	entry.Data["failure_rate"] = 0.06
+	entry.Data["hard_failure_rate"] = 0.02
 	entry.Data["first_event_wait_ms"] = 4200
 	entry.Data["first_event_timeout_count"] = 1
 	entry.Data["first_event_policy_state"] = "slow_30s"
@@ -124,10 +126,66 @@ func TestLogFormatterIncludesGPTFirstEventPolicyFields(t *testing.T) {
 		"eligible_first_attempts=120",
 		"first_event_success_rate_25=0.88",
 		"failure_rate=0.06",
+		"hard_failure_rate=0.02",
 		"first_event_wait_ms=4200",
 		"first_event_timeout_count=1",
 		"first_event_policy_state=slow_30s",
 		"first_event_wait_budget_ms=300000",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %q", line, want)
+		}
+	}
+}
+
+func TestLogFormatterIncludesRoutingAvailabilityAndCanonicalFailureFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 10, 3, 30, 0, 0, time.Local)
+	entry.Level = log.WarnLevel
+	entry.Message = "auth selection failed"
+	entry.Data["event"] = "auth_selection_failed"
+	entry.Data["candidate_route_count"] = 7
+	entry.Data["eligible_route_count"] = 0
+	entry.Data["blocked_route_count"] = 7
+	entry.Data["breaker_open_count"] = 6
+	entry.Data["blocked_reasons"] = "model_cooldown:1,route_breaker:6"
+	entry.Data["breaker_statuses"] = "502,504"
+	entry.Data["breaker_reasons"] = "gpt_first_event_timeout:6"
+	entry.Data["earliest_recovery_ms"] = int64(8750)
+	entry.Data["normalized_status"] = http.StatusGatewayTimeout
+	entry.Data["outer_status"] = http.StatusOK
+	entry.Data["failure_kind"] = "transport_error"
+	entry.Data["failure_scope"] = "provider"
+	entry.Data["scope"] = "provider"
+	entry.Data["semantic_type"] = "server_error"
+	entry.Data["semantic_code"] = "upstream_timeout"
+	entry.Data["stream_phase"] = "before_output"
+	entry.Data["output_committed"] = false
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"candidate_route_count=7",
+		"eligible_route_count=0",
+		"blocked_route_count=7",
+		"breaker_open_count=6",
+		"blocked_reasons=model_cooldown:1,route_breaker:6",
+		"breaker_statuses=502,504",
+		"breaker_reasons=gpt_first_event_timeout:6",
+		"earliest_recovery_ms=8750",
+		"normalized_status=504",
+		"outer_status=200",
+		"failure_kind=transport_error",
+		"failure_scope=provider",
+		"scope=provider",
+		"semantic_type=server_error",
+		"semantic_code=upstream_timeout",
+		"stream_phase=before_output",
+		"output_committed=false",
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("formatted line %q missing %q", line, want)

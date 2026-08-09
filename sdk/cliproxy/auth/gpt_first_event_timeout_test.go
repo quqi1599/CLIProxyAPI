@@ -2,11 +2,13 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -153,7 +155,11 @@ func TestFirstEventTimeoutDisabledForNonGPTModels(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	_, err := manager.ExecuteStream(ctx, []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if err == nil || err != context.DeadlineExceeded {
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want caller deadline", err)
+	}
+	failure, ok := failurecontract.As(err)
+	if !ok || failure == nil || failure.Scope != failurecontract.ScopeRequest || failure.HTTPStatus != 499 || failure.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped 499", failure)
 	}
 }

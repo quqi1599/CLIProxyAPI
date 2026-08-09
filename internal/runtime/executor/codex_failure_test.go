@@ -147,6 +147,102 @@ func TestCodexTransportFailurePreservesCancellation(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPDoFailureNormalizesTransportAndTimeout(t *testing.T) {
+	t.Run("provider transport", func(t *testing.T) {
+		cause := errors.New("proxy dial failed")
+		err := newCodexHTTPDoStatusErr(context.Background(), cause, false)
+		failure, ok := failurecontract.As(err)
+		if !ok {
+			t.Fatal("expected canonical transport failure")
+		}
+		if failure.Kind != failurecontract.TransportError || failure.Scope != failurecontract.ScopeProvider ||
+			failure.HTTPStatus != http.StatusBadGateway || failure.OuterStatus != http.StatusBadGateway || !failure.Retryable ||
+			failure.StreamPhase != failurecontract.StreamPhaseBeforeOutput || failure.OutputCommitted || !errors.Is(err, cause) {
+			t.Fatalf("transport failure = %+v", failure)
+		}
+	})
+
+	t.Run("provider timeout", func(t *testing.T) {
+		cause := context.DeadlineExceeded
+		err := newCodexHTTPDoStatusErr(context.Background(), cause, false)
+		failure, ok := failurecontract.As(err)
+		if !ok {
+			t.Fatal("expected canonical timeout failure")
+		}
+		if failure.HTTPStatus != http.StatusGatewayTimeout || failure.OuterStatus != http.StatusGatewayTimeout ||
+			failure.SemanticCode != "upstream_timeout" || !failure.Retryable || !errors.Is(err, cause) {
+			t.Fatalf("timeout failure = %+v", failure)
+		}
+	})
+
+	t.Run("live request upstream canceled", func(t *testing.T) {
+		cause := context.Canceled
+		err := newCodexHTTPDoStatusErr(context.Background(), cause, false)
+		failure, ok := failurecontract.As(err)
+		if !ok {
+			t.Fatal("expected canonical transport failure")
+		}
+		if failure.HTTPStatus != http.StatusBadGateway || failure.Kind != failurecontract.TransportError ||
+			failure.Scope != failurecontract.ScopeProvider || !failure.Retryable || !errors.Is(err, cause) {
+			t.Fatalf("live-context canceled failure = %+v", failure)
+		}
+	})
+}
+
+func TestCodexHTTPDoFailurePreservesEstablishedCanonicalFailure(t *testing.T) {
+	cause := &failurecontract.Failure{
+		Kind:          failurecontract.InvalidRequest,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    http.StatusBadRequest,
+		SemanticCode:  "invalid_request_error",
+		Retryable:     false,
+		PublicMessage: "invalid request",
+	}
+	if got := newCodexHTTPDoStatusErr(context.Background(), cause, false); got != cause {
+		t.Fatalf("established canonical failure was replaced: got %T %v", got, got)
+	}
+}
+
+func TestCodexHTTPDoFailurePreservesCallerDeadlineScope(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	err := newCodexHTTPDoStatusErr(ctx, context.DeadlineExceeded, false)
+	failure, ok := failurecontract.As(err)
+	if !ok || failure == nil {
+		t.Fatalf("error = %T, want canonical caller cancellation", err)
+	}
+	if failure.Kind != failurecontract.Cancelled || failure.Scope != failurecontract.ScopeRequest ||
+		failure.HTTPStatus != 499 || failure.Retryable {
+		t.Fatalf("caller deadline failure = %+v", failure)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("caller deadline cause was not preserved")
+	}
+}
+
+func TestCodexHTTPDoFailureCallerCancellationOverridesTypedProviderFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	provider := &failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		Retryable:     true,
+		PublicMessage: "provider unavailable",
+	}
+	err := newCodexHTTPDoStatusErr(ctx, provider, false)
+	failure, ok := failurecontract.As(err)
+	if !ok || failure == nil {
+		t.Fatalf("error = %T, want canonical caller cancellation", err)
+	}
+	if failure.HTTPStatus != 499 || failure.Kind != failurecontract.Cancelled || failure.Scope != failurecontract.ScopeRequest || failure.Retryable {
+		t.Fatalf("caller cancellation = %+v", failure)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal("caller cancellation cause was not preserved")
+	}
+}
+
 func TestCanonicalCodexFailurePreservesProviderCodeAndQuotaSemantics(t *testing.T) {
 	provider, _ := canonicalCodexFailure(codexFailureInput{
 		outerStatus: http.StatusServiceUnavailable,
