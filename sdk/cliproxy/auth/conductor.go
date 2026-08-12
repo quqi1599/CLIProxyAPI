@@ -4122,6 +4122,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				chunk.Err = normalizeOpaqueUpstream500Failure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
 				if isGPTRetryRoute([]string{meta.provider}, meta.requestedModel) {
 					chunk.Err = normalizeOpaqueGPTAttemptFailure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
 				}
@@ -4291,8 +4292,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				Retryable: true,
 			}
 		}
-		if errStream != nil && isGPTRetryRoute(routeProviders, routeModel) {
-			errStream = normalizeOpaqueGPTAttemptFailure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
+		if errStream != nil {
+			errStream = normalizeOpaqueUpstream500Failure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
+			if isGPTRetryRoute(routeProviders, routeModel) {
+				errStream = normalizeOpaqueGPTAttemptFailure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
+			}
 		}
 		if errStream != nil {
 			cleanupAttempt()
@@ -4419,8 +4423,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				firstPayloadDelay = time.Since(startedAt)
 			}
 		}
-		if bootstrapErr != nil && isGPTRetryRoute(routeProviders, routeModel) {
-			bootstrapErr = normalizeOpaqueGPTAttemptFailure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
+		if bootstrapErr != nil {
+			bootstrapErr = normalizeOpaqueUpstream500Failure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
+			if isGPTRetryRoute(routeProviders, routeModel) {
+				bootstrapErr = normalizeOpaqueGPTAttemptFailure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
+			}
 		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -5242,8 +5249,11 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					}
 				}
 			}
-			if errExec != nil && isGPTRetryRoute(providers, routeModel) {
-				errExec = normalizeOpaqueGPTAttemptFailure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
+			if errExec != nil {
+				errExec = normalizeOpaqueUpstream500Failure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
+				if isGPTRetryRoute(providers, routeModel) {
+					errExec = normalizeOpaqueGPTAttemptFailure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
+				}
 			}
 			elapsed := time.Since(startedAt)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
@@ -8309,6 +8319,35 @@ func normalizeOpaqueGPTResultFailure(result Result) Result {
 	result.Error = resultErrorFromCause(failure)
 	result.RetryAfter = nil
 	return result
+}
+
+func normalizeOpaqueUpstream500Failure(err error, phase failurecontract.StreamPhase, outputCommitted bool) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := failurecontract.As(err); ok {
+		return err
+	}
+	if isTransientRoutingError(err) || isRetryableEmptyUpstreamResponseError(err) {
+		return err
+	}
+	if statusCodeFromError(err) != http.StatusInternalServerError || errorCodeFromError(err) != "" {
+		return err
+	}
+	return &failurecontract.Failure{
+		Kind:            failurecontract.ProviderUnavailable,
+		Scope:           failurecontract.ScopeProvider,
+		HTTPStatus:      http.StatusInternalServerError,
+		OuterStatus:     http.StatusInternalServerError,
+		ProviderCode:    "upstream_http_500",
+		SemanticCode:    "upstream_http_500",
+		SemanticType:    "server_error",
+		StreamPhase:     phase,
+		OutputCommitted: outputCommitted,
+		Retryable:       !outputCommitted,
+		Cause:           err,
+		PublicMessage:   "upstream request failed",
+	}
 }
 
 func normalizeOpaqueGPTAttemptFailure(err error, phase failurecontract.StreamPhase, outputCommitted bool) error {
