@@ -34,13 +34,17 @@ var logFieldOrder = []string{
 	"event", "client_request_id", "provider", "model", "requested_model", "upstream_model",
 	"auth_index", "routing_strategy", "routing_scope", "routing_group", "prefix", "base_url", "token_hash",
 	"status", "status_code", "success", "error_code", "retryable", "retry_after_ms", "reset_ms", "providers",
+	"normalized_status", "outer_status", "failure_kind", "failure_scope", "scope", "semantic_type", "semantic_code",
+	"stream_phase", "output_committed",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "version", "error",
 	"request_path", "attempt_no", "round_no", "retry_reason", "tool_type", "tool_source", "policy", "reason",
+	"candidate_route_count", "eligible_route_count", "blocked_route_count", "breaker_open_count",
+	"blocked_reasons", "breaker_statuses", "breaker_reasons", "earliest_recovery_ms",
 	"outcome", "eligible", "delay_ms", "enforced_timeout_ms", "policy_state", "decision_source", "decision_reason",
 	"previous_state", "window_seconds", "eligible_first_attempts",
 	"deliverable_within_25", "deliverable_within_30", "deliverable_within_40", "deliverable_within_50",
 	"first_event_success_rate_25", "first_event_success_rate_30", "first_event_success_rate_40", "first_event_success_rate_50",
-	"failure_rate", "timeout_count", "upstream_5xx_count", "network_failure_count", "used_global_fallback",
+	"failure_rate", "hard_failure_rate", "timeout_count", "upstream_5xx_count", "network_failure_count", "used_global_fallback",
 	"max_channels", "max_rounds", "wait_budget_ms",
 	"executor", "channel", "compat_name", "compat_kind", "compat_kind_source", "compat_mapping", "upstream_request_id",
 	"payload_fields", "message_roles", "message_role_sequence", "message_content_kinds", "content_part_types",
@@ -69,7 +73,7 @@ var logFieldOrder = []string{
 	"downstream_flush_ms", "downstream_flush_calls", "chunks_count", "bytes_out",
 	"stream_output_tokens", "stream_output_tokens_observed", "output_tokens", "tokens_per_second",
 	"client_gone", "cancel_origin", "finish_reason",
-	"normalized_status", "error_type", "upstream_status", "upstream_error_code", "route_plan",
+	"error_type", "upstream_status", "upstream_error_code", "route_plan",
 }
 
 // Format renders a single log entry with custom formatting.

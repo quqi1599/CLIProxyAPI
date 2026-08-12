@@ -122,14 +122,15 @@ func TestClaudeExecutorExecutePreservesConfiguredFullMessagesEndpoint(t *testing
 	}
 }
 
-func TestClaudeExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+func TestClaudeExecutorDeepSeekResponsesRejectsApplyPatchBeforeUpstream(t *testing.T) {
 	mixedTools := []byte(`{
 		"model":"deepseek-v4-flash",
 		"input":[{"role":"user","content":"Inspect the repository."}],
 		"tools":[
 			{"type":"function","name":"lookup","parameters":{"type":"object"}},
-			{"type":"namespace","name":"workspace"},
-			{"type":"web_search"}
+			{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]},
+			{"type":"web_search"},
+			{"type":"custom","name":"apply_patch"}
 		]
 	}`)
 	functionOnly := []byte(`{
@@ -193,12 +194,61 @@ func TestClaudeExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t 
 			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
 				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
 			}
-			for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+			for _, marker := range []string{"deepseek_responses_unsupported_tools", "自定义工具(custom:apply_patch)", "CPA 不会静默删除"} {
 				if !strings.Contains(err.Error(), marker) {
 					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
 				}
 			}
 		})
+	}
+}
+
+func TestPrepareClaudeRequestDeepSeekResponsesConvertsNamespaceAndPreservesWebSearch(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+		"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "compat_kind": "deepseek",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":[{"role":"user","content":"Inspect the repository."}],
+		"tools":[
+			{"type":"function","name":"lookup","parameters":{"type":"object"}},
+			{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]},
+			{"type":"web_search"}
+		]
+	}`)
+	plan, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}, "deepseek-v4-pro", false)
+	if err != nil {
+		t.Fatalf("prepareClaudeRequest error: %v", err)
+	}
+	for _, name := range []string{"lookup", "workspace__read_file", "web_search"} {
+		if !gjson.GetBytes(plan.bodyForUpstream, `tools.#(name=="`+name+`")`).Exists() {
+			t.Fatalf("missing translated tool %q: %s", name, plan.bodyForUpstream)
+		}
+	}
+	if got := gjson.GetBytes(plan.bodyForUpstream, `tools.#(name=="web_search").type`).String(); !strings.HasPrefix(got, "web_search_") {
+		t.Fatalf("web_search type = %q, want versioned Anthropic web search: %s", got, plan.bodyForUpstream)
+	}
+}
+
+func TestPrepareClaudeRequestDeepSeekFIMRejectsAnthropicRoute(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+		"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "compat_kind": "deepseek",
+	}}
+	_, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-pro",
+		Payload: []byte(`{"model":"deepseek-v4-pro","prompt":"left","suffix":"right"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/completions",
+		},
+	}, "deepseek-v4-pro", false)
+	if err == nil || !strings.Contains(err.Error(), "deepseek_fim_requires_openai_compat") {
+		t.Fatalf("error = %v, want DeepSeek FIM Anthropic-route marker", err)
 	}
 }
 
@@ -4638,7 +4688,7 @@ func TestDowngradeClaudeStructuredOutputForCompat_AppendsArraySystemBlock(t *tes
 	}
 }
 
-func TestDowngradeClaudeToolSearchForCompatKind_DeepSeekRemovesUnsupportedBlocks(t *testing.T) {
+func TestDowngradeClaudeToolSearchForCompatKind_DeepSeekPreservesWebSearchAndRemovesUnsupportedBlocks(t *testing.T) {
 	t.Parallel()
 
 	payload := []byte(`{
@@ -4673,14 +4723,17 @@ func TestDowngradeClaudeToolSearchForCompatKind_DeepSeekRemovesUnsupportedBlocks
 
 	out := downgradeClaudeToolSearchForCompatKind("deepseek", "https://api.deepseek.com/anthropic", payload)
 
-	if got := len(gjson.GetBytes(out, "tools").Array()); got != 1 {
-		t.Fatalf("tools count = %d, want 1: %s", got, string(out))
+	if got := len(gjson.GetBytes(out, "tools").Array()); got != 2 {
+		t.Fatalf("tools count = %d, want 2: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "read_file" {
-		t.Fatalf("kept tool name = %q, want read_file: %s", got, string(out))
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "web_search" {
+		t.Fatalf("first tool name = %q, want web_search: %s", got, string(out))
 	}
-	if gjson.GetBytes(out, "tool_choice").Exists() {
-		t.Fatalf("tool_choice for removed server tool should be removed: %s", string(out))
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "read_file" {
+		t.Fatalf("second tool name = %q, want read_file: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "web_search" {
+		t.Fatalf("web_search tool_choice = %q, want web_search: %s", got, string(out))
 	}
 
 	userContent := gjson.GetBytes(out, "messages.0.content").Array()

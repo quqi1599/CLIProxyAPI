@@ -51,6 +51,164 @@ func TestManagerAttemptRunnerRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestManagerAttemptRunnerWaitsForSingleZeroEligibleProbeWithoutConsumingOutageRound(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	model := "gpt-5.6-sol"
+	ownerCtx, _ := ensureRequestAttemptTrace(context.Background())
+	waiterCtx, waiterTrace := ensureRequestAttemptTrace(context.Background())
+	waiterTrace.configureGPTRoute(true)
+	waiterTrace.configureGPTFirstEventPolicy(GPTFirstEventPolicySnapshot{
+		MaxChannels: 2,
+		MaxRounds:   1,
+	})
+	if ok, _ := manager.reserveZeroEligibleProbe(ownerCtx, model, time.Now()); !ok {
+		t.Fatal("probe owner did not acquire the zero-eligible lease")
+	}
+
+	calls := 0
+	runner := managerAttemptRunner[int]{
+		manager: manager,
+		runOnce: func(context.Context, []string, cliproxyexecutor.Request, cliproxyexecutor.Options, int) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, newModelCooldownError(model, "codex", time.Minute)
+			}
+			return 42, nil
+		},
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		manager.releaseZeroEligibleProbe(ownerCtx, model)
+	}()
+	outcome := runner.run(waiterCtx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}, 1, 30*time.Second)
+	if !outcome.success || outcome.result != 42 || outcome.returnErr != nil {
+		t.Fatalf("outcome = %+v, want probe completion retry success", outcome)
+	}
+	if calls != 2 {
+		t.Fatalf("run calls = %d, want exactly 2", calls)
+	}
+}
+
+func TestManagerAttemptRunnerRejectsOverflowProbeWaiterWithoutCooldownSleep(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	model := "gpt-5.6-sol"
+	ownerCtx, _ := ensureRequestAttemptTrace(context.Background())
+	waiterCtx, waiterTrace := ensureRequestAttemptTrace(context.Background())
+	waiterTrace.configureGPTRoute(true)
+	waiterTrace.configureGPTFirstEventPolicy(GPTFirstEventPolicySnapshot{MaxChannels: 3, MaxRounds: 1})
+	if ok, _ := manager.reserveZeroEligibleProbe(ownerCtx, model, time.Now()); !ok {
+		t.Fatal("probe owner did not acquire the zero-eligible lease")
+	}
+	key := zeroEligibleProbeKey(model)
+	manager.zeroEligibleProbeMu.Lock()
+	lease := manager.zeroEligibleProbes[key]
+	lease.waiters = gptZeroEligibleProbeMaxWaiters
+	manager.zeroEligibleProbes[key] = lease
+	manager.zeroEligibleProbeMu.Unlock()
+	t.Cleanup(func() { manager.releaseZeroEligibleProbe(ownerCtx, model) })
+
+	calls := 0
+	runner := managerAttemptRunner[int]{
+		manager: manager,
+		runOnce: func(context.Context, []string, cliproxyexecutor.Request, cliproxyexecutor.Options, int) (int, error) {
+			calls++
+			return 0, newModelCooldownError(model, "codex", 30*time.Second)
+		},
+	}
+	startedAt := time.Now()
+	outcome := runner.run(waiterCtx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}, 1, 30*time.Second)
+	if outcome.returnErr == nil || outcome.success {
+		t.Fatalf("outcome = %+v, want bounded zero-route failure", outcome)
+	}
+	if calls != 1 {
+		t.Fatalf("run calls = %d, want exactly 1", calls)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("overflow waiter slept for %v, want immediate bounded rejection", elapsed)
+	}
+}
+
+func TestNormalizeTerminalManagerErrorCanonicalizesOpaqueFailure(t *testing.T) {
+	raw := errors.New("opaque executor failure")
+	normalized := normalizeTerminalManagerError(context.Background(), raw)
+	failure, ok := failurecontract.As(normalized)
+	if !ok || failure == nil {
+		t.Fatalf("normalized error = %T, want canonical failure", normalized)
+	}
+	if failure.HTTPStatus != http.StatusInternalServerError || failure.OuterStatus != http.StatusInternalServerError {
+		t.Fatalf("statuses = %d/%d, want 500/500", failure.HTTPStatus, failure.OuterStatus)
+	}
+	if failure.Kind != failurecontract.InternalTransformError || failure.Scope != failurecontract.ScopeRequest {
+		t.Fatalf("kind/scope = %q/%q", failure.Kind, failure.Scope)
+	}
+	if failure.SemanticCode != "internal_execution_error" || failure.Retryable {
+		t.Fatalf("semantic code/retryable = %q/%v", failure.SemanticCode, failure.Retryable)
+	}
+	if !errors.Is(normalized, raw) {
+		t.Fatal("normalized error did not preserve the diagnostic cause")
+	}
+}
+
+func TestZeroEligibleProbeWaitTracksModelFirstEventDeadline(t *testing.T) {
+	trace := &requestAttemptTrace{}
+	trace.configureGPTFirstEventPolicy(GPTFirstEventPolicySnapshot{EnforcedTimeoutMs: 50_000})
+	if got, want := zeroEligibleProbeWaitForTrace(trace), 52*time.Second; got != want {
+		t.Fatalf("wait = %v, want %v", got, want)
+	}
+
+	capped := &requestAttemptTrace{}
+	capped.configureGPTFirstEventPolicy(GPTFirstEventPolicySnapshot{EnforcedTimeoutMs: 90_000})
+	if got := zeroEligibleProbeWaitForTrace(capped); got != gptZeroEligibleProbeMaxWait {
+		t.Fatalf("capped wait = %v, want %v", got, gptZeroEligibleProbeMaxWait)
+	}
+}
+
+func TestNormalizeTerminalManagerErrorCanonicalizesLegacyOpaque500(t *testing.T) {
+	raw := &Error{HTTPStatus: http.StatusInternalServerError, Message: "opaque failure"}
+	normalized := normalizeTerminalManagerError(context.Background(), raw)
+	failure, ok := failurecontract.As(normalized)
+	if !ok || failure == nil {
+		t.Fatalf("normalized error = %T, want canonical failure", normalized)
+	}
+	if failure.HTTPStatus != http.StatusInternalServerError || failure.SemanticCode != "upstream_http_500" {
+		t.Fatalf("status/code = %d/%q, want 500/upstream_http_500", failure.HTTPStatus, failure.SemanticCode)
+	}
+	if failure.Scope != failurecontract.ScopeProvider || !failure.Retryable {
+		t.Fatalf("scope/retryable = %q/%v, want provider/true", failure.Scope, failure.Retryable)
+	}
+}
+
+func TestNormalizeTerminalManagerErrorCanonicalizesCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	normalized := normalizeTerminalManagerError(ctx, context.DeadlineExceeded)
+	failure, ok := failurecontract.As(normalized)
+	if !ok || failure == nil {
+		t.Fatalf("normalized error = %T, want canonical failure", normalized)
+	}
+	if failure.HTTPStatus != 499 || failure.Kind != failurecontract.Cancelled || failure.Scope != failurecontract.ScopeRequest {
+		t.Fatalf("status/kind/scope = %d/%q/%q, want 499/cancelled/request", failure.HTTPStatus, failure.Kind, failure.Scope)
+	}
+	if failure.Retryable || !errors.Is(normalized, context.DeadlineExceeded) {
+		t.Fatalf("retryable/cause = %v/%v, want false/deadline preserved", failure.Retryable, errors.Is(normalized, context.DeadlineExceeded))
+	}
+}
+
+func TestNormalizeTerminalManagerErrorTreatsLiveDeadlineAsProviderTimeout(t *testing.T) {
+	normalized := normalizeTerminalManagerError(context.Background(), context.DeadlineExceeded)
+	failure, ok := failurecontract.As(normalized)
+	if !ok || failure == nil {
+		t.Fatalf("normalized error = %T, want canonical failure", normalized)
+	}
+	if failure.HTTPStatus != http.StatusGatewayTimeout || failure.Kind != failurecontract.TransportError || failure.Scope != failurecontract.ScopeProvider || !failure.Retryable {
+		t.Fatalf("failure = %+v, want retryable provider transport 504", failure)
+	}
+	if !errors.Is(normalized, context.DeadlineExceeded) {
+		t.Fatal("provider timeout did not retain DeadlineExceeded cause")
+	}
+}
+
 func TestManagerAttemptRunnerGPTPreservesCanonicalRetryAfter(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetRetryConfig(1, time.Second, 0)

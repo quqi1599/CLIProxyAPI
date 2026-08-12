@@ -112,6 +112,34 @@ func TestGPTChannelBreaker_TypedFailuresRespectScope(t *testing.T) {
 	}
 }
 
+func TestGPTChannelBreaker_LocalFirstEventTimeoutIsSoftFailure(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_750_000_000, 0)
+	state := codexChannelBreakerState{}
+	timeout := Result{
+		Success: false,
+		Error: &Error{
+			Code:       "gpt_first_event_timeout",
+			Message:    "no deliverable event before the local deadline",
+			Retryable:  true,
+			HTTPStatus: http.StatusGatewayTimeout,
+		},
+	}
+	if shouldCountCodexChannelBreakerFailure(timeout) {
+		t.Fatal("local first-event timeout was classified as breaker evidence")
+	}
+	for i := 0; i < codexChannelBreakerSampleLimit*2; i++ {
+		applyCodexChannelBreakerResult(&state, timeout, start.Add(time.Duration(i)*time.Millisecond), "")
+	}
+	if state.Health.Observed || state.Health.BreakerState == HealthBreakerOpen {
+		t.Fatalf("local timeouts changed breaker health: %+v", state.Health)
+	}
+	if state.consecutive5xx != 0 || state.recentCount != 0 {
+		t.Fatalf("local timeouts changed breaker counters: consecutive=%d recent=%d", state.consecutive5xx, state.recentCount)
+	}
+}
+
 func TestGPTChannelBreaker_SingleHalfOpenProbeAndEscalatingCooldown(t *testing.T) {
 	t.Parallel()
 

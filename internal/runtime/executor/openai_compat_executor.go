@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,6 +172,9 @@ func translateOpenAICompatStreamLine(ctx context.Context, upstreamFormat, downst
 func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliproxyexecutor.Options, profile openAICompatProfile, model string) (sdktranslator.Format, string) {
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
+	if openAICompatIsDeepSeekFIMRequest(opts, profile, model) {
+		return to, "/completions"
+	}
 	if opts.Alt == "responses/compact" && profile.SupportsResponses {
 		return sdktranslator.FromString("openai-response"), "/responses/compact"
 	}
@@ -185,7 +189,74 @@ func openAICompatModelSupportsNativeResponses(profile openAICompatProfile, model
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return true
 	}
-	return strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "deepseek-v4-flash")
+	modelName := normalizedOpenAICompatPolicyModelName(model)
+	return strings.HasPrefix(modelName, "deepseek-v4-flash") ||
+		strings.HasPrefix(modelName, "deepseek-v4-pro")
+}
+
+func openAICompatIsDeepSeekFIMRequest(opts cliproxyexecutor.Options, profile openAICompatProfile, model string) bool {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" ||
+		!strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "deepseek-v4-pro") {
+		return false
+	}
+	path := strings.TrimSuffix(strings.TrimSpace(helps.PayloadRequestPath(opts)), "/")
+	return path == "/completions" || strings.HasSuffix(path, "/v1/completions")
+}
+
+func openAICompatRequestURL(baseURL string, profile openAICompatProfile, endpoint string, body []byte) string {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" ||
+		!deepSeekRequestRequiresBetaEndpoint(endpoint, body) {
+		return strings.TrimSuffix(baseURL, "/") + endpoint
+	}
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || !strings.EqualFold(parsed.Hostname(), "api.deepseek.com") {
+		return strings.TrimSuffix(baseURL, "/") + endpoint
+	}
+	parsed.Path = "/beta" + endpoint
+	parsed.RawPath = ""
+	return parsed.String()
+}
+
+func deepSeekRequestRequiresBetaEndpoint(endpoint string, body []byte) bool {
+	if endpoint == "/completions" {
+		return true
+	}
+	if endpoint != "/chat/completions" || len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	messages := gjson.GetBytes(body, "messages").Array()
+	return len(messages) > 0 && messages[len(messages)-1].Get("prefix").Bool() &&
+		strings.EqualFold(strings.TrimSpace(messages[len(messages)-1].Get("role").String()), "assistant")
+}
+
+func validateDeepSeekFIMRequest(body []byte) error {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil
+	}
+	if !gjson.GetBytes(body, "prompt").Exists() {
+		return statusErr{
+			code:      http.StatusBadRequest,
+			errorCode: "request_feature_unsupported",
+			msg:       "request_feature_unsupported: deepseek_fim_prompt_required. DeepSeek FIM 补全必须通过 /v1/completions 提供 prompt，suffix 可选。",
+		}
+	}
+	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() && maxTokens.Int() > 4096 {
+		return statusErr{
+			code:      http.StatusBadRequest,
+			errorCode: "request_feature_unsupported",
+			msg:       "request_feature_unsupported: deepseek_fim_max_tokens. DeepSeek FIM 补全最多输出 4096 tokens，请降低 max_tokens 后重试。",
+		}
+	}
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	if thinkingType == "enabled" || strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()) != "" ||
+		gjson.GetBytes(body, "reasoning").Exists() {
+		return statusErr{
+			code:      http.StatusBadRequest,
+			errorCode: "request_feature_unsupported",
+			msg:       "request_feature_unsupported: deepseek_fim_non_thinking_only. DeepSeek FIM 补全仅支持非思考模式，请移除 reasoning / reasoning_effort，或设置 thinking.type=disabled 后重试。",
+		}
+	}
+	return nil
 }
 
 func openAICompatPolicyRequestMatch(from, to sdktranslator.Format, endpoint string, stream bool) compat.MatchContext {
@@ -391,15 +462,15 @@ func rejectDeepSeekUnsupportedChatResponseFormat(ctx context.Context, sourceBody
 }
 
 func deepSeekChatJSONSchemaUserMessage() string {
-	return "request_feature_unsupported: deepseek_chat_json_schema. DeepSeek 官方 Chat Completions 仅支持 response_format.type=text 或 json_object，不支持 json_schema。如果必须保证 JSON Schema，请改用 deepseek-v4-flash 的 /v1/responses；否则请将 Chat 请求改为 response_format={\"type\":\"json_object\"}，并在提示词中明确要求输出 JSON。CPA 不会静默降级 json_schema。"
+	return "request_feature_unsupported: deepseek_chat_json_schema. DeepSeek 官方 Chat Completions 仅支持 response_format.type=text 或 json_object，不支持 json_schema。如果必须保证 JSON Schema，请改用 deepseek-v4-pro 或 deepseek-v4-flash 的 /v1/responses；否则请将 Chat 请求改为 response_format={\"type\":\"json_object\"}，并在提示词中明确要求输出 JSON。CPA 不会静默降级 json_schema。"
 }
 
 func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return nil
 	}
-	imageParts := countOpenAICompatImageParts(body)
-	if imageParts == 0 {
+	imageParts, fileParts := countOpenAICompatUnsupportedAttachmentParts(body)
+	if imageParts == 0 && fileParts == 0 {
 		return nil
 	}
 	fields := log.Fields{
@@ -409,17 +480,28 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 		"request_path":  path,
 		"payload_bytes": len(body),
 		"image_parts":   imageParts,
+		"file_parts":    fileParts,
 	}
-	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek official route rejected image content before upstream request")
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek official route rejected attachment content before upstream request")
+	errorCode := "deepseek_official_image_input"
+	message := deepSeekOfficialImageInputUserMessage()
+	if imageParts == 0 {
+		errorCode = "deepseek_official_file_input"
+		message = deepSeekOfficialFileInputUserMessage()
+	}
 	return statusErr{
 		code:      http.StatusBadRequest,
 		errorCode: "request_feature_unsupported",
-		msg:       deepSeekOfficialImageInputUserMessage(),
+		msg:       "request_feature_unsupported: " + errorCode + ". " + message,
 	}
 }
 
 func deepSeekOfficialImageInputUserMessage() string {
-	return "request_feature_unsupported: deepseek_official_image_input. DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
+	return "DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
+}
+
+func deepSeekOfficialFileInputUserMessage() string {
+	return "DeepSeek 官方当前不支持 Responses 文件输入。请将 input_file / document 内容先转成文本摘要后再提交；如果必须直接传文件，请在 Codex 中切换到原生 GPT 模型/渠道。CPA 不会把文件静默替换成占位符。"
 }
 
 func rejectDeepSeekUnsupportedResponsesTools(ctx context.Context, body []byte, profile openAICompatProfile, model, path, endpoint, sourceFormat string) error {
@@ -431,7 +513,7 @@ func rejectDeepSeekUnsupportedResponsesToolsForKind(ctx context.Context, body []
 		!strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") {
 		return nil
 	}
-	toolCount, unsupportedCount, unsupportedTypes := deepSeekUnsupportedResponsesToolTypes(body)
+	toolCount, unsupportedCount, unsupportedTypes := deepSeekUnsupportedResponsesToolTypes(body, endpoint)
 	if unsupportedCount == 0 {
 		return nil
 	}
@@ -455,7 +537,7 @@ func rejectDeepSeekUnsupportedResponsesToolsForKind(ctx context.Context, body []
 	}
 }
 
-func deepSeekUnsupportedResponsesToolTypes(body []byte) (toolCount, unsupportedCount int, unsupportedTypes []string) {
+func deepSeekUnsupportedResponsesToolTypes(body []byte, endpoint string) (toolCount, unsupportedCount int, unsupportedTypes []string) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return 0, 0, nil
 	}
@@ -463,11 +545,12 @@ func deepSeekUnsupportedResponsesToolTypes(body []byte) (toolCount, unsupportedC
 	for _, tool := range gjson.GetBytes(body, "tools").Array() {
 		toolCount++
 		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
-		if toolType == "function" {
+		toolName := strings.ToLower(strings.TrimSpace(tool.Get("name").String()))
+		if deepSeekResponsesToolSupported(toolType, toolName, endpoint) {
 			continue
 		}
 		unsupportedCount++
-		toolType = safeDeepSeekToolTypeLabel(toolType)
+		toolType = deepSeekUnsupportedToolLabel(toolType, toolName)
 		if _, ok := seen[toolType]; ok {
 			continue
 		}
@@ -477,6 +560,45 @@ func deepSeekUnsupportedResponsesToolTypes(body []byte) (toolCount, unsupportedC
 		}
 	}
 	return toolCount, unsupportedCount, unsupportedTypes
+}
+
+func deepSeekResponsesToolSupported(toolType, toolName, endpoint string) bool {
+	switch toolType {
+	case "function":
+		return true
+	case "web_search", "web_search_2025_08_26":
+		return true
+	case "custom":
+		return strings.Contains(strings.ToLower(endpoint), "responses") && toolName == "apply_patch"
+	case "namespace":
+		// The Responses-to-Anthropic translator flattens namespace children into
+		// ordinary functions and reconstructs their namespace on the response.
+		return strings.Contains(strings.ToLower(endpoint), "messages")
+	default:
+		return false
+	}
+}
+
+func deepSeekUnsupportedToolLabel(toolType, toolName string) string {
+	switch toolType {
+	case "namespace":
+		return "工具命名空间(namespace)"
+	case "file_search":
+		return "文件搜索(file_search)"
+	case "code_interpreter":
+		return "代码解释器(code_interpreter)"
+	case "computer", "computer_use", "computer_use_preview":
+		return "电脑操作(" + safeDeepSeekToolTypeLabel(toolType) + ")"
+	case "mcp":
+		return "MCP 远程工具(mcp)"
+	case "custom":
+		if toolName != "" {
+			return "自定义工具(custom:" + safeDeepSeekToolTypeLabel(toolName) + ")"
+		}
+		return "自定义工具(custom)"
+	default:
+		return safeDeepSeekToolTypeLabel(toolType)
+	}
 }
 
 func safeDeepSeekToolTypeLabel(toolType string) string {
@@ -496,11 +618,43 @@ func safeDeepSeekToolTypeLabel(toolType string) string {
 }
 
 func deepSeekResponsesToolsUserMessage(unsupportedTypes []string) string {
-	typeSummary := "non-function"
+	typeSummary := "未识别的工具"
 	if len(unsupportedTypes) > 0 {
 		typeSummary = strings.Join(unsupportedTypes, ", ")
 	}
-	return fmt.Sprintf("request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：%s。CPA 不会静默删除、降级或改写这些工具。请仅保留 function 工具，或切换到原生支持这些 Responses 工具的模型/渠道；原样重复提交不会提高成功率。", typeSummary)
+	return fmt.Sprintf("request_feature_unsupported: deepseek_responses_unsupported_tools. DeepSeek V4 Pro 当前可用的 Responses 工具是：函数工具(function)、网页搜索(web_search)和补丁应用(apply_patch)。当前请求还包含不支持的：%s。CPA 不会静默删除或改写这些工具。请移除这些工具，或在 Codex 中切换到原生 GPT 模型/渠道后重试。", typeSummary)
+}
+
+func rejectDeepSeekUnsupportedResponsesState(ctx context.Context, body []byte, compatKind, model, path, endpoint, sourceFormat string) error {
+	if config.NormalizeOpenAICompatibilityKind(compatKind) != "deepseek" ||
+		!strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") || len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil
+	}
+	unsupported := ""
+	switch {
+	case gjson.GetBytes(body, "previous_response_id").Exists():
+		unsupported = "上一次响应状态(previous_response_id)"
+	case gjson.GetBytes(body, "conversation").Exists():
+		unsupported = "服务端会话状态(conversation)"
+	case gjson.GetBytes(body, "store").Bool():
+		unsupported = "服务端存储(store=true)"
+	}
+	if unsupported == "" {
+		return nil
+	}
+	helps.LogWithRequestID(ctx).WithFields(log.Fields{
+		"event":             "deepseek_responses_state_guard",
+		"model":             model,
+		"compat_kind":       "deepseek",
+		"request_path":      path,
+		"upstream_endpoint": endpoint,
+		"unsupported_state": unsupported,
+	}).Warn("DeepSeek route rejected unsupported Responses state before upstream request")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       fmt.Sprintf("request_feature_unsupported: deepseek_responses_state. DeepSeek Responses API 是无状态的，不支持%s。请由客户端保留并重传必要的 input，或切换到原生 GPT 模型/渠道。CPA 不会伪造或静默忽略会话状态。", unsupported),
+	}
 }
 
 func openAICompatSourceFormatForPath(path string) string {
@@ -522,24 +676,43 @@ func largeOpenAICompatToolHistoryUserMessage() string {
 }
 
 func countOpenAICompatImageParts(body []byte) int {
+	images, _ := countOpenAICompatUnsupportedAttachmentParts(body)
+	return images
+}
+
+func countOpenAICompatUnsupportedAttachmentParts(body []byte) (imageParts, fileParts int) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
-		return 0
+		return 0, 0
 	}
-	count := 0
-	for _, msg := range gjson.GetBytes(body, "messages").Array() {
-		content := msg.Get("content")
+	countContent := func(content gjson.Result) {
 		if !content.IsArray() {
-			continue
+			return
 		}
 		for _, part := range content.Array() {
 			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
 			switch partType {
 			case "image", "image_url", "input_image":
-				count++
+				imageParts++
+			case "document", "input_file", "file":
+				fileParts++
 			}
 		}
 	}
-	return count
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		content := msg.Get("content")
+		countContent(content)
+	}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		switch strings.ToLower(strings.TrimSpace(item.Get("type").String())) {
+		case "input_image":
+			imageParts++
+		case "input_file":
+			fileParts++
+		default:
+			countContent(item.Get("content"))
+		}
+	}
+	return imageParts, fileParts
 }
 
 func countOpenAICompatToolOutputMessages(body []byte) int {
@@ -764,6 +937,11 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		payloadSource = downgradeClaudeToolSearchForCompat(baseURL, payloadSource)
 	}
 	plan.requestSource = payloadSource
+	if plan.endpoint == "/completions" {
+		if err = validateDeepSeekFIMRequest(payloadSource); err != nil {
+			return plan, err
+		}
+	}
 
 	translationStream := opts.Stream || stream
 	originalTranslated, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.openai_compat", from, plan.upstreamFormat, baseModel, originalPayloadSource, payloadSource, translationStream, internalpayload.AmplificationOverride{})
@@ -772,11 +950,13 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerResolveStarted := time.Now()
 	providerResolveInput := body
-	thinkingProviderKey := profile.KindOrFallback(auth)
-	body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey)
-	if err != nil {
-		return plan, err
+	if plan.endpoint != "/completions" {
+		thinkingProviderKey := profile.KindOrFallback(auth)
+		body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
+		body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey)
+		if err != nil {
+			return plan, err
+		}
 	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
@@ -815,6 +995,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	providerConfigStarted := time.Now()
 	providerConfigInput := body
 	body = e.overrideModel(body, baseModel)
+	if plan.endpoint == "/completions" {
+		body = mutateOpenAICompatJSON(body, []string{"thinking", "reasoning", "reasoning_effort"}, nil)
+	}
 	plan.diagnosticSource = body
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
@@ -920,6 +1103,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	if err = rejectDeepSeekUnsupportedResponsesTools(ctx, plan.requestSource, profile, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
 		return plan, err
 	}
+	if err = rejectDeepSeekUnsupportedResponsesState(ctx, plan.requestSource, profile.Kind, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
+		return plan, err
+	}
 	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
 		return plan, err
 	}
@@ -983,8 +1169,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(plan.body, plan.upstreamFormat.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + plan.endpoint
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(plan.body))
+	requestURL := openAICompatRequestURL(baseURL, profile, plan.endpoint, plan.body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(plan.body))
 	if err != nil {
 		return resp, err
 	}
@@ -1007,7 +1193,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		authType, authValue = auth.AccountInfo()
 	}
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
+		URL:       requestURL,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
 		Body:      plan.logBody,
@@ -1177,9 +1363,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	reporter.SetTranslatedReasoningEffort(plan.body, plan.upstreamFormat.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + plan.endpoint
+	requestURL := openAICompatRequestURL(baseURL, profile, plan.endpoint, plan.body)
 	requestCtx, cancelRequest := context.WithCancel(ctx)
-	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(plan.body))
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, requestURL, bytes.NewReader(plan.body))
 	if err != nil {
 		cancelRequest()
 		return nil, err
@@ -1205,7 +1391,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		authType, authValue = auth.AccountInfo()
 	}
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
+		URL:       requestURL,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
 		Body:      plan.logBody,

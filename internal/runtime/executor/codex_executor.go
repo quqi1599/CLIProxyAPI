@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -99,8 +98,9 @@ func (e *CodexExecutor) retryCodexRequestWithoutEncryptedState(ctx context.Conte
 	}, transformStarted, internalpayload.AmplificationOverride{})
 	retryResp, err := httpClient.Do(httpReq)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return retryBody, nil, true, err
+		transportErr := newCodexHTTPDoStatusErr(ctx, err, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return retryBody, nil, true, transportErr
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
 	return retryBody, retryResp, true, nil
@@ -123,9 +123,11 @@ func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][
 }
 
 func hydrateCodexCompletedOutputItemIDs(eventData []byte, outputItems []gjson.Result, outputItemsByIndex map[int64][]byte) []byte {
-	patchedData := eventData
+	patchedItems := make([][]byte, len(outputItems))
+	changed := false
 	for outputIndex, outputItem := range outputItems {
 		itemData := []byte(outputItem.Raw)
+		patchedItems[outputIndex] = itemData
 		itemID := gjson.GetBytes(itemData, "id")
 		if itemID.Exists() && itemID.Type != gjson.Null && (itemID.Type != gjson.String || strings.TrimSpace(itemID.String()) != "") {
 			continue
@@ -140,11 +142,19 @@ func hydrateCodexCompletedOutputItemIDs(eventData []byte, outputItems []gjson.Re
 			continue
 		}
 
-		updatedData, errSet := sjson.SetRawBytes(patchedData, "response.output."+strconv.Itoa(outputIndex)+".id", []byte(completedID.Raw))
+		updatedData, errSet := sjson.SetRawBytes(itemData, "id", []byte(completedID.Raw))
 		if errSet != nil {
 			continue
 		}
-		patchedData = updatedData
+		patchedItems[outputIndex] = updatedData
+		changed = true
+	}
+	if !changed {
+		return eventData
+	}
+	patchedData, errSet := sjson.SetRawBytes(eventData, "response.output", internalpayload.BuildRaw(patchedItems))
+	if errSet != nil {
+		return eventData
 	}
 	return patchedData
 }
@@ -1062,7 +1072,11 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, errDo := httpClient.Do(httpReq)
+	if errDo != nil {
+		return httpResp, newCodexHTTPDoStatusErr(ctx, errDo, false)
+	}
+	return httpResp, nil
 }
 
 func sanitizeCodexAlphaSearchBody(body []byte) []byte {
@@ -1140,8 +1154,9 @@ func (e *CodexExecutor) ExecuteRawEndpoint(ctx context.Context, auth *cliproxyau
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.RawEndpointResponse{}, err
+		transportErr := newCodexHTTPDoStatusErr(ctx, err, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return cliproxyexecutor.RawEndpointResponse{}, transportErr
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	responseBody, err := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{
@@ -1229,6 +1244,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = newCodexHTTPDoStatusErr(ctx, err, false)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -1368,6 +1384,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = newCodexHTTPDoStatusErr(ctx, err, false)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -1470,6 +1487,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = newCodexHTTPDoStatusErr(ctx, err, false)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}

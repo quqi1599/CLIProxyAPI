@@ -123,11 +123,20 @@ func codexOpenAIImageStreamStatusErr(err error) error {
 	if !codexOpenAIImageIsTransientStreamErr(err) {
 		return err
 	}
-	return statusErr{
-		code: http.StatusGatewayTimeout,
-		msg:  fmt.Sprintf("stream error: upstream stream disconnected before completion: %v", err),
-	}
+	return codexOpenAIImageTransientStreamError{cause: err}
 }
+
+type codexOpenAIImageTransientStreamError struct {
+	cause error
+}
+
+func (err codexOpenAIImageTransientStreamError) Error() string {
+	return fmt.Sprintf("stream error: upstream stream disconnected before completion: %v", err.cause)
+}
+
+func (err codexOpenAIImageTransientStreamError) Unwrap() error { return err.cause }
+
+func (codexOpenAIImageTransientStreamError) StatusCode() int { return http.StatusGatewayTimeout }
 
 func codexOpenAIImageIsTransientStreamErr(err error) bool {
 	if err == nil {
@@ -208,8 +217,8 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			err = codexOpenAIImageStreamStatusErr(errDo)
+			err = newCodexHTTPDoStatusErr(ctx, codexOpenAIImageStreamStatusErr(errDo), false)
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			if codexOpenAIImageShouldRetry(err, attempt) {
 				helps.LogWithRequestID(ctx).Warnf("codex openai images: retrying after upstream stream failure: %v", err)
 				continue
@@ -317,8 +326,8 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			err = codexOpenAIImageStreamStatusErr(errDo)
+			err = newCodexHTTPDoStatusErr(ctx, codexOpenAIImageStreamStatusErr(errDo), false)
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			if codexOpenAIImageShouldRetry(err, attempt) {
 				helps.LogWithRequestID(ctx).Warnf("codex openai images: retrying stream setup after upstream failure: %v", err)
 				continue
@@ -485,8 +494,9 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return resp, errDo
+		transportErr := newCodexHTTPDoStatusErr(ctx, errDo, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return resp, transportErr
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	data, errRead := helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
@@ -539,8 +549,9 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return nil, errDo
+		transportErr := newCodexHTTPDoStatusErr(ctx, errDo, false)
+		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+		return nil, transportErr
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {

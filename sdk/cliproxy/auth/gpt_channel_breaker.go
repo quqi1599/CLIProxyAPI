@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
@@ -112,11 +113,23 @@ func codexChannelBreaker5xxThreshold(result Result) uint8 {
 }
 
 func shouldCountCodexChannelBreakerFailure(result Result) bool {
+	if isLocalGPTFirstEventTimeoutResult(result) {
+		return false
+	}
 	if failure, ok := typedFailureFromResult(result); ok {
 		return !failure.OutputCommitted && failure.Retryable &&
 			(failure.Scope == failurecontract.ScopeModel || failure.Scope == failurecontract.ScopeProvider)
 	}
 	return shouldCountChannelBreakerFailure(result)
+}
+
+// isLocalGPTFirstEventTimeoutResult identifies the gateway's own pre-output
+// deadline. It is a route failover signal, not provider-health evidence.
+func isLocalGPTFirstEventTimeoutResult(result Result) bool {
+	if result.Error != nil && strings.EqualFold(strings.TrimSpace(result.Error.Code), "gpt_first_event_timeout") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(errorCodeFromError(result.Cause)), "gpt_first_event_timeout")
 }
 
 func reserveCodexChannelProbe(state *codexChannelBreakerState, requestID string, now time.Time) bool {

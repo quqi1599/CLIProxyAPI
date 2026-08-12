@@ -18,6 +18,25 @@ type recordingCooldownStateStore struct {
 	load      []CooldownStateRecord
 }
 
+type recordingPolicyCooldownStateStore struct {
+	recordingCooldownStateStore
+	policySaveCount atomic.Int32
+	policyMu        sync.Mutex
+	policyRecords   []GPTFirstEventPolicyStateRecord
+	policyLoad      []GPTFirstEventPolicyStateRecord
+	policySaved     chan struct{}
+}
+
+type blockingPolicyCooldownStateStore struct {
+	recordingCooldownStateStore
+	policySaveCount atomic.Int32
+	firstStarted    chan struct{}
+	releaseFirst    chan struct{}
+	policySaved     chan struct{}
+	policyMu        sync.Mutex
+	policySaves     [][]GPTFirstEventPolicyStateRecord
+}
+
 func (s *recordingCooldownStateStore) Load(context.Context) ([]CooldownStateRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -29,6 +48,47 @@ func (s *recordingCooldownStateStore) Save(_ context.Context, records []Cooldown
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = cloneCooldownStateRecords(records)
+	return nil
+}
+
+func (s *recordingPolicyCooldownStateStore) LoadGPTFirstEventPolicyStates(context.Context) ([]GPTFirstEventPolicyStateRecord, error) {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	return append([]GPTFirstEventPolicyStateRecord(nil), s.policyLoad...), nil
+}
+
+func (s *recordingPolicyCooldownStateStore) SaveGPTFirstEventPolicyStates(_ context.Context, records []GPTFirstEventPolicyStateRecord) error {
+	s.policySaveCount.Add(1)
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.policyRecords = append([]GPTFirstEventPolicyStateRecord(nil), records...)
+	if s.policySaved != nil {
+		select {
+		case s.policySaved <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (s *blockingPolicyCooldownStateStore) LoadGPTFirstEventPolicyStates(context.Context) ([]GPTFirstEventPolicyStateRecord, error) {
+	return nil, nil
+}
+
+func (s *blockingPolicyCooldownStateStore) SaveGPTFirstEventPolicyStates(ctx context.Context, records []GPTFirstEventPolicyStateRecord) error {
+	call := s.policySaveCount.Add(1)
+	if call == 1 {
+		close(s.firstStarted)
+		select {
+		case <-s.releaseFirst:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.policyMu.Lock()
+	s.policySaves = append(s.policySaves, append([]GPTFirstEventPolicyStateRecord(nil), records...))
+	s.policyMu.Unlock()
+	s.policySaved <- struct{}{}
 	return nil
 }
 
@@ -216,6 +276,67 @@ func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
 	}
 }
 
+func TestFileCooldownStateStore_SaveLoadGPTFirstEventPolicyStatesIndependently(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	cooldown := CooldownStateRecord{
+		Provider:       "codex",
+		AuthID:         "auth-1",
+		AuthFile:       filepath.Join(authDir, "codex.json"),
+		Model:          "gpt-5.6-sol",
+		NextRetryAfter: now.Add(time.Hour),
+		UpdatedAt:      now,
+	}
+	policy := GPTFirstEventPolicyStateRecord{
+		Model:            "gpt-5.6-sol",
+		PolicyState:      gptFirstEventPolicyStateSlow40,
+		PreviousState:    gptFirstEventPolicyStateSlow30,
+		DecisionReason:   "local_timeout_pressure",
+		LastTransitionAt: now.Add(-time.Minute),
+		UpdatedAt:        now,
+	}
+
+	if errSave := store.Save(ctx, []CooldownStateRecord{cooldown}); errSave != nil {
+		t.Fatalf("Save() returned error: %v", errSave)
+	}
+	if errSave := store.SaveGPTFirstEventPolicyStates(ctx, []GPTFirstEventPolicyStateRecord{policy}); errSave != nil {
+		t.Fatalf("SaveGPTFirstEventPolicyStates() returned error: %v", errSave)
+	}
+	policyPath := store.gptFirstEventPolicyStatePath()
+	if _, errStat := os.Stat(policyPath); errStat != nil {
+		t.Fatalf("expected policy state document to exist: %v", errStat)
+	}
+	loaded, errLoad := store.LoadGPTFirstEventPolicyStates(ctx)
+	if errLoad != nil {
+		t.Fatalf("LoadGPTFirstEventPolicyStates() returned error: %v", errLoad)
+	}
+	if len(loaded) != 1 || loaded[0].Model != policy.Model || loaded[0].PolicyState != policy.PolicyState || !loaded[0].UpdatedAt.Equal(now) {
+		t.Fatalf("loaded policy records = %+v, want %+v", loaded, policy)
+	}
+
+	if errSave := store.Save(ctx, nil); errSave != nil {
+		t.Fatalf("Save(nil) returned error: %v", errSave)
+	}
+	if _, errStat := os.Stat(policyPath); errStat != nil {
+		t.Fatalf("cooldown cleanup removed independent policy state: %v", errStat)
+	}
+
+	if errSave := store.Save(ctx, []CooldownStateRecord{cooldown}); errSave != nil {
+		t.Fatalf("Save() returned error: %v", errSave)
+	}
+	if errSave := store.SaveGPTFirstEventPolicyStates(ctx, nil); errSave != nil {
+		t.Fatalf("SaveGPTFirstEventPolicyStates(nil) returned error: %v", errSave)
+	}
+	if _, errStat := os.Stat(policyPath); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("expected policy state document to be removed, stat error = %v", errStat)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "codex.cds")); errStat != nil {
+		t.Fatalf("policy cleanup removed .cds state: %v", errStat)
+	}
+}
+
 func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	store := &recordingCooldownStateStore{}
 	manager := NewManager(nil, nil, nil)
@@ -300,5 +421,143 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 	}
 	if got := store.saveCount.Load(); got != 1 {
 		t.Fatalf("restore cleanup saved cooldown state %d times, want 1", got)
+	}
+}
+
+func TestManager_RestoreCooldownStatesRestoresPolicyWithoutCooldownRecords(t *testing.T) {
+	authDir := t.TempDir()
+	store := NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
+	now := time.Now().UTC()
+
+	first := NewManager(nil, nil, nil)
+	first.SetCooldownStateStore(store)
+	first.gptFirstEventObserver.restorePolicyStates([]GPTFirstEventPolicyStateRecord{
+		{
+			Model:            "gpt-5.6-sol",
+			PolicyState:      gptFirstEventPolicyStateSlow40,
+			PreviousState:    gptFirstEventPolicyStateSlow30,
+			DecisionReason:   "local_timeout_pressure",
+			LastTransitionAt: now.Add(-time.Minute),
+			UpdatedAt:        now,
+		},
+	})
+	first.persistGPTFirstEventPolicyStates(context.Background())
+
+	cooldowns, errLoad := store.Load(context.Background())
+	if errLoad != nil {
+		t.Fatalf("Load() returned error: %v", errLoad)
+	}
+	if len(cooldowns) != 0 {
+		t.Fatalf("cooldown records = %d, want none", len(cooldowns))
+	}
+
+	second := NewManager(nil, nil, nil)
+	second.SetCooldownStateStore(store)
+	if errRestore := second.RestoreCooldownStates(context.Background()); errRestore != nil {
+		t.Fatalf("RestoreCooldownStates() returned error: %v", errRestore)
+	}
+	snapshot := second.GPTFirstEventPolicySnapshot("gpt-5.6-sol")
+	if snapshot.PolicyState != gptFirstEventPolicyStateSlow40 || snapshot.EnforcedTimeoutMs != 40000 {
+		t.Fatalf("restored policy = %q %dms, want slow_40s/40000ms", snapshot.PolicyState, snapshot.EnforcedTimeoutMs)
+	}
+	if snapshot.EligibleFirstAttempts != 0 {
+		t.Fatalf("restored sample count = %d, want no persisted samples", snapshot.EligibleFirstAttempts)
+	}
+}
+
+func TestManager_PersistsGPTFirstEventPolicyOnlyOnTransitionOrCheckpoint(t *testing.T) {
+	store := &recordingPolicyCooldownStateStore{policySaved: make(chan struct{}, 1)}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	manager.gptFirstEventObserver.restorePolicyStates([]GPTFirstEventPolicyStateRecord{
+		{Model: "gpt-5.6-sol", PolicyState: gptFirstEventPolicyStateSlow30, UpdatedAt: time.Now()},
+	})
+
+	manager.persistGPTFirstEventPolicyUpdate(context.Background(), GPTFirstEventPolicySnapshot{})
+	if got := store.policySaveCount.Load(); got != 0 {
+		t.Fatalf("non-transition saved policy state %d times, want 0", got)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager.persistGPTFirstEventPolicyUpdate(canceledCtx, GPTFirstEventPolicySnapshot{Transitioned: true})
+	select {
+	case <-store.policySaved:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for asynchronous policy persistence")
+	}
+	if got := store.policySaveCount.Load(); got != 1 {
+		t.Fatalf("transition saved policy state %d times, want 1", got)
+	}
+	manager.persistGPTFirstEventPolicyUpdate(context.Background(), GPTFirstEventPolicySnapshot{stateCheckpointed: true})
+	select {
+	case <-store.policySaved:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for asynchronous checkpoint persistence")
+	}
+	if got := store.policySaveCount.Load(); got != 2 {
+		t.Fatalf("checkpoint saved policy state %d total times, want 2", got)
+	}
+	store.policyMu.Lock()
+	records := append([]GPTFirstEventPolicyStateRecord(nil), store.policyRecords...)
+	store.policyMu.Unlock()
+	if len(records) != 1 || records[0].Model != "gpt-5.6-sol" || records[0].PolicyState != gptFirstEventPolicyStateSlow30 {
+		t.Fatalf("persisted policy records = %+v", records)
+	}
+}
+
+func TestManager_SerializesGPTFirstEventPolicyExportAndSave(t *testing.T) {
+	store := &blockingPolicyCooldownStateStore{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		policySaved:  make(chan struct{}, 2),
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	now := time.Now().UTC()
+	manager.gptFirstEventObserver.restorePolicyStates([]GPTFirstEventPolicyStateRecord{
+		{Model: "gpt-5.6-sol", PolicyState: gptFirstEventPolicyStateSlow30, UpdatedAt: now},
+	})
+
+	go manager.persistGPTFirstEventPolicyStates(context.Background())
+	select {
+	case <-store.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first blocked save")
+	}
+
+	manager.gptFirstEventObserver.mu.Lock()
+	manager.gptFirstEventObserver.policies["gpt-5.6-sol"] = &gptFirstEventPolicyState{
+		name:      gptFirstEventPolicyStateSlow40,
+		updatedAt: now.Add(time.Minute),
+	}
+	manager.gptFirstEventObserver.policies["gpt-5.6-terra"] = &gptFirstEventPolicyState{
+		name:      gptFirstEventPolicyStateSlow30,
+		updatedAt: now.Add(time.Minute),
+	}
+	manager.gptFirstEventObserver.mu.Unlock()
+
+	go manager.persistGPTFirstEventPolicyStates(context.Background())
+	close(store.releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-store.policySaved:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for serialized policy saves")
+		}
+	}
+
+	store.policyMu.Lock()
+	saves := append([][]GPTFirstEventPolicyStateRecord(nil), store.policySaves...)
+	store.policyMu.Unlock()
+	if len(saves) != 2 {
+		t.Fatalf("policy saves = %d, want 2", len(saves))
+	}
+	latest := make(map[string]string, len(saves[1]))
+	for _, record := range saves[1] {
+		latest[record.Model] = record.PolicyState
+	}
+	if latest["gpt-5.6-sol"] != gptFirstEventPolicyStateSlow40 || latest["gpt-5.6-terra"] != gptFirstEventPolicyStateSlow30 {
+		t.Fatalf("latest persisted policy states = %+v, want latest Sol plus Terra", latest)
 	}
 }

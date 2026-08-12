@@ -76,7 +76,7 @@ func TestBuildOpenAIResponsesStreamErrorChunkNormalizesContextWindowJSON(t *test
 func TestBuildOpenAIResponsesStreamErrorChunkPreservesDeepSeekCustomerGuidance(t *testing.T) {
 	chunk := BuildOpenAIResponsesStreamErrorChunk(
 		http.StatusBadRequest,
-		`{"error":{"message":"request_feature_unsupported: deepseek_responses_non_function_tools. 当前 Responses 请求包含不支持的工具类型：namespace, web_search。","code":"request_feature_unsupported"}}`,
+		`{"error":{"message":"request_feature_unsupported: deepseek_responses_unsupported_tools. 当前请求还包含不支持的：工具命名空间(namespace), 文件搜索(file_search)。","code":"request_feature_unsupported"}}`,
 		0,
 	)
 
@@ -85,12 +85,12 @@ func TestBuildOpenAIResponsesStreamErrorChunkPreservesDeepSeekCustomerGuidance(t
 		t.Fatalf("unmarshal: %v", err)
 	}
 	message, _ := payload["message"].(string)
-	for _, marker := range []string{"Codex", "工具分组", "联网搜索", "原生 GPT 模型"} {
+	for _, marker := range []string{"Codex", "工具分组", "文件搜索", "联网搜索", "原生 GPT 模型"} {
 		if !strings.Contains(message, marker) {
 			t.Fatalf("message = %q, want marker %q", message, marker)
 		}
 	}
-	for _, internalTerm := range []string{"request_feature_unsupported", "namespace", "web_search", "CPA"} {
+	for _, internalTerm := range []string{"request_feature_unsupported", "namespace", "file_search", "web_search", "CPA"} {
 		if strings.Contains(message, internalTerm) {
 			t.Fatalf("message = %q, contains internal term %q", message, internalTerm)
 		}

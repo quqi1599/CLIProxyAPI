@@ -451,7 +451,7 @@ func TestBuildErrorResponseBody_NormalizesDeepSeekChatJSONSchemaRequestFeatureUn
 }
 
 func TestBuildErrorResponseBody_ExplainsDeepSeekResponsesToolsInCustomerLanguage(t *testing.T) {
-	errText := `{"error":{"message":"request_feature_unsupported: deepseek_responses_non_function_tools. DeepSeek 官方当前仅能安全承载 function 工具，当前 Responses 请求包含不支持的工具类型：namespace, web_search。CPA 不会静默删除、降级或改写这些工具。","type":"invalid_request_error","code":"request_feature_unsupported"}}`
+	errText := `{"error":{"message":"request_feature_unsupported: deepseek_responses_unsupported_tools. DeepSeek V4 Pro 当前可用的 Responses 工具是：函数工具(function)、网页搜索(web_search)和补丁应用(apply_patch)。当前请求还包含不支持的：工具命名空间(namespace), 自定义工具(custom:shell)。CPA 不会静默删除或改写这些工具。","type":"invalid_request_error","code":"request_feature_unsupported"}}`
 	body := BuildErrorResponseBody(http.StatusBadRequest, errText)
 
 	var payload ErrorResponse
@@ -461,12 +461,12 @@ func TestBuildErrorResponseBody_ExplainsDeepSeekResponsesToolsInCustomerLanguage
 	if payload.Error.Message != userFacingDeepSeekResponsesNonFunctionToolsMessage(errText) {
 		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekResponsesNonFunctionToolsMessage(errText))
 	}
-	for _, marker := range []string{"Codex", "工具分组", "联网搜索", "原生 GPT 模型"} {
+	for _, marker := range []string{"Codex", "工具分组", "自定义工具", "已支持函数调用、联网搜索和补丁应用", "原生 GPT 模型"} {
 		if !strings.Contains(payload.Error.Message, marker) {
 			t.Fatalf("message = %q, want marker %q", payload.Error.Message, marker)
 		}
 	}
-	for _, internalTerm := range []string{"request_feature_unsupported", "deepseek_responses_non_function_tools", "namespace", "web_search", "CPA", "Responses", "function"} {
+	for _, internalTerm := range []string{"request_feature_unsupported", "deepseek_responses_unsupported_tools", "namespace", "web_search", "apply_patch", "CPA", "Responses", "function"} {
 		if strings.Contains(payload.Error.Message, internalTerm) {
 			t.Fatalf("message = %q, contains internal term %q", payload.Error.Message, internalTerm)
 		}
@@ -476,6 +476,34 @@ func TestBuildErrorResponseBody_ExplainsDeepSeekResponsesToolsInCustomerLanguage
 	}
 	if payload.Error.Code != requestFeatureUnsupportedErrorCode {
 		t.Fatalf("code = %q, want %q", payload.Error.Code, requestFeatureUnsupportedErrorCode)
+	}
+}
+
+func TestBuildErrorResponseBody_ExplainsDeepSeekCompatibilityFamilies(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		marker string
+	}{
+		{name: "file input", input: `{"error":{"message":"request_feature_unsupported: deepseek_official_file_input. unsupported","code":"request_feature_unsupported"}}`, marker: "文件输入"},
+		{name: "responses state", input: `{"error":{"message":"request_feature_unsupported: deepseek_responses_state. unsupported","code":"request_feature_unsupported"}}`, marker: "不保存服务端会话状态"},
+		{name: "fim route", input: `{"error":{"message":"request_feature_unsupported: deepseek_fim_requires_openai_compat. unsupported","code":"request_feature_unsupported"}}`, marker: "不能走 Anthropic API"},
+		{name: "fim thinking", input: `{"error":{"message":"request_feature_unsupported: deepseek_fim_non_thinking_only. unsupported","code":"request_feature_unsupported"}}`, marker: "仅支持非思考模式"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := BuildErrorResponseBody(http.StatusBadRequest, test.input)
+			var payload ErrorResponse
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !strings.Contains(payload.Error.Message, test.marker) {
+				t.Fatalf("message = %q, want marker %q", payload.Error.Message, test.marker)
+			}
+			if strings.Contains(payload.Error.Message, "request_feature_unsupported") || strings.Contains(payload.Error.Message, "deepseek_") {
+				t.Fatalf("message leaked internal marker: %q", payload.Error.Message)
+			}
+		})
 	}
 }
 

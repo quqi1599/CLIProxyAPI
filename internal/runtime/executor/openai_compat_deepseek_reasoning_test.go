@@ -140,11 +140,6 @@ func TestOpenAICompatExecutorDeepSeekChatRejectsJSONSchemaBeforeUpstream(t *test
 			sourceFormat: "openai",
 			payload:      []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"result","schema":{"type":"object"}}}}`),
 		},
-		{
-			name:         "pro responses chat fallback",
-			sourceFormat: "openai-response",
-			payload:      []byte(`{"model":"deepseek-v4-pro","input":[{"role":"user","content":"hi"}],"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}}}`),
-		},
 	}
 
 	for _, test := range tests {
@@ -218,7 +213,9 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"model":"deepseek-v4-flash",
 		"input":[{"role":"developer","content":"Be concise."},{"role":"user","content":"Inspect the repository."}],
 		"tools":[
-			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true}
+			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true},
+			{"type":"custom","name":"apply_patch","description":"Apply a patch"},
+			{"type":"web_search"}
 		],
 		"tool_choice":"auto",
 		"reasoning":{"effort":"low"},
@@ -245,6 +242,9 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"input.0.role":     "developer",
 		"tools.0.type":     "function",
 		"tools.0.name":     "lookup",
+		"tools.1.type":     "custom",
+		"tools.1.name":     "apply_patch",
+		"tools.2.type":     "web_search",
 		"tool_choice":      "auto",
 		"reasoning.effort": "low",
 		"text.format.type": "json_schema",
@@ -258,7 +258,7 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+func TestOpenAICompatExecutorDeepSeekResponsesRejectsUnsupportedToolsBeforeUpstream(t *testing.T) {
 	for _, model := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
 		t.Run(model, func(t *testing.T) {
 			upstreamCalls := 0
@@ -283,7 +283,8 @@ func TestOpenAICompatExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstr
 				"tools":[
 					{"type":"function","name":"lookup","parameters":{"type":"object"}},
 					{"type":"namespace","name":"workspace"},
-					{"type":"web_search"}
+					{"type":"web_search"},
+					{"type":"custom","name":"shell"}
 				]
 			}`, model))
 
@@ -309,7 +310,7 @@ func TestOpenAICompatExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstr
 			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
 				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
 			}
-			for _, marker := range []string{"deepseek_responses_non_function_tools", "namespace", "web_search", "CPA 不会静默删除"} {
+			for _, marker := range []string{"deepseek_responses_unsupported_tools", "工具命名空间(namespace)", "自定义工具(custom:shell)", "网页搜索(web_search)", "CPA 不会静默删除"} {
 				if !strings.Contains(err.Error(), marker) {
 					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
 				}
@@ -318,11 +319,12 @@ func TestOpenAICompatExecutorDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstr
 	}
 }
 
-func TestOpenAICompatExecutorHTTPDeepSeekResponsesRejectsNonFunctionToolsBeforeUpstream(t *testing.T) {
+func TestOpenAICompatExecutorHTTPDeepSeekResponsesAllowsWebSearch(t *testing.T) {
 	upstreamCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`))
 	}))
 	defer server.Close()
 
@@ -339,34 +341,26 @@ func TestOpenAICompatExecutorHTTPDeepSeekResponsesRejectsNonFunctionToolsBeforeU
 		"input":"Search the web.",
 		"tools":[{"type":"web_search"}]
 	}`))
+	req.RequestURI = ""
 
-	_, err := exec.HttpRequest(context.Background(), auth, req)
-	if err == nil {
-		t.Fatal("expected request_feature_unsupported error")
+	resp, err := exec.HttpRequest(context.Background(), auth, req)
+	if err != nil {
+		t.Fatalf("HttpRequest error: %v", err)
 	}
-	if upstreamCalls != 0 {
-		t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
-	}
-	status, ok := err.(interface {
-		StatusCode() int
-		ErrorCode() string
-	})
-	if !ok {
-		t.Fatalf("error type %T does not expose status/error code", err)
-	}
-	if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
-		t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
+	defer func() { _ = resp.Body.Close() }()
+	if upstreamCalls != 1 {
+		t.Fatalf("upstreamCalls = %d, want 1", upstreamCalls)
 	}
 }
 
-func TestOpenAICompatExecutorDeepSeekProKeepsChatFallbackForResponses(t *testing.T) {
+func TestOpenAICompatExecutorDeepSeekProUsesNativeResponses(t *testing.T) {
 	var gotPath string
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","model":"deepseek-v4-pro","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
 	}))
 	defer server.Close()
 
@@ -381,21 +375,140 @@ func TestOpenAICompatExecutorDeepSeekProKeepsChatFallbackForResponses(t *testing
 	}
 	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "deepseek-v4-pro",
-		Payload: []byte(`{"model":"deepseek-v4-pro","input":[{"role":"user","content":"hi"}]}`),
+		Payload: []byte(`{"model":"deepseek-v4-pro","input":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search"},{"type":"custom","name":"apply_patch"}],"text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}}}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 	})
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
 	}
-	if gotPath != "/v1/chat/completions" {
-		t.Fatalf("path = %q, want /v1/chat/completions", gotPath)
+	if gotPath != "/v1/responses" {
+		t.Fatalf("path = %q, want /v1/responses", gotPath)
 	}
-	if !gjson.GetBytes(gotBody, "messages").Exists() || gjson.GetBytes(gotBody, "input").Exists() {
-		t.Fatalf("Pro Responses request should use chat fallback: %s", string(gotBody))
+	if gjson.GetBytes(gotBody, "messages").Exists() || !gjson.GetBytes(gotBody, "input").Exists() {
+		t.Fatalf("Pro Responses request should remain native: %s", string(gotBody))
+	}
+	for path, want := range map[string]string{
+		"tools.0.type":     "web_search",
+		"tools.1.type":     "custom",
+		"tools.1.name":     "apply_patch",
+		"text.format.type": "json_schema",
+	} {
+		if got := gjson.GetBytes(gotBody, path).String(); got != want {
+			t.Fatalf("%s = %q, want %q; body=%s", path, got, want, gotBody)
+		}
 	}
 	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
 		t.Fatalf("response object = %q, want response; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekResponsesRejectsUnsupportedStateAndAttachments(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		marker string
+	}{
+		{name: "previous response state", body: `{"model":"deepseek-v4-pro","input":"hi","previous_response_id":"resp_1"}`, marker: "deepseek_responses_state"},
+		{name: "stored response state", body: `{"model":"deepseek-v4-pro","input":"hi","store":true}`, marker: "deepseek_responses_state"},
+		{name: "image input", body: `{"model":"deepseek-v4-pro","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}`, marker: "deepseek_official_image_input"},
+		{name: "file input", body: `{"model":"deepseek-v4-pro","input":[{"role":"user","content":[{"type":"input_file","file_data":"data:text/plain;base64,SGk="}]}]}`, marker: "deepseek_official_file_input"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+			auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+				"base_url": server.URL + "/v1", "api_key": "test", "compat_kind": "deepseek",
+			}}
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model: "deepseek-v4-pro", Payload: []byte(test.body),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+			if err == nil || !strings.Contains(err.Error(), test.marker) {
+				t.Fatalf("error = %v, want marker %q", err, test.marker)
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstreamCalls = %d, want 0", upstreamCalls)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekFIMUsesBetaCompletions(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-1","object":"text_completion","model":"deepseek-v4-pro","choices":[{"index":0,"text":" middle ","finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+		"base_url": server.URL + "/beta", "api_key": "test", "compat_kind": "deepseek",
+	}}
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-pro",
+		Payload: []byte(`{"model":"deepseek-v4-pro","prompt":"left","suffix":"right","max_tokens":128,"thinking":{"type":"disabled"}}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/completions",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/beta/completions" {
+		t.Fatalf("path = %q, want /beta/completions", gotPath)
+	}
+	if gjson.GetBytes(gotBody, "messages").Exists() || gjson.GetBytes(gotBody, "thinking").Exists() {
+		t.Fatalf("FIM payload was converted to chat or kept thinking controls: %s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "suffix").String(); got != "right" {
+		t.Fatalf("suffix = %q, want right; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "text_completion" {
+		t.Fatalf("object = %q, want text_completion; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekFIMRejectsThinking(t *testing.T) {
+	err := validateDeepSeekFIMRequest([]byte(`{"model":"deepseek-v4-pro","prompt":"left","suffix":"right","reasoning_effort":"high"}`))
+	if err == nil || !strings.Contains(err.Error(), "deepseek_fim_non_thinking_only") {
+		t.Fatalf("error = %v, want non-thinking FIM marker", err)
+	}
+}
+
+func TestOpenAICompatRequestURLRoutesOfficialDeepSeekBetaFeatures(t *testing.T) {
+	profile := openAICompatProfileForKind("deepseek")
+	tests := []struct {
+		name     string
+		baseURL  string
+		endpoint string
+		body     string
+		want     string
+	}{
+		{name: "fim", baseURL: "https://api.deepseek.com/v1", endpoint: "/completions", body: `{"prompt":"left"}`, want: "https://api.deepseek.com/beta/completions"},
+		{name: "chat prefix", baseURL: "https://api.deepseek.com/v1", endpoint: "/chat/completions", body: `{"messages":[{"role":"assistant","content":"prefix","prefix":true}]}`, want: "https://api.deepseek.com/beta/chat/completions"},
+		{name: "ordinary chat", baseURL: "https://api.deepseek.com/v1", endpoint: "/chat/completions", body: `{"messages":[{"role":"user","content":"hi"}]}`, want: "https://api.deepseek.com/v1/chat/completions"},
+		{name: "third party unchanged", baseURL: "https://deepseek.example.com/v1", endpoint: "/completions", body: `{"prompt":"left"}`, want: "https://deepseek.example.com/v1/completions"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := openAICompatRequestURL(test.baseURL, profile, test.endpoint, []byte(test.body)); got != test.want {
+				t.Fatalf("URL = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

@@ -4145,6 +4145,10 @@ func TestManager_Execute_DeepSeekCompatibilityBadRequestFallsBackAcrossRoutes(t 
 			name:    "null tool schema array",
 			message: `invalid_request_error: Invalid schema for function 'get_goal': null is not of type "array"`,
 		},
+		{
+			name:    "fim requires openai compatibility",
+			message: "request_feature_unsupported: deepseek_fim_requires_openai_compat. DeepSeek FIM does not support Anthropic Messages routes",
+		},
 	}
 
 	for _, tt := range tests {
