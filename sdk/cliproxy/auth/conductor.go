@@ -9349,6 +9349,9 @@ func isDeepSeekCompatibilityFallbackError(err error) bool {
 	if strings.Contains(message, "thinking mode does not support this tool_choice") {
 		return true
 	}
+	if strings.Contains(message, "deepseek_fim_requires_openai_compat") {
+		return true
+	}
 	return strings.Contains(message, "invalid schema for function") &&
 		strings.Contains(message, "null is not of type") &&
 		strings.Contains(message, "array")

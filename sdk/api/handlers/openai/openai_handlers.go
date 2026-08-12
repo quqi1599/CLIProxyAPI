@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -170,6 +171,15 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 		return
 	}
 
+	if isDeepSeekV4ProFIMRequest(rawJSON) {
+		if gjson.GetBytes(rawJSON, "stream").Bool() {
+			h.handleNativeCompletionsStreamingResponse(c, rawJSON)
+		} else {
+			h.handleNativeCompletionsNonStreamingResponse(c, rawJSON)
+		}
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
@@ -178,6 +188,73 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 		h.handleCompletionsNonStreamingResponse(c, rawJSON)
 	}
 
+}
+
+func isDeepSeekV4ProFIMRequest(rawJSON []byte) bool {
+	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()))
+	if slash := strings.LastIndex(model, "/"); slash >= 0 {
+		model = model[slash+1:]
+	}
+	return strings.HasPrefix(model, "deepseek-v4-pro") && gjson.GetBytes(rawJSON, "prompt").Exists()
+}
+
+func (h *OpenAIAPIHandler) handleNativeCompletionsNonStreamingResponse(c *gin.Context, rawJSON []byte) {
+	c.Header("Content-Type", "application/json")
+	handlers.MarkRequestWithoutToolCompatibility(c)
+	modelName := gjson.GetBytes(rawJSON, "model").String()
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	stopKeepAlive()
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write(resp)
+	cliCancel()
+}
+
+func (h *OpenAIAPIHandler) handleNativeCompletionsStreamingResponse(c *gin.Context, rawJSON []byte) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+			Message: "Streaming not supported",
+			Type:    "server_error",
+		}})
+		return
+	}
+	handlers.MarkRequestWithoutToolCompatibility(c)
+	modelName := gjson.GetBytes(rawJSON, "model").String()
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	chunk, errMsg, streamDone, errBootstrap := handlers.AwaitStreamBootstrap(c.Request.Context(), dataChan, errChan)
+	if errBootstrap != nil {
+		cliCancel(errBootstrap)
+		return
+	}
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Access-Control-Allow-Origin", "*")
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	if streamDone {
+		handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		})
+		cliCancel(nil)
+		return
+	}
+	handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+		writeOpenAIChatSSEChunk(w, chunk)
+	})
+	h.handleStreamResult(cliCtx, c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 }
 
 // convertCompletionsRequestToChatCompletions converts OpenAI completions API request to chat completions format.

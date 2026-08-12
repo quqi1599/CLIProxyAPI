@@ -307,6 +307,9 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	if err = rejectDeepSeekFIMForClaudeRoute(baseModel, helps.PayloadRequestPath(opts), originalPayloadSource); err != nil {
+		return plan, err
+	}
 	if err = rejectDeepSeekUnsupportedResponsesToolsForKind(
 		ctx,
 		originalPayloadSource,
@@ -544,6 +547,21 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 		return plan, err
 	}
 	return plan, nil
+}
+
+func rejectDeepSeekFIMForClaudeRoute(model, requestPath string, body []byte) error {
+	modelName := normalizedOpenAICompatPolicyModelName(model)
+	path := strings.TrimSuffix(strings.TrimSpace(requestPath), "/")
+	if !strings.HasPrefix(modelName, "deepseek-v4-pro") ||
+		(path != "/completions" && !strings.HasSuffix(path, "/v1/completions")) ||
+		!gjson.GetBytes(body, "prompt").Exists() {
+		return nil
+	}
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       "request_feature_unsupported: deepseek_fim_requires_openai_compat. DeepSeek FIM 仅支持 OpenAI 兼容的 /beta/completions，不支持 Anthropic Messages 路由。CPA 将尝试其他可用的 DeepSeek OpenAI 兼容通道；若没有，请配置官方 OpenAI 兼容通道。",
+	}
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -1896,8 +1914,33 @@ func isUnsupportedClaudeServerToolForCompat(compatKind string, toolType string, 
 	if !requiresClaudeContentBlockDowngradeForCompat(compatKind) {
 		return false
 	}
+	if supportsDeepSeekClaudeWebSearchTool(compatKind, toolType, strings.TrimSpace(compatStringValue(tool["name"]))) {
+		return false
+	}
 	_, hasInputSchema := tool["input_schema"]
 	return !hasInputSchema
+}
+
+func supportsDeepSeekClaudeWebSearchTool(compatKind, toolType, toolName string) bool {
+	if compatKind != "deepseek" || !strings.EqualFold(strings.TrimSpace(toolName), "web_search") {
+		return false
+	}
+	toolType = strings.ToLower(strings.TrimSpace(toolType))
+	return toolType == "web_search" || strings.HasPrefix(toolType, "web_search_")
+}
+
+func supportsDeepSeekClaudeWebSearchContent(compatKind, partType string, part map[string]any) bool {
+	if compatKind != "deepseek" {
+		return false
+	}
+	switch partType {
+	case "web_search_tool_result":
+		return true
+	case "server_tool_use":
+		return strings.EqualFold(strings.TrimSpace(compatStringValue(part["name"])), "web_search")
+	default:
+		return false
+	}
 }
 
 func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, content []any) ([]any, bool) {
@@ -1911,6 +1954,9 @@ func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, conte
 		}
 		partType := strings.TrimSpace(compatStringValue(part["type"]))
 		switch {
+		case supportsDeepSeekClaudeWebSearchContent(compatKind, partType, part):
+			cleaned = append(cleaned, part)
+			continue
 		case isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType):
 			changed = true
 			if text := claudeUnsupportedContentText(part); text != "" {

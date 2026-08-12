@@ -123,7 +123,7 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		PreserveReasoningContent: true,
 		NormalizeToolHistory:     true,
 		SupportsMetadata:         true,
-		SupportsStore:            true,
+		SupportsStore:            false,
 	},
 	"xfyun": {
 		Kind:                     "xfyun",

@@ -22,10 +22,10 @@ var (
 		newClaudeCompatCapabilityPolicy(
 			claudeCompatDeepSeekCapabilityPolicyID,
 			"deepseek",
-			"git:a1d8ce29",
+			"DeepSeek-V4-Pro-0813",
 			"internal/runtime/executor/testdata/compat/claude_deepseek_capabilities.json",
-			"DeepSeek Claude-compatible endpoints reject server tools, unsupported content blocks, and extended tool schemas.",
-			"Remove when DeepSeek Claude-compatible endpoints accept canonical Claude tools, schemas, and multimodal blocks.",
+			"DeepSeek Anthropic API supports function tools and native web search, but still rejects multimodal, code-execution, MCP, and other unsupported content blocks.",
+			"Remove when DeepSeek Anthropic API accepts canonical Claude multimodal, code-execution, MCP, and extended tool-schema payloads.",
 		),
 		newClaudeCompatCapabilityPolicy(
 			claudeCompatDoubaoCapabilityPolicyID,

@@ -67,6 +67,10 @@
         "model": "deepseek-v4-pro",
         "tools": [
           {
+            "type": "web_search_20250305",
+            "name": "web_search"
+          },
+          {
             "name": "read_file",
             "input_schema": {
               "type": "object",
@@ -76,7 +80,14 @@
             }
           }
         ],
+        "tool_choice": {"type": "tool", "name": "web_search"},
         "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {}}
+            ]
+          },
           {
             "role": "user",
             "content": [
