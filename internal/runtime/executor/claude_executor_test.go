@@ -4870,24 +4870,14 @@ func TestSanitizeClaudeHTTPRequestToolNames_NormalizesDoubaoDeepSeekThinking(t *
 	}
 }
 
-func TestSanitizeClaudeHTTPRequestToolNames_DowngradesDeepSeekAnthropicBody(t *testing.T) {
+func TestSanitizeClaudeHTTPRequestToolNames_RejectsDeepSeekAnthropicImage(t *testing.T) {
 	t.Parallel()
 
 	payload := `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "https://api.deepseek.com/anthropic/v1/messages?beta=true", strings.NewReader(payload))
 
-	if _, err := sanitizeClaudeHTTPRequestToolNames(req); err != nil {
-		t.Fatalf("sanitizeClaudeHTTPRequestToolNames() error = %v", err)
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if hasClaudePartType(gjson.GetBytes(body, "messages.0.content").Array(), "image") {
-		t.Fatalf("DeepSeek direct HttpRequest body should remove image blocks: %s", string(body))
-	}
-	if !hasClaudeText(gjson.GetBytes(body, "messages.0.content").Array(), "hi") {
-		t.Fatalf("text should be preserved: %s", string(body))
+	if _, err := sanitizeClaudeHTTPRequestToolNames(req); err == nil || !strings.Contains(err.Error(), "不支持图片内容块") {
+		t.Fatalf("sanitizeClaudeHTTPRequestToolNames() error = %v, want explicit DeepSeek image rejection", err)
 	}
 }
 

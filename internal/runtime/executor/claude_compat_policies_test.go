@@ -134,8 +134,9 @@ func TestPrepareClaudeRequestAppliesImageCapabilityPolicyWithoutTools(t *testing
 		policyID     string
 		wantImage    bool
 		wantImageURL bool
+		wantReject   bool
 	}{
-		{name: "deepseek", compatKind: "deepseek", baseURL: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro", policyID: claudeCompatDeepSeekCapabilityPolicyID},
+		{name: "deepseek", compatKind: "deepseek", baseURL: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro", policyID: claudeCompatDeepSeekCapabilityPolicyID, wantReject: true},
 		{name: "doubao", compatKind: "doubao", baseURL: "https://ark.cn-beijing.volces.com/api/coding", model: "deepseek-v3.2", policyID: claudeCompatDoubaoCapabilityPolicyID, wantImage: true},
 		{name: "xiaomi mimo v2.5", compatKind: "xiaomi", baseURL: "https://token-plan-cn.xiaomimimo.com/anthropic", model: "mimo-v2.5", policyID: claudeCompatXiaomiCapabilityPolicyID, wantImage: true},
 		{name: "xiaomi other model", compatKind: "xiaomi", baseURL: "https://token-plan-cn.xiaomimimo.com/anthropic", model: "mimo-v2.5-pro", policyID: claudeCompatXiaomiCapabilityPolicyID},
@@ -153,6 +154,13 @@ func TestPrepareClaudeRequestAppliesImageCapabilityPolicyWithoutTools(t *testing
 			for _, stream := range []bool{false, true} {
 				ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
 				plan, err := executor.prepareClaudeRequest(ctx, auth, cliproxyexecutor.Request{Model: test.model, Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, test.model, stream)
+				if test.wantReject {
+					releaseReport()
+					if err == nil || !strings.Contains(err.Error(), "不支持图片内容块") {
+						t.Fatalf("prepareClaudeRequest(stream=%v) error = %v, want explicit DeepSeek image rejection", stream, err)
+					}
+					continue
+				}
 				if err != nil {
 					t.Fatalf("prepareClaudeRequest(stream=%v) error = %v", stream, err)
 				}
@@ -263,6 +271,7 @@ func TestPrepareClaudeRequestPreservesUnsupportedImageOnlyUserMessage(t *testing
 		baseURL    string
 		model      string
 		part       string
+		wantReject bool
 	}{
 		{
 			name:       "deepseek",
@@ -270,6 +279,7 @@ func TestPrepareClaudeRequestPreservesUnsupportedImageOnlyUserMessage(t *testing
 			baseURL:    "https://api.deepseek.com/anthropic",
 			model:      "deepseek-v4-pro",
 			part:       `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}`,
+			wantReject: true,
 		},
 		{
 			name:       "doubao",
@@ -300,6 +310,12 @@ func TestPrepareClaudeRequestPreservesUnsupportedImageOnlyUserMessage(t *testing
 					Model:   test.model,
 					Payload: payload,
 				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, test.model, stream)
+				if test.wantReject {
+					if err == nil || !strings.Contains(err.Error(), "不支持图片内容块") {
+						t.Fatalf("prepareClaudeRequest(stream=%v) error = %v, want explicit DeepSeek image rejection", stream, err)
+					}
+					continue
+				}
 				if err != nil {
 					t.Fatalf("prepareClaudeRequest(stream=%v) error = %v", stream, err)
 				}

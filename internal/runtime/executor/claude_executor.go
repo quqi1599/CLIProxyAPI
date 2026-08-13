@@ -214,6 +214,8 @@ const (
 	largeClaudeCompatToolHistoryOnlyInteractions   = largeClaudeCompatToolHistoryLimitMultiplier * 700
 	largeClaudeCompatToolHistoryMCPTools           = largeClaudeCompatToolHistoryLimitMultiplier * 80
 	largeClaudeCompatToolResultOnlyMessages        = largeClaudeCompatToolHistoryLimitMultiplier * 40
+	largeClaudeDeepSeekToolResultPilePayloadBytes  = 30 * 1024 * 1024
+	largeClaudeDeepSeekToolResultOnlyMessages      = 600
 	largeClaudeCompatStepPayloadBytes              = 20 * 1024 * 1024
 	largeClaudeCompatStepMessages                  = largeClaudeCompatStepLimitMultiplier * 250
 	largeClaudeCompatStepInteractions              = largeClaudeCompatStepLimitMultiplier * 500
@@ -356,7 +358,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind)
+	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind, plan.providerIdentity.BaseHost)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, plan.baseURL, plan.providerIdentity.Kind)
 	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, plan.providerIdentity.Kind)
@@ -411,6 +413,9 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 		return plan, err
 	}
 	if err = enforceThinkingHistoryTransform(ctx, "claude", historyReport, time.Since(historyStarted)); err != nil {
+		return plan, err
+	}
+	if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, plan.providerIdentity.Kind, plan.baseURL, baseModel); err != nil {
 		return plan, err
 	}
 
@@ -921,6 +926,9 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if useProviderCapabilityPolicies {
 		body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, identity.Kind)
 		body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, identity.Kind)
+		if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, identity.Kind, baseURL, baseModel); err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
@@ -2429,12 +2437,13 @@ type compatRepairLogMeta struct {
 	executor       string
 	requestPath    string
 	compatKind     string
+	baseHost       string
 	messageCount   int
 	toolCount      int
 	toolShape      coreusage.ToolShape
 }
 
-func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstreamModel, provider, executor, requestPath, compatKind string) compatRepairLogMeta {
+func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstreamModel, provider, executor, requestPath, compatKind, baseHost string) compatRepairLogMeta {
 	return compatRepairLogMeta{
 		requestedModel: requestedModel,
 		upstreamModel:  upstreamModel,
@@ -2442,6 +2451,7 @@ func newCompatRepairLogMeta(opts cliproxyexecutor.Options, requestedModel, upstr
 		executor:       executor,
 		requestPath:    requestPath,
 		compatKind:     compatKind,
+		baseHost:       strings.ToLower(strings.TrimSpace(baseHost)),
 		messageCount:   executorIntMetadataValue(opts.Metadata[cliproxyexecutor.MessageCountMetadataKey]),
 		toolCount:      executorIntMetadataValue(opts.Metadata[cliproxyexecutor.ToolCountMetadataKey]),
 		toolShape: coreusage.ToolShape{
@@ -2525,20 +2535,26 @@ func rejectLargeClaudeCompatToolHistory(ctx context.Context, body []byte, meta c
 		return nil
 	}
 	fields := log.Fields{
-		"event":           "compat_repair_guard",
-		"requested_model": meta.requestedModel,
-		"upstream_model":  meta.upstreamModel,
-		"provider":        meta.provider,
-		"executor":        meta.executor,
-		"request_path":    meta.requestPath,
-		"compat_kind":     meta.compatKind,
-		"reason":          reason,
-		"payload_bytes":   len(body),
-		"message_count":   meta.messageCount,
-		"tool_count":      meta.toolCount,
+		"event":            "compat_repair_guard",
+		"requested_model":  meta.requestedModel,
+		"upstream_model":   meta.upstreamModel,
+		"provider":         meta.provider,
+		"executor":         meta.executor,
+		"request_path":     meta.requestPath,
+		"compat_kind":      meta.compatKind,
+		"compat_base_host": meta.baseHost,
+		"reason":           reason,
+		"payload_bytes":    len(body),
+		"message_count":    meta.messageCount,
+		"tool_count":       meta.toolCount,
 	}
 	if preflight.toolResultOnlyMessages > 0 {
 		fields["tool_result_only_messages"] = preflight.toolResultOnlyMessages
+	}
+	if reason == "tool_result_message_pile" {
+		payloadLimit, messageLimit := claudeCompatToolResultPileLimits(meta)
+		fields["payload_bytes_limit"] = payloadLimit
+		fields["tool_result_only_messages_limit"] = messageLimit
 	}
 	addCompatRepairToolShapeFields(fields, meta.toolShape)
 	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large Claude tool history rejected before compat repair")
@@ -2557,9 +2573,10 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 	if !preflight.hasToolUse && !preflight.hasToolResult {
 		return "", false
 	}
+	payloadLimit, messageLimit := claudeCompatToolResultPileLimits(meta)
 	if isKnownClaudeCompatProxyKind(meta.compatKind) &&
-		len(body) >= largeClaudeCompatToolResultPilePayloadBytes &&
-		preflight.toolResultOnlyMessages >= largeClaudeCompatToolResultOnlyMessages {
+		len(body) >= payloadLimit &&
+		preflight.toolResultOnlyMessages >= messageLimit {
 		return "tool_result_message_pile", true
 	}
 	if !isClaudeSonnet46CompatModel(meta.requestedModel) && !isClaudeSonnet46CompatModel(meta.upstreamModel) {
@@ -2618,6 +2635,85 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 		return "mcp_tool_history", true
 	}
 	return "", false
+}
+
+func claudeCompatToolResultPileLimits(meta compatRepairLogMeta) (payloadBytes int, toolResultMessages int) {
+	if strings.EqualFold(strings.TrimSpace(meta.compatKind), "deepseek") &&
+		strings.EqualFold(strings.TrimSpace(meta.baseHost), "api.deepseek.com") &&
+		(isDeepSeekV4LongContextModel(meta.requestedModel) || isDeepSeekV4LongContextModel(meta.upstreamModel)) {
+		return largeClaudeDeepSeekToolResultPilePayloadBytes, largeClaudeDeepSeekToolResultOnlyMessages
+	}
+	return largeClaudeCompatToolResultPilePayloadBytes, largeClaudeCompatToolResultOnlyMessages
+}
+
+func isDeepSeekV4LongContextModel(model string) bool {
+	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return strings.HasPrefix(baseModel, "deepseek-v4-pro") || strings.HasPrefix(baseModel, "deepseek-v4-flash")
+}
+
+func rejectDeepSeekAnthropicUnsupportedImageInput(ctx context.Context, body []byte, compatKind, baseURL, model string) error {
+	if !isOfficialDeepSeekAnthropicRoute(compatKind, baseURL) {
+		return nil
+	}
+	imageParts := countClaudeImageParts(body)
+	if imageParts == 0 {
+		return nil
+	}
+	fields := log.Fields{
+		"event":         "claude_compat_image_guard",
+		"model":         model,
+		"compat_kind":   "deepseek",
+		"base_host":     "api.deepseek.com",
+		"payload_bytes": len(body),
+		"image_parts":   imageParts,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek official Anthropic route rejected image content before capability conversion")
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       "DeepSeek 官方 Anthropic API 当前不支持图片内容块。系统不会把图片伪装成文本继续转发；请移除当前请求及历史消息中的图片，或在 Codex 中切换到原生 GPT 模型。",
+	}
+}
+
+func isOfficialDeepSeekAnthropicRoute(compatKind, baseURL string) bool {
+	if !strings.EqualFold(strings.TrimSpace(compatKind), "deepseek") {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	return err == nil && strings.EqualFold(strings.TrimSpace(parsed.Hostname()), "api.deepseek.com")
+}
+
+func countClaudeImageParts(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	count := countClaudeImagesInValue(gjson.GetBytes(body, "system"))
+	for _, message := range gjson.GetBytes(body, "messages").Array() {
+		count += countClaudeImagesInValue(message.Get("content"))
+	}
+	return count
+}
+
+func countClaudeImagesInValue(value gjson.Result) int {
+	if !value.Exists() {
+		return 0
+	}
+	if value.IsArray() {
+		count := 0
+		for _, item := range value.Array() {
+			count += countClaudeImagesInValue(item)
+		}
+		return count
+	}
+	if !value.IsObject() {
+		return 0
+	}
+	switch strings.ToLower(strings.TrimSpace(value.Get("type").String())) {
+	case "image", "image_url", "input_image":
+		return 1
+	default:
+		return countClaudeImagesInValue(value.Get("content"))
+	}
 }
 
 func isClaudeSonnet46CompatModel(model string) bool {
@@ -3439,6 +3535,9 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 	}
 	if repaired, ok := helps.RepairInvalidJSONStringEscapes(body); ok {
 		body = repaired
+	}
+	if errGuard := rejectDeepSeekAnthropicUnsupportedImageInput(req.Context(), body, compatKind, requestURLString(req), gjson.GetBytes(body, "model").String()); errGuard != nil {
+		return nil, errGuard
 	}
 	body, capabilityManaged, errCapability := applyClaudeCompatProviderCapabilities(req.Context(), body, compatKind, requestURLString(req), compat.MatchContext{
 		Model:        gjson.GetBytes(body, "model").String(),

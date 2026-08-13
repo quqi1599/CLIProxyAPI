@@ -383,6 +383,19 @@ func TestSanitizeOpenAICompatHTTPRequestBodyAllowsPreviouslyGuardedToolHistory(t
 	}
 }
 
+func TestSanitizeOpenAICompatHTTPRequestBodyRejectsDeepSeekImageBeforeScrub(t *testing.T) {
+	body := `{"model":"deepseek-v4-pro","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "https://api.deepseek.com/v1/chat/completions", strings.NewReader(body))
+
+	err := sanitizeOpenAICompatHTTPRequestBody(req, openAICompatProfileForKind("deepseek"), "https://api.deepseek.com/v1")
+	if err == nil {
+		t.Fatal("expected DeepSeek image input rejection before compatibility scrub")
+	}
+	if !strings.Contains(err.Error(), "deepseek_official_image_input") {
+		t.Fatalf("error = %q, want deepseek_official_image_input marker", err.Error())
+	}
+}
+
 func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 	tests := []struct {
 		model              string

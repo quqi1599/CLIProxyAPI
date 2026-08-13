@@ -25,9 +25,9 @@ func TestPrepareClaudeRequestReportsThinkingHistoryPolicy(t *testing.T) {
 		"compat_kind": "minimax",
 	}}
 	plan, err := executor.prepareClaudeRequest(ctx, auth, cliproxyexecutor.Request{
-		Model:   "deepseek-v4-pro",
+		Model:   "route-alias",
 		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, "deepseek-v4-pro", false)
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}, "route-alias", false)
 	if err != nil {
 		t.Fatalf("prepareClaudeRequest() error = %v", err)
 	}
