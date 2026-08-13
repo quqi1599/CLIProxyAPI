@@ -97,6 +97,15 @@ func TestManagerTypedFailureRetryAndCooldownMatrix(t *testing.T) {
 			wantModel: true,
 		},
 		{
+			name: "request too large",
+			failure: &failurecontract.Failure{
+				Kind: failurecontract.RequestTooLarge, Scope: failurecontract.ScopeRequest,
+				HTTPStatus: http.StatusRequestEntityTooLarge, ProviderCode: "request_too_large",
+				PublicMessage: "request body too large",
+			},
+			wantCalls: 1,
+		},
+		{
 			name: "account_quota",
 			failure: &failurecontract.Failure{
 				Kind: failurecontract.QuotaExceeded, Scope: failurecontract.ScopeCredential,
@@ -170,6 +179,37 @@ func TestManagerTypedFailureRetryAndCooldownMatrix(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestManagerRequestTooLargeStopsBeforeTryingAnotherCredential(t *testing.T) {
+	const model = "request-too-large-model"
+	executor := &failureScopeMatrixExecutor{failure: &failurecontract.Failure{
+		Kind: failurecontract.RequestTooLarge, Scope: failurecontract.ScopeRequest,
+		HTTPStatus: http.StatusRequestEntityTooLarge, ProviderCode: "request_too_large",
+		Retryable: false, PublicMessage: "request body too large",
+	}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, time.Second, 3)
+	manager.SetRetryQueueDelay(time.Hour)
+	manager.RegisterExecutor(executor)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	for _, authID := range []string{"request-too-large-a", "request-too-large-b"} {
+		modelRegistry.RegisterClient(authID, executor.Identifier(), []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+		if _, err := manager.Register(context.Background(), &Auth{ID: authID, Provider: executor.Identifier()}); err != nil {
+			t.Fatalf("register auth %s: %v", authID, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := manager.Execute(ctx, []string{executor.Identifier()}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("Execute() unexpectedly succeeded")
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want 1 before cross-credential retry", got)
 	}
 }
 

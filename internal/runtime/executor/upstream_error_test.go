@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 )
 
 func TestNewUpstreamStatusErrDoesNotExposeBody(t *testing.T) {
@@ -22,6 +24,20 @@ func TestNewUpstreamStatusErrDoesNotExposeBody(t *testing.T) {
 	}
 	if err.StatusCode() != http.StatusBadRequest || err.ErrorCode() != "context_length_exceeded" {
 		t.Fatalf("status/code = %d/%q", err.StatusCode(), err.ErrorCode())
+	}
+}
+
+func TestNewUpstreamStatusErrClassifies413AsRequestScoped(t *testing.T) {
+	err := newUpstreamStatusErr(http.StatusRequestEntityTooLarge, http.Header{"Content-Type": {"application/json"}}, "application/json", []byte(`{"error":{"message":"request body too large"}}`))
+	typed, ok := failurecontract.As(err)
+	if !ok {
+		t.Fatalf("error = %#v, want typed failure", err)
+	}
+	if typed.Kind != failurecontract.RequestTooLarge || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %#v, want non-retryable request-too-large", typed)
+	}
+	if typed.HTTPStatus != http.StatusRequestEntityTooLarge || typed.ProviderCode != "request_too_large" {
+		t.Fatalf("failure status/code = %d/%q", typed.HTTPStatus, typed.ProviderCode)
 	}
 }
 

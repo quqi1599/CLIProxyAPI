@@ -3660,6 +3660,28 @@ func TestDeepSeekOfficialImageInputDoesNotRetryOrFallback(t *testing.T) {
 	}
 }
 
+func TestRequestEntityTooLargeDoesNotRetryOrFallback(t *testing.T) {
+	err := &Error{Code: "request_too_large", HTTPStatus: http.StatusRequestEntityTooLarge, Message: "request body too large"}
+	if !isRequestInvalidError(err) {
+		t.Fatal("expected 413 to be request invalid")
+	}
+	for _, model := range []string{"qwen3.7-plus", "claude-sonnet-4-6", "glm-4.7"} {
+		if shouldFallbackRequestScopedRouteErrorForRequest(model, cliproxyexecutor.Options{}, err) {
+			t.Fatalf("expected 413 to stop fallback for %s", model)
+		}
+	}
+}
+
+func TestResultErrorFromCauseClassifiesLegacy413AsRequestScoped(t *testing.T) {
+	resultErr := resultErrorFromCause(codedStatusError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", msg: "request body too large"})
+	if resultErr == nil {
+		t.Fatal("resultErrorFromCause() returned nil")
+	}
+	if resultErr.Kind != string(failurecontract.RequestTooLarge) || resultErr.Scope != string(failurecontract.ScopeRequest) || resultErr.Retryable {
+		t.Fatalf("result error = %#v, want non-retryable request-too-large", resultErr)
+	}
+}
+
 func TestMiMoIncompleteThinkingHistoryDoesNotRetryOrFallback(t *testing.T) {
 	err := &failurecontract.Failure{
 		Kind:          failurecontract.InvalidThinkingHistory,

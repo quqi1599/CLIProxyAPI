@@ -534,6 +534,9 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if plan.oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		plan.bodyForUpstream = signAnthropicMessagesBody(plan.bodyForUpstream)
 	}
+	if err = rejectQwenLargeInlineBase64ImageRequest(ctx, plan.bodyForUpstream, plan.providerIdentity.Kind, baseModel, requestPath, "ClaudeExecutor"); err != nil {
+		return plan, err
+	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
 		claudeFinalSanitizeTransformStage,

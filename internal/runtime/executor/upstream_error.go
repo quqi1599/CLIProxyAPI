@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/tidwall/gjson"
 )
@@ -20,7 +21,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"model_not_supported": {}, "not_found": {}, "overloaded": {}, "overloaded_error": {},
 	"permission_denied": {}, "permission_error": {}, "policy_denied": {},
 	"previous_response_not_found": {}, "quota_exceeded": {}, "quota_exhausted": {}, "rate_limit": {}, "rate_limit_error": {},
-	"rate_limit_exceeded": {}, "request_feature_unsupported": {}, "resource_exhausted": {},
+	"rate_limit_exceeded": {}, "request_feature_unsupported": {}, "request_too_large": {}, "resource_exhausted": {},
 	"server_error": {}, "thinking_signature_invalid": {}, "timeout": {}, "unauthenticated": {},
 	"unknown": {}, "unavailable": {}, "upstream_response_too_large": {},
 	"upstream_timeout": {}, "usage_limit_reached": {}, "websocket_connection_limit_reached": {},
@@ -32,13 +33,27 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 	if headers != nil {
 		clonedHeaders = headers.Clone()
 	}
-	return statusErr{
+	result := statusErr{
 		code:               statusCode,
 		providerStatusCode: statusCode,
 		msg:                message,
 		errorCode:          errorCode,
 		headers:            clonedHeaders,
 	}
+	if statusCode == http.StatusRequestEntityTooLarge {
+		if result.errorCode == "" {
+			result.errorCode = "request_too_large"
+		}
+		result.failure = &failurecontract.Failure{
+			Kind:          failurecontract.RequestTooLarge,
+			Scope:         failurecontract.ScopeRequest,
+			HTTPStatus:    http.StatusRequestEntityTooLarge,
+			ProviderCode:  result.errorCode,
+			Retryable:     false,
+			PublicMessage: result.msg,
+		}
+	}
+	return result
 }
 
 func safeUpstreamFailureMessage(contentType string, body []byte) (string, string) {
