@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/tidwall/gjson"
 )
@@ -116,7 +118,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 	}
 }
 
-func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsPartialToolReasoning(t *testing.T) {
+func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesPartialHistoryWithoutExplicitThinking(t *testing.T) {
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","reasoning_content":"first plan","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
@@ -125,16 +127,22 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsPartialToolReasoning(t *te
 		]
 	}`)
 
-	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-pro")
-	if err == nil || !strings.Contains(err.Error(), "缺少原始 reasoning_content") {
-		t.Fatalf("error = %v, want missing reasoning history", err)
+	out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReport(body, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModelWithReport() error = %v", err)
 	}
-	if changed || downgraded || !bytes.Equal(out, body) {
-		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("incomplete default history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
+	}
+	if report.DowngradeReason != thinkingHistoryUnrepairableReason || report.CheckedToolCallTurns != 2 {
+		t.Fatalf("report = %+v", report)
 	}
 }
 
-func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsMissingToolReasoning(t *testing.T) {
+func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutExplicitThinking(t *testing.T) {
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
@@ -143,11 +151,14 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsMissingToolReasoning(t *te
 	}`)
 
 	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-flash")
-	if err == nil || !strings.Contains(err.Error(), "缺少原始 reasoning_content") {
-		t.Fatalf("error = %v, want missing reasoning history", err)
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
 	}
-	if changed || downgraded || !bytes.Equal(out, body) {
-		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("incomplete default history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
 	}
 }
 
@@ -161,11 +172,64 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsMissingReasoningWhenThinki
 	}`)
 
 	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "openai", "deepseek-v4-pro")
-	if err == nil || !strings.Contains(err.Error(), "缺少原始 reasoning_content") {
+	if err == nil || !strings.Contains(err.Error(), "切换到 OpenAI 原生 GPT 模型") {
 		t.Fatalf("error = %v, want missing reasoning history", err)
 	}
 	if changed || downgraded || !bytes.Equal(out, body) {
 		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.HTTPStatus != http.StatusBadRequest || typed.ProviderCode != deepSeekInvalidThinkingHistoryCode || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped DeepSeek history error", typed)
+	}
+	for _, want := range []string{"/compact 无法修复", "新建 DeepSeek 会话", "不是账号额度或网络错误"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want guidance %q", err.Error(), want)
+		}
+	}
+}
+
+func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutExplicitThinking(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+	]}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
+	}
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("incomplete default history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
+	}
+}
+
+func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsExplicitThinkingWithProtocolNeutralMessage(t *testing.T) {
+	body := []byte(`{
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
+	}`)
+
+	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-pro")
+	if err == nil {
+		t.Fatal("normalizeThinkingHistoryForModel() should reject explicit thinking with incomplete history")
+	}
+	if changed || downgraded || !bytes.Equal(out, body) {
+		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if strings.Contains(err.Error(), "reasoning_content") || strings.Contains(err.Error(), "thinking at message") {
+		t.Fatalf("customer message exposed protocol internals: %q", err.Error())
+	}
+	if err.Error() != deepSeekInvalidThinkingHistoryMessage {
+		t.Fatalf("error = %q, want shared customer message", err.Error())
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped DeepSeek history error", typed)
 	}
 }
 
@@ -392,7 +456,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 	}
 }
 
-func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsPartialToolThinking(t *testing.T) {
+func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesPartialToolThinkingByDefault(t *testing.T) {
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","content":[{"type":"thinking","thinking":"first plan"},{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
@@ -402,15 +466,18 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsPartialToolThinking(t *tes
 	}`)
 
 	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-pro")
-	if err == nil || !strings.Contains(err.Error(), "缺少原始 thinking") {
-		t.Fatalf("error = %v, want missing reasoning history", err)
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
 	}
-	if changed || downgraded || !bytes.Equal(out, body) {
-		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("incomplete default history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
 	}
 }
 
-func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsMissingToolThinking(t *testing.T) {
+func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesMissingToolThinkingByDefault(t *testing.T) {
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
@@ -419,11 +486,14 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsMissingToolThinking(t *tes
 	}`)
 
 	out, changed, downgraded, err := normalizeThinkingHistoryForModel(body, "claude", "deepseek-v4-flash")
-	if err == nil || !strings.Contains(err.Error(), "缺少原始 thinking") {
-		t.Fatalf("error = %v, want missing reasoning history", err)
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModel() error = %v", err)
 	}
-	if changed || downgraded || !bytes.Equal(out, body) {
-		t.Fatalf("invalid history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("incomplete default history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
 	}
 }
 

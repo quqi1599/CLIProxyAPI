@@ -4,6 +4,13 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func TestClaudeDeepSeekOfficialLongContextToolPileLimits(t *testing.T) {
@@ -45,5 +52,57 @@ func TestDeepSeekAnthropicImageGuardOnlyAppliesToOfficialHost(t *testing.T) {
 	err := rejectDeepSeekAnthropicUnsupportedImageInput(context.Background(), body, "deepseek", "https://api.deepseek.com/anthropic", "deepseek-v4-pro")
 	if err == nil || !strings.Contains(err.Error(), "不支持图片内容块") {
 		t.Fatalf("official DeepSeek Anthropic image guard error = %v", err)
+	}
+}
+
+func TestPrepareClaudeRequestDeepSeekDowngradesIncompleteDefaultHistory(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+		"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "compat_kind": "deepseek",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[
+			{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`)
+	plan, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}, "deepseek-v4-pro", false)
+	if err != nil {
+		t.Fatalf("prepareClaudeRequest() error = %v", err)
+	}
+	if got := gjson.GetBytes(plan.bodyForUpstream, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, plan.bodyForUpstream)
+	}
+	if gjson.GetBytes(plan.bodyForUpstream, "messages.0.content.#(type==\"thinking\")").Exists() {
+		t.Fatalf("missing thinking history was synthesized: %s", plan.bodyForUpstream)
+	}
+}
+
+func TestPrepareClaudeRequestDeepSeekRejectsIncompleteExplicitHistory(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+		"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "compat_kind": "deepseek",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v4-pro",
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
+	}`)
+	_, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}, "deepseek-v4-pro", false)
+	if err == nil {
+		t.Fatal("prepareClaudeRequest() should reject explicit thinking with incomplete history")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.ProviderCode != deepSeekInvalidThinkingHistoryCode || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped DeepSeek history error", typed)
+	}
+	if err.Error() != deepSeekInvalidThinkingHistoryMessage {
+		t.Fatalf("error = %q, want customer guidance", err.Error())
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -81,6 +82,118 @@ func TestOpenAICompatExecutorDeepSeekOfficialAllowsMaxReasoningEffort(t *testing
 	}
 	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "max" {
 		t.Fatalf("reasoning_effort = %q, want max; body=%s", got, string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekDowngradesIncompleteDefaultHistoryBeforeUpstream(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-history","object":"chat.completion","model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "compat_kind": "deepseek",
+	}}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[
+				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"},
+				{"role":"user","content":"continue"}
+			]
+		}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("missing reasoning content was synthesized: %s", gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekRejectsIncompleteExplicitHistoryBeforeUpstream(t *testing.T) {
+	upstreamCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "compat_kind": "deepseek",
+	}}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"reasoning_effort":"high",
+			"messages":[
+				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"}
+			]
+		}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() should reject explicit thinking with incomplete history")
+	}
+	if upstreamCalled {
+		t.Fatal("upstream should not be called for deterministic incomplete history")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.ProviderCode != deepSeekInvalidThinkingHistoryCode || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped DeepSeek history error", typed)
+	}
+	if err.Error() != deepSeekInvalidThinkingHistoryMessage {
+		t.Fatalf("error = %q, want customer guidance", err.Error())
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekRechecksIncompleteHistoryAfterPayloadConfig(t *testing.T) {
+	upstreamCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
+		Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "deepseek-v4-pro", Protocol: "openai"}},
+			Params: map[string]any{"thinking.type": "enabled"},
+		}}},
+	})
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "compat_kind": "deepseek",
+	}}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[
+				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"}
+			]
+		}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err == nil {
+		t.Fatal("Execute() should reject payload config that re-enables thinking with incomplete history")
+	}
+	if upstreamCalled {
+		t.Fatal("upstream should not be called after payload config re-enables unsafe thinking")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Kind != failurecontract.InvalidThinkingHistory || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %+v, want non-retryable request-scoped DeepSeek history error", typed)
 	}
 }
 

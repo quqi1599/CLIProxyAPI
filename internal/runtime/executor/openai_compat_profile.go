@@ -347,7 +347,8 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 		payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	}
 	if profile.NormalizeToolHistory {
-		repairMissingReasoning := compatKind != "xiaomi" || !isXiaomiMimoV25Model(model)
+		repairMissingReasoning := (compatKind != "xiaomi" || !isXiaomiMimoV25Model(model)) &&
+			(compatKind != "deepseek" || !requiresReturnedThinkingHistory(model))
 		if normalized, err := normalizeOpenAICompatToolMessageLinksWithReasoningRepair(payload, "openai compat executor", repairMissingReasoning); err == nil {
 			payload = normalized
 		} else {

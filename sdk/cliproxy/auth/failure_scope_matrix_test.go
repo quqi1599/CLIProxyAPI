@@ -213,6 +213,44 @@ func TestManagerRequestTooLargeStopsBeforeTryingAnotherCredential(t *testing.T) 
 	}
 }
 
+func TestManagerDeepSeekInvalidThinkingHistoryStopsBeforeProtocolOrCredentialFallback(t *testing.T) {
+	const model = "deepseek-v4-pro"
+	executor := &failureScopeMatrixExecutor{failure: &failurecontract.Failure{
+		Kind:          failurecontract.InvalidThinkingHistory,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    http.StatusBadRequest,
+		ProviderCode:  "missing_reasoning_history",
+		Retryable:     false,
+		PublicMessage: "DeepSeek tool history is missing original reasoning",
+	}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(5, time.Second, 5)
+	manager.SetRetryQueueDelay(time.Hour)
+	manager.RegisterExecutor(executor)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	for _, authID := range []string{"deepseek-openai-route", "deepseek-anthropic-route"} {
+		modelRegistry.RegisterClient(authID, executor.Identifier(), []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+		if _, err := manager.Register(context.Background(), &Auth{ID: authID, Provider: executor.Identifier()}); err != nil {
+			t.Fatalf("register auth %s: %v", authID, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err := manager.Execute(ctx, []string{executor.Identifier()}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("Execute() unexpectedly succeeded")
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want exactly one request-scoped failure", got)
+	}
+	if !isRequestInvalidError(err) {
+		t.Fatalf("error = %v, want request-invalid classification", err)
+	}
+}
+
 func TestTypedFailureUnauthorizedEvictionMatrix(t *testing.T) {
 	tests := []struct {
 		name  string

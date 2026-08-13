@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,9 +32,19 @@ const (
 	openAIReasoningUnavailablePlaceholder = compathistory.OpenAIUnavailableValue
 	claudeThinkingUnavailablePlaceholder  = compathistory.ClaudeUnavailableValue
 	xiaomiMimoInvalidThinkingHistoryCode  = "mimo_incomplete_reasoning_history"
+	deepSeekInvalidThinkingHistoryCode    = "missing_reasoning_history"
 )
 
 const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少真实 reasoning_content，CPA 无法可靠还原。请新建会话、关闭思考或清理工具历史后重试；系统不会伪造思考内容、删除工具或跨渠道重试。"
+const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的原始推理内容。Codex 中重复重试或 /compact 无法修复；请切换到 OpenAI 原生 GPT 模型后继续并执行 /compact，或新建 DeepSeek 会话。若客户端支持，也可关闭思考模式后继续；这不是账号额度或网络错误。"
+
+type deepSeekThinkingIntent uint8
+
+const (
+	deepSeekThinkingIntentDefault deepSeekThinkingIntent = iota
+	deepSeekThinkingIntentDisabled
+	deepSeekThinkingIntentEnabled
+)
 
 type thinkingHistoryTransformReport = compathistory.Report
 
@@ -100,14 +111,28 @@ func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, mo
 		if !deepSeekThinkingHistoryRequiredForRequest(body, provider) {
 			return body, false, false, report, nil
 		}
+		var err error
 		switch strings.ToLower(strings.TrimSpace(provider)) {
 		case "openai":
-			return validateOpenAIThinkingHistoryWithReport(body)
+			report, err = compathistory.Validate(body, compathistory.FormatOpenAI, true)
 		case "claude":
-			return validateClaudeThinkingHistoryWithReport(body)
+			report, err = compathistory.Validate(body, compathistory.FormatClaude, true)
 		default:
 			return body, false, false, report, nil
 		}
+		if err == nil {
+			return body, false, false, report, nil
+		}
+		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault {
+			out, errDisable := disableDeepSeekThinkingForIncompleteHistory(body, provider)
+			if errDisable != nil {
+				return body, false, false, report, errDisable
+			}
+			report.OutputBytes = len(out)
+			report.DowngradeReason = thinkingHistoryUnrepairableReason
+			return out, !bytes.Equal(out, body), true, report, nil
+		}
+		return body, false, false, report, missingReasoningHistoryStatusError(err)
 	}
 	if preservesOnlyRealReasoningHistory(model) {
 		return body, false, false, report, nil
@@ -258,17 +283,60 @@ func requiresReturnedThinkingHistory(model string) bool {
 }
 
 func deepSeekThinkingHistoryRequiredForRequest(body []byte, provider string) bool {
-	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
-	if isDisabledThinkingType(thinkingType) {
-		return false
-	}
-	if strings.EqualFold(strings.TrimSpace(provider), "openai") {
-		effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()))
-		if effort == "none" || effort == "off" || effort == "disabled" {
-			return false
+	return deepSeekThinkingHistoryIntent(body, provider) != deepSeekThinkingIntentDisabled
+}
+
+func deepSeekThinkingHistoryIntent(body []byte, provider string) deepSeekThinkingIntent {
+	if thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())); thinkingType != "" {
+		if isDisabledThinkingType(thinkingType) {
+			return deepSeekThinkingIntentDisabled
 		}
+		return deepSeekThinkingIntentEnabled
 	}
-	return true
+
+	effortPaths := []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"}
+	if strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		effortPaths = []string{"output_config.effort", "reasoning.effort"}
+	}
+	for _, path := range effortPaths {
+		effort := gjson.GetBytes(body, path)
+		if !effort.Exists() {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if value == "" {
+			continue
+		}
+		if isDisabledThinkingType(value) {
+			return deepSeekThinkingIntentDisabled
+		}
+		return deepSeekThinkingIntentEnabled
+	}
+
+	for _, path := range []string{"thinking_budget", "thinking.budget_tokens"} {
+		budget := gjson.GetBytes(body, path)
+		if !budget.Exists() {
+			continue
+		}
+		if value, ok := deepSeekThinkingBudgetValue(budget); ok && value == 0 {
+			return deepSeekThinkingIntentDisabled
+		}
+		return deepSeekThinkingIntentEnabled
+	}
+	return deepSeekThinkingIntentDefault
+}
+
+func disableDeepSeekThinkingForIncompleteHistory(body []byte, provider string) ([]byte, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "openai" && provider != "claude" {
+		return body, nil
+	}
+	out := thinking.StripThinkingConfig(body, provider)
+	updated, err := sjson.SetBytes(out, "thinking.type", "disabled")
+	if err != nil {
+		return body, fmt.Errorf("disable DeepSeek thinking for incomplete history: %w", err)
+	}
+	return updated, nil
 }
 
 func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
@@ -291,40 +359,26 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 	return result.Payload, result.Changed, result.Downgraded, result.Report, err
 }
 
-func validateOpenAIThinkingHistoryWithReport(body []byte) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
-	report, err := compathistory.Validate(body, compathistory.FormatOpenAI, true)
-	if err != nil {
-		return body, false, false, report, missingReasoningHistoryStatusError(err)
-	}
-	return body, false, false, report, nil
-}
-
-func validateClaudeThinkingHistoryWithReport(body []byte) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
-	report, err := compathistory.Validate(body, compathistory.FormatClaude, true)
-	if err != nil {
-		return body, false, false, report, missingReasoningHistoryStatusError(err)
-	}
-	return body, false, false, report, nil
-}
-
 func missingReasoningHistoryStatusError(err error) error {
 	var missing *compathistory.MissingReasoningError
 	if !errors.As(err, &missing) {
 		return err
 	}
-	field := "reasoning_content"
-	if missing.Format == compathistory.FormatClaude {
-		field = "thinking"
+	failure := &failurecontract.Failure{
+		Kind:          failurecontract.InvalidThinkingHistory,
+		Scope:         failurecontract.ScopeRequest,
+		HTTPStatus:    http.StatusBadRequest,
+		ProviderCode:  deepSeekInvalidThinkingHistoryCode,
+		SemanticCode:  deepSeekInvalidThinkingHistoryCode,
+		Retryable:     false,
+		Cause:         missing,
+		PublicMessage: deepSeekInvalidThinkingHistoryMessage,
 	}
 	return statusErr{
 		code:      http.StatusBadRequest,
-		errorCode: "missing_reasoning_history",
-		msg: fmt.Sprintf(
-			"DeepSeek 思考模式的工具调用历史缺少原始 %s。系统不会伪造、复制或填充推理内容；请完整保留 DeepSeek 返回的 %s 后重试，或者新建会话。详情：%s",
-			field,
-			field,
-			missing.Error(),
-		),
+		errorCode: deepSeekInvalidThinkingHistoryCode,
+		msg:       deepSeekInvalidThinkingHistoryMessage,
+		failure:   failure,
 	}
 }
 
