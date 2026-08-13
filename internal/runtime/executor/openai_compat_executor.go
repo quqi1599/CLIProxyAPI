@@ -380,6 +380,43 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 	}
 }
 
+func rejectQwenLargeInlineBase64ImageRequest(ctx context.Context, body []byte, compatKind, model, path, executor string) error {
+	imageParts, reject := helps.LargeQwenInlineBase64ImageRequest(compatKind, body)
+	if !reject {
+		return nil
+	}
+	fields := log.Fields{
+		"event":               "qwen_inline_base64_image_guard",
+		"executor":            executor,
+		"model":               model,
+		"compat_kind":         "qwen",
+		"request_path":        path,
+		"payload_bytes":       len(body),
+		"payload_bytes_limit": helps.QwenInlineBase64ImagePayloadLimitBytes,
+		"inline_image_parts":  imageParts,
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).Warn("large Qwen inline Base64 image request rejected before upstream request")
+	message := qwenLargeInlineBase64ImageUserMessage()
+	return statusErr{
+		code:               http.StatusRequestEntityTooLarge,
+		providerStatusCode: http.StatusRequestEntityTooLarge,
+		errorCode:          "request_too_large",
+		msg:                message,
+		failure: &failurecontract.Failure{
+			Kind:          failurecontract.RequestTooLarge,
+			Scope:         failurecontract.ScopeRequest,
+			HTTPStatus:    http.StatusRequestEntityTooLarge,
+			ProviderCode:  "request_too_large",
+			Retryable:     false,
+			PublicMessage: message,
+		},
+	}
+}
+
+func qwenLargeInlineBase64ImageUserMessage() string {
+	return "request_too_large: qwen_large_base64_image. 当前 Qwen 请求包含大尺寸 Base64 内嵌图片，完整请求体已超过 10 MiB，上游仍会拒绝；请压缩图片，或将图片上传到可访问的 HTTPS URL 后通过 image_url 引用。单纯放大 CPA 上限、切换凭证或原样重试不会成功。"
+}
+
 func deepSeekOfficialImageInputUserMessage() string {
 	return "request_feature_unsupported: deepseek_official_image_input. DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
 }
@@ -770,6 +807,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.failureCtx = cliproxyusage.WithFailureDiagnostic(ctx, diagnostic.failureDiagnostic())
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
+	if err = rejectQwenLargeInlineBase64ImageRequest(ctx, body, profile.Kind, baseModel, plan.requestPath, "OpenAICompatExecutor"); err != nil {
+		return plan, err
+	}
 	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
 		return plan, err
 	}

@@ -7527,6 +7527,10 @@ func resultErrorFromCause(err error) *Error {
 		resultErr.Kind = string(failurecontract.InvalidRequest)
 		resultErr.Scope = string(failurecontract.ScopeRequest)
 		resultErr.Retryable = false
+	} else if resultErr.HTTPStatus == http.StatusRequestEntityTooLarge {
+		resultErr.Kind = string(failurecontract.RequestTooLarge)
+		resultErr.Scope = string(failurecontract.ScopeRequest)
+		resultErr.Retryable = false
 	}
 	return resultErr
 }
@@ -8545,9 +8549,9 @@ func isSpecificFallbackModel(model string, target string) bool {
 // "invalid_request_error"/"InvalidParameter", guarded oversized Claude compat
 // tool-history requests, unsupported request features, request-scoped content
 // safety/context-window rejections, request-scoped 404 item misses caused by
-// `store=false`, and all 422 responses as request-shape failures for the generic
-// retry loop. Model-support errors are excluded so routing can fall through to
-// another auth or upstream.
+// `store=false`, all 413 responses, and all 422 responses as request-shape
+// failures for the generic retry loop. Model-support errors are excluded so
+// routing can fall through to another auth or upstream.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -8610,6 +8614,8 @@ func isRequestInvalidError(err error) bool {
 			strings.Contains(msg, "FAILED_PRECONDITION")
 	case http.StatusUnavailableForLegalReasons:
 		return false
+	case http.StatusRequestEntityTooLarge:
+		return true
 	case http.StatusNotFound:
 		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
