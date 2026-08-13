@@ -193,6 +193,56 @@ func TestLogFormatterIncludesRoutingAvailabilityAndCanonicalFailureFields(t *tes
 	}
 }
 
+func TestLogFormatterIncludesGPTRetryPressureFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 13, 17, 52, 32, 0, time.Local)
+	entry.Level = log.InfoLevel
+	entry.Message = "gpt_retry_pressure"
+	entry.Data["event"] = "gpt_retry_pressure"
+	entry.Data["model"] = "gpt-5.6-luna"
+	entry.Data["retry_pressure_state"] = "congested"
+	entry.Data["retry_pressure_reason"] = "route_pool_exhausted"
+	entry.Data["degraded_route_count"] = 4
+	entry.Data["retry_permit_limit"] = 1
+	entry.Data["retry_in_flight"] = 1
+	entry.Data["retry_waiters"] = 2
+	entry.Data["retry_permit_wait_ms"] = int64(750)
+	entry.Data["retry_permit_acquired"] = true
+	entry.Data["retry_permit_rejected"] = false
+	entry.Data["retry_pressure_wait_ms"] = int64(750)
+	entry.Data["retry_pressure_permit_limit"] = 1
+	entry.Data["retry_pressure_eligible_routes"] = 1
+	entry.Data["retry_pressure_degraded_routes"] = 4
+	entry.Data["retry_pressure_throttled"] = true
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"retry_pressure_state=congested",
+		"retry_pressure_reason=route_pool_exhausted",
+		"degraded_route_count=4",
+		"retry_permit_limit=1",
+		"retry_in_flight=1",
+		"retry_waiters=2",
+		"retry_permit_wait_ms=750",
+		"retry_permit_acquired=true",
+		"retry_permit_rejected=false",
+		"retry_pressure_wait_ms=750",
+		"retry_pressure_permit_limit=1",
+		"retry_pressure_eligible_routes=1",
+		"retry_pressure_degraded_routes=4",
+		"retry_pressure_throttled=true",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %q", line, want)
+		}
+	}
+}
+
 func TestLogFormatterIncludesCompatibilityDiagnosticFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 7, 6, 2, 14, 0, 0, time.Local)
