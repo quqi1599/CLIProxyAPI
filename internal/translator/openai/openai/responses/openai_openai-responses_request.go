@@ -221,10 +221,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				appendRegularMessage(message)
 
 			case "reasoning":
-				if !parsed.Reasoning.Available || strings.TrimSpace(parsed.Reasoning.Text) == "" {
-					continue
-				}
 				reasoningContent := parsed.Reasoning.Text
+				if !parsed.Reasoning.Available {
+					reasoningContent = "[reasoning unavailable]"
+				}
 				if pendingReasoningContent == "" {
 					pendingReasoningContent = reasoningContent
 				} else {
