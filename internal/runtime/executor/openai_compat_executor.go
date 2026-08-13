@@ -1103,6 +1103,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
+	if requiresReturnedThinkingHistory(baseModel) {
+		body, _, _, _, err = normalizeThinkingHistoryForModelWithReport(body, "openai", baseModel)
+		if err != nil {
+			return plan, err
+		}
+	}
 	body, _, err = normalizeXiaomiMimoThinkingHistory(body, profile.Kind, baseModel)
 	if err != nil {
 		return plan, err
