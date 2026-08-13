@@ -131,6 +131,13 @@ type requestAttemptTrace struct {
 	gptFirstEventPolicySet       bool
 	gptFirstEventPolicy          GPTFirstEventPolicySnapshot
 	gptFirstEventBudgetExhausted bool
+	gptRetryPressureState        string
+	gptRetryPressureReason       string
+	gptRetryPressureWait         time.Duration
+	gptRetryPressurePermitLimit  int
+	gptRetryPressureEligible     int
+	gptRetryPressureDegraded     int
+	gptRetryPressureThrottled    bool
 	zeroEligibleProbeKey         string
 }
 
@@ -153,6 +160,13 @@ type requestExecutionSummary struct {
 	GPTFirstEventWait            time.Duration
 	GPTFirstEventPolicy          GPTFirstEventPolicySnapshot
 	GPTFirstEventBudgetExhausted bool
+	GPTRetryPressureState        string
+	GPTRetryPressureReason       string
+	GPTRetryPressureWait         time.Duration
+	GPTRetryPressurePermitLimit  int
+	GPTRetryPressureEligible     int
+	GPTRetryPressureDegraded     int
+	GPTRetryPressureThrottled    bool
 }
 
 type routePlanSummary struct {
@@ -346,15 +360,25 @@ func (t *requestAttemptTrace) gptFirstEventPolicyValue() (GPTFirstEventPolicySna
 func (t *requestAttemptTrace) gptFirstEventRetryLimits() (maxChannels, maxRounds int) {
 	policy, configured := t.gptFirstEventPolicyValue()
 	if !configured {
-		return gptImmediateFailoverMaxChannels, gptImmediateFailoverMaxRounds
+		maxChannels, maxRounds = gptImmediateFailoverMaxChannels, gptImmediateFailoverMaxRounds
+	} else {
+		if policy.MaxChannels <= 0 {
+			policy.MaxChannels = gptImmediateFailoverMaxChannels
+		}
+		if policy.MaxRounds <= 0 {
+			policy.MaxRounds = gptImmediateFailoverMaxRounds
+		}
+		maxChannels, maxRounds = policy.MaxChannels, policy.MaxRounds
 	}
-	if policy.MaxChannels <= 0 {
-		policy.MaxChannels = gptImmediateFailoverMaxChannels
+	if t != nil {
+		t.mu.Lock()
+		pressureEvaluated := t.gptRetryPressureState != ""
+		t.mu.Unlock()
+		if pressureEvaluated && maxRounds > 2 {
+			maxRounds = 2
+		}
 	}
-	if policy.MaxRounds <= 0 {
-		policy.MaxRounds = gptImmediateFailoverMaxRounds
-	}
-	return policy.MaxChannels, policy.MaxRounds
+	return maxChannels, maxRounds
 }
 
 func (t *requestAttemptTrace) gptFirstEventRemainingBudget() (time.Duration, bool) {
@@ -379,6 +403,23 @@ func (t *requestAttemptTrace) markGPTFirstEventBudgetExhausted() {
 	}
 	t.mu.Lock()
 	t.gptFirstEventBudgetExhausted = true
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) recordGPTRetryPressure(snapshot gptRetryPressureSnapshot, err error) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.gptRetryPressureState = snapshot.State
+	t.gptRetryPressureReason = snapshot.Reason
+	t.gptRetryPressureWait += snapshot.Wait
+	t.gptRetryPressurePermitLimit = snapshot.PermitLimit
+	t.gptRetryPressureEligible = snapshot.EligibleRoutes
+	t.gptRetryPressureDegraded = snapshot.DegradedRoutes
+	if err != nil || snapshot.Rejected || snapshot.State == gptRetryPressureStateCongested || snapshot.Wait >= time.Millisecond {
+		t.gptRetryPressureThrottled = true
+	}
 	t.mu.Unlock()
 }
 
@@ -664,6 +705,13 @@ func (t *requestAttemptTrace) summary() requestExecutionSummary {
 		GPTFirstEventWait:            t.gptFirstEventWait,
 		GPTFirstEventPolicy:          t.gptFirstEventPolicy,
 		GPTFirstEventBudgetExhausted: t.gptFirstEventBudgetExhausted,
+		GPTRetryPressureState:        t.gptRetryPressureState,
+		GPTRetryPressureReason:       t.gptRetryPressureReason,
+		GPTRetryPressureWait:         t.gptRetryPressureWait,
+		GPTRetryPressurePermitLimit:  t.gptRetryPressurePermitLimit,
+		GPTRetryPressureEligible:     t.gptRetryPressureEligible,
+		GPTRetryPressureDegraded:     t.gptRetryPressureDegraded,
+		GPTRetryPressureThrottled:    t.gptRetryPressureThrottled,
 	}
 }
 
@@ -812,6 +860,15 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	}
 	if summary.GPTFirstEventBudgetExhausted {
 		fields["first_event_wait_budget_exhausted"] = true
+	}
+	if summary.GPTRetryPressureState != "" {
+		fields["retry_pressure_state"] = summary.GPTRetryPressureState
+		fields["retry_pressure_reason"] = summary.GPTRetryPressureReason
+		fields["retry_pressure_wait_ms"] = summary.GPTRetryPressureWait.Milliseconds()
+		fields["retry_pressure_permit_limit"] = summary.GPTRetryPressurePermitLimit
+		fields["retry_pressure_eligible_routes"] = summary.GPTRetryPressureEligible
+		fields["retry_pressure_degraded_routes"] = summary.GPTRetryPressureDegraded
+		fields["retry_pressure_throttled"] = summary.GPTRetryPressureThrottled
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
 }
@@ -1441,6 +1498,7 @@ type Manager struct {
 	refreshLocks          sync.Map
 	activeStreams         *activeStreamTracker
 	gptFirstEventObserver *gptFirstEventObserver
+	gptRetryPressure      *gptRetryPressureController
 	gptPolicyPersistMu    sync.Mutex
 }
 
@@ -1470,6 +1528,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		codexModelLoads:          make(map[string]int),
 		activeStreams:            newActiveStreamTracker(),
 		gptFirstEventObserver:    newGPTFirstEventObserver(),
+		gptRetryPressure:         newGPTRetryPressureController(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -4302,7 +4361,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			cleanupAttempt()
 			rerr := resultErrorFromCause(errStream)
 			elapsed := time.Since(startedAt)
-			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, elapsed, false, errStream)
+			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, elapsed, false, errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: elapsed, TTFT: elapsed, Error: rerr, Cause: errStream}
 			result.RetryAfter = retryAfterFromError(errStream)
 			channelFailover := shouldFailoverGPTChannel(errStream, routeProviders, routeModel)
@@ -4436,7 +4495,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, newCallerRequestFailure(errCtx)
 			}
-			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
+			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
 			rerr := resultErrorFromCause(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: bootstrapErr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
@@ -4492,7 +4551,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, false, emptyErr)
+			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: emptyErr}
 			result.keepSelectorLease = idx < len(execModels)-1
 			m.MarkResult(ctx, result)
@@ -4540,7 +4599,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
 			toolShape:        toolShapeFromOptions(opts),
 		}
-		m.recordGPTFirstEventAttempt(ctx, routeModel, firstEventTimeout, firstPayloadDelay, true, nil)
+		m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, true, nil)
 		return m.wrapStreamResult(
 			attemptCtx,
 			auth.Clone(),
@@ -5109,7 +5168,21 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
+	var retryPermitRelease func()
+	defer func() {
+		if retryPermitRelease != nil {
+			retryPermitRelease()
+		}
+	}()
 	for {
+		if operation == "execute" && isGPTRetryRoute(providers, routeModel) && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
+			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
+			trace.recordGPTRetryPressure(pressure, errPermit)
+			if errPermit != nil {
+				return cliproxyexecutor.Response{}, errPermit
+			}
+			retryPermitRelease = release
+		}
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
 			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
 			if lastErr != nil {
@@ -5256,6 +5329,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				}
 			}
 			elapsed := time.Since(startedAt)
+			if operation == "execute" && isGPTRetryRoute(providers, routeModel) {
+				m.recordGPTRetryPressureAttempt(execCtx, routeModel, routingChannelBaseKey(auth), errExec == nil, errExec)
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -5375,7 +5451,21 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
+	var retryPermitRelease func()
+	defer func() {
+		if retryPermitRelease != nil {
+			retryPermitRelease()
+		}
+	}()
 	for {
+		if isGPTRetryRoute(providers, routeModel) && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
+			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
+			trace.recordGPTRetryPressure(pressure, errPermit)
+			if errPermit != nil {
+				return nil, errPermit
+			}
+			retryPermitRelease = release
+		}
 		if isGPTRetryRoute(providers, routeModel) {
 			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
 				trace.markGPTFirstEventBudgetExhausted()
@@ -12067,104 +12157,7 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 }
 
 func (m *Manager) authAvailabilityMetricFields(providers []string, model string, now time.Time) log.Fields {
-	fields := log.Fields{}
-	if m == nil {
-		return fields
-	}
-	providerSet := make(map[string]struct{}, len(providers))
-	for _, provider := range normalizeProviderKeys(providers) {
-		providerSet[provider] = struct{}{}
-	}
-	registryRef := registry.GetGlobalRegistry()
-	candidateRoutes := make(map[string]struct{})
-	eligibleRoutes := make(map[string]struct{})
-	blockedRoutes := make(map[string]string)
-	breakerRoutes := make(map[string]int)
-	var earliestRecovery time.Time
-
-	m.mu.RLock()
-	for _, auth := range m.auths {
-		if auth == nil || executorKeyForProviderSet(auth, providerSet, m.executors) == "" {
-			continue
-		}
-		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
-			continue
-		}
-		routeKey := routingChannelBaseKey(auth)
-		if routeKey == "" {
-			continue
-		}
-		candidateRoutes[routeKey] = struct{}{}
-		checkModel := m.selectionModelForAuth(auth, model)
-		blocked, reason, next := isAuthBlockedForModelRoute(auth, checkModel, now, true)
-		if !blocked {
-			eligibleRoutes[routeKey] = struct{}{}
-			continue
-		}
-		if _, exists := blockedRoutes[routeKey]; !exists {
-			blockedRoutes[routeKey] = blockReasonLabel(reason)
-		}
-		if !next.IsZero() && next.After(now) && (earliestRecovery.IsZero() || next.Before(earliestRecovery)) {
-			earliestRecovery = next
-		}
-		health := resolveHealthState(auth, checkModel)
-		if health.BreakerState == HealthBreakerOpen && health.OpenUntil.After(now) {
-			breakerRoutes[routeKey] = health.LastStatusCode
-			if earliestRecovery.IsZero() || health.OpenUntil.Before(earliestRecovery) {
-				earliestRecovery = health.OpenUntil
-			}
-		}
-	}
-	m.mu.RUnlock()
-
-	for routeKey := range eligibleRoutes {
-		delete(blockedRoutes, routeKey)
-		delete(breakerRoutes, routeKey)
-	}
-	fields["candidate_route_count"] = len(candidateRoutes)
-	fields["eligible_route_count"] = len(eligibleRoutes)
-	fields["blocked_route_count"] = len(blockedRoutes)
-	fields["breaker_open_count"] = len(breakerRoutes)
-	if len(blockedRoutes) > 0 {
-		counts := make(map[string]int)
-		for _, reason := range blockedRoutes {
-			counts[reason]++
-		}
-		fields["blocked_reasons"] = formatReasonCounts(counts)
-	}
-	if len(breakerRoutes) > 0 {
-		breakerStatuses := make(map[int]struct{}, len(breakerRoutes))
-		for _, status := range breakerRoutes {
-			if status > 0 {
-				breakerStatuses[status] = struct{}{}
-			}
-		}
-		statuses := make([]int, 0, len(breakerStatuses))
-		for status := range breakerStatuses {
-			statuses = append(statuses, status)
-		}
-		sort.Ints(statuses)
-		parts := make([]string, 0, len(statuses))
-		for _, status := range statuses {
-			parts = append(parts, strconv.Itoa(status))
-		}
-		fields["breaker_statuses"] = strings.Join(parts, ",")
-	}
-	if len(breakerRoutes) > 0 {
-		counts := make(map[string]int)
-		for _, status := range breakerRoutes {
-			reason := "status_unknown"
-			if status > 0 {
-				reason = "status_" + strconv.Itoa(status)
-			}
-			counts[reason]++
-		}
-		fields["breaker_reasons"] = formatReasonCounts(counts)
-	}
-	if !earliestRecovery.IsZero() && earliestRecovery.After(now) {
-		fields["earliest_recovery_ms"] = earliestRecovery.Sub(now).Milliseconds()
-	}
-	return fields
+	return m.gptRouteAvailabilitySnapshot(providers, model, now).logFields(now)
 }
 
 func blockReasonLabel(reason blockReason) string {

@@ -475,7 +475,10 @@ func TestManagerGPTChannelFailoverDoesNotSwitchModelsAcrossRounds(t *testing.T) 
 				t.Fatalf("%s unexpectedly succeeded via the same channel model pool", test.name)
 			}
 			got := test.calls(test.executor)
-			want := []string{firstModel, firstModel, firstModel}
+			want := []string{firstModel, firstModel}
+			if test.name == "count" {
+				want = append(want, firstModel)
+			}
 			if !stringSlicesEqual(got, want) {
 				t.Fatalf("%s models = %v, want %v", test.name, got, want)
 			}
@@ -612,10 +615,14 @@ func TestManagerGPTChannelFailoverUsesBoundedRounds(t *testing.T) {
 						t.Fatalf("%s unexpectedly succeeded", operation.name)
 					}
 					got := operation.calls(executor)
-					if want := channelCount * test.rounds; len(got) != want {
+					rounds := test.rounds
+					if operation.name != "count" && rounds > 2 {
+						rounds = 2
+					}
+					if want := channelCount * rounds; len(got) != want {
 						t.Fatalf("%s calls = %d, want %d: %v", operation.name, len(got), want, got)
 					}
-					for round := 0; round < test.rounds; round++ {
+					for round := 0; round < rounds; round++ {
 						seen := make(map[string]struct{}, channelCount)
 						for _, authID := range got[round*channelCount : (round+1)*channelCount] {
 							seen[authID] = struct{}{}
@@ -630,7 +637,7 @@ func TestManagerGPTChannelFailoverUsesBoundedRounds(t *testing.T) {
 	}
 }
 
-func TestManagerGPTChannelFailoverThirdRoundOnlyRetriesEligibleChannels(t *testing.T) {
+func TestManagerGPTRetryPressureCapsExecutionAtTwoRounds(t *testing.T) {
 	const (
 		model    = "gpt-5.5"
 		provider = "gpt-third-round"
@@ -659,8 +666,8 @@ func TestManagerGPTChannelFailoverThirdRoundOnlyRetriesEligibleChannels(t *testi
 	for _, authID := range executor.ExecuteCalls() {
 		counts[authID]++
 	}
-	if counts["channel-429"] != 2 || counts["channel-502"] != 2 || counts["channel-503"] != 3 {
-		t.Fatalf("channel attempt counts = %v, want 429=2, 502=2, 503=3", counts)
+	if counts["channel-429"] != 2 || counts["channel-502"] != 2 || counts["channel-503"] != 2 {
+		t.Fatalf("channel attempt counts = %v, want every channel tried in two rounds", counts)
 	}
 }
 
