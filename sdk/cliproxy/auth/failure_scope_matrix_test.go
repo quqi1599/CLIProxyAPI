@@ -97,13 +97,13 @@ func TestManagerTypedFailureRetryAndCooldownMatrix(t *testing.T) {
 			wantModel: true,
 		},
 		{
-			name: "credential",
+			name: "account_quota",
 			failure: &failurecontract.Failure{
-				Kind: failurecontract.RateLimited, Scope: failurecontract.ScopeCredential,
+				Kind: failurecontract.QuotaExceeded, Scope: failurecontract.ScopeCredential,
 				HTTPStatus: http.StatusTooManyRequests, Retryable: true, RetryAfter: &retryNow,
-				PublicMessage: "credential rate limited",
+				SemanticCode: "usage_limit_reached", PublicMessage: "account quota exhausted",
 			},
-			wantCalls:      2,
+			wantCalls:      1,
 			wantCredential: true,
 		},
 		{
@@ -156,7 +156,7 @@ func TestManagerTypedFailureRetryAndCooldownMatrix(t *testing.T) {
 					t.Fatalf("credential quota state = %t, want %t; auth=%+v", updated.Quota.Exceeded, scope.wantCredential, updated)
 				}
 				if scope.wantModel {
-					if modelState.Status != StatusDisabled || !modelState.Unavailable || modelState.LastError == nil {
+					if modelState.Status == StatusActive || !modelState.Unavailable || modelState.LastError == nil {
 						t.Fatalf("model failure state = %+v", modelState)
 					}
 					if modelState.LastError.Kind != string(scope.failure.Kind) || modelState.LastError.Scope != string(scope.failure.Scope) {

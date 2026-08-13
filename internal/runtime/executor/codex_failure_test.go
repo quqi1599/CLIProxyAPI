@@ -68,6 +68,52 @@ func TestCanonicalCodexFailureDeterministicOuter400NeverRetries(t *testing.T) {
 	}
 }
 
+func TestCanonicalCodexFailureCredentialScopeRequiresAccountLevelEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		wantKind  failurecontract.Kind
+		wantScope failurecontract.Scope
+		wantRetry bool
+	}{
+		{
+			name:      "invalid api key",
+			status:    http.StatusForbidden,
+			body:      `{"error":{"type":"authentication_error","code":"invalid_api_key","message":"invalid key"}}`,
+			wantKind:  failurecontract.AuthenticationFailed,
+			wantScope: failurecontract.ScopeCredential,
+		},
+		{
+			name:      "model permission denied",
+			status:    http.StatusForbidden,
+			body:      `{"error":{"type":"permission_error","code":"permission_denied","message":"model access denied"}}`,
+			wantKind:  failurecontract.ModelUnavailable,
+			wantScope: failurecontract.ScopeModel,
+			wantRetry: true,
+		},
+		{
+			name:   "generic forbidden",
+			status: http.StatusForbidden,
+			body:   `{"error":{"message":"forbidden by upstream policy"}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			failure, _ := canonicalCodexFailure(codexFailureInput{outerStatus: tc.status, body: []byte(tc.body)})
+			if failure.Kind != tc.wantKind || failure.Scope != tc.wantScope || failure.Retryable != tc.wantRetry {
+				t.Fatalf("classification = %q/%q/%t, want %q/%q/%t", failure.Kind, failure.Scope, failure.Retryable, tc.wantKind, tc.wantScope, tc.wantRetry)
+			}
+		})
+	}
+}
+
 func TestCanonicalCodexFailureNestedEnvelopes(t *testing.T) {
 	for _, pathBody := range []string{
 		`{"body":{"error":{"type":"server_error","code":"server_error","message":"boom"}}}`,

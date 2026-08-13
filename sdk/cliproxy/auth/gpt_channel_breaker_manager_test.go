@@ -83,7 +83,7 @@ func TestManagerGPTChannelBreakerClosedRecoveryPropagates(t *testing.T) {
 	}
 }
 
-func TestManagerGPTChannelBreakerTypedCredential429DoesNotOpenChannel(t *testing.T) {
+func TestManagerGPTChannelBreakerLegacyCredential429DownscopesWithoutOpeningChannel(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	auth := gptChannelBreakerTestAuth("typed-429", "https://typed-429.example/v1")
 	peer := gptChannelBreakerTestAuth("typed-429-peer", "https://typed-429.example/v1")
@@ -122,8 +122,8 @@ func TestManagerGPTChannelBreakerTypedCredential429DoesNotOpenChannel(t *testing
 	if state == nil || state.Health.BreakerState == HealthBreakerOpen || state.consecutive5xx != 0 || state.recentCount != 2 {
 		t.Fatalf("typed credential 429 affected route/model breaker: %+v", state)
 	}
-	if !manager.auths[auth.ID].Unavailable {
-		t.Fatal("typed credential 429 did not cool the affected credential")
+	if manager.auths[auth.ID].Unavailable {
+		t.Fatal("generic credential-shaped 429 cooled the whole credential")
 	}
 	if manager.auths[peer.ID].Unavailable {
 		t.Fatal("typed credential 429 cooled a peer credential")

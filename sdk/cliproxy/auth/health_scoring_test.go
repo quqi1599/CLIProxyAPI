@@ -353,7 +353,7 @@ func TestManagerAvailableAuthsForRouteModel_AllCoolingUsesLowFrequencyProbe(t *t
 	}
 }
 
-func TestManagerAvailableAuthsForRouteModel_CodexIgnoresLocalCooling(t *testing.T) {
+func TestManagerAvailableAuthsForRouteModel_CodexOAuthRespectsAvailabilityCooldowns(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -390,19 +390,11 @@ func TestManagerAvailableAuthsForRouteModel_CodexIgnoresLocalCooling(t *testing.
 	disabled := &Auth{ID: "disabled", Provider: "codex", Disabled: true}
 
 	available, err := manager.availableAuthsForRouteModel([]*Auth{authA, authB, disabled}, "codex", model, now)
-	if err != nil {
-		t.Fatalf("availableAuthsForRouteModel() error = %v", err)
+	if err == nil {
+		t.Fatal("availableAuthsForRouteModel() unexpectedly ignored OAuth availability cooldowns")
 	}
-	if len(available) != 2 {
-		t.Fatalf("availableAuthsForRouteModel() len = %d, want 2 codex auths despite local cooling", len(available))
-	}
-	if available[0].ID != "a" || available[1].ID != "b" {
-		t.Fatalf("availableAuthsForRouteModel() ids = [%s %s], want [a b]", available[0].ID, available[1].ID)
-	}
-
-	models := manager.filterExecutionModels(authA, model, []string{model}, false)
-	if len(models) != 1 || models[0] != model {
-		t.Fatalf("filterExecutionModels() = %+v, want codex model despite local cooling", models)
+	if len(available) != 0 {
+		t.Fatalf("availableAuthsForRouteModel() len = %d, want no immediately eligible OAuth auths", len(available))
 	}
 }
 
@@ -443,7 +435,7 @@ func TestManagerAvailableAuthsForRouteModel_CodexAPIKeyHealthOpenBlocksSelection
 	}
 }
 
-func TestManagerMarkResult_CodexFailureDoesNotCooldown(t *testing.T) {
+func TestManagerMarkResult_CodexGeneric429ReplacesStaleAuthCooldownWithModelState(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -483,11 +475,11 @@ func TestManagerMarkResult_CodexFailureDoesNotCooldown(t *testing.T) {
 	if state == nil {
 		t.Fatal("codex model state missing")
 	}
-	if state.Unavailable || !state.NextRetryAfter.IsZero() || state.Quota.Exceeded || state.Status != StatusActive {
-		t.Fatalf("codex model cooling = status:%s unavailable:%v next:%v quota:%+v, want active and clear", state.Status, state.Unavailable, state.NextRetryAfter, state.Quota)
+	if !state.Unavailable || !state.Quota.Exceeded || state.Status != StatusError {
+		t.Fatalf("codex model cooling = status:%s unavailable:%v next:%v quota:%+v, want model-only pressure", state.Status, state.Unavailable, state.NextRetryAfter, state.Quota)
 	}
-	if state.Health.BreakerState != "" || state.Health.Observed {
-		t.Fatalf("codex model health = %+v, want clear", state.Health)
+	if state.Health.BreakerState == HealthBreakerOpen {
+		t.Fatalf("codex generic 429 opened model health breaker: %+v", state.Health)
 	}
 }
 

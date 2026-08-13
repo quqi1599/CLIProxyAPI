@@ -96,15 +96,6 @@ func buildErrorEventAuthStatus(result Result, authSnapshot *Auth) errorEventAuth
 	model := strings.TrimSpace(result.Model)
 	if modelState := errorEventModelStatusFrom(model, authSnapshot); modelState != nil {
 		status.Model = modelState
-		if modelState.Unavailable {
-			status.Unavailable = true
-		}
-		if status.Quota == nil && modelState.Quota != nil {
-			status.Quota = modelState.Quota
-		}
-		if status.NextRetryAfter == nil && modelState.NextRetryAfter != nil {
-			status.NextRetryAfter = modelState.NextRetryAfter
-		}
 	}
 	if result.Error != nil && model != "" && (status.Model == nil || !status.Model.Unavailable) {
 		statusCode := statusCodeFromResult(result.Error)

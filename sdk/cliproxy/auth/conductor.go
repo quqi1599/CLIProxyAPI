@@ -2131,6 +2131,12 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	}
 
 	if model == "" {
+		// Older builds persisted generic upstream 429s as credential-wide
+		// cooldowns. They cannot prove that the whole account is exhausted and
+		// would incorrectly block sibling models after a restart.
+		if isLegacyGenericRateLimitError(record.LastError) {
+			return clearCredentialCooldownState(auth, now)
+		}
 		auth.Unavailable = true
 		auth.Status = StatusError
 		auth.NextRetryAfter = record.NextRetryAfter
@@ -2153,8 +2159,42 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		state.StatusMessage = reason
 	}
 	state.LastError = cloneError(record.LastError)
-	updateAggregatedAvailability(auth, now)
+	// A model record is intentionally independent from credential
+	// availability. Credential-wide state is restored only from its own record.
+	clearAggregatedAvailabilityUnlessExplicitCredentialCooldown(auth, now)
 	return true
+}
+
+func clearCredentialCooldownState(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	changed := auth.Unavailable || !auth.NextRetryAfter.IsZero() || auth.Quota.Exceeded || auth.LastError != nil
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.LastError = nil
+	auth.StatusMessage = ""
+	if auth.Status != StatusDisabled {
+		auth.Status = StatusActive
+	}
+	if changed {
+		auth.UpdatedAt = now
+	}
+	return changed
+}
+
+func isLegacyGenericRateLimitError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusTooManyRequests {
+		return false
+	}
+	if isAccountQuotaExhaustedResultError(err) || isBalanceExhaustedResultError(err) {
+		return false
+	}
+	kind := failurecontract.Kind(strings.ToLower(strings.TrimSpace(err.Kind)))
+	scope, _ := controlledFailureScope(err.Scope)
+	return (kind == "" || kind == failurecontract.RateLimited) &&
+		(scope == "" || scope == failurecontract.ScopeCredential)
 }
 
 func clearCooldownStateForAuth(auth *Auth, now time.Time) bool {
@@ -6765,6 +6805,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 	result = normalizeResultFailureContract(result)
+	result = normalizeModelRateLimitScope(result)
 	if isGPTRequestRoute(ctx, []string{result.Provider}, result.Model) {
 		result = normalizeOpaqueGPTResultFailure(result)
 	}
@@ -6809,6 +6850,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if aliasAvailabilityModel != "" {
 			managedModel = aliasAvailabilityModel
 		}
+		managedModel = canonicalModelKey(managedModel)
 		registryModel = managedModel
 		if result.Success && aliasAvailabilityModel == "" {
 			registryModel = strings.TrimSpace(result.Model)
@@ -6821,6 +6863,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			!codexOAuthUnauthorized
 		typedFailure, hasTypedFailure := typedFailureFromResult(result)
 		failureScope, hasTypedFailureScope := failureScopeFromResult(result)
+		preserveAuthLevelCooldown := shouldPreserveAuthLevelCooldown(auth, now)
 		slowPenalty := 0
 		if result.Success && m.slowRequestPenaltyEnabledLocked(auth) {
 			latency := result.TTFT
@@ -6869,11 +6912,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}).Warn("disabled auth because upstream reported insufficient balance")
 		} else if result.Success {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
+				state := ensureModelState(auth, canonicalModelKey(result.Model))
 				resetModelState(state, now)
 				applyHealthSuccess(&state.Health, now)
 				applySlowRequestHealthPenalty(&state.Health, now, slowPenalty)
-				updateAggregatedAvailability(auth, now)
+				if !preserveAuthLevelCooldown {
+					updateAggregatedAvailability(auth, now)
+				}
 				if aliasAvailabilityModel != "" && aliasAvailabilityModel != strings.TrimSpace(result.Model) {
 					aliasState := ensureModelState(auth, aliasAvailabilityModel)
 					resetModelState(aliasState, now)
@@ -6881,7 +6926,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					aliasState.UpdatedAt = now
 					clearAggregatedAvailability(auth)
 				}
-				if !hasModelError(auth, now) {
+				if !preserveAuthLevelCooldown && !hasModelError(auth, now) {
 					auth.LastError = nil
 					auth.StatusMessage = ""
 					auth.Status = StatusActive
@@ -6904,6 +6949,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else if codexOAuthUnauthorized {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+			} else if hasTypedFailure && hasTypedFailureScope && failureScope == failurecontract.ScopeModel && managedModel != "" {
+				applyTypedModelFailureState(auth, managedModel, typedFailure, result.Error, now, preserveAuthLevelCooldown, quotaCooldownDisabledForAuth(auth))
+				if typedFailure.Kind == failurecontract.RateLimited {
+					shouldSuspendModel = !ensureModelState(auth, managedModel).NextRetryAfter.IsZero()
+					setModelQuota = shouldSuspendModel
+					modelQuotaRecoverAt = ensureModelState(auth, managedModel).NextRetryAfter
+					suspendReason = "rate_limited"
+				}
 			} else if codexBypassCooling {
 				if result.Model != "" {
 					state := ensureModelState(auth, result.Model)
@@ -6946,8 +6999,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if result.Error != nil {
 						state.LastError = cloneError(result.Error)
 						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
+						if !preserveAuthLevelCooldown {
+							auth.LastError = cloneError(result.Error)
+							auth.StatusMessage = result.Error.Message
+						}
 					}
 					if isModelSupportResultError(result.Error) {
 						state.Status = StatusDisabled
@@ -7064,7 +7119,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 					auth.Status = StatusError
 					auth.UpdatedAt = now
-					if !accountQuotaFailure {
+					if !accountQuotaFailure && !preserveAuthLevelCooldown {
 						updateAggregatedAvailability(auth, now)
 						if aliasAvailabilityModel != "" {
 							clearAggregatedAvailability(auth)
@@ -7315,6 +7370,9 @@ func (m *Manager) applyChannelBreakerResultLocked(ctx context.Context, auth *Aut
 		return m.applyGPTChannelBreakerResultLocked(ctx, auth, result, routeModel, now)
 	}
 	aliasScoped := openAICompatAvailabilityAliasForResult(auth, requestedModelAlias, result) != ""
+	if failure, ok := typedFailureFromResult(result); ok && failure.Kind == failurecontract.RateLimited {
+		return nil
+	}
 	breakerModel := channelBreakerModelKeyForResult(auth, result, requestedModelAlias)
 	key := channelBreakerKey(auth, breakerModel)
 	if key == "" {
@@ -8260,6 +8318,169 @@ func normalizeResultFailureContract(result Result) Result {
 		result.RetryAfter = &retryAfter
 	}
 	return result
+}
+
+func normalizeModelRateLimitScope(result Result) Result {
+	if result.Success || strings.TrimSpace(result.Model) == "" {
+		return result
+	}
+	var classified *failurecontract.Failure
+	if result.Cause != nil {
+		classified = failurecontract.Classify(result.Cause)
+	}
+	if classified == nil || classified.Kind == "" {
+		if result.Error == nil || statusCodeFromResult(result.Error) != http.StatusTooManyRequests {
+			return result
+		}
+		classified = &failurecontract.Failure{
+			Kind:          failurecontract.RateLimited,
+			Scope:         failurecontract.ScopeCredential,
+			HTTPStatus:    http.StatusTooManyRequests,
+			OuterStatus:   http.StatusTooManyRequests,
+			SemanticCode:  strings.TrimSpace(result.Error.Code),
+			StreamPhase:   failurecontract.StreamPhaseUnknown,
+			RetryAfter:    result.RetryAfter,
+			Retryable:     result.Error.Retryable,
+			Cause:         result.Cause,
+			PublicMessage: result.Error.Message,
+		}
+	}
+	if classified.HTTPStatus != http.StatusTooManyRequests || classified.Kind == failurecontract.QuotaExceeded {
+		return result
+	}
+	if isExplicitAccountWideRateLimitFailure(classified, result.Error) {
+		return result
+	}
+	if classified.Kind != failurecontract.RateLimited && classified.Kind != "" {
+		return result
+	}
+	downscoped := *classified
+	downscoped.Kind = failurecontract.RateLimited
+	downscoped.Scope = failurecontract.ScopeModel
+	if downscoped.HTTPStatus <= 0 {
+		downscoped.HTTPStatus = http.StatusTooManyRequests
+	}
+	if downscoped.OuterStatus <= 0 {
+		downscoped.OuterStatus = http.StatusTooManyRequests
+	}
+	if downscoped.RetryAfter == nil {
+		downscoped.RetryAfter = result.RetryAfter
+	}
+	downscoped.Retryable = true
+	if strings.TrimSpace(downscoped.PublicMessage) == "" && result.Error != nil {
+		downscoped.PublicMessage = result.Error.Message
+	}
+	result.Cause = &downscoped
+	result.Error = resultErrorFromCause(&downscoped)
+	result.RetryAfter = downscoped.RetryAfter
+	return result
+}
+
+func isExplicitAccountWideRateLimitFailure(failure *failurecontract.Failure, resultErr *Error) bool {
+	if failure != nil {
+		if failure.Kind == failurecontract.QuotaExceeded && failure.Scope == failurecontract.ScopeCredential {
+			return true
+		}
+		identifiers := strings.ToLower(strings.TrimSpace(failure.SemanticCode + " " + failure.SemanticType + " " + failure.ProviderCode))
+		for _, identifier := range []string{
+			"usage_limit_reached", "billing_cycle_quota", "insufficient_quota", "quota_exhausted",
+			"quota_exceeded", "insufficient_balance", "balance_insufficient", "account_rpm_limit_exceeded",
+		} {
+			if strings.Contains(identifiers, identifier) {
+				return true
+			}
+		}
+	}
+	return isAccountQuotaExhaustedResultError(resultErr) || isBalanceExhaustedResultError(resultErr)
+}
+
+func shouldPreserveAuthLevelCooldown(auth *Auth, now time.Time) bool {
+	if auth == nil || !auth.Unavailable || auth.LastError == nil {
+		return false
+	}
+	active := auth.NextRetryAfter.After(now) || auth.Quota.NextRecoverAt.After(now)
+	if !active {
+		return false
+	}
+	err := auth.LastError
+	scope, controlled := controlledFailureScope(err.Scope)
+	kind := failurecontract.Kind(strings.ToLower(strings.TrimSpace(err.Kind)))
+	if controlled && scope == failurecontract.ScopeCredential {
+		if kind == failurecontract.AuthenticationFailed || kind == failurecontract.QuotaExceeded {
+			return true
+		}
+	}
+	if isInvalidGrantResultError(err) || isAccountQuotaExhaustedResultError(err) || isBalanceExhaustedResultError(err) {
+		return true
+	}
+	return statusCodeFromResult(err) == http.StatusUnauthorized && !isModelSupportResultError(err)
+}
+
+func clearAggregatedAvailabilityUnlessExplicitCredentialCooldown(auth *Auth, now time.Time) {
+	if !shouldPreserveAuthLevelCooldown(auth, now) {
+		clearAggregatedAvailability(auth)
+	}
+}
+
+func applyTypedModelFailureState(auth *Auth, model string, failure *failurecontract.Failure, resultErr *Error, now time.Time, preserveCredential, disableCooling bool) {
+	if auth == nil || failure == nil || strings.TrimSpace(model) == "" {
+		return
+	}
+	model = canonicalModelKey(model)
+	state := ensureModelState(auth, model)
+	status := failure.HTTPStatus
+	if status <= 0 {
+		status = statusCodeFromResult(resultErr)
+	}
+	state.Status = StatusError
+	state.Unavailable = true
+	state.UpdatedAt = now
+	applyHealthFailure(&state.Health, now, status)
+	if resultErr != nil {
+		state.LastError = cloneError(resultErr)
+		state.StatusMessage = resultErr.Message
+		if !preserveCredential {
+			auth.LastError = cloneError(resultErr)
+			auth.StatusMessage = resultErr.Message
+		}
+	}
+	next := time.Time{}
+	if !disableCooling && failure.RetryAfter != nil && *failure.RetryAfter > 0 {
+		next = now.Add(*failure.RetryAfter)
+	} else if !disableCooling {
+		switch status {
+		case http.StatusTooManyRequests:
+			if shouldHardCooldownQuotaForAuth(auth, state.Health, nil) {
+				cooldown, nextLevel := nextQuotaCooldown(state.Quota.BackoffLevel, false)
+				if cooldown > 0 {
+					next = now.Add(cooldown)
+				}
+				state.Quota.BackoffLevel = nextLevel
+				next = laterTime(next, state.Health.OpenUntil)
+			}
+		case http.StatusNotFound:
+			next = now.Add(12 * time.Hour)
+		case http.StatusForbidden:
+			next = now.Add(30 * time.Minute)
+		default:
+			if isTransientUpstreamStatus(status) {
+				next = nextTransientErrorRetryAfter(now)
+			}
+		}
+	}
+	state.NextRetryAfter = next
+	if failure.Kind == failurecontract.RateLimited {
+		state.Quota.Exceeded = true
+		state.Quota.Reason = "rate_limit"
+		state.Quota.NextRecoverAt = next
+	}
+	if !preserveCredential {
+		clearAggregatedAvailability(auth)
+	}
+	if auth.Status != StatusDisabled && !preserveCredential {
+		auth.Status = StatusError
+	}
+	auth.UpdatedAt = now
 }
 
 func normalizeOpaqueGPTResultFailure(result Result) Result {

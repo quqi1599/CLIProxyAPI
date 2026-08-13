@@ -98,8 +98,8 @@ func TestGPTChannelBreaker_TypedFailuresRespectScope(t *testing.T) {
 		at := start.Add(time.Duration(i+2) * time.Second)
 		applyCodexChannelBreakerResult(&modelState, gptTypedChannelBreakerFailure(failurecontract.ScopeModel, http.StatusTooManyRequests), at, "")
 	}
-	if modelState.Health.BreakerState != HealthBreakerOpen {
-		t.Fatalf("typed model 429 window health = %+v, want open at 8/10 failures", modelState.Health)
+	if modelState.Health.BreakerState == HealthBreakerOpen || modelState.recentCount != 2 {
+		t.Fatalf("typed model 429 affected shared channel breaker: health=%+v count=%d", modelState.Health, modelState.recentCount)
 	}
 
 	providerState := codexChannelBreakerState{}

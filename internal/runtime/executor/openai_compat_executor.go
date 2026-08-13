@@ -2095,6 +2095,9 @@ func openAICompatFailureSemantics(statusCode, providerStatusCode int, message, e
 	if openAICompatContentSafetyFailure(providerStatusCode, message, errorCode) {
 		return failurecontract.ContentSafetyBlocked, failurecontract.ScopeRequest, false
 	}
+	if openAICompatModelAccessFailure(message, errorCode) {
+		return failurecontract.ModelUnavailable, failurecontract.ScopeModel, true
+	}
 	switch statusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		return failurecontract.InvalidRequest, failurecontract.ScopeRequest, false
@@ -2123,7 +2126,7 @@ func openAICompatFailureSemantics(statusCode, providerStatusCode int, message, e
 			openAICompatQuotaErrorCode(errorCode) {
 			return failurecontract.QuotaExceeded, failurecontract.ScopeCredential, true
 		}
-		return failurecontract.RateLimited, failurecontract.ScopeCredential, true
+		return failurecontract.RateLimited, failurecontract.ScopeModel, true
 	case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusGatewayTimeout, 524:
 		return failurecontract.TransportError, failurecontract.ScopeProvider, true
 	default:
@@ -2164,13 +2167,25 @@ func openAICompatContentSafetyFailure(providerStatusCode int, message, errorCode
 func openAICompatAuthenticationFailure(message, errorCode string) bool {
 	code := strings.Trim(strings.ToLower(strings.TrimSpace(errorCode)), `"'(),:;[]{}<>`)
 	switch code {
-	case "invalid_api_key", "authentication_error", "unauthorized", "forbidden", "access_denied", "permission_denied":
+	case "invalid_api_key", "authentication_error", "invalid_grant", "invalid_token", "unauthenticated", "unauthorized":
 		return true
 	}
 	lower := strings.ToLower(strings.TrimSpace(message))
 	return containsAny(lower,
 		"api key", "api_key", "authentication", "unauthorized",
-		"invalid token", "access denied", "permission denied",
+		"invalid token", "expired token",
+	)
+}
+
+func openAICompatModelAccessFailure(message, errorCode string) bool {
+	code := strings.Trim(strings.ToLower(strings.TrimSpace(errorCode)), `"'(),:;[]{}<>`)
+	switch code {
+	case "access_denied", "auth_unavailable", "forbidden", "permission_denied", "permission_error":
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(lower, "model") && containsAny(lower,
+		"access denied", "not authorized", "permission denied",
 	)
 }
 
@@ -2188,7 +2203,7 @@ func openAICompatModelUnavailableFailure(message, errorCode string) bool {
 
 func openAICompatQuotaErrorCode(errorCode string) bool {
 	switch strings.ToLower(strings.TrimSpace(errorCode)) {
-	case "insufficient_quota", "quota_exhausted", "billing_cycle_quota":
+	case "insufficient_quota", "quota_exhausted", "quota_exceeded", "billing_cycle_quota":
 		return true
 	default:
 		return false

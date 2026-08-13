@@ -576,7 +576,7 @@ func TestManager_MarkResult_429StaysSoftBeforeRepeatedQuotaFailures(t *testing.T
 	}
 }
 
-func TestManager_MarkResult_429ModerateRetryAfterDoesNotHardCooldownImmediately(t *testing.T) {
+func TestManager_MarkResult_429RetryAfterCoolsOnlyModel(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -609,8 +609,8 @@ func TestManager_MarkResult_429ModerateRetryAfterDoesNotHardCooldownImmediately(
 	if state == nil {
 		t.Fatal("model state not found after 429")
 	}
-	if !state.NextRetryAfter.IsZero() {
-		t.Fatalf("cooldown = %v, want zero for moderate retry-after before repeated failures", state.NextRetryAfter)
+	if state.NextRetryAfter.IsZero() {
+		t.Fatal("expected provider retry-after to cool the affected model")
 	}
 	if !state.Quota.Exceeded {
 		t.Fatal("expected quota pressure to be recorded")
@@ -620,7 +620,7 @@ func TestManager_MarkResult_429ModerateRetryAfterDoesNotHardCooldownImmediately(
 	}
 }
 
-func TestManager_MarkResult_KimiCredential429ImmediatelyCoolsAuth(t *testing.T) {
+func TestManager_MarkResult_Kimi429CoolsOnlyModel(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -677,16 +677,20 @@ func TestManager_MarkResult_KimiCredential429ImmediatelyCoolsAuth(t *testing.T) 
 			if !ok {
 				t.Fatal("auth not found after 429")
 			}
-			if updated.NextRetryAfter.IsZero() {
-				t.Fatal("Kimi credential 429 should set an immediate cooldown")
+			if !updated.NextRetryAfter.IsZero() || updated.Unavailable || updated.Quota.Exceeded {
+				t.Fatalf("Kimi generic 429 leaked to credential: %+v", updated)
+			}
+			state := updated.ModelStates["kimi-k3"]
+			if state == nil || state.NextRetryAfter.IsZero() {
+				t.Fatalf("Kimi model 429 did not set immediate model cooldown: %+v", state)
 			}
 			minExpected := before.Add(quotaBackoffBase)
 			maxExpected := after.Add(quotaBackoffBase + time.Second)
-			if updated.NextRetryAfter.Before(minExpected) || updated.NextRetryAfter.After(maxExpected) {
-				t.Fatalf("cooldown = %v, want within [%v, %v]", updated.NextRetryAfter, minExpected, maxExpected)
+			if state.NextRetryAfter.Before(minExpected) || state.NextRetryAfter.After(maxExpected) {
+				t.Fatalf("cooldown = %v, want within [%v, %v]", state.NextRetryAfter, minExpected, maxExpected)
 			}
-			if !updated.Quota.Exceeded || updated.Quota.BackoffLevel != 1 {
-				t.Fatalf("auth quota = %+v, want exceeded with backoff level 1", updated.Quota)
+			if !state.Quota.Exceeded || state.Quota.BackoffLevel != 1 {
+				t.Fatalf("model quota = %+v, want exceeded with backoff level 1", state.Quota)
 			}
 			blocked, reason, next := isAuthBlockedForModel(updated, "kimi-k3", after)
 			if !blocked || reason != blockReasonCooldown || next.IsZero() {
@@ -1016,12 +1020,14 @@ func TestManager_MarkResult_OpenAICompatChannelBreakerScopesToRequestedAlias(t *
 	})
 
 	ctx := coreusage.WithRequestedModelAlias(context.Background(), routeModel)
+	retryAfter := 30 * time.Second
 	for i := 0; i < channelBreakerOpenFailures; i++ {
 		manager.MarkResult(ctx, Result{
-			AuthID:   auths[0].ID,
-			Provider: auths[0].Provider,
-			Model:    upstreamModel,
-			Success:  false,
+			AuthID:     auths[0].ID,
+			Provider:   auths[0].Provider,
+			Model:      upstreamModel,
+			Success:    false,
+			RetryAfter: &retryAfter,
 			Error: &Error{
 				HTTPStatus: http.StatusTooManyRequests,
 				Message:    "no available channel",
@@ -1057,11 +1063,17 @@ func TestManager_MarkResult_OpenAICompatChannelBreakerScopesToRequestedAlias(t *
 		t.Fatalf("availableAuthsForRouteModel(otherAlias) len = %d, want %d", len(availableOther), len(currentAuths))
 	}
 
-	for _, updated := range currentAuths {
+	for i, updated := range currentAuths {
 		if state := updated.ModelStates[upstreamModel]; state != nil {
 			t.Fatalf("auth %s upstream state = %#v, want breaker to avoid upstream-model contamination", updated.ID, state)
 		}
 		state := updated.ModelStates[routeModel]
+		if i > 0 {
+			if state != nil && state.Unavailable {
+				t.Fatalf("peer auth %s was cooled by another credential's 429: %#v", updated.ID, state)
+			}
+			continue
+		}
 		if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
 			t.Fatalf("auth %s route alias state = %#v, want unavailable alias-scoped cooldown", updated.ID, state)
 		}
