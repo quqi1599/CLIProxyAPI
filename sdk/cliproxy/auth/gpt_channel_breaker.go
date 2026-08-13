@@ -117,6 +117,9 @@ func shouldCountCodexChannelBreakerFailure(result Result) bool {
 		return false
 	}
 	if failure, ok := typedFailureFromResult(result); ok {
+		if failure.Kind == failurecontract.RateLimited {
+			return false
+		}
 		return !failure.OutputCommitted && failure.Retryable &&
 			(failure.Scope == failurecontract.ScopeModel || failure.Scope == failurecontract.ScopeProvider)
 	}

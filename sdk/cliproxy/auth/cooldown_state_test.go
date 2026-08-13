@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 )
 
 type recordingCooldownStateStore struct {
@@ -421,6 +423,77 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 	}
 	if got := store.saveCount.Load(); got != 1 {
 		t.Fatalf("restore cleanup saved cooldown state %d times, want 1", got)
+	}
+}
+
+func TestManager_RestoreModelCooldownDoesNotBlockSiblingModel(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	store := &recordingCooldownStateStore{load: []CooldownStateRecord{{
+		Provider: "codex", AuthID: "codex-model-only", Model: "gpt-5.4",
+		Status: "cooling", NextRetryAfter: nextRetry, Reason: "rate_limit",
+		Quota:     QuotaState{Exceeded: true, Reason: "rate_limit", NextRecoverAt: nextRetry},
+		LastError: &Error{Kind: string(failurecontract.RateLimited), Scope: string(failurecontract.ScopeModel), HTTPStatus: 429},
+		UpdatedAt: nextRetry.Add(-time.Minute),
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "codex-model-only", Provider: "codex"}); err != nil {
+		t.Fatalf("Register() returned error: %v", err)
+	}
+	if err := manager.RestoreCooldownStates(context.Background()); err != nil {
+		t.Fatalf("RestoreCooldownStates() returned error: %v", err)
+	}
+	auth, _ := manager.GetByID("codex-model-only")
+	if auth.Unavailable || !auth.NextRetryAfter.IsZero() || auth.Quota.Exceeded {
+		t.Fatalf("model record leaked to credential state: %+v", auth)
+	}
+	if blocked, _, _ := isAuthBlockedForModelRoute(auth, "gpt-5.4", time.Now(), true); !blocked {
+		t.Fatal("restored gpt-5.4 cooldown was not enforced")
+	}
+	if blocked, reason, _ := isAuthBlockedForModelRoute(auth, "gpt-5.6-terra", time.Now(), true); blocked {
+		t.Fatalf("sibling model was blocked: %v", reason)
+	}
+}
+
+func TestManager_AccountQuotaSurvivesLaterModelRateLimitAndRestore(t *testing.T) {
+	store := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	auth := &Auth{ID: "account-quota-preserve", Provider: "codex", Status: StatusActive}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register() returned error: %v", err)
+	}
+	retryAfter := time.Hour
+	quotaFailure := &failurecontract.Failure{
+		Kind: failurecontract.QuotaExceeded, Scope: failurecontract.ScopeCredential,
+		HTTPStatus: 429, OuterStatus: 429, SemanticCode: "usage_limit_reached",
+		RetryAfter: &retryAfter, PublicMessage: "account quota exhausted",
+	}
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5.4", Cause: quotaFailure})
+	modelRetry := 30 * time.Second
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: "codex", Model: "gpt-5.6-terra", RetryAfter: &modelRetry,
+		Error: &Error{Kind: string(failurecontract.RateLimited), Scope: string(failurecontract.ScopeCredential), HTTPStatus: 429, Message: "rate limited"},
+	})
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5.6-sol", Success: true})
+	updated, _ := manager.GetByID(auth.ID)
+	if !updated.Unavailable || !updated.Quota.Exceeded || updated.LastError == nil || updated.LastError.Code != "usage_limit_reached" {
+		t.Fatalf("account quota was overwritten by sibling results: %+v", updated)
+	}
+	store.mu.Lock()
+	loaded := cloneCooldownStateRecords(store.records)
+	store.mu.Unlock()
+	restarted := NewManager(nil, nil, nil)
+	restarted.SetCooldownStateStore(&recordingCooldownStateStore{load: loaded})
+	if _, err := restarted.Register(WithSkipPersist(context.Background()), &Auth{ID: auth.ID, Provider: "codex"}); err != nil {
+		t.Fatalf("restart Register() returned error: %v", err)
+	}
+	if err := restarted.RestoreCooldownStates(context.Background()); err != nil {
+		t.Fatalf("restart RestoreCooldownStates() returned error: %v", err)
+	}
+	restored, _ := restarted.GetByID(auth.ID)
+	if !restored.Unavailable || !restored.Quota.Exceeded || restored.LastError == nil || restored.LastError.Code != "usage_limit_reached" {
+		t.Fatalf("account quota did not survive restore: %+v", restored)
 	}
 }
 

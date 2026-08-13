@@ -19,7 +19,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"invalid_thinking_history": {}, "invalidargument": {}, "invalid_parameter": {}, "model_not_found": {},
 	"model_not_supported": {}, "not_found": {}, "overloaded": {}, "overloaded_error": {},
 	"permission_denied": {}, "permission_error": {}, "policy_denied": {},
-	"previous_response_not_found": {}, "rate_limit": {}, "rate_limit_error": {},
+	"previous_response_not_found": {}, "quota_exceeded": {}, "quota_exhausted": {}, "rate_limit": {}, "rate_limit_error": {},
 	"rate_limit_exceeded": {}, "request_feature_unsupported": {}, "resource_exhausted": {},
 	"server_error": {}, "thinking_signature_invalid": {}, "timeout": {}, "unauthenticated": {},
 	"unknown": {}, "unavailable": {}, "upstream_response_too_large": {},
@@ -153,7 +153,7 @@ func safeUpstreamFailureReasons(body []byte, errorCode, errorType, errorStatus s
 	) {
 		add("model_not_supported model unavailable")
 	}
-	if identifierIs("billing_cycle_quota", "insufficient_balance", "insufficient_quota", "usage_limit_reached") || contains(
+	if identifierIs("billing_cycle_quota", "insufficient_balance", "insufficient_quota", "quota_exceeded", "quota_exhausted", "usage_limit_reached") || contains(
 		"usage limit", "billing cycle", "quota will be refreshed", "refreshed in the next cycle",
 		"monthly quota", "insufficient balance", "balance insufficient", "quota exhausted", "quota_exhausted",
 		"用量上限", "账期", "额度已用尽", "额度不足", "余额不足", "账户余额不足", "帐户余额不足",

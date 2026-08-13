@@ -24,15 +24,17 @@ func TestManagerMarkResultPublishesErrorEventAfterAuthStateUpdate(t *testing.T) 
 			"type": "codex",
 		},
 	}
+	retryAfter := 30 * time.Second
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("Register returned error: %v", errRegister)
 	}
 
 	manager.MarkResult(context.Background(), Result{
-		AuthID:   auth.ID,
-		Provider: "codex",
-		Model:    "gpt-5",
-		Success:  false,
+		AuthID:     auth.ID,
+		Provider:   "codex",
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
 		Error: &Error{
 			Code:       "rate_limit",
 			Message:    `{"error":"quota"}`,
@@ -86,16 +88,16 @@ func TestManagerMarkResultPublishesErrorEventAfterAuthStateUpdate(t *testing.T) 
 	if event.Code != "rate_limit" || !event.Retryable {
 		t.Fatalf("unexpected error code fields: code=%q retryable=%t", event.Code, event.Retryable)
 	}
-	if event.AuthStatus.Status != StatusError || !event.AuthStatus.Unavailable {
+	if event.AuthStatus.Status != StatusError || event.AuthStatus.Unavailable {
 		t.Fatalf("unexpected auth status: %+v", event.AuthStatus)
 	}
 	if event.AuthStatus.Model == nil || event.AuthStatus.Model.Name != "gpt-5" || event.AuthStatus.Model.Status != StatusError || !event.AuthStatus.Model.Unavailable {
 		t.Fatalf("unexpected model status: %+v", event.AuthStatus.Model)
 	}
-	if event.AuthStatus.Quota == nil || !event.AuthStatus.Quota.Exceeded || event.AuthStatus.Quota.Reason != "quota" {
-		t.Fatalf("unexpected auth quota: %+v", event.AuthStatus.Quota)
+	if event.AuthStatus.Quota != nil && event.AuthStatus.Quota.Exceeded {
+		t.Fatalf("generic model 429 leaked to auth quota: %+v", event.AuthStatus.Quota)
 	}
-	if event.AuthStatus.Model.Quota == nil || !event.AuthStatus.Model.Quota.Exceeded || event.AuthStatus.Model.Quota.Reason != "quota" {
+	if event.AuthStatus.Model.Quota == nil || !event.AuthStatus.Model.Quota.Exceeded || event.AuthStatus.Model.Quota.Reason != "rate_limit" {
 		t.Fatalf("unexpected model quota: %+v", event.AuthStatus.Model.Quota)
 	}
 }

@@ -48,3 +48,27 @@ func TestSafeUpstreamFailureMessageKeepsRoutingSignalsCanonical(t *testing.T) {
 		})
 	}
 }
+
+func TestSafeUpstreamFailureMessagePreservesQuotaIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []string{"quota_exhausted", "quota_exceeded"} {
+		code := code
+		t.Run(code, func(t *testing.T) {
+			t.Parallel()
+
+			body := []byte(`{"error":{"message":"private account limit","code":"` + code + `"}}`)
+			message, gotCode := safeUpstreamFailureMessage("application/json", body)
+			if gotCode != code {
+				t.Fatalf("error code = %q, want %q", gotCode, code)
+			}
+			if !strings.Contains(message, "reason=usage limit billing cycle quota will be refreshed") ||
+				!strings.Contains(message, "error_code="+code) {
+				t.Fatalf("summary = %q, want preserved quota identifier and reason", message)
+			}
+			if strings.Contains(message, "private account") {
+				t.Fatalf("summary exposed upstream body: %s", message)
+			}
+		})
+	}
+}

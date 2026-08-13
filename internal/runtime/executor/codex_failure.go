@@ -487,6 +487,15 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		}
 		failure.Kind = failurecontract.AuthenticationFailed
 		failure.Scope = failurecontract.ScopeCredential
+	case codexModelAccessIdentifier(code, typeID):
+		if code == "" {
+			code = typeID
+		}
+		setSemantic(code, typeID)
+		failure.HTTPStatus = outerStatus
+		failure.Kind = failurecontract.ModelUnavailable
+		failure.Scope = failurecontract.ScopeModel
+		failure.Retryable = true
 	case codexQuotaIdentifier(code, typeID):
 		if code == "" {
 			code = typeID
@@ -496,11 +505,13 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		failure.Kind = failurecontract.QuotaExceeded
 		failure.Scope = failurecontract.ScopeCredential
 		failure.Retryable = outerStatus != http.StatusBadRequest
-	case outerStatus == http.StatusUnauthorized || outerStatus == http.StatusForbidden:
+	case outerStatus == http.StatusUnauthorized:
 		setSemantic("auth_unavailable", "authentication_error")
 		failure.HTTPStatus = outerStatus
 		failure.Kind = failurecontract.AuthenticationFailed
 		failure.Scope = failurecontract.ScopeCredential
+	case outerStatus == http.StatusForbidden:
+		failure.HTTPStatus = outerStatus
 	case identifierIs("model_at_capacity") || isCodexModelCapacityError(body):
 		setSemantic("model_at_capacity", "server_error")
 		failure.HTTPStatus = http.StatusTooManyRequests
@@ -517,7 +528,7 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		setSemantic(code, typeID)
 		failure.HTTPStatus = http.StatusTooManyRequests
 		failure.Kind = failurecontract.RateLimited
-		failure.Scope = failurecontract.ScopeCredential
+		failure.Scope = failurecontract.ScopeModel
 		failure.Retryable = true
 	case codexProviderFailureIdentifier(code, typeID):
 		if code == "" || isCodexPlaceholderCode(code) {
@@ -585,8 +596,17 @@ func codexDeterministicRequestType(typeID string) bool {
 func codexAuthenticationIdentifier(code, typeID string) bool {
 	for _, candidate := range []string{code, typeID} {
 		switch candidate {
-		case "authentication_error", "auth_unavailable", "invalid_api_key", "invalid_grant", "unauthenticated",
-			"permission_denied", "permission_error", "unauthorized":
+		case "authentication_error", "invalid_api_key", "invalid_grant", "unauthenticated", "unauthorized":
+			return true
+		}
+	}
+	return false
+}
+
+func codexModelAccessIdentifier(code, typeID string) bool {
+	for _, candidate := range []string{code, typeID} {
+		switch candidate {
+		case "auth_unavailable", "permission_denied", "permission_error":
 			return true
 		}
 	}
@@ -596,7 +616,7 @@ func codexAuthenticationIdentifier(code, typeID string) bool {
 func codexQuotaIdentifier(code, typeID string) bool {
 	for _, candidate := range []string{code, typeID} {
 		switch candidate {
-		case "usage_limit_reached", "insufficient_balance", "insufficient_quota", "billing_cycle_quota", "quota_exceeded":
+		case "usage_limit_reached", "insufficient_balance", "insufficient_quota", "billing_cycle_quota", "quota_exhausted", "quota_exceeded":
 			return true
 		}
 	}
