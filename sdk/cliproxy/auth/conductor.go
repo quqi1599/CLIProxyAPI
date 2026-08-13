@@ -1259,6 +1259,8 @@ const (
 	gptImmediateFailoverMaxChannels  = 8
 	gptImmediateFailoverMaxRounds    = 3
 	gptChannelProbeLease             = 10 * time.Minute
+	deepSeekProtocolAffinityMinBytes = 3 * 1024 * 1024
+	deepSeekProtocolAffinityMinTools = 120
 	defaultGPTFirstEventTimeout      = 25 * time.Second
 	gptZeroEligibleProbeActiveTTL    = 6 * time.Minute
 	gptZeroEligibleProbeMinWait      = 15 * time.Second
@@ -10510,6 +10512,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errAvailable
 	}
 	available = cloneAuthSlice(available)
+	if pinnedAuthID == "" {
+		available = preferDeepSeekProtocolAffinityAuths(available, model, opts)
+	}
 	selector = m.selectorForAuths(available)
 	m.mu.RUnlock()
 
@@ -10728,6 +10733,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errAvailable
 	}
 	available = cloneAuthSlice(available)
+	if pinnedAuthID == "" {
+		available = preferDeepSeekProtocolAffinityAuths(available, model, opts)
+	}
 	selector = m.selectorForAuths(available)
 	m.mu.RUnlock()
 
@@ -10771,6 +10779,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
+	}
+	if pinnedAuthIDFromMetadata(opts.Metadata) == "" && shouldPreferDeepSeekProtocolAffinity(model, opts) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
@@ -10867,6 +10878,52 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		return authCopy, executor, providerKey, nil
 	}
+}
+
+func shouldPreferDeepSeekProtocolAffinity(model string, opts cliproxyexecutor.Options) bool {
+	if !isDeepSeekV4RouteModel(model) {
+		return false
+	}
+	sourceFormat := strings.ToLower(strings.TrimSpace(opts.SourceFormat.String()))
+	if sourceFormat != "openai" && sourceFormat != "claude" {
+		return false
+	}
+	toolInteractions := intMetadataValue(opts.Metadata[cliproxyexecutor.ToolInteractionCountMetadataKey])
+	if toolInteractions == 0 {
+		return false
+	}
+	requestBytes := intMetadataValue(opts.Metadata[cliproxyexecutor.RequestBodyBytesMetadataKey])
+	return toolInteractions >= deepSeekProtocolAffinityMinTools || requestBytes >= deepSeekProtocolAffinityMinBytes
+}
+
+func preferDeepSeekProtocolAffinityAuths(auths []*Auth, model string, opts cliproxyexecutor.Options) []*Auth {
+	if !shouldPreferDeepSeekProtocolAffinity(model, opts) {
+		return auths
+	}
+	sourceFormat := strings.ToLower(strings.TrimSpace(opts.SourceFormat.String()))
+	preferred := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		identity := routePlanProviderIdentity(auth, "")
+		if identity.CanonicalProvider != "deepseek" || identity.BaseHost != "api.deepseek.com" {
+			continue
+		}
+		switch sourceFormat {
+		case "openai":
+			if isOpenAICompatAPIKeyAuth(auth) &&
+				!strings.EqualFold(strings.TrimSpace(identity.ExecutorKey), "claude") &&
+				!strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+				preferred = append(preferred, auth)
+			}
+		case "claude":
+			if strings.EqualFold(strings.TrimSpace(identity.ExecutorKey), "claude") || strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+				preferred = append(preferred, auth)
+			}
+		}
+	}
+	if len(preferred) == 0 {
+		return auths
+	}
+	return preferred
 }
 
 type homeErrorEnvelope struct {

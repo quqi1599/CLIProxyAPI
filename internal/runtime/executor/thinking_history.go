@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,6 +25,7 @@ const (
 	thinkingHistoryUnrepairableReason     = compathistory.UnrepairableReason
 	thinkingHistorySyntheticBudgetPolicy  = "thinking_history.synthetic_budget"
 	thinkingHistoryPlaceholderPolicy      = "thinking_history.placeholder"
+	thinkingHistoryValidationPolicy       = "thinking_history.real_reasoning_validation"
 	openAIThinkingHistoryTransformStage   = "normalize.thinking_history.openai"
 	claudeThinkingHistoryTransformStage   = "normalize.thinking_history.claude"
 	openAIReasoningUnavailablePlaceholder = compathistory.OpenAIUnavailableValue
@@ -46,9 +48,12 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider string, repor
 		return nil
 	}
 
-	appliedPolicies := make([]string, 0, 1)
+	appliedPolicies := make([]string, 0, 2)
 	if report.PlaceholderCount > 0 {
 		appliedPolicies = append(appliedPolicies, thinkingHistoryPlaceholderPolicy)
+	}
+	if report.CheckedToolCallTurns > 0 {
+		appliedPolicies = append(appliedPolicies, thinkingHistoryValidationPolicy)
 	}
 	downgrades := make([]string, 0, 1)
 	switch report.DowngradeReason {
@@ -91,27 +96,31 @@ func normalizeThinkingHistoryWithReport(body []byte, provider string) ([]byte, b
 
 func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, model string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
 	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
+	if requiresReturnedThinkingHistory(model) {
+		if !deepSeekThinkingHistoryRequiredForRequest(body, provider) {
+			return body, false, false, report, nil
+		}
+		switch strings.ToLower(strings.TrimSpace(provider)) {
+		case "openai":
+			return validateOpenAIThinkingHistoryWithReport(body)
+		case "claude":
+			return validateClaudeThinkingHistoryWithReport(body)
+		default:
+			return body, false, false, report, nil
+		}
+	}
 	if preservesOnlyRealReasoningHistory(model) {
 		return body, false, false, report, nil
 	}
 	requested := thinkingHistoryRequested(body, provider)
-	if !requested && requiresReturnedThinkingHistory(model) {
-		switch strings.ToLower(strings.TrimSpace(provider)) {
-		case "openai":
-			requested = deepSeekOpenAIThinkingEnabled(body) || openAIHistoryNeedsThinkingNormalization(body)
-		case "claude":
-			requested = claudeHistoryNeedsThinkingNormalization(body)
-		}
-	}
 	if !requested {
 		return body, false, false, report, nil
 	}
-	requireCompleteHistory := requiresReturnedThinkingHistory(model)
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
-		return normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
+		return normalizeOpenAIThinkingHistoryWithReport(body, false)
 	case "claude":
-		return normalizeClaudeThinkingHistoryWithReport(body, requireCompleteHistory)
+		return normalizeClaudeThinkingHistoryWithReport(body, false)
 	default:
 		return body, false, false, report, nil
 	}
@@ -248,6 +257,20 @@ func requiresReturnedThinkingHistory(model string) bool {
 	return strings.HasPrefix(modelName, "deepseek-v4") || strings.Contains(modelName, "deepseek-reasoner")
 }
 
+func deepSeekThinkingHistoryRequiredForRequest(body []byte, provider string) bool {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	if isDisabledThinkingType(thinkingType) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "openai") {
+		effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()))
+		if effort == "none" || effort == "off" || effort == "disabled" {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
 	out, changed, downgraded, _, err := normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
 	return out, changed, downgraded, err
@@ -266,6 +289,43 @@ func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([
 func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
 	result, err := compathistory.Repair(body, compathistory.FormatClaude, requireCompleteHistory)
 	return result.Payload, result.Changed, result.Downgraded, result.Report, err
+}
+
+func validateOpenAIThinkingHistoryWithReport(body []byte) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report, err := compathistory.Validate(body, compathistory.FormatOpenAI, true)
+	if err != nil {
+		return body, false, false, report, missingReasoningHistoryStatusError(err)
+	}
+	return body, false, false, report, nil
+}
+
+func validateClaudeThinkingHistoryWithReport(body []byte) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report, err := compathistory.Validate(body, compathistory.FormatClaude, true)
+	if err != nil {
+		return body, false, false, report, missingReasoningHistoryStatusError(err)
+	}
+	return body, false, false, report, nil
+}
+
+func missingReasoningHistoryStatusError(err error) error {
+	var missing *compathistory.MissingReasoningError
+	if !errors.As(err, &missing) {
+		return err
+	}
+	field := "reasoning_content"
+	if missing.Format == compathistory.FormatClaude {
+		field = "thinking"
+	}
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "missing_reasoning_history",
+		msg: fmt.Sprintf(
+			"DeepSeek 思考模式的工具调用历史缺少原始 %s。系统不会伪造、复制或填充推理内容；请完整保留 DeepSeek 返回的 %s 后重试，或者新建会话。详情：%s",
+			field,
+			field,
+			missing.Error(),
+		),
+	}
 }
 
 func thinkingHistoryRequested(body []byte, provider string) bool {

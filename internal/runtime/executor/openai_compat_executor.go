@@ -359,6 +359,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if errReject := rejectLargeOpenAICompatToolHistory(req.Context(), body, profile, model, path); errReject != nil {
 		return errReject
 	}
+	if errReject := rejectDeepSeekUnsupportedImageInput(req.Context(), body, profile, model, path); errReject != nil {
+		return errReject
+	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
 	inlinedImages := false
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(req.Context(), updated, profile, model); changed {

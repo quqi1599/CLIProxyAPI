@@ -198,7 +198,7 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesReasoningT
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_KeepsReasoningBeforeUserMessage(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_SkipsUnavailableReasoningBeforeUserMessage(t *testing.T) {
 	raw := []byte(`{
 		"input": [
 			{"type": "reasoning", "id": "rs_empty", "summary": []},
@@ -210,17 +210,14 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_KeepsReasoningBefo
 	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4-flash", raw, false)
 	t.Logf("output json:\n%s", prettyJSONForTest(out))
 
-	if got := gjson.GetBytes(out, "messages.#").Int(); got != 2 {
-		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 1 {
+		t.Fatalf("messages count = %d, want 1; output=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
-		t.Fatalf("messages.0.role = %q, want assistant; output=%s", got, out)
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
+		t.Fatalf("messages.0.role = %q, want user; output=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "[reasoning unavailable]" {
-		t.Fatalf("messages.0.reasoning_content = %q, want placeholder; output=%s", got, out)
-	}
-	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
-		t.Fatalf("messages.1.role = %q, want user; output=%s", got, out)
+	if gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("unavailable reasoning should not be synthesized; output=%s", out)
 	}
 }
 
