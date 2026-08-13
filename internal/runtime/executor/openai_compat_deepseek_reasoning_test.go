@@ -107,7 +107,7 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 	}
 	payload := []byte(`{
 		"model":"deepseek-v4-flash",
-		"input":[{"role":"developer","content":"Be concise."},{"role":"user","content":"Inspect the repository."}],
+		"input":[{"role":"developer","content":"Be concise."},{"role":"user","content":[{"type":"input_text","text":"Inspect the repository."},{"type":"input_image","image_url":"https://example.com/repository.png"}]}],
 		"tools":[
 			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true},
 			{"type":"custom","name":"apply_patch","description":"Apply a patch"},
@@ -135,15 +135,16 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		t.Fatalf("native Responses request was translated to chat: %s", string(gotBody))
 	}
 	for path, want := range map[string]string{
-		"input.0.role":     "developer",
-		"tools.0.type":     "function",
-		"tools.0.name":     "lookup",
-		"tools.1.type":     "custom",
-		"tools.1.name":     "apply_patch",
-		"tools.2.type":     "web_search",
-		"tool_choice":      "auto",
-		"reasoning.effort": "low",
-		"text.format.type": "json_schema",
+		"input.0.role":           "developer",
+		"input.1.content.1.type": "input_image",
+		"tools.0.type":           "function",
+		"tools.0.name":           "lookup",
+		"tools.1.type":           "custom",
+		"tools.1.name":           "apply_patch",
+		"tools.2.type":           "web_search",
+		"tool_choice":            "auto",
+		"reasoning.effort":       "low",
+		"text.format.type":       "json_schema",
 	} {
 		if got := gjson.GetBytes(gotBody, path).String(); got != want {
 			t.Fatalf("%s = %q, want %q; body=%s", path, got, want, string(gotBody))
@@ -191,6 +192,35 @@ func TestOpenAICompatExecutorDeepSeekProKeepsChatFallbackForResponses(t *testing
 	}
 	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
 		t.Fatalf("response object = %q, want response; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekProResponsesImageUsesChatGuard(t *testing.T) {
+	upstreamCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":    server.URL + "/v1",
+			"api_key":     "test",
+			"compat_kind": "deepseek",
+		},
+	}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-pro",
+		Payload: []byte(`{"model":"deepseek-v4-pro","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"https://example.com/a.png"}]}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err == nil || !strings.Contains(err.Error(), "deepseek_official_chat_image_input") {
+		t.Fatalf("Execute() error = %v, want Chat image guard", err)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
 	}
 }
 

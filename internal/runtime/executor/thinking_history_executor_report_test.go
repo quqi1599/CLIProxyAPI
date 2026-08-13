@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -14,7 +13,7 @@ import (
 )
 
 func TestPrepareClaudeRequestReportsThinkingHistoryPolicy(t *testing.T) {
-	payload := buildClaudeThinkingBudgetBody(strings.Repeat("r", maxSyntheticThinkingHistoryBytes), 9)
+	payload := []byte(`{"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"original reasoning"},{"type":"tool_use","id":"tool_1","name":"tool","input":{}}]}]}`)
 	payload = mustSetSemanticReportFixture(t, payload, "tools", `[{"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"}]`)
 	payload = mustSetSemanticReportFixture(t, payload, "output_config.format", `{"type":"json_schema","schema":{"type":"object"}}`)
 	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
@@ -45,7 +44,7 @@ func TestPrepareClaudeRequestReportsThinkingHistoryPolicy(t *testing.T) {
 }
 
 func TestPrepareOpenAICompatRequestReportsThinkingHistoryPolicy(t *testing.T) {
-	payload := buildOpenAIThinkingBudgetBody(strings.Repeat("r", maxSyntheticThinkingHistoryBytes), 9)
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
 	payload = mustSetSemanticReportFixture(t, payload, "metadata", `{"tenant":"test"}`)
 	payload = mustSetSemanticReportFixture(t, payload, "store", `true`)
 	payload = mustSetSemanticReportFixture(t, payload, "parallel_tool_calls", `true`)
@@ -69,7 +68,7 @@ func TestPrepareOpenAICompatRequestReportsThinkingHistoryPolicy(t *testing.T) {
 	reused := true
 	changed := false
 	assertSemanticRequestStages(t, ctx, []semanticStageExpectation{
-		{id: openAICompatProviderResolveTransformStage, policy: openAICompatProviderResolvePolicy, reused: &changed},
+		{id: openAICompatProviderResolveTransformStage, policy: openAICompatProviderResolvePolicy, reused: &reused},
 		{id: openAICompatProviderConfigTransformStage, policy: openAICompatProviderConfigPolicy, reused: &changed},
 		{id: openAICompatToolHistoryTransformStage, policy: openAICompatToolHistoryPolicy, reused: &reused},
 		{id: openAICompatProviderPreQuirkStage, policy: openAICompatProviderPreQuirkPolicy, downgrade: openAICompatMetadataRemovedDowngrade, reused: &changed},
@@ -151,19 +150,19 @@ func assertThinkingHistoryProductionStage(t *testing.T, ctx context.Context, wan
 		if stage.Stage != wantStage {
 			continue
 		}
-		if stage.InputBytes <= 0 || stage.OutputBytes <= 0 || stage.SyntheticBytes <= 0 || stage.PatchedCount != 9 || stage.Duration < 0 {
+		if stage.InputBytes <= 0 || stage.OutputBytes <= 0 || stage.SyntheticBytes != 0 || stage.PatchedCount != 0 || stage.Duration < 0 || !stage.ReusedInput {
 			t.Fatalf("thinking history stage bytes = %#v", stage)
 		}
-		if report.PatchedCount != 9 {
+		if report.PatchedCount != 0 {
 			t.Fatalf("thinking history report patched count = %d", report.PatchedCount)
 		}
-		if len(stage.AppliedPolicies) != 2 || stage.AppliedPolicies[0] != thinkingHistoryPlaceholderPolicy || stage.AppliedPolicies[1] != thinkingHistorySyntheticBudgetPolicy {
+		if !containsTransformMetadataID(stage.AppliedPolicies, thinkingHistoryValidationPolicy) {
 			t.Fatalf("thinking history policies = %v", stage.AppliedPolicies)
 		}
-		if len(stage.Downgrades) != 1 || stage.Downgrades[0] != thinkingHistoryBudgetDowngradeReason {
+		if len(stage.Downgrades) != 0 {
 			t.Fatalf("thinking history downgrades = %v", stage.Downgrades)
 		}
-		if !stage.Amplification.OverrideApplied || stage.Amplification.PolicyID != thinkingHistorySyntheticBudgetPolicy || stage.Amplification.Exceeded {
+		if stage.Amplification.OverrideApplied || stage.Amplification.Exceeded {
 			t.Fatalf("thinking history amplification = %#v", stage.Amplification)
 		}
 		return

@@ -285,6 +285,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if errReject := rejectLargeOpenAICompatToolHistory(req.Context(), body, profile, model, path); errReject != nil {
 		return errReject
 	}
+	if errReject := rejectDeepSeekUnsupportedImageInput(req.Context(), body, profile, model, path); errReject != nil {
+		return errReject
+	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
 	inlinedImages := false
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(req.Context(), updated, profile, model); changed {
@@ -356,7 +359,7 @@ func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOut
 	return largeOpenAICompatToolHistoryPayloadBytes, largeOpenAICompatToolOutputMessages
 }
 
-func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
+func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, endpoint string) error {
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return nil
 	}
@@ -364,11 +367,14 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 	if imageParts == 0 {
 		return nil
 	}
+	if isDeepSeekFlashNativeResponsesImageRoute(model, endpoint) {
+		return nil
+	}
 	fields := log.Fields{
 		"event":         "openai_compat_image_guard",
 		"model":         model,
 		"compat_kind":   "deepseek",
-		"request_path":  path,
+		"upstream_path": endpoint,
 		"payload_bytes": len(body),
 		"image_parts":   imageParts,
 	}
@@ -381,7 +387,14 @@ func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profi
 }
 
 func deepSeekOfficialImageInputUserMessage() string {
-	return "request_feature_unsupported: deepseek_official_image_input. DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
+	return "request_feature_unsupported: deepseek_official_chat_image_input. DeepSeek 官方 Chat Completions 兼容层不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；DeepSeek V4 Flash 的原生 Responses 路由可保留图片输入。原样重复提交不会提高成功率。"
+}
+
+func isDeepSeekFlashNativeResponsesImageRoute(model, endpoint string) bool {
+	endpoint = strings.ToLower(strings.TrimSpace(endpoint))
+	return strings.HasSuffix(endpoint, "/responses") &&
+		!strings.HasSuffix(endpoint, "/responses/compact") &&
+		strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "deepseek-v4-flash")
 }
 
 func hasOpenAICompatToolOutputMarker(body []byte) bool {
@@ -400,16 +413,27 @@ func countOpenAICompatImageParts(body []byte) int {
 	}
 	count := 0
 	for _, msg := range gjson.GetBytes(body, "messages").Array() {
-		content := msg.Get("content")
-		if !content.IsArray() {
-			continue
+		count += countOpenAICompatImageContentParts(msg.Get("content"))
+	}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		switch strings.ToLower(strings.TrimSpace(item.Get("type").String())) {
+		case "image", "image_url", "input_image":
+			count++
 		}
-		for _, part := range content.Array() {
-			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
-			switch partType {
-			case "image", "image_url", "input_image":
-				count++
-			}
+		count += countOpenAICompatImageContentParts(item.Get("content"))
+	}
+	return count
+}
+
+func countOpenAICompatImageContentParts(content gjson.Result) int {
+	if !content.IsArray() {
+		return 0
+	}
+	count := 0
+	for _, part := range content.Array() {
+		switch strings.ToLower(strings.TrimSpace(part.Get("type").String())) {
+		case "image", "image_url", "input_image":
+			count++
 		}
 	}
 	return count
@@ -770,7 +794,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.failureCtx = cliproxyusage.WithFailureDiagnostic(ctx, diagnostic.failureDiagnostic())
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
-	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
+	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.endpoint); err != nil {
 		return plan, err
 	}
 	plan.logBody = body

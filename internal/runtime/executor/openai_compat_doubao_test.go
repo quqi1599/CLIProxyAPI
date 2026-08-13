@@ -541,10 +541,10 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	if got := status.ErrorCode(); got != "request_feature_unsupported" {
 		t.Fatalf("ErrorCode() = %q, want request_feature_unsupported", got)
 	}
-	if !strings.Contains(err.Error(), "DeepSeek 官方当前不支持图片输入") {
+	if !strings.Contains(err.Error(), "DeepSeek 官方 Chat Completions 兼容层不支持图片输入") {
 		t.Fatalf("error = %q, want direct Chinese image-input guidance", err.Error())
 	}
-	if !strings.Contains(err.Error(), "deepseek_official_image_input") {
+	if !strings.Contains(err.Error(), "deepseek_official_chat_image_input") {
 		t.Fatalf("error = %q, want stable image-input marker", err.Error())
 	}
 
@@ -557,6 +557,32 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	}
 	if got := failureEntry.Data["content_part_types"]; got != "image_url:1,text:1" {
 		t.Fatalf("failure content_part_types = %#v, want image_url:1,text:1", got)
+	}
+}
+
+func TestDeepSeekImageGuardAllowsOnlyFlashNativeResponses(t *testing.T) {
+	profile := openAICompatProfile{Kind: "deepseek"}
+	body := []byte(`{"model":"deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"https://example.com/a.png"}]}]}`)
+	if got := countOpenAICompatImageParts(body); got != 1 {
+		t.Fatalf("image parts = %d, want 1", got)
+	}
+	if err := rejectDeepSeekUnsupportedImageInput(context.Background(), body, profile, "deepseek-v4-flash", "/responses"); err != nil {
+		t.Fatalf("Flash native Responses image input rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name     string
+		model    string
+		endpoint string
+	}{
+		{name: "Flash Chat", model: "deepseek-v4-flash", endpoint: "/chat/completions"},
+		{name: "Pro Responses fallback", model: "deepseek-v4-pro", endpoint: "/chat/completions"},
+		{name: "Flash compact", model: "deepseek-v4-flash", endpoint: "/responses/compact"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := rejectDeepSeekUnsupportedImageInput(context.Background(), body, profile, test.model, test.endpoint); err == nil {
+				t.Fatal("expected image guard error")
+			}
+		})
 	}
 }
 

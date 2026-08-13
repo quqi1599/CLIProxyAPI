@@ -2,6 +2,9 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -12,17 +15,9 @@ import (
 )
 
 const (
-	maxSyntheticThinkingHistoryBytes      = compathistory.MaxSyntheticItemBytes
-	maxSyntheticThinkingHistoryTotalBytes = compathistory.MaxSyntheticTotalBytes
-
-	thinkingHistoryBudgetDowngradeReason  = compathistory.BudgetDowngradeReason
-	thinkingHistoryUnrepairableReason     = compathistory.UnrepairableReason
-	thinkingHistorySyntheticBudgetPolicy  = "thinking_history.synthetic_budget"
-	thinkingHistoryPlaceholderPolicy      = "thinking_history.placeholder"
-	openAIThinkingHistoryTransformStage   = "normalize.thinking_history.openai"
-	claudeThinkingHistoryTransformStage   = "normalize.thinking_history.claude"
-	openAIReasoningUnavailablePlaceholder = compathistory.OpenAIUnavailableValue
-	claudeThinkingUnavailablePlaceholder  = compathistory.ClaudeUnavailableValue
+	thinkingHistoryValidationPolicy     = "thinking_history.real_reasoning_validation"
+	openAIThinkingHistoryTransformStage = "normalize.thinking_history.openai"
+	claudeThinkingHistoryTransformStage = "normalize.thinking_history.claude"
 )
 
 type thinkingHistoryTransformReport = compathistory.Report
@@ -38,34 +33,14 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider string, repor
 		return nil
 	}
 
-	appliedPolicies := make([]string, 0, 1)
-	if report.PlaceholderCount > 0 {
-		appliedPolicies = append(appliedPolicies, thinkingHistoryPlaceholderPolicy)
-	}
-	downgrades := make([]string, 0, 1)
-	switch report.DowngradeReason {
-	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason:
-		downgrades = append(downgrades, report.DowngradeReason)
-	}
-	override := internalpayload.AmplificationOverride{}
-	if report.PatchedCount > 0 {
-		override = internalpayload.AmplificationOverride{
-			PolicyID:          thinkingHistorySyntheticBudgetPolicy,
-			MaxExpansionBytes: 2 * maxSyntheticThinkingHistoryTotalBytes,
-			MaxExpansionRatio: internalpayload.DefaultMaxExpansionRatio,
-		}
-	}
 	return internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
 		Stage:           stage,
 		InputBytes:      int64(report.InputBytes),
 		OutputBytes:     int64(report.OutputBytes),
-		SyntheticBytes:  int64(report.SyntheticBytes),
-		PatchedCount:    int64(report.PatchedCount),
 		Duration:        duration,
-		AppliedPolicies: appliedPolicies,
-		Downgrades:      downgrades,
-		ReusedInput:     report.PatchedCount == 0 && report.SyntheticBytes == 0 && report.InputBytes == report.OutputBytes,
-	}, override)
+		AppliedPolicies: []string{thinkingHistoryValidationPolicy},
+		ReusedInput:     true,
+	}, internalpayload.AmplificationOverride{})
 }
 
 func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool, error) {
@@ -82,60 +57,16 @@ func normalizeThinkingHistoryWithReport(body []byte, provider string) ([]byte, b
 }
 
 func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, model string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
-	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
-	requested := thinkingHistoryRequested(body, provider)
-	if !requested && requiresReturnedThinkingHistory(model) {
-		switch strings.ToLower(strings.TrimSpace(provider)) {
-		case "openai":
-			requested = deepSeekOpenAIThinkingEnabled(body) || openAIHistoryNeedsThinkingNormalization(body)
-		case "claude":
-			requested = claudeHistoryNeedsThinkingNormalization(body)
-		}
-	}
-	if !requested {
-		return body, false, false, report, nil
-	}
-	requireCompleteHistory := requiresReturnedThinkingHistory(model)
+	requireToolCallReasoning := requiresReturnedThinkingHistory(model)
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
-		return normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
+		return normalizeOpenAIThinkingHistoryWithReport(body, requireToolCallReasoning)
 	case "claude":
-		return normalizeClaudeThinkingHistoryWithReport(body, requireCompleteHistory)
+		return normalizeClaudeThinkingHistoryWithReport(body, requireToolCallReasoning)
 	default:
+		report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
 		return body, false, false, report, nil
 	}
-}
-
-func openAIHistoryNeedsThinkingNormalization(body []byte) bool {
-	for _, message := range gjson.GetBytes(body, "messages").Array() {
-		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "assistant") {
-			continue
-		}
-		if strings.TrimSpace(message.Get("reasoning_content").String()) != "" {
-			return true
-		}
-		if toolCalls := message.Get("tool_calls"); toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func claudeHistoryNeedsThinkingNormalization(body []byte) bool {
-	for _, message := range gjson.GetBytes(body, "messages").Array() {
-		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "assistant") {
-			continue
-		}
-		for _, part := range message.Get("content").Array() {
-			if strings.EqualFold(strings.TrimSpace(part.Get("type").String()), "thinking") && strings.TrimSpace(part.Get("thinking").String()) != "" {
-				return true
-			}
-			if strings.EqualFold(strings.TrimSpace(part.Get("type").String()), "tool_use") {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func requiresReturnedThinkingHistory(model string) bool {
@@ -143,44 +74,50 @@ func requiresReturnedThinkingHistory(model string) bool {
 	return strings.HasPrefix(modelName, "deepseek-v4") || strings.Contains(modelName, "deepseek-reasoner")
 }
 
-func normalizeOpenAIThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
-	out, changed, downgraded, _, err := normalizeOpenAIThinkingHistoryWithReport(body, requireCompleteHistory)
+func normalizeOpenAIThinkingHistory(body []byte, requireToolCallReasoning bool) ([]byte, bool, bool, error) {
+	out, changed, downgraded, _, err := normalizeOpenAIThinkingHistoryWithReport(body, requireToolCallReasoning)
 	return out, changed, downgraded, err
 }
 
-func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
-	result, err := compathistory.Repair(body, compathistory.FormatOpenAI, requireCompleteHistory)
-	return result.Payload, result.Changed, result.Downgraded, result.Report, err
+func normalizeOpenAIThinkingHistoryWithReport(body []byte, requireToolCallReasoning bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report, err := compathistory.Validate(body, compathistory.FormatOpenAI, requireToolCallReasoning)
+	if err != nil {
+		return body, false, false, report, missingReasoningHistoryStatusError(err)
+	}
+	return body, false, false, report, nil
 }
 
-func normalizeClaudeThinkingHistory(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, error) {
-	out, changed, downgraded, _, err := normalizeClaudeThinkingHistoryWithReport(body, requireCompleteHistory)
+func normalizeClaudeThinkingHistory(body []byte, requireToolCallReasoning bool) ([]byte, bool, bool, error) {
+	out, changed, downgraded, _, err := normalizeClaudeThinkingHistoryWithReport(body, requireToolCallReasoning)
 	return out, changed, downgraded, err
 }
 
-func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistory bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
-	result, err := compathistory.Repair(body, compathistory.FormatClaude, requireCompleteHistory)
-	return result.Payload, result.Changed, result.Downgraded, result.Report, err
+func normalizeClaudeThinkingHistoryWithReport(body []byte, requireToolCallReasoning bool) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	report, err := compathistory.Validate(body, compathistory.FormatClaude, requireToolCallReasoning)
+	if err != nil {
+		return body, false, false, report, missingReasoningHistoryStatusError(err)
+	}
+	return body, false, false, report, nil
 }
 
-func thinkingHistoryRequested(body []byte, provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "openai":
-		return openAIThinkingEnabled(body)
-	case "claude":
-		return claudeThinkingEnabled(body)
-	default:
-		return false
+func missingReasoningHistoryStatusError(err error) error {
+	var missing *compathistory.MissingReasoningError
+	if !errors.As(err, &missing) {
+		return err
 	}
-}
-
-func openAIThinkingEnabled(body []byte) bool {
-	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
-		if strings.TrimSpace(gjson.GetBytes(body, path).String()) != "" {
-			return true
-		}
+	field := "reasoning_content"
+	if missing.Format == compathistory.FormatClaude {
+		field = "thinking block"
 	}
-	return false
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "missing_reasoning_history",
+		msg: fmt.Sprintf(
+			"invalid_request_error: missing_real_reasoning_history. %s. CPA will not fabricate, copy, or insert placeholder reasoning. Preserve the original %s returned by DeepSeek on every assistant tool-call turn, or start a new conversation.",
+			missing.Error(),
+			field,
+		),
+	}
 }
 
 func deepSeekOpenAIThinkingEnabled(body []byte) bool {
@@ -206,10 +143,11 @@ func deepSeekOpenAIThinkingEnabled(body []byte) bool {
 	return false
 }
 
-func claudeThinkingEnabled(body []byte) bool {
-	thinkingType := strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())
-	if thinkingType != "" && thinkingType != "disabled" {
-		return true
+func openAIThinkingEnabled(body []byte) bool {
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort"} {
+		if strings.TrimSpace(gjson.GetBytes(body, path).String()) != "" {
+			return true
+		}
 	}
-	return strings.TrimSpace(gjson.GetBytes(body, "output_config.effort").String()) != ""
+	return false
 }
