@@ -948,7 +948,7 @@ func (m *Manager) selectGPTFirstEventPolicy(model string) GPTFirstEventPolicySna
 	return snapshot
 }
 
-func (m *Manager) recordGPTFirstEventAttempt(ctx context.Context, model string, enforcedTimeout, delay time.Duration, deliverable bool, err error) {
+func (m *Manager) recordGPTFirstEventAttempt(ctx context.Context, model, routeKey string, enforcedTimeout, delay time.Duration, deliverable bool, err error) {
 	if m == nil || !isGPTRequestRoute(ctx, nil, model) {
 		return
 	}
@@ -958,6 +958,7 @@ func (m *Manager) recordGPTFirstEventAttempt(ctx context.Context, model string, 
 	}
 	timedOut := strings.EqualFold(strings.TrimSpace(errorCodeFromError(err)), "gpt_first_event_timeout")
 	trace.recordGPTFirstEventAttempt(delay, timedOut)
+	m.recordGPTRetryPressureAttempt(ctx, model, routeKey, deliverable, err)
 	if !trace.claimGPTFirstEventObservation() {
 		return
 	}

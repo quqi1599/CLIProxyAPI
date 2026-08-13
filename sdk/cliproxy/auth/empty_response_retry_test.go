@@ -737,8 +737,8 @@ func TestManagerEmptyResponseRetryReturnsTypedFailureWhenAllChannelsAreEmpty(t *
 		summary.Data["empty_response_exhausted"] != true {
 		t.Fatalf("summary fields = %#v", summary.Data)
 	}
-	if summary.Data["empty_response_count"] != 6 ||
-		summary.Data["empty_response_retry_count"] != 5 ||
+	if summary.Data["empty_response_count"] != 4 ||
+		summary.Data["empty_response_retry_count"] != 3 ||
 		summary.Data["empty_response_upstream_count"] != 2 {
 		t.Fatalf("summary counters = %#v", summary.Data)
 	}
@@ -748,8 +748,8 @@ func TestManagerEmptyResponseRetryReturnsTypedFailureWhenAllChannelsAreEmpty(t *
 			t.Fatalf("auth %s not found", authID)
 		}
 		state := auth.ModelStates["gpt-5.6-sol"]
-		if state == nil || state.Health.BreakerState != HealthBreakerOpen {
-			t.Fatalf("auth %s model breaker = %+v, want open after repeated empty responses", authID, state)
+		if state == nil || state.Health.BreakerState == HealthBreakerOpen {
+			t.Fatalf("auth %s model breaker = %+v, want bounded two-round evidence without opening the protocol breaker", authID, state)
 		}
 	}
 }
