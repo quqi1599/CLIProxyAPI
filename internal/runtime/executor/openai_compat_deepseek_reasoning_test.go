@@ -158,6 +158,50 @@ func TestOpenAICompatExecutorDeepSeekRejectsIncompleteExplicitHistoryBeforeUpstr
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekWorkBuddyDowngradesIncompleteExplicitHistory(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-workbuddy","object":"chat.completion","model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "openai-compatibility", Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "compat_kind": "deepseek",
+	}}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-v4-pro",
+			"reasoning_effort":"high",
+			"messages":[
+				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"}
+			]
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ClientProfileMetadataKey:           "workbuddy",
+			cliproxyexecutor.ReasoningEffortOriginalMetadataKey: "high",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after downgrade: %s", gotBody)
+	}
+	if gjson.GetBytes(gotBody, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("missing reasoning history was synthesized: %s", gotBody)
+	}
+}
+
 func TestOpenAICompatExecutorDeepSeekRechecksIncompleteHistoryAfterPayloadConfig(t *testing.T) {
 	upstreamCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

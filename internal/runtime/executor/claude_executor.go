@@ -408,7 +408,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 
 	historyStarted := time.Now()
 	var historyReport thinkingHistoryTransformReport
-	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReport(body, "claude", baseModel)
+	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReportForClient(body, "claude", baseModel, executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey))
 	if err != nil {
 		return plan, err
 	}
