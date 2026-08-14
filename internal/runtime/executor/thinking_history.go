@@ -24,6 +24,7 @@ const (
 
 	thinkingHistoryBudgetDowngradeReason  = compathistory.BudgetDowngradeReason
 	thinkingHistoryUnrepairableReason     = compathistory.UnrepairableReason
+	thinkingHistoryClientDowngradeReason  = "thinking_history_downgraded"
 	thinkingHistorySyntheticBudgetPolicy  = "thinking_history.synthetic_budget"
 	thinkingHistoryPlaceholderPolicy      = "thinking_history.placeholder"
 	thinkingHistoryValidationPolicy       = "thinking_history.real_reasoning_validation"
@@ -37,6 +38,7 @@ const (
 
 const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少真实 reasoning_content，CPA 无法可靠还原。请新建会话、关闭思考或清理工具历史后重试；系统不会伪造思考内容、删除工具或跨渠道重试。"
 const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的原始推理内容。Codex 中重复重试或 /compact 无法修复；请切换到 OpenAI 原生 GPT 模型后继续并执行 /compact，或新建 DeepSeek 会话。若客户端支持，也可关闭思考模式后继续；这不是账号额度或网络错误。"
+const workBuddyDeepSeekInvalidThinkingHistoryMessage = "当前对话的深度思考记录不完整，暂时无法继续。请任选一种方式处理：\n1. 推荐：在 WorkBuddy 中点击“新建对话”，然后重新发送刚才的问题。\n2. 或关闭深度思考：打开 WorkBuddy 的“设置” → 进入“模型设置”或“自定义模型” → 选择当前 DeepSeek 模型 → 关闭“深度思考”“Thinking”或“Reasoning”开关 → 返回对话重试。不同版本的菜单名称可能略有不同。\n3. 如果仍然无法使用，请在模型列表中切换到 OpenAI 原生 GPT 模型，再重新发送。\n这不是账号余额或网络问题。"
 
 type deepSeekThinkingIntent uint8
 
@@ -68,7 +70,7 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider string, repor
 	}
 	downgrades := make([]string, 0, 1)
 	switch report.DowngradeReason {
-	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason:
+	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason, thinkingHistoryClientDowngradeReason:
 		downgrades = append(downgrades, report.DowngradeReason)
 	}
 	override := internalpayload.AmplificationOverride{}
@@ -106,6 +108,10 @@ func normalizeThinkingHistoryWithReport(body []byte, provider string) ([]byte, b
 }
 
 func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, model string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
+	return normalizeThinkingHistoryForModelWithReportForClient(body, provider, model, "")
+}
+
+func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider string, model string, clientProfile string) ([]byte, bool, bool, thinkingHistoryTransformReport, error) {
 	report := thinkingHistoryTransformReport{InputBytes: len(body), OutputBytes: len(body)}
 	if requiresReturnedThinkingHistory(model) {
 		if !deepSeekThinkingHistoryRequiredForRequest(body, provider) {
@@ -123,13 +129,22 @@ func normalizeThinkingHistoryForModelWithReport(body []byte, provider string, mo
 		if err == nil {
 			return body, false, false, report, nil
 		}
-		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault {
+		clientProfile = strings.ToLower(strings.TrimSpace(clientProfile))
+		workBuddyDowngrade := clientProfile == "workbuddy"
+		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault || workBuddyDowngrade {
 			out, errDisable := disableDeepSeekThinkingForIncompleteHistory(body, provider)
 			if errDisable != nil {
+				if workBuddyDowngrade {
+					return body, false, false, report, missingReasoningHistoryStatusErrorWithMessage(err, workBuddyDeepSeekInvalidThinkingHistoryMessage)
+				}
 				return body, false, false, report, errDisable
 			}
 			report.OutputBytes = len(out)
-			report.DowngradeReason = thinkingHistoryUnrepairableReason
+			if workBuddyDowngrade {
+				report.DowngradeReason = thinkingHistoryClientDowngradeReason
+			} else {
+				report.DowngradeReason = thinkingHistoryUnrepairableReason
+			}
 			return out, !bytes.Equal(out, body), true, report, nil
 		}
 		return body, false, false, report, missingReasoningHistoryStatusError(err)
@@ -360,9 +375,17 @@ func normalizeClaudeThinkingHistoryWithReport(body []byte, requireCompleteHistor
 }
 
 func missingReasoningHistoryStatusError(err error) error {
+	return missingReasoningHistoryStatusErrorWithMessage(err, deepSeekInvalidThinkingHistoryMessage)
+}
+
+func missingReasoningHistoryStatusErrorWithMessage(err error, publicMessage string) error {
 	var missing *compathistory.MissingReasoningError
 	if !errors.As(err, &missing) {
 		return err
+	}
+	publicMessage = strings.TrimSpace(publicMessage)
+	if publicMessage == "" {
+		publicMessage = deepSeekInvalidThinkingHistoryMessage
 	}
 	failure := &failurecontract.Failure{
 		Kind:          failurecontract.InvalidThinkingHistory,
@@ -372,12 +395,12 @@ func missingReasoningHistoryStatusError(err error) error {
 		SemanticCode:  deepSeekInvalidThinkingHistoryCode,
 		Retryable:     false,
 		Cause:         missing,
-		PublicMessage: deepSeekInvalidThinkingHistoryMessage,
+		PublicMessage: publicMessage,
 	}
 	return statusErr{
 		code:      http.StatusBadRequest,
 		errorCode: deepSeekInvalidThinkingHistoryCode,
-		msg:       deepSeekInvalidThinkingHistoryMessage,
+		msg:       publicMessage,
 		failure:   failure,
 	}
 }

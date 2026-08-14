@@ -1019,7 +1019,8 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		return plan, err
 	}
 	var historyReport thinkingHistoryTransformReport
-	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReport(body, "openai", baseModel)
+	clientProfile := openAICompatMetadataString(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)
+	body, _, _, historyReport, err = normalizeThinkingHistoryForModelWithReportForClient(body, "openai", baseModel, clientProfile)
 	if err != nil {
 		return plan, err
 	}
@@ -1104,7 +1105,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
 	if requiresReturnedThinkingHistory(baseModel) {
-		body, _, _, _, err = normalizeThinkingHistoryForModelWithReport(body, "openai", baseModel)
+		body, _, _, _, err = normalizeThinkingHistoryForModelWithReportForClient(body, "openai", baseModel, clientProfile)
 		if err != nil {
 			return plan, err
 		}
