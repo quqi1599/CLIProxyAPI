@@ -307,6 +307,11 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
+#     responses-compaction:
+#       legacy-endpoint: "native" # native | unsupported; omitted leaves custom routes disabled
+#       trigger-mode: "native-stream" # native-stream | bridge-legacy | unsupported
+#       context-management: false
+#       compatibility-group: "verified-codex-route"
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     headers:
 #       X-Custom-Header: "custom-value"
@@ -391,6 +396,11 @@ nonstream-keepalive-interval: 0
 #     kind: "newapi" # optional built-in profile: kimi, minimax, qwen, zhipu, xfyun, maas, langengyun, newapi
 #     disabled: false # optional: set to true to disable this provider without removing it
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
+#     responses-compaction:
+#       legacy-endpoint: "unsupported" # native | unsupported
+#       trigger-mode: "unsupported" # native-stream | bridge-legacy | unsupported
+#       context-management: false
+#       compatibility-group: "verified-provider-route"
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
 #     disable-cooling: false # optional: per-provider override for auth/model cooldown scheduling
 #     headers:

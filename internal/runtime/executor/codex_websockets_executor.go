@@ -380,6 +380,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
 	transformStarted := time.Now()
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -412,6 +413,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		if contextManagement := gjson.GetBytes(req.Payload, "context_management"); contextManagement.Exists() {
+			body, err = sjson.SetRawBytes(body, "context_management", []byte(contextManagement.Raw))
+			if err != nil {
+				return resp, fmt.Errorf("codex websockets executor: restore context_management: %w", err)
+			}
+		}
+	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
@@ -603,6 +612,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	var activeFrame codexWebsocketRead
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	defer activeFrame.release()
 	for {
 		activeFrame.release()
@@ -661,6 +672,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, streamErr
 		}
 
+		rawEventType := gjson.GetBytes(payload, "type").String()
+		if rawEventType == "response.output_item.done" {
+			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+		}
+		if rawEventType == "response.completed" || rawEventType == "response.done" {
+			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
+		}
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
 		if eventType == "response.completed" {
@@ -669,6 +687,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			var param any
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+				compactionResponse := []byte(gjson.GetBytes(clientPayload, "response").Raw)
+				err = helps.ValidateContextManagementCompactionResponse(compactionResponse)
+				helps.RecordResponsesCompactionValidation(ctx, "context_management_json", compactionResponse, err)
+				if err != nil {
+					return resp, err
+				}
+			}
 			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, clientPayload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
@@ -683,6 +709,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
+	}
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger &&
+		cliproxyexecutor.CompactionTriggerModeFromOptions(opts) == cliproxyauth.ResponsesCompactionTriggerBridgeLegacy {
+		return e.CodexExecutor.executeCompactionTriggerViaLegacy(ctx, auth, req, opts)
 	}
 	transformStarted := time.Now()
 
@@ -712,6 +743,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
+	if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		if contextManagement := gjson.GetBytes(req.Payload, "context_management"); contextManagement.Exists() {
+			body, err = sjson.SetRawBytes(body, "context_management", []byte(contextManagement.Raw))
+			if err != nil {
+				return nil, fmt.Errorf("codex websockets executor: restore context_management: %w", err)
+			}
+		}
+	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
@@ -944,6 +983,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 		var param any
 		var activeFrame codexWebsocketRead
+		outputItemsByIndex := make(map[int64][]byte)
+		var outputItemsFallback [][]byte
 		outputCommitted := false
 		defer activeFrame.release()
 		for {
@@ -1028,6 +1069,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
+			if eventType == "response.output_item.done" {
+				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+			}
+			if eventType == "response.completed" || eventType == "response.done" {
+				payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
+			}
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
@@ -1078,7 +1125,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}()
 
-	return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
+	result := &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger || compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		result = helps.WrapResponsesCompactionStream(ctx, result)
+	}
+	return result, nil
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {

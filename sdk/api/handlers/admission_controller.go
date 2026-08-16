@@ -572,6 +572,11 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 }
 
 func setExecutionRequestShapeMetadata(meta map[string]any, rawJSON []byte, options modelExecutionOptions) {
+	alt := ""
+	if strings.EqualFold(strings.TrimSpace(options.complexityDimensions.Endpoint), "compact") {
+		alt = coreexecutor.ResponsesCompactAlt
+	}
+	_, _ = coreexecutor.SetCompactionIntentMetadata(meta, rawJSON, alt)
 	if options.complexity != nil {
 		if options.complexityValid {
 			options.complexity.applyDimensions(refineComplexityDimensions(options.complexityDimensions, requestPathMetadata(meta)))

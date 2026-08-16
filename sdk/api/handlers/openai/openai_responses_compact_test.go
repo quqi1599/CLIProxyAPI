@@ -87,13 +87,39 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesRejectsMalformedRemoteCompactionV2(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+	for name, payload := range map[string]string{
+		"trigger not final": `{"model":"gpt-5","stream":true,"input":[{"type":"compaction_trigger"},{"type":"message"}]}`,
+		"not streaming":     `{"model":"gpt-5","stream":false,"input":[{"type":"message"},{"type":"compaction_trigger"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", resp.Code, resp.Body.String())
+			}
+			if got := gjson.GetBytes(resp.Body.Bytes(), "error.code").String(); got != "invalid_compaction_request" {
+				t.Fatalf("error code = %q, want invalid_compaction_request", got)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &compactCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "auth2", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -126,13 +152,46 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesCompactRejectsRouteWithoutCapabilityCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &compactCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-no-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.POST("/v1/responses/compact", h.Compact)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"test-model","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", resp.Code, resp.Body.String())
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "error.code").String(); got != "remote_compaction_unsupported" {
+		t.Fatalf("error.code = %q, want remote_compaction_unsupported; body=%s", got, resp.Body.String())
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executor.calls)
+	}
+}
+
 func TestOpenAIResponsesCompactNormalizesOpenAICompactModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &compactCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth-compact-openai", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "auth-compact-openai", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -168,7 +227,9 @@ func TestOpenAIResponsesCompactDecodesZstdRequestBody(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "auth3", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "auth3", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}

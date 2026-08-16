@@ -262,6 +262,12 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
 		return nil, nil, nil, err
 	}
+	err = helps.ValidateLegacyResponsesCompaction(data)
+	helps.RecordResponsesCompactionValidation(ctx, "legacy_json", data, err)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return nil, nil, nil, err
+	}
 
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
@@ -269,7 +275,13 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 }
 
 func (e *XAIExecutor) executeCompactionTriggerStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	prepared, data, headers, err := e.executeCompactRequest(ctx, auth, req, opts)
+	compactPayload, err := helps.BuildLegacyResponsesCompactionRequest(req.Payload)
+	if err != nil {
+		return nil, err
+	}
+	compactReq := req
+	compactReq.Payload = compactPayload
+	prepared, data, headers, err := e.executeCompactRequest(ctx, auth, compactReq, opts)
 	if err != nil {
 		return nil, err
 	}

@@ -101,6 +101,111 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	assertTransformStageContract(t, ctx, releaseReport, "request_plan.codex.websocket", upstreamRequestBytes)
 }
 
+func TestCodexWebsocketsExecuteContextManagementRestoresRequestAndValidatesOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, requestPayload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read websocket request: %v", err)
+			return
+		}
+		capturedPayload <- bytes.Clone(requestPayload)
+		for _, event := range [][]byte{
+			[]byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"type":"compaction","encrypted_content":"opaque"}}`),
+			[]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp-compact","status":"completed","output":[]}}`),
+		} {
+			if errWrite := conn.WriteMessage(websocket.TextMessage, event); errWrite != nil {
+				t.Errorf("write websocket event: %v", errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.4","context_management":[{"type":"compaction"}],"input":[{"type":"message","role":"user","content":"history"}]}`)
+	response, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload,
+		Metadata: map[string]any{cliproxyexecutor.CompactionIntentMetadataKey: string(cliproxyexecutor.CompactionIntentContextManagement)},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(response.Payload, "output.0.type").String(); got != "compaction" {
+		t.Fatalf("response compaction type = %q; payload=%s", got, response.Payload)
+	}
+	select {
+	case upstream := <-capturedPayload:
+		if got := gjson.GetBytes(upstream, "context_management.0.type").String(); got != "compaction" {
+			t.Fatalf("upstream context_management type = %q; payload=%s", got, upstream)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream request")
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamValidatesRawCompactionBeforeDelivery(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, err = conn.ReadMessage(); err != nil {
+			t.Errorf("read websocket request: %v", err)
+			return
+		}
+		for _, event := range [][]byte{
+			[]byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"type":"compaction","encrypted_content":"opaque"}}`),
+			[]byte(`{"type":"response.done","sequence_number":1,"response":{"id":"resp-compact","status":"completed","output":[]}}`),
+		} {
+			if errWrite := conn.WriteMessage(websocket.TextMessage, event); errWrite != nil {
+				t.Errorf("write websocket event: %v", errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`)
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	result, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload, Stream: true,
+		Metadata: map[string]any{
+			cliproxyexecutor.CompactionIntentMetadataKey:      string(cliproxyexecutor.CompactionIntentV2Trigger),
+			cliproxyexecutor.CompactionTriggerModeMetadataKey: cliproxyauth.ResponsesCompactionTriggerNativeStream,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var delivered bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+		delivered.Write(chunk.Payload)
+		delivered.WriteByte('\n')
+	}
+	if got := gjson.Get(delivered.String(), "response.output.0.type").String(); got == "" {
+		if !strings.Contains(delivered.String(), `"type":"compaction"`) || !strings.Contains(delivered.String(), `"encrypted_content":"opaque"`) {
+			t.Fatalf("delivered stream lost compaction output: %s", delivered.String())
+		}
+	}
+}
+
 func TestCodexWebsocketsExecuteStreamUpgradeRequiredReturnsWithoutLockingSession(t *testing.T) {
 	upgradeAttempts := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

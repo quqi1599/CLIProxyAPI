@@ -43,6 +43,43 @@ func TestConfigSynthesizer_Synthesize_NilConfig(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_ResponsesCompactionAttributes(t *testing.T) {
+	t.Parallel()
+	contextManagement := true
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{CodexKey: []config.CodexKey{{
+			APIKey: "test-key", BaseURL: "https://example.com/v1",
+			ResponsesCompaction: config.ResponsesCompactionConfig{
+				LegacyEndpoint: "native", TriggerMode: "bridge-legacy",
+				ContextManagement: &contextManagement, CompatibilityGroup: "group-a",
+			},
+		}}},
+		Now: time.Now(), IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	attrs := auths[0].Attributes
+	if attrs["responses_compaction_legacy"] != "native" || attrs["responses_compaction_trigger"] != "bridge-legacy" ||
+		attrs["responses_compaction_context_management"] != "true" || attrs["responses_compaction_group"] != "group-a" {
+		t.Fatalf("compaction attributes = %+v", attrs)
+	}
+}
+
+func TestApplyResponsesCompactionAttributesPreservesExplicitFalse(t *testing.T) {
+	t.Parallel()
+	disabled := false
+	attrs := make(map[string]string)
+	applyResponsesCompactionAttributes(attrs, config.ResponsesCompactionConfig{ContextManagement: &disabled})
+	if got := attrs["responses_compaction_context_management"]; got != "false" {
+		t.Fatalf("context management attribute = %q, want false", got)
+	}
+}
+
 func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	tests := []struct {
 		name       string

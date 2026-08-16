@@ -170,27 +170,30 @@ type requestExecutionSummary struct {
 }
 
 type routePlanSummary struct {
-	RequestedModel   string `json:"requested_model,omitempty"`
-	ResolvedModel    string `json:"resolved_model,omitempty"`
-	UpstreamModel    string `json:"upstream_model,omitempty"`
-	AuthIndex        string `json:"auth_index,omitempty"`
-	Provider         string `json:"provider,omitempty"`
-	Protocol         string `json:"protocol,omitempty"`
-	Executor         string `json:"executor,omitempty"`
-	UpstreamPath     string `json:"upstream_path,omitempty"`
-	Translator       string `json:"translator,omitempty"`
-	RoutingGroup     string `json:"routing_group,omitempty"`
-	FallbackFrom     string `json:"fallback_from,omitempty"`
-	FallbackReason   string `json:"fallback_reason,omitempty"`
-	CompatKind       string `json:"compat_kind,omitempty"`
-	CompatKindSource string `json:"compat_kind_source,omitempty"`
-	CompatMapping    string `json:"compat_mapping,omitempty"`
-	CompatBaseHost   string `json:"compat_base_host,omitempty"`
-	ClientProfile    string `json:"client_profile,omitempty"`
-	ContextHint      string `json:"model_context_hint,omitempty"`
-	EffortSource     string `json:"reasoning_effort_source,omitempty"`
-	EffortOriginal   string `json:"reasoning_effort_original,omitempty"`
-	EffortNormalized string `json:"reasoning_effort_normalized,omitempty"`
+	RequestedModel               string `json:"requested_model,omitempty"`
+	ResolvedModel                string `json:"resolved_model,omitempty"`
+	UpstreamModel                string `json:"upstream_model,omitempty"`
+	AuthIndex                    string `json:"auth_index,omitempty"`
+	Provider                     string `json:"provider,omitempty"`
+	Protocol                     string `json:"protocol,omitempty"`
+	Executor                     string `json:"executor,omitempty"`
+	UpstreamPath                 string `json:"upstream_path,omitempty"`
+	Translator                   string `json:"translator,omitempty"`
+	RoutingGroup                 string `json:"routing_group,omitempty"`
+	FallbackFrom                 string `json:"fallback_from,omitempty"`
+	FallbackReason               string `json:"fallback_reason,omitempty"`
+	CompatKind                   string `json:"compat_kind,omitempty"`
+	CompatKindSource             string `json:"compat_kind_source,omitempty"`
+	CompatMapping                string `json:"compat_mapping,omitempty"`
+	CompatBaseHost               string `json:"compat_base_host,omitempty"`
+	ClientProfile                string `json:"client_profile,omitempty"`
+	ContextHint                  string `json:"model_context_hint,omitempty"`
+	EffortSource                 string `json:"reasoning_effort_source,omitempty"`
+	EffortOriginal               string `json:"reasoning_effort_original,omitempty"`
+	EffortNormalized             string `json:"reasoning_effort_normalized,omitempty"`
+	CompactionIntent             string `json:"compaction_intent,omitempty"`
+	CompactionTriggerMode        string `json:"compaction_trigger_mode,omitempty"`
+	CompactionCompatibilityGroup string `json:"compaction_compatibility_group,omitempty"`
 }
 
 func ensureRequestAttemptTrace(ctx context.Context) (context.Context, *requestAttemptTrace) {
@@ -941,8 +944,11 @@ func logRoutePlan(ctx context.Context, auth *Auth, provider, routeModel, resolve
 	}
 	plan := buildRoutePlanSummary(trace.summary(), auth, provider, routeModel, resolvedModel, upstreamModel, opts, executor, operation, coreusage.RequestAttemptFromContext(ctx))
 	fields := log.Fields{
-		"event":      "route_plan",
-		"route_plan": plan,
+		"event":                          "route_plan",
+		"route_plan":                     plan,
+		"compaction_intent":              metadataString(opts.Metadata, cliproxyexecutor.CompactionIntentMetadataKey),
+		"compaction_trigger_mode":        metadataString(opts.Metadata, cliproxyexecutor.CompactionTriggerModeMetadataKey),
+		"compaction_compatibility_group": metadataString(opts.Metadata, cliproxyexecutor.CompactionCompatibilityGroupMetadataKey),
 	}
 	addRequestAttemptLogFields(ctx, fields)
 	logEntryWithRequestID(ctx).WithFields(fields).Info("route_plan")
@@ -965,29 +971,64 @@ func buildRoutePlanSummary(previous requestExecutionSummary, auth *Auth, provide
 	if identity.Kind != "" {
 		compatKindSource = string(identity.Source)
 	}
-	return routePlanSummary{
-		RequestedModel:   requestedModel,
-		ResolvedModel:    strings.TrimSpace(resolvedModel),
-		UpstreamModel:    strings.TrimSpace(upstreamModel),
-		AuthIndex:        authMetricIndex(auth),
-		Provider:         strings.TrimSpace(provider),
-		Protocol:         protocol,
-		Executor:         executorName,
-		UpstreamPath:     routePlanUpstreamPath(protocol, requestPath, executorName, operation),
-		Translator:       routePlanTranslator(protocol, requestPath, executorName),
-		RoutingGroup:     routingGroup,
-		FallbackFrom:     routePlanFallbackFrom(previous),
-		FallbackReason:   strings.TrimSpace(attempt.RetryReason),
-		CompatKind:       identity.Kind,
-		CompatKindSource: compatKindSource,
-		CompatMapping:    routePlanCompatMapping(requestedModel, resolvedModel, identity.Kind),
-		CompatBaseHost:   identity.BaseHost,
-		ClientProfile:    clientProfile,
-		ContextHint:      metadataString(opts.Metadata, cliproxyexecutor.ModelContextHintMetadataKey),
-		EffortSource:     metadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortSourceMetadataKey),
-		EffortOriginal:   effortOriginal,
-		EffortNormalized: routePlanNormalizedReasoningEffort(auth, provider, requestedModel, clientProfile, resolvedModel, effortOriginal),
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(cliproxyexecutor.Request{}, opts)
+	compactionTriggerMode := metadataString(opts.Metadata, cliproxyexecutor.CompactionTriggerModeMetadataKey)
+	upstreamPath := routePlanUpstreamPath(protocol, requestPath, executorName, operation)
+	translator := routePlanTranslator(protocol, requestPath, executorName)
+	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent) {
+		upstreamPath, translator = routePlanRemoteCompactionTarget(compactionIntent, compactionTriggerMode, executorName, upstreamPath, translator)
 	}
+	return routePlanSummary{
+		RequestedModel:               requestedModel,
+		ResolvedModel:                strings.TrimSpace(resolvedModel),
+		UpstreamModel:                strings.TrimSpace(upstreamModel),
+		AuthIndex:                    authMetricIndex(auth),
+		Provider:                     strings.TrimSpace(provider),
+		Protocol:                     protocol,
+		Executor:                     executorName,
+		UpstreamPath:                 upstreamPath,
+		Translator:                   translator,
+		RoutingGroup:                 routingGroup,
+		FallbackFrom:                 routePlanFallbackFrom(previous),
+		FallbackReason:               strings.TrimSpace(attempt.RetryReason),
+		CompatKind:                   identity.Kind,
+		CompatKindSource:             compatKindSource,
+		CompatMapping:                routePlanCompatMapping(requestedModel, resolvedModel, identity.Kind),
+		CompatBaseHost:               identity.BaseHost,
+		ClientProfile:                clientProfile,
+		ContextHint:                  metadataString(opts.Metadata, cliproxyexecutor.ModelContextHintMetadataKey),
+		EffortSource:                 metadataString(opts.Metadata, cliproxyexecutor.ReasoningEffortSourceMetadataKey),
+		EffortOriginal:               effortOriginal,
+		EffortNormalized:             routePlanNormalizedReasoningEffort(auth, provider, requestedModel, clientProfile, resolvedModel, effortOriginal),
+		CompactionIntent:             string(compactionIntent),
+		CompactionTriggerMode:        compactionTriggerMode,
+		CompactionCompatibilityGroup: metadataString(opts.Metadata, cliproxyexecutor.CompactionCompatibilityGroupMetadataKey),
+	}
+}
+
+func routePlanRemoteCompactionTarget(intent cliproxyexecutor.CompactionIntent, triggerMode, executorName, fallbackPath, fallbackTranslator string) (string, string) {
+	upstreamPath := fallbackPath
+	translator := fallbackTranslator
+	switch intent {
+	case cliproxyexecutor.CompactionIntentLegacyEndpoint:
+		upstreamPath = "/responses/compact"
+	case cliproxyexecutor.CompactionIntentV2Trigger:
+		if triggerMode == ResponsesCompactionTriggerBridgeLegacy {
+			upstreamPath = "/responses/compact"
+		} else {
+			upstreamPath = "/responses"
+		}
+	case cliproxyexecutor.CompactionIntentContextManagement:
+		upstreamPath = "/responses"
+	}
+	if executorName == "OpenAICompatExecutor" {
+		if intent == cliproxyexecutor.CompactionIntentV2Trigger && triggerMode == ResponsesCompactionTriggerBridgeLegacy {
+			translator = "OpenAIResponsesCompactionBridgeLegacy"
+		} else {
+			translator = "OpenAIResponsesPassthrough"
+		}
+	}
+	return upstreamPath, translator
 }
 
 func routePlanProviderIdentity(auth *Auth, provider string) provideridentity.Identity {
@@ -1492,6 +1533,8 @@ type Manager struct {
 	zeroEligibleProbes       map[string]zeroEligibleProbeLease
 	channelBreakers          map[string]HealthState
 	gptChannelBreakers       map[string]*codexChannelBreakerState
+	compactionBreakerMu      sync.Mutex
+	compactionBreakers       map[string]*compactionBreakerState
 
 	codexModelLoadMu sync.Mutex
 	codexModelLoads  map[string]int
@@ -1527,6 +1570,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		zeroEligibleProbes:       make(map[string]zeroEligibleProbeLease),
 		channelBreakers:          make(map[string]HealthState),
 		gptChannelBreakers:       make(map[string]*codexChannelBreakerState),
+		compactionBreakers:       make(map[string]*compactionBreakerState),
 		codexModelLoads:          make(map[string]int),
 		activeStreams:            newActiveStreamTracker(),
 		gptFirstEventObserver:    newGPTFirstEventObserver(),
@@ -4073,6 +4117,7 @@ type streamExecutionLogMeta struct {
 	compatKindSource string
 	compatMapping    string
 	toolShape        coreusage.ToolShape
+	compactionIntent cliproxyexecutor.CompactionIntent
 }
 
 type streamRuntimeStats struct {
@@ -4224,11 +4269,11 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			if chunk.Err != nil && !failed {
 				failed = true
 				chunk.Err = normalizeOpaqueUpstream500Failure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
-				if isGPTRetryRoute([]string{meta.provider}, meta.requestedModel) {
+				if !cliproxyexecutor.IsRemoteCompactionIntent(meta.compactionIntent) && isGPTRetryRoute([]string{meta.provider}, meta.requestedModel) {
 					chunk.Err = normalizeOpaqueGPTAttemptFailure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
 				}
 				rerr := resultErrorFromCause(chunk.Err)
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: chunk.Err})
+				m.markExecutionResult(ctx, auth, selectorModel, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: chunk.Err}, meta.compactionIntent)
 				resultRecorded = true
 				runtime.recordFinalStatus(statusCodeFromError(chunk.Err))
 				if shouldEvictUnauthorizedError(chunk.Err) {
@@ -4299,7 +4344,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: true, Duration: time.Since(startedAt), TTFT: firstPayloadDelay})
+			m.markExecutionResult(ctx, auth, selectorModel, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: true, Duration: time.Since(startedAt), TTFT: firstPayloadDelay}, meta.compactionIntent)
 			resultRecorded = true
 			if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 				trace.recordFinalStatus(http.StatusOK)
@@ -4314,6 +4359,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
+	compactionIntent := compactionIntentFromRequest(req, opts)
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
+	gptRoute := isGPTRetryRoute(routeProviders, routeModel) && !remoteCompaction
+	if remoteCompaction && len(execModels) > 1 {
+		execModels = execModels[:1]
+	}
 	var lastErr error
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
@@ -4323,7 +4374,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, newGPTFirstEventWaitBudgetError()
 			}
 		}
-		if idx > 0 && isGPTRetryRoute(routeProviders, routeModel) &&
+		if idx > 0 && gptRoute &&
 			!m.reserveGPTChannelAttempt(ctx, auth, provider, routeModel, time.Now()) {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			m.releaseGPTChannelAttempt(ctx, auth)
@@ -4335,7 +4386,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
-		execOpts := opts
+		execOpts := withSelectedCompactionCapability(execReq, opts, auth)
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		releaseSlot, errReserve := m.reserveCodexModelSlot(provider, resultModel)
 		if errReserve != nil {
@@ -4395,7 +4446,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if errStream != nil {
 			errStream = normalizeOpaqueUpstream500Failure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
-			if isGPTRetryRoute(routeProviders, routeModel) {
+			if gptRoute {
 				errStream = normalizeOpaqueGPTAttemptFailure(errStream, failurecontract.StreamPhaseBeforeOutput, false)
 			}
 		}
@@ -4403,7 +4454,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			cleanupAttempt()
 			rerr := resultErrorFromCause(errStream)
 			elapsed := time.Since(startedAt)
-			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, elapsed, false, errStream)
+			if gptRoute {
+				m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, elapsed, false, errStream)
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: elapsed, TTFT: elapsed, Error: rerr, Cause: errStream}
 			result.RetryAfter = retryAfterFromError(errStream)
 			channelFailover := shouldFailoverGPTChannel(errStream, routeProviders, routeModel)
@@ -4415,9 +4468,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
-			m.MarkResult(ctx, result)
+			m.markExecutionResult(ctx, auth, routeModel, result, compactionIntent)
 			channelFailover = channelFailover ||
-				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4526,7 +4579,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if bootstrapErr != nil {
 			bootstrapErr = normalizeOpaqueUpstream500Failure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
-			if isGPTRetryRoute(routeProviders, routeModel) {
+			if gptRoute {
 				bootstrapErr = normalizeOpaqueGPTAttemptFailure(bootstrapErr, failurecontract.StreamPhaseBeforeOutput, false)
 			}
 		}
@@ -4537,7 +4590,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.releaseGPTChannelAttempt(ctx, auth)
 				return nil, newCallerRequestFailure(errCtx)
 			}
-			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
+			if gptRoute {
+				m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, bootstrapErr)
+			}
 			rerr := resultErrorFromCause(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: bootstrapErr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
@@ -4550,9 +4605,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
-			m.MarkResult(ctx, result)
+			m.markExecutionResult(ctx, auth, routeModel, result, compactionIntent)
 			channelFailover = channelFailover ||
-				(isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4593,11 +4648,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, emptyErr)
+			if gptRoute {
+				m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, false, emptyErr)
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: emptyErr}
 			result.keepSelectorLease = idx < len(execModels)-1
-			m.MarkResult(ctx, result)
-			channelFailover := isGPTRetryRoute(routeProviders, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now())
+			m.markExecutionResult(ctx, auth, routeModel, result, compactionIntent)
+			channelFailover := gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now())
 			if channelFailover && result.keepSelectorLease {
 				m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			}
@@ -4640,8 +4697,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			compatKindSource: compatKindSource,
 			compatMapping:    routePlanCompatMapping(requestedModel, execModel, compatKind),
 			toolShape:        toolShapeFromOptions(opts),
+			compactionIntent: compactionIntent,
 		}
-		m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, true, nil)
+		if gptRoute {
+			m.recordGPTFirstEventAttempt(ctx, routeModel, routingChannelBaseKey(auth), firstEventTimeout, firstPayloadDelay, true, nil)
+		}
 		return m.wrapStreamResult(
 			attemptCtx,
 			auth.Clone(),
@@ -4827,7 +4887,7 @@ func (m *Manager) SetGPTFirstEventTimeout(timeout time.Duration) {
 }
 
 func (m *Manager) firstEventTimeoutForRoute(ctx context.Context, providers []string, model string) time.Duration {
-	if m == nil || !isGPTRetryRoute(providers, model) {
+	if m == nil || !isGPTRequestRoute(ctx, providers, model) {
 		return 0
 	}
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
@@ -5197,8 +5257,11 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	compactionIntent := compactionIntentFromRequest(req, opts)
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
+	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
 	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
-	if isGPTRetryRoute(providers, routeModel) {
+	if gptRoute {
 		maxRetryCredentials = gptImmediateFailoverMaxChannels - 1
 	}
 	maxRetryCredentials = fallbackGuard.effectiveMaxRetryCredentials(maxRetryCredentials)
@@ -5217,7 +5280,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 	}()
 	for {
-		if operation == "execute" && isGPTRetryRoute(providers, routeModel) && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
+		if operation == "execute" && gptRoute && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
 			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
 			trace.recordGPTRetryPressure(pressure, errPermit)
 			if errPermit != nil {
@@ -5269,7 +5332,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
-		if isGPTRetryRoute(providers, routeModel) {
+		if gptRoute {
 			models = trace.pinGPTChannelModel(routingChannelBaseKey(auth), models)
 		}
 		if len(models) == 0 {
@@ -5282,13 +5345,16 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			attempted[auth.ID] = struct{}{}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
+			if remoteCompaction {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			lastErr = errPrepare
 			nextRetryReason = retryReasonFromError(errPrepare)
 			trace.recordFinalStatus(statusCodeFromError(errPrepare))
 			trace.recordFallback()
 			continue
 		}
-		if isGPTRetryRoute(providers, routeModel) {
+		if gptRoute {
 			channelKey := routingChannelBaseKey(auth)
 			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
@@ -5317,7 +5383,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		didRefreshOnUnauthorized := false
 	modelLoop:
 		for idx, upstreamModel := range models {
-			if idx > 0 && isGPTRetryRoute(providers, routeModel) &&
+			if idx > 0 && gptRoute &&
 				!m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 				authErr = markGPTChannelFailoverError(authErr)
@@ -5326,7 +5392,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
-			execOpts := opts
+			execOpts := withSelectedCompactionCapability(execReq, opts, auth)
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			logRoutePlan(execCtx, auth, provider, routeModel, resultModel, upstreamModel, execOpts, executor, operation)
 			if trace != nil {
@@ -5366,12 +5432,12 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			}
 			if errExec != nil {
 				errExec = normalizeOpaqueUpstream500Failure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
-				if isGPTRetryRoute(providers, routeModel) {
+				if gptRoute {
 					errExec = normalizeOpaqueGPTAttemptFailure(errExec, failurecontract.StreamPhaseBeforeOutput, false)
 				}
 			}
 			elapsed := time.Since(startedAt)
-			if operation == "execute" && isGPTRetryRoute(providers, routeModel) {
+			if operation == "execute" && gptRoute {
 				m.recordGPTRetryPressureAttempt(execCtx, routeModel, routingChannelBaseKey(auth), errExec == nil, errExec)
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Duration: elapsed, TTFT: elapsed}
@@ -5394,9 +5460,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					!channelFailover &&
 					!unauthorized &&
 					(!requestInvalid || routeFallback)
-				m.MarkResult(execCtx, result)
+				m.markExecutionResult(execCtx, auth, routeModel, result, compactionIntent)
 				channelFailover = channelFailover ||
-					(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+					(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 				if channelFailover && result.keepSelectorLease {
 					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
 				}
@@ -5404,6 +5470,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
 				authErr = errExec
 				countAttempt = true
+				if remoteCompaction {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				if channelFailover {
 					if !shouldFailoverGPTChannel(errExec, providers, routeModel) {
 						authErr = markGPTChannelFailoverError(errExec)
@@ -5434,7 +5503,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				}
 				continue modelLoop
 			}
-			m.MarkResult(execCtx, result)
+			m.markExecutionResult(execCtx, auth, routeModel, result, compactionIntent)
 			trace.recordFinalStatus(http.StatusOK)
 			if responseModelAlias := m.requestedResponseModelAlias(auth, opts, routeModel, upstreamModel); responseModelAlias != "" {
 				resp.Payload = rewriteResponsePayloadModelAlias(resp.Payload, responseModelAlias)
@@ -5443,7 +5512,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 		if authErr != nil {
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
-				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(authErr) {
 				m.markRetryChannelTried(ctx, tried, auth, authErr)
 			}
@@ -5479,9 +5548,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	compactionIntent := compactionIntentFromRequest(req, opts)
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
+	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
 	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
 	trace := requestAttemptTraceFromContext(ctx)
-	if isGPTRetryRoute(providers, routeModel) {
+	if gptRoute {
 		maxChannels, _ := trace.gptFirstEventRetryLimits()
 		maxRetryCredentials = maxChannels - 1
 	}
@@ -5500,7 +5572,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 	}()
 	for {
-		if isGPTRetryRoute(providers, routeModel) && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
+		if gptRoute && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
 			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
 			trace.recordGPTRetryPressure(pressure, errPermit)
 			if errPermit != nil {
@@ -5508,7 +5580,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			retryPermitRelease = release
 		}
-		if isGPTRetryRoute(providers, routeModel) {
+		if gptRoute {
 			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
 				trace.markGPTFirstEventBudgetExhausted()
 				return nil, newGPTFirstEventWaitBudgetError()
@@ -5557,7 +5629,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			nextRetryReason = ""
 		}
 		models, pooled := m.preparedExecutionModelsForRequest(auth, routeModel, req, opts)
-		if isGPTRetryRoute(providers, routeModel) {
+		if gptRoute {
 			models = trace.pinGPTChannelModel(routingChannelBaseKey(auth), models)
 		}
 		if len(models) == 0 {
@@ -5570,13 +5642,16 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			attempted[auth.ID] = struct{}{}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
+			if remoteCompaction {
+				return nil, errPrepare
+			}
 			lastErr = errPrepare
 			nextRetryReason = retryReasonFromError(errPrepare)
 			trace.recordFinalStatus(statusCodeFromError(errPrepare))
 			trace.recordFallback()
 			continue
 		}
-		if isGPTRetryRoute(providers, routeModel) {
+		if gptRoute {
 			channelKey := routingChannelBaseKey(auth)
 			if !m.reserveGPTChannelAttempt(execCtx, auth, provider, routeModel, time.Now()) {
 				m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
@@ -5607,7 +5682,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, newCallerRequestFailure(errCtx)
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
-				(isGPTRetryRoute(providers, routeModel) && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
+			if remoteCompaction {
+				return nil, errStream
+			}
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
 				m.markRetryChannelTried(ctx, tried, auth, errStream)
 			}
@@ -10459,6 +10537,15 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+		if err == nil {
+			intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
+			if !remoteCompactionCandidateAllowed(auth, intent) {
+				return nil, nil, remoteCompactionSelectionError(intent)
+			}
+			if !m.remoteCompactionCandidateAllowed(auth, model, intent) {
+				return nil, nil, remoteCompactionRouteUnavailableError()
+			}
+		}
 		return auth, exec, err
 	}
 
@@ -10475,6 +10562,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	candidates := make([]*Auth, 0, len(m.auths))
+	intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
+	compactionBlocked := false
+	compactionUnavailable := false
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -10500,10 +10590,24 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if !remoteCompactionCandidateAllowed(candidate, intent) {
+			compactionBlocked = true
+			continue
+		}
+		if !m.remoteCompactionCandidateAllowed(candidate, model, intent) {
+			compactionUnavailable = true
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if compactionUnavailable && cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			return nil, nil, remoteCompactionRouteUnavailableError()
+		}
+		if compactionBlocked && cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			return nil, nil, remoteCompactionSelectionError(intent)
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
@@ -10598,8 +10702,10 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
-		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
-		return auth, exec, err
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
@@ -10669,7 +10775,17 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts, tried)
+		auth, exec, provider, err := m.pickNextViaHome(ctx, model, opts, tried)
+		if err == nil {
+			intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
+			if !remoteCompactionCandidateAllowed(auth, intent) {
+				return nil, nil, "", remoteCompactionSelectionError(intent)
+			}
+			if !m.remoteCompactionCandidateAllowed(auth, model, intent) {
+				return nil, nil, "", remoteCompactionRouteUnavailableError()
+			}
+		}
+		return auth, exec, provider, err
 	}
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
@@ -10692,6 +10808,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	selector := m.selector
 	pluginScheduler := m.pluginScheduler
 	candidates := make([]*Auth, 0, len(m.auths))
+	intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
+	compactionBlocked := false
+	compactionUnavailable := false
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
 	if modelKey != "" {
@@ -10721,10 +10840,24 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if !remoteCompactionCandidateAllowed(candidate, intent) {
+			compactionBlocked = true
+			continue
+		}
+		if !m.remoteCompactionCandidateAllowed(candidate, model, intent) {
+			compactionUnavailable = true
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if compactionUnavailable && cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			return nil, nil, "", remoteCompactionRouteUnavailableError()
+		}
+		if compactionBlocked && cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			return nil, nil, "", remoteCompactionSelectionError(intent)
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
@@ -10778,7 +10911,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts, tried)
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
+	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	if pinnedAuthIDFromMetadata(opts.Metadata) == "" && shouldPreferDeepSeekProtocolAffinity(model, opts) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)

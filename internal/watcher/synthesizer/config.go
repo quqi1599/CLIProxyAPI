@@ -212,6 +212,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.Websockets {
 			attrs["websockets"] = "true"
 		}
+		applyResponsesCompactionAttributes(attrs, ck.ResponsesCompaction)
 		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
@@ -290,6 +291,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 					attrs["compat_kind"] = identity.Kind
 				}
 			}
+			applyResponsesCompactionAttributes(attrs, compat.ResponsesCompaction)
 			metadata := map[string]any{}
 			if disableCooling {
 				metadata["disable_cooling"] = true
@@ -348,6 +350,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 					attrs["compat_kind"] = identity.Kind
 				}
 			}
+			applyResponsesCompactionAttributes(attrs, compat.ResponsesCompaction)
 			metadata := map[string]any{}
 			if disableCooling {
 				metadata["disable_cooling"] = true

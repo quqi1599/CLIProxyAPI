@@ -122,7 +122,7 @@ func TestCodexExecutorCompactDropsInvalidReasoningEncryptedContentFromFinalReque
 		}
 		gotBody = body
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
 	}))
 	defer server.Close()
 

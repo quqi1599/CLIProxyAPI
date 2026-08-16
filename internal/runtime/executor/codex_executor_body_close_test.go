@@ -76,7 +76,7 @@ func TestCodexExecutorNonStreamClosesResponseBodyOnce(t *testing.T) {
 			alt:         "responses/compact",
 			path:        "/backend-api/codex/responses/compact",
 			contentType: "application/json",
-			response:    `{"id":"resp_1","object":"response.compaction"}`,
+			response:    `{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}]}`,
 		},
 	}
 

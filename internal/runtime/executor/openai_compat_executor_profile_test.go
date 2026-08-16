@@ -85,7 +85,7 @@ func TestOpenAICompatExecutorRejectsOversizedErrorBody(t *testing.T) {
 	}
 }
 
-func TestOpenAICompatExecutorCompactFallsBackToChatCompletionsForProfile(t *testing.T) {
+func TestOpenAICompatExecutorCompactRejectsChatCompletionsFallback(t *testing.T) {
 	var gotPath string
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,27 +110,53 @@ func TestOpenAICompatExecutorCompactFallsBackToChatCompletionsForProfile(t *test
 		"compat_kind": "newapi",
 	}}
 	payload := []byte(`{"model":"kimi-k2","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
-	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "kimi-k2",
 		Payload: payload,
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 		Alt:          "responses/compact",
 	})
+	if err == nil {
+		t.Fatal("Execute error = nil, want unsupported compaction error")
+	}
+	failure, ok := failurecontract.As(err)
+	if !ok || failure.ErrorCode() != "remote_compaction_unsupported" || failure.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("Execute error = %T %v", err, err)
+	}
+	if gotPath != "" || len(gotBody) != 0 {
+		t.Fatalf("unsupported compact request reached upstream path=%q body=%s", gotPath, gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorCompactUsesExplicitNativeEndpoint(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact","output":[{"type":"compaction","encrypted_content":"opaque"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("newapi-provider", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{Name: "newapi-provider", Kind: "newapi"}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "compat_name": "newapi-provider", "compat_kind": "newapi",
+		"responses_compaction_legacy": cliproxyauth.ResponsesCompactionLegacyNative,
+	}}
+	payload := []byte(`{"model":"gpt-5","input":[{"role":"user","content":"history"}]}`)
+	response, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"), Alt: cliproxyexecutor.ResponsesCompactAlt,
+	})
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
 	}
-	if gotPath != "/v1/chat/completions" {
-		t.Fatalf("path = %q, want %q", gotPath, "/v1/chat/completions")
+	if gotPath != "/v1/responses/compact" {
+		t.Fatalf("path = %q, want /v1/responses/compact", gotPath)
 	}
-	if !gjson.GetBytes(gotBody, "messages").Exists() {
-		t.Fatalf("expected chat completions payload, got %s", string(gotBody))
-	}
-	if gjson.GetBytes(gotBody, "input").Exists() {
-		t.Fatalf("unexpected responses input payload, got %s", string(gotBody))
-	}
-	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
-		t.Fatalf("response object = %q, want %q; payload=%s", got, "response", string(resp.Payload))
+	if got := gjson.GetBytes(response.Payload, "output.0.type").String(); got != "compaction" {
+		t.Fatalf("response output type = %q; payload=%s", got, response.Payload)
 	}
 }
 

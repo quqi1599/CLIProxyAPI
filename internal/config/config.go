@@ -337,6 +337,47 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
+// ResponsesCompactionConfig declares which remote-compaction protocols an upstream route supports.
+type ResponsesCompactionConfig struct {
+	// LegacyEndpoint controls /responses/compact support: native or unsupported.
+	LegacyEndpoint string `yaml:"legacy-endpoint,omitempty" json:"legacy-endpoint,omitempty"`
+	// TriggerMode controls v2 trigger handling: native-stream, bridge-legacy, or unsupported.
+	TriggerMode string `yaml:"trigger-mode,omitempty" json:"trigger-mode,omitempty"`
+	// ContextManagement allows server-side compaction configuration on normal /responses requests.
+	// A pointer preserves the distinction between an omitted value and an
+	// explicit false override for routes with a verified built-in default.
+	ContextManagement *bool `yaml:"context-management,omitempty" json:"context-management,omitempty"`
+	// CompatibilityGroup identifies routes that can safely replay opaque encrypted state.
+	CompatibilityGroup string `yaml:"compatibility-group,omitempty" json:"compatibility-group,omitempty"`
+}
+
+func sanitizeResponsesCompactionConfig(value ResponsesCompactionConfig) ResponsesCompactionConfig {
+	value.LegacyEndpoint = normalizeResponsesCompactionLegacyMode(value.LegacyEndpoint)
+	value.TriggerMode = normalizeResponsesCompactionTriggerMode(value.TriggerMode)
+	value.CompatibilityGroup = strings.TrimSpace(value.CompatibilityGroup)
+	return value
+}
+
+func normalizeResponsesCompactionLegacyMode(value string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
+	case "", "native", "unsupported":
+		return normalized
+	default:
+		log.WithField("value", value).Warn("invalid responses-compaction legacy-endpoint; using unsupported")
+		return "unsupported"
+	}
+}
+
+func normalizeResponsesCompactionTriggerMode(value string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
+	case "", "native-stream", "bridge-legacy", "unsupported":
+		return normalized
+	default:
+		log.WithField("value", value).Warn("invalid responses-compaction trigger-mode; using unsupported")
+		return "unsupported"
+	}
+}
+
 // TLSConfig holds HTTPS server settings.
 type TLSConfig struct {
 	// Enable toggles HTTPS server mode.
@@ -596,6 +637,9 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// ResponsesCompaction declares remote-compaction protocol capabilities for this route.
+	ResponsesCompaction ResponsesCompactionConfig `yaml:"responses-compaction,omitempty" json:"responses-compaction,omitempty"`
+
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -710,6 +754,9 @@ type OpenAICompatibility struct {
 
 	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// ResponsesCompaction declares remote-compaction protocol capabilities for this provider.
+	ResponsesCompaction ResponsesCompactionConfig `yaml:"responses-compaction,omitempty" json:"responses-compaction,omitempty"`
 
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
@@ -1085,6 +1132,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.RoutingGroup = normalizeRoutingGroup(e.RoutingGroup)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ResponsesCompaction = sanitizeResponsesCompactionConfig(e.ResponsesCompaction)
 		e.Headers = NormalizeHeaders(e.Headers)
 		if len(e.APIKeyEntries) > 0 {
 			keys := make([]OpenAICompatibilityAPIKey, 0, len(e.APIKeyEntries))
@@ -1134,6 +1182,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.RoutingGroup = normalizeRoutingGroup(e.RoutingGroup)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ResponsesCompaction = sanitizeResponsesCompactionConfig(e.ResponsesCompaction)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
 		if e.BaseURL == "" {

@@ -172,10 +172,15 @@ func translateOpenAICompatStreamLine(ctx context.Context, upstreamFormat, downst
 func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliproxyexecutor.Options, profile openAICompatProfile, model string) (sdktranslator.Format, string) {
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(cliproxyexecutor.Request{}, opts)
+	if opts.Alt == "" && (compactionIntent == cliproxyexecutor.CompactionIntentContextManagement ||
+		(compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger && cliproxyexecutor.CompactionTriggerModeFromOptions(opts) == cliproxyauth.ResponsesCompactionTriggerNativeStream)) {
+		return sdktranslator.FromString("openai-response"), "/responses"
+	}
 	if openAICompatIsDeepSeekFIMRequest(opts, profile, model) {
 		return to, "/completions"
 	}
-	if opts.Alt == "responses/compact" && profile.SupportsResponses {
+	if opts.Alt == "responses/compact" {
 		return sdktranslator.FromString("openai-response"), "/responses/compact"
 	}
 	if opts.Alt == "" && profile.SupportsNativeResponses && openAICompatModelSupportsNativeResponses(profile, model) &&
@@ -1196,6 +1201,21 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	profile := e.resolveProfile(auth)
+	if cliproxyexecutor.CompactionIntentFromOptions(req, opts) == cliproxyexecutor.CompactionIntentLegacyEndpoint &&
+		cliproxyauth.ResolveResponsesCompactionCapability(auth).LegacyEndpoint != cliproxyauth.ResponsesCompactionLegacyNative {
+		return resp, &failurecontract.Failure{
+			Kind:          failurecontract.UnsupportedFeature,
+			Scope:         failurecontract.ScopeModel,
+			HTTPStatus:    http.StatusBadRequest,
+			OuterStatus:   http.StatusBadRequest,
+			ProviderCode:  "remote_compaction_unsupported",
+			SemanticCode:  "remote_compaction_unsupported",
+			SemanticType:  "invalid_request_error",
+			StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
+			Retryable:     false,
+			PublicMessage: "remote_compaction_unsupported: the selected OpenAI-compatible route does not support /responses/compact",
+		}
+	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	failureCtx := ctx
@@ -1279,6 +1299,22 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			plan.body,
 		)
 		return resp, err
+	}
+	if cliproxyexecutor.CompactionIntentFromOptions(req, opts) == cliproxyexecutor.CompactionIntentLegacyEndpoint {
+		err = helps.ValidateLegacyResponsesCompaction(body)
+		helps.RecordResponsesCompactionValidation(ctx, "legacy_json", body, err)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+	}
+	if cliproxyexecutor.CompactionIntentFromOptions(req, opts) == cliproxyexecutor.CompactionIntentContextManagement {
+		err = helps.ValidateContextManagementCompactionResponse(body)
+		helps.RecordResponsesCompactionValidation(ctx, "context_management_json", body, err)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
 	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
@@ -1389,6 +1425,11 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImagesStream(ctx, auth, req, opts, endpointPath)
+	}
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger &&
+		cliproxyexecutor.CompactionTriggerModeFromOptions(opts) == cliproxyauth.ResponsesCompactionTriggerBridgeLegacy {
+		return e.executeCompactionTriggerViaLegacy(ctx, auth, req, opts)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -1575,7 +1616,43 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.EnsurePublished(ctx)
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
+	result := &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger || compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		result = helps.WrapResponsesCompactionStream(ctx, result)
+	}
+	return result, nil
+}
+
+func (e *OpenAICompatExecutor) executeCompactionTriggerViaLegacy(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	compactPayload, err := helps.BuildLegacyResponsesCompactionRequest(req.Payload)
+	if err != nil {
+		return nil, err
+	}
+	compactReq := req
+	compactReq.Payload = compactPayload
+	compactOpts := opts
+	compactOpts.Stream = false
+	compactOpts.Alt = cliproxyexecutor.ResponsesCompactAlt
+	compactOpts.OriginalRequest = compactPayload
+	response, err := e.Execute(ctx, auth, compactReq, compactOpts)
+	if err != nil {
+		return nil, err
+	}
+	frames, err := helps.BuildResponsesCompactionTriggerStream(response.Payload, req.Model)
+	if err != nil {
+		return nil, err
+	}
+	headers := response.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set("Content-Type", "text/event-stream")
+	chunks := make(chan cliproxyexecutor.StreamChunk, len(frames))
+	for _, frame := range frames {
+		chunks <- cliproxyexecutor.StreamChunk{Payload: frame}
+	}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: chunks}, nil
 }
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {
