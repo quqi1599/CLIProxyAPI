@@ -5,12 +5,31 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func applyResponsesCompactionAttributes(attrs map[string]string, capability config.ResponsesCompactionConfig) {
+	if attrs == nil {
+		return
+	}
+	if value := strings.TrimSpace(capability.LegacyEndpoint); value != "" {
+		attrs["responses_compaction_legacy"] = value
+	}
+	if value := strings.TrimSpace(capability.TriggerMode); value != "" {
+		attrs["responses_compaction_trigger"] = value
+	}
+	if capability.ContextManagement != nil {
+		attrs["responses_compaction_context_management"] = strconv.FormatBool(*capability.ContextManagement)
+	}
+	if value := strings.TrimSpace(capability.CompatibilityGroup); value != "" {
+		attrs["responses_compaction_group"] = value
+	}
+}
 
 // StableIDGenerator generates stable, deterministic IDs for auth entries.
 // It uses SHA256 hashing with collision handling via counters.

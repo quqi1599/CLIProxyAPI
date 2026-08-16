@@ -204,6 +204,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	if body, ok := BuildRequestFeatureUnsupportedErrorBody(status, errText); ok {
 		return body
 	}
+	if body, ok := BuildRemoteCompactionErrorBody(status, errText); ok {
+		return body
+	}
 	if body, ok := BuildClientHintErrorBody(status, errText); ok {
 		return body
 	}
@@ -292,6 +295,9 @@ func normalizeKnownUserErrorStatus(status int, errText string) (int, bool) {
 	if IsRequestFeatureUnsupportedError(status, errText) {
 		return http.StatusBadRequest, true
 	}
+	if _, normalizedStatus, ok := remoteCompactionErrorDetail(status, errText); ok {
+		return normalizedStatus, true
+	}
 	if isInvalidRequestParameterError(status, errText) {
 		return http.StatusBadRequest, true
 	}
@@ -314,6 +320,9 @@ func KnownUserErrorDetail(status int, errText string) (ErrorDetail, bool) {
 		return detail, true
 	}
 	if detail, ok := requestFeatureUnsupportedErrorDetail(status, errText); ok {
+		return detail, true
+	}
+	if detail, _, ok := remoteCompactionErrorDetail(status, errText); ok {
 		return detail, true
 	}
 	return clientHintErrorDetail(status, errText)

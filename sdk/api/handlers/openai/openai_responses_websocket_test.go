@@ -886,6 +886,31 @@ func TestResponseCompletedOutputFromPayload(t *testing.T) {
 	}
 }
 
+func TestRestoreResponsesWebsocketCompletionOutputFromDoneItems(t *testing.T) {
+	t.Parallel()
+	indexed := make(map[int64][]byte)
+	var fallback [][]byte
+	for _, event := range [][]byte{
+		[]byte(`{"type":"response.output_item.done","output_index":1,"item":{"type":"compaction","id":"compact-1","encrypted_content":"opaque"}}`),
+		[]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning-1"}}`),
+		[]byte(`{"type":"response.output_item.done","item":{"type":"message","id":"message-1"}}`),
+	} {
+		collectResponsesWebsocketOutputItem(event, indexed, &fallback)
+	}
+
+	completed := []byte(`{"type":"response.done","response":{"id":"resp-1","output":[]}}`)
+	restored := restoreResponsesWebsocketCompletionOutput(completed, indexed, fallback)
+	items := gjson.GetBytes(restored, "response.output").Array()
+	if len(items) != 3 {
+		t.Fatalf("restored output len = %d, want 3: %s", len(items), restored)
+	}
+	for i, want := range []string{"reasoning-1", "compact-1", "message-1"} {
+		if got := items[i].Get("id").String(); got != want {
+			t.Fatalf("restored output[%d].id = %q, want %q: %s", i, got, want, restored)
+		}
+	}
+}
+
 func TestAppendWebsocketEvent(t *testing.T) {
 	var builder strings.Builder
 
@@ -3586,7 +3611,9 @@ func TestResponsesWebsocketCompactionResetsTurnStateOnCustomToolTranscriptReplac
 	executor := &websocketCompactionCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -3690,7 +3717,9 @@ func TestResponsesWebsocketCompactionResetsTurnStateOnTranscriptReplacement(t *t
 	executor := &websocketCompactionCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}

@@ -54,7 +54,9 @@ func TestOpenAIResponsesCompactForwardsInvalidReasoningEncryptedContentToExecuto
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
-	auth := &coreauth.Auth{ID: "signature-auth-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "signature-auth-compact", Provider: executor.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{
+		"responses_compaction_legacy": coreauth.ResponsesCompactionLegacyNative,
+	}}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}

@@ -1183,6 +1183,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1204,6 +1205,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	originalPayloadSource := plan.originalPayloadSource
 	originalPayload := originalPayloadSource
 	body := plan.body
+	if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		if contextManagement := gjson.GetBytes(req.Payload, "context_management"); contextManagement.Exists() {
+			body, err = sjson.SetRawBytes(body, "context_management", []byte(contextManagement.Raw))
+			if err != nil {
+				return resp, fmt.Errorf("codex executor: restore context_management: %w", err)
+			}
+		}
+	}
 	replayScope := plan.replayScope
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
@@ -1315,6 +1324,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
+		if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+			compactionResponse := []byte(gjson.GetBytes(clientCompletedData, "response").Raw)
+			err = helps.ValidateContextManagementCompactionResponse(compactionResponse)
+			helps.RecordResponsesCompactionValidation(ctx, "context_management_json", compactionResponse, err)
+			if err != nil {
+				return resp, err
+			}
+		}
 		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: decodedResponseHeaders(httpResp.Header)}
 		return resp, nil
@@ -1402,6 +1419,12 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		err = newCodexStatusErrWithMetadata(httpResp.StatusCode, httpResp.Header, upstreamData, failurecontract.StreamPhaseBeforeOutput, false)
 		return resp, err
 	}
+	err = helps.ValidateLegacyResponsesCompaction(upstreamData)
+	helps.RecordResponsesCompactionValidation(ctx, "legacy_json", upstreamData, err)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(upstreamData))
 	reporter.EnsurePublished(ctx)
 	var param any
@@ -1417,6 +1440,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
+	}
+	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger &&
+		cliproxyexecutor.CompactionTriggerModeFromOptions(opts) == cliproxyauth.ResponsesCompactionTriggerBridgeLegacy {
+		return e.executeCompactionTriggerViaLegacy(ctx, auth, req, opts)
 	}
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -1439,6 +1467,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	originalPayloadSource := plan.originalPayloadSource
 	originalPayload := originalPayloadSource
 	body := plan.body
+	if compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		if contextManagement := gjson.GetBytes(req.Payload, "context_management"); contextManagement.Exists() {
+			body, err = sjson.SetRawBytes(body, "context_management", []byte(contextManagement.Raw))
+			if err != nil {
+				return nil, fmt.Errorf("codex executor: restore context_management: %w", err)
+			}
+		}
+	}
 	replayScope := plan.replayScope
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
@@ -1692,7 +1728,43 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}, nil
+	result := &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}
+	if compactionIntent == cliproxyexecutor.CompactionIntentV2Trigger || compactionIntent == cliproxyexecutor.CompactionIntentContextManagement {
+		result = helps.WrapResponsesCompactionStream(ctx, result)
+	}
+	return result, nil
+}
+
+func (e *CodexExecutor) executeCompactionTriggerViaLegacy(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	compactPayload, err := helps.BuildLegacyResponsesCompactionRequest(req.Payload)
+	if err != nil {
+		return nil, err
+	}
+	compactReq := req
+	compactReq.Payload = compactPayload
+	compactOpts := opts
+	compactOpts.Stream = false
+	compactOpts.Alt = cliproxyexecutor.ResponsesCompactAlt
+	compactOpts.OriginalRequest = compactPayload
+	response, err := e.executeCompact(ctx, auth, compactReq, compactOpts)
+	if err != nil {
+		return nil, err
+	}
+	frames, err := helps.BuildResponsesCompactionTriggerStream(response.Payload, req.Model)
+	if err != nil {
+		return nil, err
+	}
+	headers := response.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set("Content-Type", "text/event-stream")
+	chunks := make(chan cliproxyexecutor.StreamChunk, len(frames))
+	for _, frame := range frames {
+		chunks <- cliproxyexecutor.StreamChunk{Payload: frame}
+	}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: chunks}, nil
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

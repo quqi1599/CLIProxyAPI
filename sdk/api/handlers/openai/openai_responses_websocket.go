@@ -2171,6 +2171,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	completed := false
 	completedOutput := []byte("[]")
 	completedResponseID := ""
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	pendingToolCallIDs := make(map[string]struct{})
 	for {
 		if data == nil && errs == nil {
@@ -2248,13 +2250,17 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
+				collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
+				eventType := gjson.GetBytes(payloads[i], "type").String()
+				if isResponsesWebsocketCompletionEvent(eventType) {
+					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
+				}
 				if toolCacheTurn != nil {
 					toolCacheTurn.recordResponse(payloads[i])
 				} else {
 					recordResponsesWebsocketToolCallsFromPayloadWithCache(toolCallCache, toolCacheKey, payloads[i])
 				}
 				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
-				eventType := gjson.GetBytes(payloads[i], "type").String()
 				var payloadErrMsg *interfaces.ErrorMessage
 				if eventType == wsEventTypeError {
 					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
@@ -2347,6 +2353,61 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {
 	return internalpayload.CloneStringBytes(responseCompletedOutputRawFromPayload(payload))
+}
+
+func collectResponsesWebsocketOutputItem(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+	if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
+		return
+	}
+	item := gjson.GetBytes(payload, "item")
+	if !item.Exists() || !item.IsObject() {
+		return
+	}
+	outputIndex := gjson.GetBytes(payload, "output_index")
+	if outputIndex.Exists() {
+		outputItemsByIndex[outputIndex.Int()] = internalpayload.CloneStringBytes(item.Raw)
+		return
+	}
+	*outputItemsFallback = append(*outputItemsFallback, internalpayload.CloneStringBytes(item.Raw))
+}
+
+func restoreResponsesWebsocketCompletionOutput(payload []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	output := gjson.GetBytes(payload, "response.output")
+	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		return payload
+	}
+	restoredOutput := collectedResponsesWebsocketOutput(outputItemsByIndex, outputItemsFallback)
+	if len(restoredOutput) == 0 {
+		return payload
+	}
+	restored, err := sjson.SetRawBytes(payload, "response.output", restoredOutput)
+	if err != nil {
+		return payload
+	}
+	return restored
+}
+
+func collectedResponsesWebsocketOutput(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
+		return nil
+	}
+	indexes := make([]int64, 0, len(outputItemsByIndex))
+	for index := range outputItemsByIndex {
+		indexes = append(indexes, index)
+	}
+	sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+	items := make([]json.RawMessage, 0, len(outputItemsByIndex)+len(outputItemsFallback))
+	for _, index := range indexes {
+		items = append(items, json.RawMessage(outputItemsByIndex[index]))
+	}
+	for _, item := range outputItemsFallback {
+		items = append(items, json.RawMessage(item))
+	}
+	output, err := json.Marshal(items)
+	if err != nil {
+		return nil
+	}
+	return output
 }
 
 func responseCompletedOutputRawFromPayload(payload []byte) string {

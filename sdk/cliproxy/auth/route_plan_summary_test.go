@@ -174,6 +174,50 @@ func TestRoutePlanHelperMappings(t *testing.T) {
 	}
 }
 
+func TestBuildRoutePlanSummaryUsesSelectedRemoteCompactionTarget(t *testing.T) {
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey:                  "/v1/responses",
+			cliproxyexecutor.CompactionIntentMetadataKey:             string(cliproxyexecutor.CompactionIntentV2Trigger),
+			cliproxyexecutor.CompactionTriggerModeMetadataKey:        ResponsesCompactionTriggerNativeStream,
+			cliproxyexecutor.CompactionCompatibilityGroupMetadataKey: "gpt-agent-e2e",
+		},
+	}
+	executor := &OpenAICompatExecutor{}
+	plan := buildRoutePlanSummary(requestExecutionSummary{}, nil, "openai-compatible-gpt-agent-e2e", "gpt-5.5", "gpt-5.5", "gpt-5.5", opts, executor, "stream", coreusage.RequestAttempt{})
+	if plan.UpstreamPath != "/responses" || plan.Translator != "OpenAIResponsesPassthrough" {
+		t.Fatalf("remote compaction route = %q/%q, want /responses passthrough", plan.UpstreamPath, plan.Translator)
+	}
+	if plan.CompactionIntent != string(cliproxyexecutor.CompactionIntentV2Trigger) || plan.CompactionTriggerMode != ResponsesCompactionTriggerNativeStream || plan.CompactionCompatibilityGroup != "gpt-agent-e2e" {
+		t.Fatalf("remote compaction metadata = %+v", plan)
+	}
+}
+
+type OpenAICompatExecutor struct{}
+
+func (*OpenAICompatExecutor) Identifier() string { return "openai-compatible-test" }
+
+func (*OpenAICompatExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (*OpenAICompatExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (*OpenAICompatExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	return nil, nil
+}
+
+func (*OpenAICompatExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (*OpenAICompatExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
 func TestRoutePlanProviderIdentityUsesCanonicalPrecedence(t *testing.T) {
 	auth := &Auth{
 		Provider: "openai-compatible-configured-route",

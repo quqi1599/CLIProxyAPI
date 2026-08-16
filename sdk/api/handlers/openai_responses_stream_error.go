@@ -72,7 +72,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		message = requestFeatureDetail.Message
 		code = requestFeatureDetail.Code
 	}
-	isNormalizedError := isContentSafety || isContextWindowExceeded || isRequestFeatureUnsupported
+	remoteCompactionDetail, _, isRemoteCompactionError := remoteCompactionErrorDetail(status, errText)
+	if isRemoteCompactionError {
+		message = remoteCompactionDetail.Message
+		code = remoteCompactionDetail.Code
+	}
+	isNormalizedError := isContentSafety || isContextWindowExceeded || isRequestFeatureUnsupported || isRemoteCompactionError
 	if !isNormalizedError {
 		detail, isClientHint := clientHintErrorDetail(status, errText)
 		if isClientHint {

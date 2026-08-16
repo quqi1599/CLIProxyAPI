@@ -2,11 +2,144 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
+
+// ResponsesCompactAlt identifies the legacy Responses compaction endpoint.
+const ResponsesCompactAlt = "responses/compact"
+
+// CompactionIntentMetadataKey stores the normalized remote-compaction request intent.
+const CompactionIntentMetadataKey = "compaction_intent"
+
+// CompactionCompatibilityGroupMetadataKey stores the selected opaque-state compatibility group.
+const CompactionCompatibilityGroupMetadataKey = "compaction_compatibility_group"
+
+// CompactionTriggerModeMetadataKey stores the selected v2 trigger transport mode.
+const CompactionTriggerModeMetadataKey = "compaction_trigger_mode"
+
+// CompactionIntent identifies one Responses compaction protocol family.
+type CompactionIntent string
+
+const (
+	CompactionIntentNone              CompactionIntent = "none"
+	CompactionIntentLegacyEndpoint    CompactionIntent = "legacy_endpoint"
+	CompactionIntentV2Trigger         CompactionIntent = "v2_trigger"
+	CompactionIntentContextManagement CompactionIntent = "context_management"
+	CompactionIntentReplay            CompactionIntent = "replay"
+)
+
+// DetectCompactionIntent classifies a Responses request before provider translation.
+// A v2 trigger must occur exactly once and be the final input item.
+func DetectCompactionIntent(payload []byte, alt string) (CompactionIntent, error) {
+	if strings.EqualFold(strings.TrimSpace(alt), ResponsesCompactAlt) {
+		return CompactionIntentLegacyEndpoint, nil
+	}
+
+	input := gjson.GetBytes(payload, "input")
+	triggerCount := 0
+	triggerIndex := -1
+	replay := false
+	if input.IsArray() {
+		items := input.Array()
+		for i := range items {
+			switch strings.TrimSpace(items[i].Get("type").String()) {
+			case "compaction_trigger":
+				triggerCount++
+				triggerIndex = i
+			case "compaction", "compaction_summary":
+				replay = true
+			}
+		}
+		if triggerCount > 0 {
+			if triggerCount != 1 || triggerIndex != len(items)-1 {
+				return CompactionIntentNone, fmt.Errorf("compaction_trigger must be the final input item and appear exactly once")
+			}
+		}
+	}
+
+	contextCompaction := false
+	contextManagement := gjson.GetBytes(payload, "context_management")
+	if contextManagement.IsArray() {
+		for _, item := range contextManagement.Array() {
+			if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction") {
+				contextCompaction = true
+				break
+			}
+		}
+	}
+	if triggerCount > 0 && contextCompaction {
+		return CompactionIntentNone, fmt.Errorf("compaction_trigger and context_management compaction cannot be combined")
+	}
+	if triggerCount > 0 {
+		return CompactionIntentV2Trigger, nil
+	}
+	if contextCompaction {
+		return CompactionIntentContextManagement, nil
+	}
+	if replay {
+		return CompactionIntentReplay, nil
+	}
+	return CompactionIntentNone, nil
+}
+
+// SetCompactionIntentMetadata classifies payload and records the result when metadata is available.
+func SetCompactionIntentMetadata(metadata map[string]any, payload []byte, alt string) (CompactionIntent, error) {
+	intent, err := DetectCompactionIntent(payload, alt)
+	if err != nil {
+		return CompactionIntentNone, err
+	}
+	if metadata != nil {
+		metadata[CompactionIntentMetadataKey] = string(intent)
+	}
+	return intent, nil
+}
+
+// CompactionIntentFromOptions returns the preclassified intent, falling back to request inspection.
+func CompactionIntentFromOptions(req Request, opts Options) CompactionIntent {
+	if opts.Metadata != nil {
+		if value, ok := opts.Metadata[CompactionIntentMetadataKey].(string); ok {
+			switch intent := CompactionIntent(strings.TrimSpace(value)); intent {
+			case CompactionIntentLegacyEndpoint, CompactionIntentV2Trigger, CompactionIntentContextManagement, CompactionIntentReplay:
+				return intent
+			}
+		}
+	}
+	payload := req.Payload
+	if len(payload) == 0 {
+		payload = opts.OriginalRequest
+	}
+	intent, err := DetectCompactionIntent(payload, opts.Alt)
+	if err != nil {
+		return CompactionIntentNone
+	}
+	return intent
+}
+
+// IsRemoteCompactionIntent reports whether intent requires a compaction-capable route.
+func IsRemoteCompactionIntent(intent CompactionIntent) bool {
+	switch intent {
+	case CompactionIntentLegacyEndpoint, CompactionIntentV2Trigger, CompactionIntentContextManagement:
+		return true
+	default:
+		return false
+	}
+}
+
+// CompactionTriggerModeFromOptions returns the transport mode selected for a
+// v2 compaction trigger.
+func CompactionTriggerModeFromOptions(opts Options) string {
+	if opts.Metadata == nil {
+		return ""
+	}
+	value, _ := opts.Metadata[CompactionTriggerModeMetadataKey].(string)
+	return strings.TrimSpace(value)
+}
 
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"

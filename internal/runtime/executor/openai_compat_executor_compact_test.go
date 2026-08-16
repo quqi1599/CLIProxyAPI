@@ -29,7 +29,7 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		gotBody = body
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
 	}))
 	defer func() {
 		server.CloseClientConnections()
@@ -38,8 +38,9 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 
 	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"base_url": server.URL + "/v1",
-		"api_key":  "test",
+		"base_url":                    server.URL + "/v1",
+		"api_key":                     "test",
+		"responses_compaction_legacy": cliproxyauth.ResponsesCompactionLegacyNative,
 	}}
 	payload := []byte(`{"model":"gpt-5.1-codex-max","input":[{"role":"user","content":"hi"}]}`)
 	ctx, releaseReport := retainExecutorTransformReport(context.Background(), len(payload))
@@ -63,10 +64,89 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	if gjson.GetBytes(gotBody, "messages").Exists() {
 		t.Fatalf("unexpected messages in body")
 	}
-	if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
+	if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
 		t.Fatalf("payload = %s", string(resp.Payload))
 	}
 	assertExecutorRequestTransformReport(t, ctx, releaseReport, openAICompatFinalSanitizeTransformStage, len(gotBody))
+}
+
+func TestOpenAICompatExecutorRemoteCompactionV2Native(t *testing.T) {
+	t.Parallel()
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/v1", "api_key": "test"}}
+	payload := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":[]},{"type":"compaction_trigger"}]}`)
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload, Stream: true,
+		Metadata: map[string]any{
+			cliproxyexecutor.CompactionIntentMetadataKey:      string(cliproxyexecutor.CompactionIntentV2Trigger),
+			cliproxyexecutor.CompactionTriggerModeMetadataKey: cliproxyauth.ResponsesCompactionTriggerNativeStream,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var output bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+		output.Write(chunk.Payload)
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("path = %q, want /v1/responses", gotPath)
+	}
+	input := gjson.GetBytes(gotBody, "input").Array()
+	if len(input) != 2 || input[len(input)-1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("native v2 trigger was not preserved: %s", gotBody)
+	}
+	if !strings.Contains(output.String(), `"type":"compaction"`) || !strings.Contains(output.String(), `"encrypted_content":"opaque"`) {
+		t.Fatalf("compaction output missing: %s", output.String())
+	}
+}
+
+func TestOpenAICompatExecutorContextManagementNative(t *testing.T) {
+	t.Parallel()
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1", "api_key": "test", "responses_compaction_context_management": "true",
+	}}
+	payload := []byte(`{"model":"gpt-5.4","context_management":[{"type":"compaction","compact_threshold":12000}],"input":[{"type":"message","role":"user","content":"history"}]}`)
+	response, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.4", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload,
+		Metadata: map[string]any{cliproxyexecutor.CompactionIntentMetadataKey: string(cliproxyexecutor.CompactionIntentContextManagement)},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("path = %q, want /v1/responses", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "context_management.0.type").String(); got != "compaction" {
+		t.Fatalf("context_management type = %q; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(response.Payload, "output.0.type").String(); got != "compaction" {
+		t.Fatalf("response output type = %q; payload=%s", got, response.Payload)
+	}
 }
 
 func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {

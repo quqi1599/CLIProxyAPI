@@ -35,6 +35,7 @@ type managerAttemptRunner[T any] struct {
 func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration) managerAttemptOutcome[T] {
 	var lastErr error
 	probeWaitUsed := false
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(req, opts))
 attempts:
 	for attempt := 0; ; {
 		trace := requestAttemptTraceFromContext(ctx)
@@ -47,6 +48,9 @@ attempts:
 			return managerAttemptOutcome[T]{result: result, success: true}
 		}
 		lastErr = errRun
+		if remoteCompaction {
+			break attempts
+		}
 		if trace != nil && isGPTZeroEligibleSelectionError(errRun) {
 			if gptRoute, configured := trace.gptRouteValue(); configured && gptRoute {
 				if probeWaitUsed {
@@ -97,7 +101,7 @@ attempts:
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if runner.fallback != nil {
+	if runner.fallback != nil && !remoteCompaction {
 		result, ok, errFallback := runner.fallback(ctx, providers, req, opts, lastErr)
 		if errFallback != nil {
 			return managerAttemptOutcome[T]{returnErr: errFallback, finalErr: errFallback}
@@ -202,11 +206,16 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 		outcome.finalErr = outcome.returnErr
 		return outcome.result, outcome.returnErr
 	}
-	gptRoute := isGPTRetryRoute(providers, req.Model)
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(req, opts))
+	gptRoute := isGPTRetryRoute(providers, req.Model) && !remoteCompaction
 	trace.configureGPTRoute(gptRoute)
 
 	requestRetry, maxRetryCredentials, maxWait := manager.retrySettings()
-	if gptRoute {
+	if remoteCompaction {
+		maxRetryCredentials = 0
+		maxWait = 0
+		trace.configureBudget(1, 0)
+	} else if gptRoute {
 		if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
 			trace.configureBudget(gptLargeToolHistoryMaxRetryCredentials+1, gptLargeToolHistoryMaxRetryCredentials)
 		} else if runner.configureGPTFirstEventPolicy {

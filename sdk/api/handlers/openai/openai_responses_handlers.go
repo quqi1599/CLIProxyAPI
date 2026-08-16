@@ -23,6 +23,7 @@ import (
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -405,9 +406,26 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		handlers.WriteRequestBodyError(c, err)
 		return
 	}
+	intent, errIntent := coreexecutor.DetectCompactionIntent(rawJSON, "")
+	if errIntent != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+			Message: errIntent.Error(),
+			Type:    "invalid_request_error",
+			Code:    "invalid_compaction_request",
+		}})
+		return
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
+	if intent == coreexecutor.CompactionIntentV2Trigger && streamResult.Type != gjson.True {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+			Message: "remote compaction v2 requires stream=true",
+			Type:    "invalid_request_error",
+			Code:    "invalid_compaction_request",
+		}})
+		return
+	}
 	if streamResult.Type == gjson.True {
 		h.handleStreamingResponse(c, rawJSON)
 	} else {
