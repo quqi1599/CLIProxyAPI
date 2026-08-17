@@ -115,6 +115,21 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if oldCfg.Routing.SessionAffinity != newCfg.Routing.SessionAffinity {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity: %t -> %t", oldCfg.Routing.SessionAffinity, newCfg.Routing.SessionAffinity))
+	}
+	if oldCfg.Routing.SessionAffinityTTL != newCfg.Routing.SessionAffinityTTL {
+		changes = append(changes, fmt.Sprintf("routing.session-affinity-ttl: %s -> %s", oldCfg.Routing.SessionAffinityTTL, newCfg.Routing.SessionAffinityTTL))
+	}
+	if !reflect.DeepEqual(oldCfg.Routing.GroupStrategies, newCfg.Routing.GroupStrategies) {
+		changes = append(changes, "routing.group-strategies: updated")
+	}
+	if !reflect.DeepEqual(oldCfg.Routing.ProviderStrategies, newCfg.Routing.ProviderStrategies) {
+		changes = append(changes, "routing.provider-strategies: updated")
+	}
+	if !reflect.DeepEqual(oldCfg.Routing.GroupSessionAffinity, newCfg.Routing.GroupSessionAffinity) {
+		changes = append(changes, "routing.group-session-affinity: updated")
+	}
 	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}

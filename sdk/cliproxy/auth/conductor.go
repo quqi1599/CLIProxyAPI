@@ -101,6 +101,16 @@ type selectorRouteSelection struct {
 	authID   string
 }
 
+type selectionAvailabilitySummary struct {
+	total              int
+	ready              int
+	skippedDisabled    int
+	skippedCooldown    int
+	skippedBreaker     int
+	skippedUnavailable int
+	healthDownweighted int
+}
+
 type requestAttemptTrace struct {
 	mu                           sync.Mutex
 	requestID                    string
@@ -125,6 +135,8 @@ type requestAttemptTrace struct {
 	gptRoute                     bool
 	gptRouteSet                  bool
 	selection                    selectorRouteSelection
+	selectionReason              string
+	selectionAvailability        selectionAvailabilitySummary
 	gptFirstEventObserved        bool
 	gptFirstEventTimeouts        int
 	gptFirstEventWait            time.Duration
@@ -570,6 +582,70 @@ func (t *requestAttemptTrace) selectorSelection(authID string, release bool) (se
 	return selection, true
 }
 
+func (t *requestAttemptTrace) recordSelectionReason(reason string) {
+	if t == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	t.mu.Lock()
+	t.selectionReason = reason
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) recordSelectionAvailability(summary selectionAvailabilitySummary) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.selectionAvailability = summary
+	t.mu.Unlock()
+}
+
+func (t *requestAttemptTrace) selectionLogFields() log.Fields {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	fields := log.Fields{}
+	if t.selectionReason != "" {
+		fields["selection_reason"] = t.selectionReason
+	}
+	summary := t.selectionAvailability
+	if summary.total > 0 {
+		fields["candidate_count"] = summary.total
+		fields["candidate_ready_count"] = summary.ready
+	}
+	if summary.skippedDisabled > 0 {
+		fields["candidate_skipped_disabled"] = summary.skippedDisabled
+	}
+	if summary.skippedCooldown > 0 {
+		fields["candidate_skipped_cooldown"] = summary.skippedCooldown
+	}
+	if summary.skippedBreaker > 0 {
+		fields["candidate_skipped_breaker"] = summary.skippedBreaker
+	}
+	if summary.skippedUnavailable > 0 {
+		fields["candidate_skipped_unavailable"] = summary.skippedUnavailable
+	}
+	if summary.healthDownweighted > 0 {
+		fields["candidate_health_downweighted"] = summary.healthDownweighted
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return fields
+}
+
+func recordSelectorReason(ctx context.Context, reason string) {
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		trace.recordSelectionReason(reason)
+	}
+}
+
 func (t *requestAttemptTrace) reserveGPTChannel(key string, limit int) (newChannel, allowed bool) {
 	if t == nil || key == "" {
 		return true, true
@@ -765,6 +841,9 @@ func addRequestAttemptLogFields(ctx context.Context, fields log.Fields) {
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		if round := trace.gptRoundValue(); round > 0 {
 			fields["round_no"] = round
+		}
+		for key, value := range trace.selectionLogFields() {
+			fields[key] = value
 		}
 	}
 }
@@ -1830,7 +1909,42 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 	if group == "" {
 		return SelectorForRoutingStrategy(normalizedStrategy)
 	}
-	cacheKey := group + "\x00" + normalizedStrategy
+
+	selector := SelectorForRoutingStrategy(normalizedStrategy)
+	if normalizedStrategy == RoutingStrategySpread && strings.HasPrefix(group, "group:") {
+		selector = &SpreadSelector{channelAware: true}
+	}
+	affinityEnabled := false
+	affinityTTL := time.Hour
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg != nil {
+		if parsedTTL, errParse := time.ParseDuration(strings.TrimSpace(cfg.Routing.SessionAffinityTTL)); errParse == nil && parsedTTL > 0 {
+			affinityTTL = parsedTTL
+		}
+	}
+	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil {
+		affinityEnabled = true
+		if sessionSelector.cache != nil && sessionSelector.cache.ttl > 0 {
+			affinityTTL = sessionSelector.cache.ttl
+		}
+	}
+	if strings.HasPrefix(group, "group:") {
+		groupName := strings.TrimPrefix(group, "group:")
+		if cfg != nil {
+			for configuredGroup, enabled := range cfg.Routing.GroupSessionAffinity {
+				if normalizeRoutingGroupKey(configuredGroup) == groupName {
+					affinityEnabled = enabled
+					break
+				}
+			}
+		}
+	}
+	cacheKey := strings.Join([]string{
+		group,
+		normalizedStrategy,
+		strconv.FormatBool(affinityEnabled),
+		affinityTTL.String(),
+	}, "\x00")
 
 	m.dynamicSelectorsMu.Lock()
 	defer m.dynamicSelectorsMu.Unlock()
@@ -1838,15 +1952,10 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 		return selector
 	}
 
-	var selector Selector = SelectorForRoutingStrategy(normalizedStrategy)
-	if sessionSelector, ok := m.selector.(*SessionAffinitySelector); ok && sessionSelector != nil {
-		ttl := time.Hour
-		if sessionSelector.cache != nil && sessionSelector.cache.ttl > 0 {
-			ttl = sessionSelector.cache.ttl
-		}
+	if affinityEnabled {
 		selector = NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 			Fallback: selector,
-			TTL:      ttl,
+			TTL:      affinityTTL,
 		})
 	}
 	m.dynamicSelectors[cacheKey] = selector
@@ -2101,7 +2210,15 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	previous, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	routingPolicyChanged := previous == nil ||
+		!reflect.DeepEqual(previous.Routing.GroupStrategies, cfg.Routing.GroupStrategies) ||
+		!reflect.DeepEqual(previous.Routing.ProviderStrategies, cfg.Routing.ProviderStrategies) ||
+		!reflect.DeepEqual(previous.Routing.GroupSessionAffinity, cfg.Routing.GroupSessionAffinity)
 	m.runtimeConfig.Store(cfg)
+	if routingPolicyChanged {
+		m.stopDynamicSelectors()
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -2985,6 +3102,12 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
+	availabilitySummary := selectionAvailabilitySummary{total: len(auths)}
+	defer func() {
+		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			trace.recordSelectionAvailability(availabilitySummary)
+		}
+	}()
 
 	gptRoute := isGPTRequestRoute(ctx, []string{provider}, routeModel)
 	if gptRoute {
@@ -2999,6 +3122,13 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	var earliest time.Time
 	recordAvailable := func(candidate *Auth, checkModel string, includeHealth bool) {
 		availableAll = append(availableAll, candidate)
+		availabilitySummary.ready++
+		if includeHealth && spreadAcrossPriorities {
+			state := resolveHealthState(candidate, checkModel)
+			if healthStateKnown(state) && recoveredHealthScore(state, now) < healthScoreDefault {
+				availabilitySummary.healthDownweighted++
+			}
+		}
 		if spreadAcrossPriorities {
 			return
 		}
@@ -3034,6 +3164,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 				healthBlocked, healthNext = m.healthSelectionBlocked(candidate, checkModel, now)
 			}
 			if healthBlocked {
+				availabilitySummary.skippedBreaker++
 				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth)
 				continue
 			}
@@ -3048,6 +3179,19 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 				continue
 			}
 			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth)
+		}
+		switch reason {
+		case blockReasonDisabled:
+			availabilitySummary.skippedDisabled++
+		case blockReasonCooldown:
+			availabilitySummary.skippedCooldown++
+		case blockReasonOther:
+			state := resolveHealthState(candidate, checkModel)
+			if state.BreakerState == HealthBreakerOpen || state.BreakerState == HealthBreakerHalfOpen {
+				availabilitySummary.skippedBreaker++
+			} else {
+				availabilitySummary.skippedUnavailable++
+			}
 		}
 	}
 
@@ -3839,6 +3983,12 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 			tried[selected.ID] = struct{}{}
 			continue
 		}
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			recordSelectorReason(ctx, "builtin_scheduler_fill_first")
+		default:
+			recordSelectorReason(ctx, "builtin_scheduler_round_robin")
+		}
 		return selected, true, nil
 	}
 }
@@ -3868,6 +4018,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 		return nil, false, nil
 	}
 	if selected := pickSchedulerAuthByID(candidates, resp.AuthID); selected != nil {
+		recordSelectorReason(ctx, "plugin_scheduler")
 		return selected, true, nil
 	}
 
@@ -10769,6 +10920,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			}
 			m.mu.Unlock()
 		}
+		recordSelectorReason(ctx, "builtin_scheduler_round_robin")
 		return authCopy, executor, nil
 	}
 }
@@ -11012,6 +11164,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			}
 			m.mu.Unlock()
 		}
+		recordSelectorReason(ctx, "builtin_scheduler_round_robin")
 		return authCopy, executor, providerKey, nil
 	}
 }
@@ -12440,6 +12593,9 @@ func selectorMetricStrategy(selector Selector) string {
 	case *SequentialFillSelector:
 		return RoutingStrategySequentialFill
 	case *SpreadSelector:
+		if s.channelAware {
+			return "channel-spread"
+		}
 		return RoutingStrategySpread
 	case *SessionAffinitySelector:
 		fallback := selectorMetricStrategy(s.fallback)
@@ -12456,8 +12612,8 @@ func (m *Manager) authMetricRouting(auth *Auth) (string, string) {
 	if m == nil {
 		return "default", ""
 	}
-	if group, strategy, ok := m.routingStrategyForAuths([]*Auth{auth}); ok {
-		return group, strategy
+	if group, _, ok := m.routingStrategyForAuths([]*Auth{auth}); ok {
+		return group, selectorMetricStrategy(m.selectorForAuths([]*Auth{auth}))
 	}
 	m.mu.RLock()
 	selector := m.selector

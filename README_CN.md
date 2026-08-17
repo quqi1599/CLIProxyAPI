@@ -72,7 +72,18 @@ routing:
     codex: "spread"
     openai-compatibility: "spread"
   session-affinity: true
+  group-session-affinity:
+    kimi: false
 ```
+
+显式路由分组的 `spread` 使用“先选渠道、再选渠道内凭证”的两级调度，因此某个
+渠道增加更多 key 不会自动放大该渠道的流量占比。渠道和凭证权重由配置优先级与
+未熔断的健康分数共同计算；禁用、冷却或 breaker open 的条目仍不可调度。
+`group-session-affinity` 可以让无状态 API key 分组单独关闭全局会话粘性，其他
+分组仍继承 `session-affinity`。
+`auth_selection` 日志会记录真实生效的策略（例如 `channel-spread` 或
+`session-affinity+channel-spread`）、本次选择原因，以及禁用、冷却、熔断和
+不可用候选的汇总跳过数量。
 
 混用 Kimi OpenAI-compatible key 和 Kimi Coding Agent key 时，要把两类上游
 入口分清楚。有些 Kimi Coding key 只能走 Claude-compatible `/v1/messages`

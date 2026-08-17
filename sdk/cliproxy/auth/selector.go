@@ -38,6 +38,7 @@ type SpreadSelector struct {
 	currentWeights map[string]map[string]int
 	load           *spreadLoadTracker
 	maxKeys        int
+	channelAware   bool
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
@@ -166,18 +167,17 @@ func authPriority(auth *Auth) int {
 }
 
 const (
-	healthScoreDefault       = 100
-	healthScoreStepSuccess   = 15
-	healthRecoveryStep       = 5
-	healthRecoveryInterval   = 2 * time.Minute
-	healthPriorityMultiplier = 100
-	healthBreakerThreshold   = 50
-	healthHalfOpenSuccesses  = 2
-	healthHalfOpenInterval   = 20 * time.Second
-	healthHalfOpenActiveTTL  = 5 * time.Second
-	quotaHalfOpenInterval    = 2 * time.Second
-	quotaHalfOpenActiveTTL   = 20 * time.Second
-	health429OpenFailures    = 20
+	healthScoreDefault      = 100
+	healthScoreStepSuccess  = 15
+	healthRecoveryStep      = 5
+	healthRecoveryInterval  = 2 * time.Minute
+	healthBreakerThreshold  = 50
+	healthHalfOpenSuccesses = 2
+	healthHalfOpenInterval  = 20 * time.Second
+	healthHalfOpenActiveTTL = 5 * time.Second
+	quotaHalfOpenInterval   = 2 * time.Second
+	quotaHalfOpenActiveTTL  = 20 * time.Second
+	health429OpenFailures   = 20
 
 	channelBreakerOpenFailures  = 3
 	channelBreakerStateLimit    = 4096
@@ -278,26 +278,11 @@ func recoveredHealthScore(state HealthState, now time.Time) int {
 	return score
 }
 
-func healthTier(auth *Auth, model string, now time.Time) int {
-	score := recoveredHealthScore(resolveHealthState(auth, model), now)
-	if score < 0 {
-		return 0
-	}
-	tier := score / 10
-	if tier > 10 {
-		tier = 10
-	}
-	return tier
+func effectiveSelectionPriority(auth *Auth, _ string, _ time.Time) int {
+	return authPriority(auth)
 }
 
-func effectiveSelectionPriority(auth *Auth, model string, now time.Time) int {
-	return authPriority(auth)*healthPriorityMultiplier + healthTier(auth, model, now)
-}
-
-func effectiveSelectionPriorityForRoute(auth *Auth, model string, now time.Time, includeHealth bool) int {
-	if !includeHealth {
-		return authPriority(auth)*healthPriorityMultiplier + healthScoreDefault/10
-	}
+func effectiveSelectionPriorityForRoute(auth *Auth, model string, now time.Time, _ bool) int {
 	return effectiveSelectionPriority(auth, model, now)
 }
 
@@ -855,6 +840,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	}
 	s.cursors[key] = index + 1
 	s.mu.Unlock()
+	recordSelectorReason(ctx, RoutingStrategyRoundRobin)
 	return available[index%len(available)], nil
 }
 
@@ -905,6 +891,11 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 		}
 		s.cursors[innerKey] = innerIndex + 1
 		s.mu.Unlock()
+		if s.channelAware {
+			recordSelectorReason(ctx, "channel_spread")
+		} else {
+			recordSelectorReason(ctx, "credential_spread")
+		}
 		return group[innerIndex%len(group)], nil
 	}
 
@@ -912,6 +903,11 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 	s.mu.Unlock()
 	if selected == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if s.channelAware {
+		recordSelectorReason(ctx, "channel_spread")
+	} else {
+		recordSelectorReason(ctx, "credential_spread")
 	}
 	return selected, nil
 }
@@ -931,6 +927,9 @@ func (s *SpreadSelector) ensureWeightKey(key string, limit int) {
 func (s *SpreadSelector) pickWeightedLocked(key, model string, now time.Time, available []*Auth, limit int, gptRoute bool) *Auth {
 	if gptRoute {
 		return s.pickGPTWeightedLocked(key, model, now, available, limit)
+	}
+	if s.channelAware {
+		return s.pickChannelWeightedLocked(key, model, now, available, limit)
 	}
 	return s.pickLegacyWeightedLocked(key, model, now, available, limit)
 }
@@ -1007,6 +1006,157 @@ func (s *SpreadSelector) pickLegacyWeightedLocked(key, model string, now time.Ti
 type spreadChannelGroup struct {
 	auths      []*Auth
 	baseWeight int
+}
+
+func spreadChannelBaseKey(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if key := routingChannelBaseKey(auth); key != "" && !strings.HasPrefix(key, "auth\x00") {
+		return key
+	}
+	baseURL := ""
+	if auth.Attributes != nil {
+		baseURL = normalizeChannelBreakerURL(auth.Attributes["base_url"])
+	}
+	if baseURL == "" {
+		return "auth\x00" + strings.TrimSpace(auth.ID)
+	}
+	providerKey := executorKeyFromAuth(auth)
+	if providerKey == "" {
+		providerKey = strings.ToLower(strings.TrimSpace(auth.Provider))
+	}
+	return strings.Join([]string{
+		"channel",
+		providerKey,
+		baseURL,
+		normalizeChannelBreakerURL(auth.ProxyURL),
+		strings.ToLower(strings.TrimSpace(auth.Prefix)),
+		authRoutingGroup(auth),
+	}, "\x00")
+}
+
+func (s *SpreadSelector) pickChannelWeightedLocked(key, model string, now time.Time, available []*Auth, limit int) *Auth {
+	if len(available) == 0 {
+		return nil
+	}
+	if s.load == nil {
+		s.load = newSpreadLoadTracker()
+	}
+
+	groupsByKey := make(map[string]*spreadChannelGroup, len(available))
+	channelKeys := make([]string, 0, len(available))
+	for i, auth := range available {
+		channelKey := spreadChannelBaseKey(auth)
+		if channelKey == "" {
+			channelKey = fmt.Sprintf("__index_%d", i)
+		}
+		group := groupsByKey[channelKey]
+		if group == nil {
+			group = &spreadChannelGroup{}
+			groupsByKey[channelKey] = group
+			channelKeys = append(channelKeys, channelKey)
+		}
+		group.auths = append(group.auths, auth)
+		if weight := spreadSelectionWeightForRoute(auth, model, now, false, true); weight > group.baseWeight {
+			group.baseWeight = weight
+		}
+		if auth != nil && strings.TrimSpace(auth.ID) != "" {
+			s.load.bindAuth(key, auth.ID, channelKey, now, limit)
+		}
+	}
+	sort.Strings(channelKeys)
+
+	weightKey := key + "::channels"
+	s.ensureWeightKey(weightKey, limit)
+	state := s.currentWeights[weightKey]
+	if state == nil {
+		state = make(map[string]int, len(channelKeys))
+		s.currentWeights[weightKey] = state
+	}
+	loadSnapshot := s.load.snapshot(key, channelKeys, now, limit)
+	totalLoad := 0.0
+	for _, channelKey := range channelKeys {
+		record := loadSnapshot[channelKey]
+		totalLoad += record.recentHits + float64(record.inFlight*spreadLoadInflightWeight)
+	}
+	averageLoad := 0.0
+	if len(channelKeys) > 0 {
+		averageLoad = totalLoad / float64(len(channelKeys))
+	}
+
+	active := make(map[string]struct{}, len(channelKeys))
+	totalWeight := 0
+	selectedKey := ""
+	selectedScore := 0
+	for _, channelKey := range channelKeys {
+		group := groupsByKey[channelKey]
+		active[channelKey] = struct{}{}
+		record := loadSnapshot[channelKey]
+		channelLoad := record.recentHits + float64(record.inFlight*spreadLoadInflightWeight)
+		weight := adjustedSpreadSelectionWeight(group.baseWeight, channelLoad, averageLoad)
+		totalWeight += weight
+		state[channelKey] += weight
+		if selectedKey == "" || state[channelKey] > selectedScore {
+			selectedKey = channelKey
+			selectedScore = state[channelKey]
+		}
+	}
+	for channelKey := range state {
+		if _, ok := active[channelKey]; !ok {
+			delete(state, channelKey)
+		}
+	}
+	group := groupsByKey[selectedKey]
+	if group == nil || len(group.auths) == 0 || totalWeight <= 0 {
+		return nil
+	}
+	state[selectedKey] -= totalWeight
+	s.load.markPicked(key, selectedKey, now, limit)
+	return s.pickChannelCredentialLocked(key, selectedKey, model, now, group.auths, limit)
+}
+
+func (s *SpreadSelector) pickChannelCredentialLocked(key, channelKey, model string, now time.Time, auths []*Auth, limit int) *Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
+	weightKey := key + "::channel-credentials:" + channelKey
+	s.ensureWeightKey(weightKey, limit)
+	state := s.currentWeights[weightKey]
+	if state == nil {
+		state = make(map[string]int, len(auths))
+		s.currentWeights[weightKey] = state
+	}
+	active := make(map[string]struct{}, len(auths))
+	totalWeight := 0
+	selectedID := ""
+	selectedScore := 0
+	var selected *Auth
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		authID := strings.TrimSpace(auth.ID)
+		active[authID] = struct{}{}
+		weight := spreadSelectionWeightForRoute(auth, model, now, false, true)
+		totalWeight += weight
+		state[authID] += weight
+		if selected == nil || state[authID] > selectedScore {
+			selected = auth
+			selectedID = authID
+			selectedScore = state[authID]
+		}
+	}
+	for authID := range state {
+		if _, ok := active[authID]; !ok {
+			delete(state, authID)
+		}
+	}
+	if selected != nil && totalWeight > 0 {
+		state[selectedID] -= totalWeight
+	}
+	return selected
 }
 
 func (s *SpreadSelector) pickGPTWeightedLocked(key, model string, now time.Time, available []*Auth, limit int) *Auth {
@@ -1144,8 +1294,8 @@ func (s *SpreadSelector) markPickedAuth(provider, model string, auth *Auth) {
 		limit = spreadLoadDefaultKeyLimit
 	}
 	recordKey := auth.ID
-	if isGPTRetryRoute([]string{provider}, model) || isGPTRetryRoute([]string{auth.Provider}, model) {
-		recordKey = routingChannelBaseKey(auth)
+	if s.channelAware || isGPTRetryRoute([]string{provider}, model) || isGPTRetryRoute([]string{auth.Provider}, model) {
+		recordKey = spreadChannelBaseKey(auth)
 		if recordKey == "" {
 			recordKey = auth.ID
 		}
@@ -1323,6 +1473,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	recordSelectorReason(ctx, RoutingStrategyFillFirst)
 	return available[0], nil
 }
 
@@ -1331,6 +1482,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 // credentials are exhausted, then advances to the next provider.
 func (s *SequentialFillSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
+	recordSelectorReason(ctx, RoutingStrategySequentialFill)
 	now := time.Now()
 	available, err := getAvailableAuthsForRoute(auths, provider, model, now, isGPTRequestRoute(ctx, []string{provider}, model))
 	if err != nil {
@@ -1671,17 +1823,22 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, errPick := s.fallback.Pick(ctx, provider, model, opts, auths)
+		if errPick == nil {
+			recordSelectorReason(ctx, "session_affinity_no_id")
+		}
+		return auth, errPick
 	}
 
 	now := time.Now()
 	gptRoute := isGPTRequestRoute(ctx, []string{provider}, model)
-	gptSpread := gptRoute && selectorUsesSpread(s.fallback)
+	spreadFallback := selectorUsesSpread(s.fallback)
+	gptSpread := gptRoute && spreadFallback
 	var (
 		available []*Auth
 		err       error
 	)
-	if gptSpread {
+	if spreadFallback {
 		available, err = getSpreadAvailableAuthsForRoute(auths, provider, model, now, gptRoute)
 	} else {
 		available, err = getAvailableAuthsForRoute(auths, provider, model, now, gptRoute)
@@ -1761,6 +1918,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errPick
 		}
 		if keep {
+			recordSelectorReason(ctx, "session_affinity_hit")
 			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
@@ -1768,6 +1926,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errPick != nil {
 			return nil, errPick
 		}
+		recordSelectorReason(ctx, "session_affinity_reselect")
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -1783,6 +1942,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				if !gptRoute {
 					stageSessionAffinityBinding(ctx, s.cache, cacheKey, auth.ID, "", deferBinding)
 				}
+				recordSelectorReason(ctx, "session_affinity_fallback_hit")
 				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -1791,6 +1951,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				if errPick != nil {
 					return nil, errPick
 				}
+				recordSelectorReason(ctx, "session_affinity_fallback_reselect")
 				entry.Infof("session-affinity: fallback cache hit but channel unavailable, reselected | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -1801,6 +1962,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if errPick != nil {
 		return nil, errPick
 	}
+	recordSelectorReason(ctx, "session_affinity_miss")
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }

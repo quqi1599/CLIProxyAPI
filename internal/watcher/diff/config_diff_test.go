@@ -93,6 +93,33 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_RoutingPolicyChanges(t *testing.T) {
+	oldCfg := &config.Config{Routing: config.RoutingConfig{
+		Strategy:           "round-robin",
+		SessionAffinity:    true,
+		SessionAffinityTTL: "1h",
+		GroupStrategies:    map[string]string{"kimi": "spread"},
+	}}
+	newCfg := &config.Config{Routing: config.RoutingConfig{
+		Strategy:           "spread",
+		SessionAffinity:    false,
+		SessionAffinityTTL: "30m",
+		GroupStrategies:    map[string]string{"kimi": "spread", "minimax": "spread"},
+		ProviderStrategies: map[string]string{"claude": "spread"},
+		GroupSessionAffinity: map[string]bool{
+			"kimi": false,
+		},
+	}}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "routing.strategy: round-robin -> spread")
+	expectContains(t, details, "routing.session-affinity: true -> false")
+	expectContains(t, details, "routing.session-affinity-ttl: 1h -> 30m")
+	expectContains(t, details, "routing.group-strategies: updated")
+	expectContains(t, details, "routing.provider-strategies: updated")
+	expectContains(t, details, "routing.group-session-affinity: updated")
+}
+
 func TestBuildConfigChangeDetails_GeminiVertexHeaders(t *testing.T) {
 	oldCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{

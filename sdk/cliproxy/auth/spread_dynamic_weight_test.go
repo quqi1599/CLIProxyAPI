@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -173,6 +174,149 @@ func TestSpreadDynamicWeight_MixedNonGPTDoesNotUseGPTChannelGrouping(t *testing.
 		t.Fatalf("mixed non-GPT channel bindings = %d, want legacy credential-level spread", bindings)
 	}
 	selector.MarkDone(picked.ID, model)
+}
+
+func TestChannelSpread_KimiBalancesChannelsBeforeCredentials(t *testing.T) {
+	selector := &SpreadSelector{load: newSpreadLoadTracker(), channelAware: true}
+	channelAKey1 := &Auth{ID: "channel-a-key-1", Provider: "claude", Status: StatusActive, Attributes: map[string]string{
+		"base_url": "https://api.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+	}}
+	channelAKey2 := channelAKey1.Clone()
+	channelAKey2.ID = "channel-a-key-2"
+	channelAKey3 := channelAKey1.Clone()
+	channelAKey3.ID = "channel-a-key-3"
+	channelBKey := &Auth{ID: "channel-b-key", Provider: "openai-compatible-kimi", Status: StatusActive, Attributes: map[string]string{
+		"base_url": "https://api.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+	}}
+	auths := []*Auth{channelAKey1, channelAKey2, channelAKey3, channelBKey}
+
+	channelCounts := map[string]int{}
+	credentialCounts := map[string]int{}
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureGPTRoute(false)
+	for range 120 {
+		picked, errPick := selector.Pick(ctx, "mixed", "kimi-k3", cliproxyexecutor.Options{}, auths)
+		if errPick != nil {
+			t.Fatalf("Pick() error = %v", errPick)
+		}
+		channelCounts[spreadChannelBaseKey(picked)]++
+		credentialCounts[picked.ID]++
+		selector.MarkDone(picked.ID, "kimi-k3")
+	}
+
+	channelA := spreadChannelBaseKey(channelAKey1)
+	channelB := spreadChannelBaseKey(channelBKey)
+	if channelCounts[channelA] != channelCounts[channelB] {
+		t.Fatalf("channel counts = %+v, want equal channel shares independent of key count", channelCounts)
+	}
+	for _, auth := range auths {
+		if credentialCounts[auth.ID] == 0 {
+			t.Fatalf("credential counts = %+v, want every ready key selected", credentialCounts)
+		}
+	}
+	if got := trace.selectionLogFields()["selection_reason"]; got != "channel_spread" {
+		t.Fatalf("selection_reason = %v, want channel_spread", got)
+	}
+}
+
+func TestChannelSpread_HealthDownweightsWithoutHardExclusion(t *testing.T) {
+	selector := &SpreadSelector{load: newSpreadLoadTracker(), channelAware: true}
+	now := time.Now()
+	degraded := &Auth{
+		ID:       "degraded-channel",
+		Provider: "claude",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"base_url": "https://degraded.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+		},
+		Health: HealthState{Observed: true, Score: 20, LastUpdatedAt: now},
+	}
+	healthy := &Auth{
+		ID:       "healthy-channel",
+		Provider: "openai-compatible-kimi",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"base_url": "https://healthy.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+		},
+	}
+	counts := map[string]int{}
+	for range 120 {
+		picked, errPick := selector.Pick(context.Background(), "mixed", "kimi-k3", cliproxyexecutor.Options{}, []*Auth{degraded, healthy})
+		if errPick != nil {
+			t.Fatalf("Pick() error = %v", errPick)
+		}
+		counts[picked.ID]++
+		selector.MarkDone(picked.ID, "kimi-k3")
+	}
+	if counts[degraded.ID] == 0 {
+		t.Fatalf("counts = %+v, degraded closed-breaker channel was hard-excluded", counts)
+	}
+	if counts[degraded.ID] >= counts[healthy.ID] {
+		t.Fatalf("counts = %+v, want degraded channel downweighted below healthy channel", counts)
+	}
+}
+
+func TestChannelSpread_KimiHotEnabledKeyJoinsCachedGroupSelector(t *testing.T) {
+	manager := NewManager(nil, NewSessionAffinitySelector(&RoundRobinSelector{}), nil)
+	defer manager.StopAutoRefresh()
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		GroupStrategies: map[string]string{"kimi": "spread"},
+		GroupSessionAffinity: map[string]bool{
+			"kimi": false,
+		},
+	}})
+	keyA := &Auth{ID: "kimi-key-a", Provider: "claude", Status: StatusActive, Attributes: map[string]string{
+		"base_url": "https://api.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+	}}
+	keyB := keyA.Clone()
+	keyB.ID = "kimi-key-b"
+	keyB.Disabled = true
+	keyB.Status = StatusDisabled
+	otherChannel := &Auth{ID: "kimi-other-channel", Provider: "openai-compatible-kimi", Status: StatusActive, Attributes: map[string]string{
+		"base_url": "https://api.kimi.example/v1", "routing_group": "kimi", "priority": "20",
+	}}
+	for _, auth := range []*Auth{keyA, keyB, otherChannel} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	availableBefore, errAvailable := manager.availableAuthsForRouteModel(manager.List(), "mixed", "kimi-k3", time.Now())
+	if errAvailable != nil {
+		t.Fatalf("available before enable: %v", errAvailable)
+	}
+	selectorBefore := manager.selectorForAuths(availableBefore)
+
+	keyB.Disabled = false
+	keyB.Status = StatusActive
+	if _, errUpdate := manager.Update(context.Background(), keyB); errUpdate != nil {
+		t.Fatalf("enable key: %v", errUpdate)
+	}
+	availableAfter, errAvailable := manager.availableAuthsForRouteModel(manager.List(), "mixed", "kimi-k3", time.Now())
+	if errAvailable != nil {
+		t.Fatalf("available after enable: %v", errAvailable)
+	}
+	selectorAfter := manager.selectorForAuths(availableAfter)
+	if selectorAfter != selectorBefore {
+		t.Fatal("key-only hot reload replaced the cached group selector")
+	}
+	spread, ok := selectorAfter.(*SpreadSelector)
+	if !ok {
+		t.Fatalf("selector = %T, want *SpreadSelector", selectorAfter)
+	}
+
+	counts := map[string]int{}
+	for range 80 {
+		picked, errPick := selectorAfter.Pick(context.Background(), "mixed", "kimi-k3", cliproxyexecutor.Options{}, availableAfter)
+		if errPick != nil {
+			t.Fatalf("Pick() after enable: %v", errPick)
+		}
+		counts[picked.ID]++
+		spread.MarkDone(picked.ID, "kimi-k3")
+	}
+	if counts[keyB.ID] == 0 {
+		t.Fatalf("counts = %+v, hot-enabled key never joined channel rotation", counts)
+	}
 }
 
 func TestMixedNonGPTIgnoresCodexChannelHealth(t *testing.T) {

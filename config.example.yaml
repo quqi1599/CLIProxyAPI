@@ -214,6 +214,11 @@ routing:
   # provider-strategies:
   #   codex: "spread"
   #   openai-compatibility: "spread"
+  # Optional: override session affinity for a routing group. Explicit group
+  # spread uses two-level channel -> credential scheduling, so disabling
+  # affinity lets newly enabled keys participate in new requests immediately.
+  # group-session-affinity:
+  #   kimi: false
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Client-Request-Id (PI), conversation_id,

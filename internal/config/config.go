@@ -445,6 +445,11 @@ type RoutingConfig struct {
 	// provider-wide policy without requiring per-key routing-group labels.
 	ProviderStrategies map[string]string `yaml:"provider-strategies,omitempty" json:"provider-strategies,omitempty"`
 
+	// GroupSessionAffinity overrides the global session-affinity setting for a
+	// specific routing group. This is useful for stateless API-key pools that
+	// should rebalance immediately when credentials are added or recovered.
+	GroupSessionAffinity map[string]bool `yaml:"group-session-affinity,omitempty" json:"group-session-affinity,omitempty"`
+
 	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
 	// When enabled, requests with the same session ID (extracted from metadata.user_id)
 	// are routed to the same auth credential when available.

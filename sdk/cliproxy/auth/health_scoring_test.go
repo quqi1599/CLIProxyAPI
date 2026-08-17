@@ -10,7 +10,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-func TestGetAvailableAuths_PrefersHealthierAuthWithinSamePriority(t *testing.T) {
+func TestGetAvailableAuths_HealthDoesNotCreateHardPriorityTier(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -31,11 +31,11 @@ func TestGetAvailableAuths_PrefersHealthierAuthWithinSamePriority(t *testing.T) 
 	if err != nil {
 		t.Fatalf("getAvailableAuths() error = %v", err)
 	}
-	if len(available) != 1 {
-		t.Fatalf("getAvailableAuths() len = %d, want 1 healthy auth in the top tier", len(available))
+	if len(available) != 2 {
+		t.Fatalf("getAvailableAuths() len = %d, want both same-priority closed-breaker auths", len(available))
 	}
-	if available[0].ID != "b" {
-		t.Fatalf("getAvailableAuths() auth.ID = %q, want %q", available[0].ID, "b")
+	if available[0].ID != "a" || available[1].ID != "b" {
+		t.Fatalf("getAvailableAuths() ids = [%s %s], want [a b]", available[0].ID, available[1].ID)
 	}
 }
 
@@ -60,8 +60,13 @@ func TestGetAvailableAuths_HealthScoreRecoversOverTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getAvailableAuths(now) error = %v", err)
 	}
-	if len(availableNow) != 1 || availableNow[0].ID != "b" {
-		t.Fatalf("getAvailableAuths(now) = %+v, want only auth b in the top tier", availableNow)
+	if len(availableNow) != 2 {
+		t.Fatalf("getAvailableAuths(now) = %+v, want health to avoid hard exclusion", availableNow)
+	}
+	weightANow := spreadSelectionWeightForRoute(authA, "claude-sonnet-4-6", now, false, true)
+	weightBNow := spreadSelectionWeightForRoute(authB, "claude-sonnet-4-6", now, false, true)
+	if weightANow >= weightBNow {
+		t.Fatalf("spread weights now = (%d, %d), want failed auth downweighted", weightANow, weightBNow)
 	}
 
 	recoveredAt := now.Add(20 * time.Minute)
@@ -74,6 +79,11 @@ func TestGetAvailableAuths_HealthScoreRecoversOverTime(t *testing.T) {
 	}
 	if availableRecovered[0].ID != "a" || availableRecovered[1].ID != "b" {
 		t.Fatalf("getAvailableAuths(recovered) ids = [%s %s], want [a b]", availableRecovered[0].ID, availableRecovered[1].ID)
+	}
+	weightARecovered := spreadSelectionWeightForRoute(authA, "claude-sonnet-4-6", recoveredAt, false, true)
+	weightBRecovered := spreadSelectionWeightForRoute(authB, "claude-sonnet-4-6", recoveredAt, false, true)
+	if weightARecovered != weightBRecovered {
+		t.Fatalf("spread weights after recovery = (%d, %d), want equal", weightARecovered, weightBRecovered)
 	}
 }
 
@@ -106,8 +116,13 @@ func TestGetAvailableAuths_ModelHealthIsScopedPerModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getAvailableAuths(gpt-5.4) error = %v", err)
 	}
-	if len(availableBadModel) != 1 || availableBadModel[0].ID != "b" {
-		t.Fatalf("getAvailableAuths(gpt-5.4) = %+v, want only auth b in top tier", availableBadModel)
+	if len(availableBadModel) != 2 {
+		t.Fatalf("getAvailableAuths(gpt-5.4) = %+v, want both closed-breaker auths", availableBadModel)
+	}
+	badWeightA := spreadSelectionWeightForRoute(authA, "gpt-5.4", now, false, true)
+	badWeightB := spreadSelectionWeightForRoute(authB, "gpt-5.4", now, false, true)
+	if badWeightA >= badWeightB {
+		t.Fatalf("gpt-5.4 spread weights = (%d, %d), want model-scoped downweight", badWeightA, badWeightB)
 	}
 
 	availableOtherModel, err := getAvailableAuths([]*Auth{authA, authB}, "codex", "gpt-5.3", now)
@@ -119,6 +134,11 @@ func TestGetAvailableAuths_ModelHealthIsScopedPerModel(t *testing.T) {
 	}
 	if availableOtherModel[0].ID != "a" || availableOtherModel[1].ID != "b" {
 		t.Fatalf("getAvailableAuths(gpt-5.3) ids = [%s %s], want [a b]", availableOtherModel[0].ID, availableOtherModel[1].ID)
+	}
+	otherWeightA := spreadSelectionWeightForRoute(authA, "gpt-5.3", now, false, true)
+	otherWeightB := spreadSelectionWeightForRoute(authB, "gpt-5.3", now, false, true)
+	if otherWeightA != otherWeightB {
+		t.Fatalf("gpt-5.3 spread weights = (%d, %d), want no cross-model downweight", otherWeightA, otherWeightB)
 	}
 }
 
@@ -222,6 +242,65 @@ func TestManagerAvailableAuthsForRouteModel_SpreadKeepsLowerPriorityCandidates(t
 	}
 	if available[0].ID != "a" || available[1].ID != "b" {
 		t.Fatalf("availableAuthsForRouteModel() ids = [%s %s], want [a b]", available[0].ID, available[1].ID)
+	}
+}
+
+func TestSelectionAvailabilityLogsDownweightAndHardSkipReasons(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	manager := NewManager(nil, &SpreadSelector{channelAware: true}, nil)
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	healthy := &Auth{ID: "healthy", Provider: "claude", Status: StatusActive, Attributes: map[string]string{"routing_group": "kimi"}}
+	degraded := &Auth{
+		ID:         "degraded",
+		Provider:   "claude",
+		Status:     StatusActive,
+		Attributes: map[string]string{"routing_group": "kimi"},
+		Health:     HealthState{Observed: true, Score: 40, LastUpdatedAt: now},
+	}
+	cooling := &Auth{
+		ID:             "cooling",
+		Provider:       "claude",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		Quota:          QuotaState{Exceeded: true},
+		Attributes:     map[string]string{"routing_group": "kimi"},
+	}
+	breaker := &Auth{
+		ID:         "breaker",
+		Provider:   "claude",
+		Status:     StatusActive,
+		Attributes: map[string]string{"routing_group": "kimi"},
+		Health: HealthState{
+			Observed:     true,
+			Score:        20,
+			BreakerState: HealthBreakerOpen,
+			OpenUntil:    now.Add(time.Minute),
+		},
+	}
+	disabled := &Auth{ID: "disabled", Provider: "claude", Status: StatusDisabled, Disabled: true, Attributes: map[string]string{"routing_group": "kimi"}}
+
+	available, errAvailable := manager.availableAuthsForRouteModelContext(ctx, []*Auth{healthy, degraded, cooling, breaker, disabled}, "mixed", "kimi-k3", now)
+	if errAvailable != nil {
+		t.Fatalf("availableAuthsForRouteModelContext() error = %v", errAvailable)
+	}
+	if len(available) != 2 {
+		t.Fatalf("available auths = %d, want healthy plus degraded", len(available))
+	}
+	fields := trace.selectionLogFields()
+	for key, want := range map[string]int{
+		"candidate_count":               5,
+		"candidate_ready_count":         2,
+		"candidate_health_downweighted": 1,
+		"candidate_skipped_cooldown":    1,
+		"candidate_skipped_breaker":     1,
+		"candidate_skipped_disabled":    1,
+	} {
+		if got := fields[key]; got != want {
+			t.Fatalf("selection field %s = %v, want %d; fields=%v", key, got, want, fields)
+		}
 	}
 }
 

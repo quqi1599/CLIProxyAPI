@@ -243,3 +243,75 @@ func TestManagerSelectorForAuths_FallsBackToGlobalSelectorForMixedGroups(t *test
 		t.Fatalf("selectorForAuths() = %T, want fallback global selector %T", selector, manager.selector)
 	}
 }
+
+func TestManagerSelectorForAuths_GroupDisablesGlobalSessionAffinity(t *testing.T) {
+	manager := NewManager(nil, NewSessionAffinitySelector(&RoundRobinSelector{}), nil)
+	defer manager.StopAutoRefresh()
+	manager.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			GroupStrategies: map[string]string{
+				"kimi": "spread",
+			},
+			GroupSessionAffinity: map[string]bool{
+				"kimi": false,
+			},
+		},
+	})
+	auths := []*Auth{
+		{ID: "claude-kimi", Provider: "claude", Status: StatusActive, Attributes: map[string]string{"routing_group": "kimi", "base_url": "https://api.kimi.example/v1"}},
+		{ID: "openai-kimi", Provider: "openai-compatible-kimi", Status: StatusActive, Attributes: map[string]string{"routing_group": "kimi", "base_url": "https://api.kimi.example/v1"}},
+	}
+
+	selector := manager.selectorForAuths(auths)
+	spread, ok := selector.(*SpreadSelector)
+	if !ok || !spread.channelAware {
+		t.Fatalf("selectorForAuths() = %#v, want channel-aware *SpreadSelector", selector)
+	}
+
+	counts := map[string]int{}
+	opts := cliproxyexecutor.Options{Headers: map[string][]string{"X-Session-ID": {"same-session"}}}
+	for range 20 {
+		picked, errPick := selector.Pick(context.Background(), "mixed", "kimi-k3", opts, auths)
+		if errPick != nil {
+			t.Fatalf("Pick() error = %v", errPick)
+		}
+		counts[picked.ID]++
+		spread.MarkDone(picked.ID, "kimi-k3")
+	}
+	if counts[auths[0].ID] == 0 || counts[auths[1].ID] == 0 {
+		t.Fatalf("same-session channel counts = %+v, want both channels when group affinity is disabled", counts)
+	}
+}
+
+func TestManagerSelectorForAuths_GroupAffinityIsVisibleInMetrics(t *testing.T) {
+	manager := NewManager(nil, NewSessionAffinitySelector(&RoundRobinSelector{}), nil)
+	defer manager.StopAutoRefresh()
+	auth := &Auth{
+		ID:       "kimi-auth",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"routing_group": "kimi",
+			"base_url":      "https://api.kimi.example/v1",
+		},
+	}
+
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		GroupStrategies: map[string]string{"kimi": "spread"},
+		GroupSessionAffinity: map[string]bool{
+			"kimi": false,
+		},
+	}})
+	if scope, strategy := manager.authMetricRouting(auth); scope != "group:kimi" || strategy != "channel-spread" {
+		t.Fatalf("routing metric = (%q, %q), want (%q, %q)", scope, strategy, "group:kimi", "channel-spread")
+	}
+
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+		GroupStrategies: map[string]string{"kimi": "spread"},
+		GroupSessionAffinity: map[string]bool{
+			"kimi": true,
+		},
+	}})
+	if scope, strategy := manager.authMetricRouting(auth); scope != "group:kimi" || strategy != "session-affinity+channel-spread" {
+		t.Fatalf("routing metric after reload = (%q, %q), want (%q, %q)", scope, strategy, "group:kimi", "session-affinity+channel-spread")
+	}
+}

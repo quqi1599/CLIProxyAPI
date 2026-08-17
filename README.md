@@ -75,7 +75,19 @@ routing:
     codex: "spread"
     openai-compatibility: "spread"
   session-affinity: true
+  group-session-affinity:
+    kimi: false
 ```
+
+An explicit routing-group `spread` uses two-level channel-to-credential
+scheduling, so adding more keys to one channel does not multiply that channel's
+share. Channel and credential weights derive from configured priority and
+closed-breaker health, while disabled, cooling, and open-breaker entries remain
+ineligible. `group-session-affinity` can opt a stateless group out of global
+session stickiness; other groups continue to inherit `session-affinity`.
+`auth_selection` logs report the effective strategy (for example
+`channel-spread` or `session-affinity+channel-spread`), the selection reason,
+and aggregate disabled/cooldown/breaker/unavailable skip counts.
 
 When mixing Kimi OpenAI-compatible keys with Kimi Coding Agent keys, keep the
 two upstream surfaces separated. Some Kimi Coding keys only work through the
