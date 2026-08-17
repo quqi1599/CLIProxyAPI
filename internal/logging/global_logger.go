@@ -33,6 +33,8 @@ type LogFormatter struct{}
 var logFieldOrder = []string{
 	"event", "client_request_id", "provider", "model", "requested_model", "upstream_model",
 	"auth_index", "routing_strategy", "routing_scope", "routing_group", "prefix", "base_url", "token_hash",
+	"selection_reason", "candidate_count", "candidate_ready_count", "candidate_health_downweighted",
+	"candidate_skipped_disabled", "candidate_skipped_cooldown", "candidate_skipped_breaker", "candidate_skipped_unavailable",
 	"status", "status_code", "success", "error_code", "retryable", "retry_after_ms", "reset_ms", "providers",
 	"normalized_status", "outer_status", "failure_kind", "failure_scope", "scope", "semantic_type", "semantic_code",
 	"stream_phase", "output_committed",
