@@ -5,10 +5,8 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
-	"golang.org/x/text/unicode/norm"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,10 +53,18 @@ type ahoNode struct {
 
 // Matcher is immutable after compilation and safe for concurrent use.
 type Matcher struct {
-	policy       Policy
-	nodes        []ahoNode
-	terms        []compiledTerm
-	keywordCount int
+	policy         Policy
+	nodes          []ahoNode
+	candidateNodes []ahoNode
+	terms          []compiledTerm
+	keywordCount   int
+	analyzer       *moderationAnalyzer
+}
+
+type preparedPolicyTerm struct {
+	ruleIndex int
+	raw       string
+	candidate string
 }
 
 // LoadPolicy compiles a YAML or JSON policy file.
@@ -81,14 +87,12 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		return nil, fmt.Errorf("content audit policy version is required")
 	}
 
-	m := &Matcher{
-		policy: policy,
-		nodes:  []ahoNode{{next: make(map[rune]int)}},
-	}
 	seenRuleIDs := make(map[string]struct{}, len(policy.Rules))
 	seenTerms := make(map[string]struct{})
-	for ruleIndex := range m.policy.Rules {
-		rule := &m.policy.Rules[ruleIndex]
+	preparedTerms := make([]preparedPolicyTerm, 0)
+	rawKeywords := make([]string, 0)
+	for ruleIndex := range policy.Rules {
+		rule := &policy.Rules[ruleIndex]
 		rule.ID = strings.TrimSpace(rule.ID)
 		rule.Category = strings.TrimSpace(rule.Category)
 		rule.Severity = normalizeSeverity(rule.Severity)
@@ -106,37 +110,61 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 			return nil, fmt.Errorf("content audit rule %q has invalid severity", rule.ID)
 		}
 
-		rule.Allowlist = normalizeTermList(rule.Allowlist)
 		for _, rawTerm := range rule.Keywords {
-			term := normalizeForMatch(rawTerm)
-			if utf8.RuneCountInString(term) < 2 {
+			candidate := moderationCandidateText(rawTerm)
+			if utf8.RuneCountInString(candidate) < 2 {
 				return nil, fmt.Errorf("content audit rule %q has a keyword shorter than two normalized characters", rule.ID)
 			}
-			key := fmt.Sprintf("%d\x00%s", ruleIndex, term)
+			key := fmt.Sprintf("%d\x00%s", ruleIndex, candidate)
 			if _, exists := seenTerms[key]; exists {
 				continue
 			}
 			seenTerms[key] = struct{}{}
-			m.addTerm(compiledTerm{ruleIndex: ruleIndex, term: term, runeLen: utf8.RuneCountInString(term)})
-			m.keywordCount++
-			if m.keywordCount > maxPolicyKeywords {
+			preparedTerms = append(preparedTerms, preparedPolicyTerm{ruleIndex: ruleIndex, raw: rawTerm, candidate: candidate})
+			rawKeywords = append(rawKeywords, rawTerm)
+			if len(preparedTerms) > maxPolicyKeywords {
 				return nil, fmt.Errorf("content audit policy exceeds %d keywords", maxPolicyKeywords)
 			}
 		}
 	}
-	if m.keywordCount == 0 {
+	if len(preparedTerms) == 0 {
 		return nil, fmt.Errorf("content audit policy has no enabled keywords")
 	}
-	m.policy.GlobalAllowlist = normalizeTermList(m.policy.GlobalAllowlist)
+	analyzer, err := buildModerationAnalyzer(rawKeywords)
+	if err != nil {
+		return nil, fmt.Errorf("initialize content audit analyzer: %w", err)
+	}
+	m := &Matcher{
+		policy:         policy,
+		nodes:          []ahoNode{{next: make(map[rune]int)}},
+		candidateNodes: []ahoNode{{next: make(map[rune]int)}},
+		analyzer:       analyzer,
+	}
+	for _, prepared := range preparedTerms {
+		term := analyzer.normalize(prepared.raw)
+		if term == "" {
+			continue
+		}
+		m.addTerm(compiledTerm{ruleIndex: prepared.ruleIndex, term: term, runeLen: utf8.RuneCountInString(term)})
+		m.addCandidateTerm(prepared.candidate)
+		m.keywordCount++
+	}
+	if m.keywordCount == 0 {
+		return nil, fmt.Errorf("content audit policy has no tokenizable keywords")
+	}
+	for ruleIndex := range m.policy.Rules {
+		m.policy.Rules[ruleIndex].Allowlist = normalizeTermList(m.policy.Rules[ruleIndex].Allowlist, analyzer)
+	}
+	m.policy.GlobalAllowlist = normalizeTermList(m.policy.GlobalAllowlist, analyzer)
 	m.buildFailureLinks()
 	return m, nil
 }
 
-func normalizeTermList(values []string) []string {
+func normalizeTermList(values []string, analyzer *moderationAnalyzer) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
 	for _, value := range values {
-		normalized := normalizeForMatch(value)
+		normalized := analyzer.normalize(value)
 		if normalized == "" {
 			continue
 		}
@@ -180,19 +208,6 @@ func severityRank(value string) int {
 	}
 }
 
-func normalizeForMatch(value string) string {
-	value = norm.NFKC.String(strings.ToLower(value))
-	var out strings.Builder
-	out.Grow(len(value))
-	for _, r := range value {
-		if unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
-			continue
-		}
-		out.WriteRune(r)
-	}
-	return out.String()
-}
-
 func (m *Matcher) addTerm(term compiledTerm) {
 	nodeIndex := 0
 	for _, r := range term.term {
@@ -209,32 +224,51 @@ func (m *Matcher) addTerm(term compiledTerm) {
 	m.nodes[nodeIndex].out = append(m.nodes[nodeIndex].out, termIndex)
 }
 
+func (m *Matcher) addCandidateTerm(term string) {
+	nodeIndex := 0
+	for _, r := range term {
+		nextIndex, exists := m.candidateNodes[nodeIndex].next[r]
+		if !exists {
+			nextIndex = len(m.candidateNodes)
+			m.candidateNodes[nodeIndex].next[r] = nextIndex
+			m.candidateNodes = append(m.candidateNodes, ahoNode{next: make(map[rune]int)})
+		}
+		nodeIndex = nextIndex
+	}
+	m.candidateNodes[nodeIndex].out = append(m.candidateNodes[nodeIndex].out, 0)
+}
+
 func (m *Matcher) buildFailureLinks() {
-	queue := make([]int, 0, len(m.nodes))
-	for _, child := range m.nodes[0].next {
-		m.nodes[child].fail = 0
+	buildAhoFailureLinks(m.nodes)
+	buildAhoFailureLinks(m.candidateNodes)
+}
+
+func buildAhoFailureLinks(nodes []ahoNode) {
+	queue := make([]int, 0, len(nodes))
+	for _, child := range nodes[0].next {
+		nodes[child].fail = 0
 		queue = append(queue, child)
 	}
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
-		for r, child := range m.nodes[current].next {
+		for r, child := range nodes[current].next {
 			queue = append(queue, child)
-			fallback := m.nodes[current].fail
+			fallback := nodes[current].fail
 			for fallback != 0 {
-				if next, exists := m.nodes[fallback].next[r]; exists {
+				if next, exists := nodes[fallback].next[r]; exists {
 					fallback = next
 					break
 				}
-				fallback = m.nodes[fallback].fail
+				fallback = nodes[fallback].fail
 			}
 			if fallback == 0 {
-				if next, exists := m.nodes[0].next[r]; exists && next != child {
+				if next, exists := nodes[0].next[r]; exists && next != child {
 					fallback = next
 				}
 			}
-			m.nodes[child].fail = fallback
-			m.nodes[child].out = append(m.nodes[child].out, m.nodes[fallback].out...)
+			nodes[child].fail = fallback
+			nodes[child].out = append(nodes[child].out, nodes[fallback].out...)
 		}
 	}
 }
@@ -244,7 +278,10 @@ func (m *Matcher) Match(text string) Decision {
 	if m == nil || len(m.nodes) == 0 {
 		return Decision{}
 	}
-	normalized := []rune(normalizeForMatch(text))
+	if !m.hasCandidate(moderationCandidateText(text)) {
+		return Decision{PolicyVersion: m.policy.Version}
+	}
+	normalized := []rune(m.analyzer.normalize(text))
 	if len(normalized) == 0 {
 		return Decision{PolicyVersion: m.policy.Version}
 	}
@@ -266,7 +303,7 @@ func (m *Matcher) Match(text string) Decision {
 		for _, termIndex := range m.nodes[nodeIndex].out {
 			term := m.terms[termIndex]
 			start := position - term.runeLen + 1
-			if start < 0 || m.allowlisted(normalized, start, position+1, term.ruleIndex) {
+			if start < 0 || !matchOnTermBoundaries(normalized, start, position+1) || m.allowlisted(normalized, start, position+1, term.ruleIndex) {
 				continue
 			}
 			rule := m.policy.Rules[term.ruleIndex]
@@ -287,6 +324,34 @@ func (m *Matcher) Match(text string) Decision {
 		}
 	}
 	return best
+}
+
+func (m *Matcher) hasCandidate(normalized string) bool {
+	if normalized == "" || len(m.candidateNodes) == 0 {
+		return false
+	}
+	nodeIndex := 0
+	for _, r := range normalized {
+		for nodeIndex != 0 {
+			if _, exists := m.candidateNodes[nodeIndex].next[r]; exists {
+				break
+			}
+			nodeIndex = m.candidateNodes[nodeIndex].fail
+		}
+		if next, exists := m.candidateNodes[nodeIndex].next[r]; exists {
+			nodeIndex = next
+		}
+		if len(m.candidateNodes[nodeIndex].out) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func matchOnTermBoundaries(text []rune, start, end int) bool {
+	return start >= 0 && end <= len(text) &&
+		(start == 0 || text[start-1] == ' ') &&
+		(end == len(text) || text[end] == ' ')
 }
 
 func (m *Matcher) allowlisted(text []rune, matchStart, matchEnd, ruleIndex int) bool {

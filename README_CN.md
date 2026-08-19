@@ -121,6 +121,33 @@ empty-response-retry:
 `empty_upstream_response`。客户端主动断开会立即结束当前处理，不会发起新的
 上游尝试。
 
+### 上游前置内容审计
+
+本 fork 提供可选的本地内容安全门禁，覆盖 OpenAI、Responses、Claude、Gemini、
+图片、视频和 Codex 的 HTTP 请求入口。它只提取请求中的提示词字段，先执行内存
+Aho-Corasick 候选扫描；只有出现候选词时才进入关键词增强的中文分词复核。
+内置策略包含 11 个风险分类和 642 条来源词，规范化去重后编译为 641 个运行时模式。
+
+首次启用应使用观察模式。命中内容会加密保存并显示在管理中心，但请求仍继续发往
+上游；完成误报检查后，再把 `audit-only` 改为 `false`，命中请求会在发往上游前
+被拒绝。该功能不会封禁 session、用户或 API Key。
+
+```yaml
+content-audit:
+  enabled: true
+  audit-only: true
+  policy-file: "content-audit-policy.yaml"
+  database-path: "content-audit/audit.db"
+  require-signed-identity: true
+  evidence-key-id: "primary-v1"
+  raw-retention-days: 30
+  metadata-retention-days: 180
+```
+
+请通过环境变量提供 `CPA_AUDIT_IDENTITY_SECRET`、`CPA_AUDIT_EVIDENCE_KEY` 和
+`CPA_AUDIT_EVIDENCE_VIEW_SECRET`。观察模式不会检查 WebSocket 帧；强制模式会
+拒绝无法审计的 WebSocket 请求，并提示客户端改用对应 HTTP 接口。
+
 ### 使用量统计持久化
 
 控制使用量统计的数据库持久化：

@@ -128,6 +128,37 @@ When every eligible channel fails this way, the request ends with HTTP `502`
 and error code `empty_upstream_response`. A client cancellation stops the
 attempt without starting another upstream request.
 
+### Pre-upstream Content Audit
+
+The fork includes an optional local content-safety gate for OpenAI, Responses,
+Claude, Gemini, image, video, and Codex HTTP request surfaces. It extracts only
+prompt-bearing request fields, performs an in-memory Aho-Corasick candidate
+scan, and invokes keyword-seeded Chinese segmentation only for candidate hits.
+The bundled policy contains 642 reviewed source phrases across 11 risk
+categories; normalization compiles them into 641 unique runtime patterns.
+
+Start in observation mode. A match is encrypted and shown in the Management
+Center, but the request continues upstream. After reviewing false positives,
+set `audit-only: false` to reject matching requests before upstream dispatch.
+The gate never bans a session, user, or API key.
+
+```yaml
+content-audit:
+  enabled: true
+  audit-only: true
+  policy-file: "content-audit-policy.yaml"
+  database-path: "content-audit/audit.db"
+  require-signed-identity: true
+  evidence-key-id: "primary-v1"
+  raw-retention-days: 30
+  metadata-retention-days: 180
+```
+
+Provide `CPA_AUDIT_IDENTITY_SECRET`, `CPA_AUDIT_EVIDENCE_KEY`, and
+`CPA_AUDIT_EVIDENCE_VIEW_SECRET` through the environment. WebSocket frames are
+not inspected in observation mode; enforcement mode rejects unaudited
+WebSocket requests and directs clients to the corresponding HTTP endpoint.
+
 ### Usage Statistics Persistence
 
 Control database persistence for usage statistics:

@@ -23,34 +23,35 @@ type ExtractedRequest struct {
 }
 
 var promptBearingKeys = map[string]struct{}{
-	"content":            {},
-	"contents":           {},
-	"input":              {},
-	"instructions":       {},
-	"messages":           {},
-	"prompt":             {},
-	"query":              {},
-	"system":             {},
-	"system_instruction": {},
-	"text":               {},
+	"content":  {},
+	"contents": {},
+	"input":    {},
+	"messages": {},
+	"output":   {},
+	"prompt":   {},
+	"query":    {},
+	"text":     {},
 }
 
 var skippedContentKeys = map[string]struct{}{
-	"api_key":       {},
-	"authorization": {},
-	"cookie":        {},
-	"credentials":   {},
-	"id":            {},
-	"image_url":     {},
-	"metadata":      {},
-	"model":         {},
-	"name":          {},
-	"password":      {},
-	"role":          {},
-	"secret":        {},
-	"tools":         {},
-	"type":          {},
-	"url":           {},
+	"api_key":            {},
+	"authorization":      {},
+	"cookie":             {},
+	"credentials":        {},
+	"id":                 {},
+	"image_url":          {},
+	"instructions":       {},
+	"metadata":           {},
+	"model":              {},
+	"name":               {},
+	"password":           {},
+	"role":               {},
+	"secret":             {},
+	"system":             {},
+	"system_instruction": {},
+	"tools":              {},
+	"type":               {},
+	"url":                {},
 }
 
 var evidenceSecretKeys = map[string]struct{}{
@@ -111,6 +112,19 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 func collectPromptFields(value any, path string, active bool, parts, fields *[]string) {
 	switch typed := value.(type) {
 	case map[string]any:
+		if role, exists := typed["role"].(string); exists {
+			if isTrustedPromptRole(role) {
+				if isAssistantPromptRole(role) {
+					for _, key := range []string{"tool_calls", "function_call", "functionCall"} {
+						if dynamicCall, ok := typed[key]; ok {
+							collectPromptFields(dynamicCall, path+"."+key, true, parts, fields)
+						}
+					}
+				}
+				return
+			}
+			active = true
+		}
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
 			keys = append(keys, key)
@@ -142,6 +156,19 @@ func collectPromptFields(value any, path string, active bool, parts, fields *[]s
 		*parts = append(*parts, text)
 		*fields = append(*fields, path)
 	}
+}
+
+func isAssistantPromptRole(role string) bool {
+	role = strings.TrimSpace(role)
+	return strings.EqualFold(role, "assistant") || strings.EqualFold(role, "model")
+}
+
+func isTrustedPromptRole(role string) bool {
+	role = strings.TrimSpace(role)
+	return strings.EqualFold(role, "system") ||
+		strings.EqualFold(role, "developer") ||
+		strings.EqualFold(role, "assistant") ||
+		strings.EqualFold(role, "model")
 }
 
 func sanitizeEvidenceValue(value any, key string) any {

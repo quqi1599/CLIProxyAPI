@@ -46,6 +46,7 @@ type runtimeState struct {
 // Status reports whether enforcement is configured and ready without exposing secrets.
 type Status struct {
 	Enabled               bool   `json:"enabled"`
+	AuditOnly             bool   `json:"audit_only"`
 	Ready                 bool   `json:"ready"`
 	Error                 string `json:"error,omitempty"`
 	PolicyVersion         string `json:"policy_version,omitempty"`
@@ -140,6 +141,7 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 			"policy_version": state.matcher.Version(),
 			"keyword_count":  state.matcher.KeywordCount(),
 			"database_path":  state.storePath,
+			"audit_only":     state.cfg.AuditOnly,
 		}).Info("content audit enabled")
 	}
 }
@@ -204,6 +206,7 @@ func (s *Service) Status() Status {
 	}
 	status := Status{
 		Enabled:               state.cfg.Enabled,
+		AuditOnly:             state.cfg.AuditOnly,
 		Ready:                 state.initErr == nil,
 		DatabaseAvailable:     state.store != nil,
 		RequireSignedIdentity: state.cfg.RequireSignedIdentity,
@@ -233,12 +236,25 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if state.cfg.AuditOnly && isAuditWebSocketRequest(c.Request) {
+			StripIdentityHeaders(c.Request.Header)
+			c.Next()
+			return
+		}
+		if state.cfg.AuditOnly && (state.initErr != nil || state.matcher == nil || state.store == nil) {
+			StripIdentityHeaders(c.Request.Header)
+			c.Next()
+			return
+		}
 
 		identity, identityErr := VerifyIdentity(c.Request, state.identitySecret, state.cfg.RequireSignedIdentity, time.Now(), 5*time.Minute)
 		StripIdentityHeaders(c.Request.Header)
-		if identityErr != nil {
+		if identityErr != nil && !state.cfg.AuditOnly {
 			writeAuditError(c, http.StatusUnauthorized, "cpa_audit_identity_invalid", "authentication_error", "CPA 审计身份校验失败，请联系管理员检查 NewAPI 渠道签名配置。", "", "")
 			return
+		}
+		if identityErr != nil {
+			identity = Identity{}
 		}
 		if state.initErr != nil || state.matcher == nil || state.store == nil {
 			writeAuditError(c, http.StatusServiceUnavailable, "cpa_content_audit_unavailable", "server_error", "CPA 内容审计当前不可用，请稍后重试或联系管理员。", "", "")
@@ -288,7 +304,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			PolicyVersion:    decision.PolicyVersion,
 			RequestBytes:     requestBytes,
 			IdentityVerified: identity.Verified,
-			UpstreamSent:     false,
+			UpstreamSent:     state.cfg.AuditOnly,
 			EvidenceStatus:   "encrypted",
 			EvidenceKeyID:    state.cfg.EvidenceKeyID,
 			ReviewLabel:      defaultReviewLabel,
@@ -302,8 +318,12 @@ func (s *Service) Middleware() gin.HandlerFunc {
 				"request_id": requestID,
 				"category":   decision.Category,
 				"rule_id":    decision.RuleID,
-			}).WithError(err).Error("failed to persist blocked content audit event")
+			}).WithError(err).Error("failed to persist matched content audit event")
 			c.Header("X-CPA-Audit-Evidence-Status", "storage_failed")
+		}
+		if state.cfg.AuditOnly {
+			c.Next()
+			return
 		}
 		writeAuditError(c, http.StatusBadRequest, "cpa_content_audit_blocked", "content_safety_blocked", "请求内容触发了本地安全审计，已在发送至上游模型前停止。请移除违法、色情、暴力、电诈、毒品或未授权网络攻击相关的请求后重试。", auditID, decision.Category)
 	}

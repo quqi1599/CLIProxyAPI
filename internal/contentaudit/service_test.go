@@ -121,6 +121,47 @@ func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
 	}
 }
 
+func TestMiddlewareAuditOnlyRecordsAndContinues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(identitySecretEnv, "identity-shared-secret")
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:               true,
+		AuditOnly:             true,
+		PolicyFile:            policyPath,
+		DatabasePath:          filepath.Join(tempDir, "audit.db"),
+		RequireSignedIdentity: true,
+		EvidenceKeyID:         "test-key",
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"blocked fixture"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || list.Total != 1 || !list.Items[0].UpstreamSent || list.Items[0].IdentityVerified {
+		t.Fatalf("List() = %#v err=%v", list, err)
+	}
+}
+
 func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
@@ -148,6 +189,62 @@ func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || nextCalls != 0 {
 		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+}
+
+func TestMiddlewareAuditOnlyAllowsUnauditedWebSocketFrames(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tempDir := t.TempDir()
+	service := NewService(config.ContentAuditConfig{
+		Enabled:      true,
+		AuditOnly:    true,
+		PolicyFile:   filepath.Join(tempDir, "missing-policy.yaml"),
+		DatabasePath: filepath.Join(tempDir, "audit.db"),
+	}, filepath.Join(tempDir, "config.yaml"))
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.GET("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusSwitchingProtocols)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Upgrade", "websocket")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusSwitchingProtocols || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+}
+
+func TestMiddlewareAuditOnlyDoesNotFailTrafficWhenAuditUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tempDir := t.TempDir()
+	service := NewService(config.ContentAuditConfig{
+		Enabled:      true,
+		AuditOnly:    true,
+		PolicyFile:   filepath.Join(tempDir, "missing-policy.yaml"),
+		DatabasePath: filepath.Join(tempDir, "audit.db"),
+	}, filepath.Join(tempDir, "config.yaml"))
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"ordinary request"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+	status := service.Status()
+	if !status.Enabled || !status.AuditOnly || status.Ready {
+		t.Fatalf("Status() = %#v", status)
 	}
 }
 
