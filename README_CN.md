@@ -144,8 +144,8 @@ content-audit:
   metadata-retention-days: 180
 ```
 
-请通过环境变量提供 `CPA_AUDIT_IDENTITY_SECRET`、`CPA_AUDIT_EVIDENCE_KEY` 和
-`CPA_AUDIT_EVIDENCE_VIEW_SECRET`。观察模式不会检查 WebSocket 帧；强制模式会
+请通过环境变量提供 `CPA_AUDIT_IDENTITY_SECRET` 和 `CPA_AUDIT_EVIDENCE_KEY`。
+审计证据由管理 API 身份验证后直接查看。观察模式不会检查 WebSocket 帧；强制模式会
 拒绝无法审计的 WebSocket 请求，并提示客户端改用对应 HTTP 接口。
 
 ### 使用量统计持久化

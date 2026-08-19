@@ -50,7 +50,7 @@ type Event struct {
 	Category         string `json:"category"`
 	Severity         string `json:"severity"`
 	RuleID           string `json:"rule_id"`
-	MatchedTerm      string `json:"-"`
+	MatchedTerm      string `json:"matched_term,omitempty"`
 	PolicyVersion    string `json:"policy_version"`
 	RequestBytes     int64  `json:"request_bytes"`
 	IdentityVerified bool   `json:"identity_verified"`
@@ -323,7 +323,7 @@ func scanEvent(scanner eventScanner) (Event, error) {
 	err := scanner.Scan(
 		&event.ID, &event.CreatedAt, &event.RequestID, &event.UserID, &event.TokenID,
 		&event.TokenName, &event.Method, &event.Path, &event.Protocol, &event.Model, &stream,
-		&event.Category, &event.Severity, &event.RuleID, &event.PolicyVersion, &event.RequestBytes,
+		&event.Category, &event.Severity, &event.RuleID, &event.MatchedTerm, &event.PolicyVersion, &event.RequestBytes,
 		&identityVerified, &upstreamSent, &event.EvidenceStatus, &event.EvidenceKeyID,
 		&event.ReviewLabel, &event.ReviewNote, &event.ReviewedAt, &event.ReviewedBy,
 	)
@@ -334,7 +334,7 @@ func scanEvent(scanner eventScanner) (Event, error) {
 }
 
 const eventSelectColumns = `id, created_at, request_id, user_id, token_id, token_name,
-	method, path, protocol, model, stream, category, severity, rule_id, policy_version,
+	method, path, protocol, model, stream, category, severity, rule_id, matched_term, policy_version,
 	request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
 	review_label, review_note, reviewed_at, reviewed_by`
 
@@ -354,8 +354,8 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (ListResult, error)
 	args := make([]any, 0, 12)
 	if value := strings.TrimSpace(filter.Search); value != "" {
 		like := "%" + value + "%"
-		clauses = append(clauses, `(id LIKE ? OR request_id LIKE ? OR token_name LIKE ? OR model LIKE ? OR rule_id LIKE ?)`)
-		args = append(args, like, like, like, like, like)
+		clauses = append(clauses, `(id LIKE ? OR request_id LIKE ? OR token_name LIKE ? OR model LIKE ? OR rule_id LIKE ? OR matched_term LIKE ?)`)
+		args = append(args, like, like, like, like, like, like)
 	}
 	if value := strings.TrimSpace(filter.Category); value != "" {
 		clauses = append(clauses, "category = ?")

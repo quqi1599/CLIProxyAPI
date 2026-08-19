@@ -22,7 +22,6 @@ func TestMiddlewareBlocksBeforeNextAndPersistsCustomerEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
 	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
-	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
 	tempDir := t.TempDir()
 	policyPath := filepath.Join(tempDir, "policy.yaml")
 	policy := `version: test-v1
@@ -75,15 +74,20 @@ rules:
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if list.Total != 1 || list.Items[0].UserID != 42 || list.Items[0].TokenID != 73 || list.Items[0].TokenName != "production-token" || list.Items[0].UpstreamSent {
+	if list.Total != 1 || list.Items[0].UserID != 42 || list.Items[0].TokenID != 73 || list.Items[0].TokenName != "production-token" || list.Items[0].MatchedTerm != "sensitive synthetic phrase" || list.Items[0].UpstreamSent {
 		t.Fatalf("stored event = %#v", list)
 	}
-	if _, err = service.Reveal(t.Context(), list.Items[0].ID, "investigate false positive", "127.0.0.1", "wrong-key"); err == nil {
-		t.Fatal("Reveal() wrong key error = nil")
+	matchedList, err := service.List(t.Context(), ListFilter{Search: "synthetic phrase"})
+	if err != nil || matchedList.Total != 1 {
+		t.Fatalf("List() matched term search = %#v err=%v", matchedList, err)
 	}
-	evidence, err := service.Reveal(t.Context(), list.Items[0].ID, "investigate false positive", "127.0.0.1", "evidence-view-secret-0123456789")
+	evidence, err := service.Reveal(t.Context(), list.Items[0].ID, "127.0.0.1")
 	if err != nil || !bytes.Contains(evidence, []byte("sensitive synthetic phrase")) {
 		t.Fatalf("Reveal() evidence=%s err=%v", evidence, err)
+	}
+	detail, err := service.Get(t.Context(), list.Items[0].ID)
+	if err != nil || len(detail.AccessHistory) != 1 || detail.AccessHistory[0].Action != "reveal" || detail.AccessHistory[0].Reason != "management console evidence view" {
+		t.Fatalf("Get() detail=%#v err=%v", detail, err)
 	}
 }
 
@@ -91,7 +95,6 @@ func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
 	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
-	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
 	tempDir := t.TempDir()
 	policyPath := filepath.Join(tempDir, "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
@@ -125,7 +128,6 @@ func TestMiddlewareAuditOnlyRecordsAndContinues(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
 	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
-	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
 	tempDir := t.TempDir()
 	policyPath := filepath.Join(tempDir, "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
@@ -166,7 +168,6 @@ func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
 	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
-	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
 	tempDir := t.TempDir()
 	policyPath := filepath.Join(tempDir, "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {

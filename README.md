@@ -154,8 +154,8 @@ content-audit:
   metadata-retention-days: 180
 ```
 
-Provide `CPA_AUDIT_IDENTITY_SECRET`, `CPA_AUDIT_EVIDENCE_KEY`, and
-`CPA_AUDIT_EVIDENCE_VIEW_SECRET` through the environment. WebSocket frames are
+Provide `CPA_AUDIT_IDENTITY_SECRET` and `CPA_AUDIT_EVIDENCE_KEY` through the
+environment. Management API authentication controls evidence viewing. WebSocket frames are
 not inspected in observation mode; enforcement mode rejects unaudited
 WebSocket requests and directs clients to the corresponding HTTP endpoint.
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -25,9 +24,8 @@ import (
 )
 
 const (
-	identitySecretEnv     = "CPA_AUDIT_IDENTITY_SECRET"
-	evidenceKeyEnv        = "CPA_AUDIT_EVIDENCE_KEY"
-	evidenceViewSecretEnv = "CPA_AUDIT_EVIDENCE_VIEW_SECRET"
+	identitySecretEnv = "CPA_AUDIT_IDENTITY_SECRET"
+	evidenceKeyEnv    = "CPA_AUDIT_EVIDENCE_KEY"
 
 	defaultMaxBodyBytes = 32 << 20
 )
@@ -37,7 +35,6 @@ type runtimeState struct {
 	matcher                *Matcher
 	store                  *Store
 	identitySecret         string
-	evidenceViewSecret     string
 	storePath              string
 	evidenceKeyFingerprint [32]byte
 	initErr                error
@@ -85,7 +82,6 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	normalizeAuditConfig(&cfg)
 	state := &runtimeState{cfg: cfg}
 	state.identitySecret = firstNonEmptySecret(os.Getenv(identitySecretEnv), cfg.IdentitySecret)
-	state.evidenceViewSecret = firstNonEmptySecret(os.Getenv(evidenceViewSecretEnv), cfg.EvidenceViewSecret)
 	evidenceKey := firstNonEmptySecret(os.Getenv(evidenceKeyEnv), cfg.EvidenceKey)
 	state.evidenceKeyFingerprint = sha256.Sum256([]byte(evidenceKey))
 
@@ -112,8 +108,6 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 			state.initErr = fmt.Errorf("content audit policy file is required")
 		case evidenceKey == "":
 			state.initErr = fmt.Errorf("%s is required", evidenceKeyEnv)
-		case state.evidenceViewSecret == "":
-			state.initErr = fmt.Errorf("%s is required", evidenceViewSecretEnv)
 		case cfg.RequireSignedIdentity && state.identitySecret == "":
 			state.initErr = fmt.Errorf("%s is required", identitySecretEnv)
 		default:
@@ -447,16 +441,13 @@ func (s *Service) Get(ctx context.Context, eventID string) (EventDetail, error) 
 	return state.store.Get(ctx, eventID)
 }
 
-// Reveal validates the independent evidence-view secret and decrypts one event.
-func (s *Service) Reveal(ctx context.Context, eventID, reason, actor, providedSecret string) ([]byte, error) {
+// Reveal decrypts one event for an authenticated Management API request.
+func (s *Service) Reveal(ctx context.Context, eventID, actor string) ([]byte, error) {
 	state, err := s.currentStore()
 	if err != nil {
 		return nil, err
 	}
-	if !constantTimeSecretEqual(providedSecret, state.evidenceViewSecret) {
-		return nil, fmt.Errorf("invalid content audit evidence key")
-	}
-	evidence, err := state.store.Reveal(ctx, eventID, reason, actor)
+	evidence, err := state.store.Reveal(ctx, eventID, "management console evidence view", actor)
 	return []byte(evidence), err
 }
 
@@ -481,17 +472,6 @@ func (s *Service) RecordAccess(ctx context.Context, eventID, action, reason, act
 		return fmt.Errorf("invalid content audit access action")
 	}
 	return state.store.RecordAccess(ctx, eventID, action, reason, actor)
-}
-
-func constantTimeSecretEqual(provided, expected string) bool {
-	provided = strings.TrimSpace(provided)
-	expected = strings.TrimSpace(expected)
-	if provided == "" || expected == "" {
-		return false
-	}
-	providedHash := sha256.Sum256([]byte(provided))
-	expectedHash := sha256.Sum256([]byte(expected))
-	return subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) == 1
 }
 
 // IsNotFound reports whether a store operation did not find the requested event.

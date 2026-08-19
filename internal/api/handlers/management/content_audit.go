@@ -21,10 +21,6 @@ type contentAuditAccessRequest struct {
 	Reason string `json:"reason"`
 }
 
-type contentAuditRevealRequest struct {
-	Reason string `json:"reason"`
-}
-
 func (h *Handler) contentAuditService() *contentaudit.Service {
 	if h == nil {
 		return nil
@@ -84,24 +80,17 @@ func (h *Handler) GetContentAuditEvent(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// RevealContentAuditEvidence requires both Management API auth and a separate evidence key.
+// RevealContentAuditEvidence decrypts evidence for an authenticated Management API request.
 func (h *Handler) RevealContentAuditEvidence(c *gin.Context) {
 	service := h.contentAuditService()
 	if service == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content audit service is unavailable"})
 		return
 	}
-	var request contentAuditRevealRequest
-	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &request); err != nil {
-		writeManagementRequestBodyError(c, err)
-		return
-	}
 	evidence, err := service.Reveal(
 		c.Request.Context(),
 		strings.TrimSpace(c.Param("id")),
-		request.Reason,
 		c.ClientIP(),
-		c.GetHeader("X-CPA-Audit-Evidence-Key"),
 	)
 	if err != nil {
 		writeContentAuditManagementError(c, err)
@@ -164,8 +153,6 @@ func writeContentAuditManagementError(c *gin.Context, err error) {
 	switch {
 	case contentaudit.IsNotFound(err):
 		status = http.StatusNotFound
-	case strings.Contains(strings.ToLower(message), "invalid content audit evidence key"):
-		status = http.StatusForbidden
 	case strings.Contains(strings.ToLower(message), "unavailable"):
 		status = http.StatusServiceUnavailable
 	}

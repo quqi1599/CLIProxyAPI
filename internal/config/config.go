@@ -209,7 +209,6 @@ type ContentAuditConfig struct {
 	IdentitySecret        string `yaml:"identity-secret,omitempty" json:"-"`
 	EvidenceKey           string `yaml:"evidence-key,omitempty" json:"-"`
 	EvidenceKeyID         string `yaml:"evidence-key-id" json:"evidence-key-id"`
-	EvidenceViewSecret    string `yaml:"evidence-view-secret,omitempty" json:"-"`
 	MaxBodyBytes          int64  `yaml:"max-body-bytes" json:"max-body-bytes"`
 	RawRetentionDays      int    `yaml:"raw-retention-days" json:"raw-retention-days"`
 	MetadataRetentionDays int    `yaml:"metadata-retention-days" json:"metadata-retention-days"`
