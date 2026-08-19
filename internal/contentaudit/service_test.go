@@ -164,6 +164,84 @@ func TestMiddlewareAuditOnlyRecordsAndContinues(t *testing.T) {
 	}
 }
 
+func TestMiddlewareMixedPolicyBlocksOnlyBlockRules(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	policy := `version: mixed-v1
+rules:
+  - id: observe-rule
+    category: academic
+    severity: critical
+    action: observe
+    keywords: ["academic sensitive term"]
+  - id: block-rule
+    category: jailbreak
+    severity: high
+    action: block
+    keywords: ["high confidence jailbreak"]
+`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:       true,
+		PolicyFile:    policyPath,
+		DatabasePath:  filepath.Join(tempDir, "audit.db"),
+		EvidenceKeyID: "test-key",
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+
+	observeRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"academic sensitive term"}`))
+	observeRequest.Header.Set("Content-Type", "application/json")
+	observeResponse := httptest.NewRecorder()
+	router.ServeHTTP(observeResponse, observeRequest)
+	if observeResponse.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("observe status=%d next=%d body=%s", observeResponse.Code, nextCalls, observeResponse.Body.String())
+	}
+
+	blockRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"high confidence jailbreak"}`))
+	blockRequest.Header.Set("Content-Type", "application/json")
+	blockResponse := httptest.NewRecorder()
+	router.ServeHTTP(blockResponse, blockRequest)
+	if blockResponse.Code != http.StatusBadRequest || nextCalls != 1 || !bytes.Contains(blockResponse.Body.Bytes(), []byte("cpa_content_audit_blocked")) {
+		t.Fatalf("block status=%d next=%d body=%s", blockResponse.Code, nextCalls, blockResponse.Body.String())
+	}
+
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || list.Total != 2 {
+		t.Fatalf("List() = %#v err=%v", list, err)
+	}
+	for _, item := range list.Items {
+		switch item.RuleID {
+		case "block-rule":
+			if item.UpstreamSent {
+				t.Fatalf("block event was sent upstream: %#v", item)
+			}
+		case "observe-rule":
+			if !item.UpstreamSent {
+				t.Fatalf("observe event was not sent upstream: %#v", item)
+			}
+		default:
+			t.Fatalf("unexpected event: %#v", item)
+		}
+	}
+	status := service.Status()
+	if status.BlockRuleCount != 1 || status.ObserveRuleCount != 1 || status.AuditOnly {
+		t.Fatalf("Status() = %#v", status)
+	}
+}
+
 func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
@@ -203,6 +281,31 @@ func TestMiddlewareAuditOnlyAllowsUnauditedWebSocketFrames(t *testing.T) {
 		DatabasePath: filepath.Join(tempDir, "audit.db"),
 	}, filepath.Join(tempDir, "config.yaml"))
 
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.GET("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusSwitchingProtocols)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Upgrade", "websocket")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusSwitchingProtocols || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+}
+
+func TestMiddlewareMixedPolicyAllowsConfiguredUnauditedWebSocketFrames(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tempDir := t.TempDir()
+	service := NewService(config.ContentAuditConfig{
+		Enabled:                 true,
+		AllowUnauditedWebsocket: true,
+		PolicyFile:              filepath.Join(tempDir, "missing-policy.yaml"),
+		DatabasePath:            filepath.Join(tempDir, "audit.db"),
+	}, filepath.Join(tempDir, "config.yaml"))
 	nextCalls := 0
 	router := gin.New()
 	router.Use(service.Middleware())

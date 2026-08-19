@@ -126,27 +126,30 @@ empty-response-retry:
 本 fork 提供可选的本地内容安全门禁，覆盖 OpenAI、Responses、Claude、Gemini、
 图片、视频和 Codex 的 HTTP 请求入口。它只提取请求中的提示词字段，先执行内存
 Aho-Corasick 候选扫描；只有出现候选词时才进入关键词增强的中文分词复核。
-内置策略包含 11 个风险分类和 642 条来源词，规范化去重后编译为 641 个运行时模式。
+可管理策略包含 14 条规则和 684 条来源词，规范化去重后编译为 683 个运行时模式。
 
 首次启用应使用观察模式。命中内容会加密保存并显示在管理中心，但请求仍继续发往
-上游；完成误报检查后，再把 `audit-only` 改为 `false`，命中请求会在发往上游前
-被拒绝。该功能不会封禁 session、用户或 API Key。
+上游；完成误报检查后，再把 `audit-only` 改为 `false`，此时每条规则按
+`block` 或 `observe` 独立执行。`audit-only: true` 保留为全部仅观察的紧急开关。
+该功能不会封禁 session、用户或 API Key。
 
 ```yaml
 content-audit:
   enabled: true
   audit-only: true
-  policy-file: "content-audit-policy.yaml"
+  policy-file: "content-audit/policy.yaml"
   database-path: "content-audit/audit.db"
   require-signed-identity: true
+  allow-unaudited-websocket: true
   evidence-key-id: "primary-v1"
   raw-retention-days: 30
   metadata-retention-days: 180
 ```
 
 请通过环境变量提供 `CPA_AUDIT_IDENTITY_SECRET` 和 `CPA_AUDIT_EVIDENCE_KEY`。
-审计证据由管理 API 身份验证后直接查看。观察模式不会检查 WebSocket 帧；强制模式会
-拒绝无法审计的 WebSocket 请求，并提示客户端改用对应 HTTP 接口。
+审计证据由管理 API 身份验证后直接查看。策略文件应放在可写的持久化目录，
+之后可以在管理中心在线修改规则动作、关键词、上下文条件和例外，并回滚历史版本，
+无需重建镜像。启用 `allow-unaudited-websocket` 时 WebSocket 帧继续通行。
 
 ### 使用量统计持久化
 

@@ -35,6 +35,7 @@ type runtimeState struct {
 	matcher                *Matcher
 	store                  *Store
 	identitySecret         string
+	policyPath             string
 	storePath              string
 	evidenceKeyFingerprint [32]byte
 	initErr                error
@@ -42,23 +43,28 @@ type runtimeState struct {
 
 // Status reports whether enforcement is configured and ready without exposing secrets.
 type Status struct {
-	Enabled               bool   `json:"enabled"`
-	AuditOnly             bool   `json:"audit_only"`
-	Ready                 bool   `json:"ready"`
-	Error                 string `json:"error,omitempty"`
-	PolicyVersion         string `json:"policy_version,omitempty"`
-	KeywordCount          int    `json:"keyword_count"`
-	DatabaseAvailable     bool   `json:"database_available"`
-	RequireSignedIdentity bool   `json:"require_signed_identity"`
-	MaxBodyBytes          int64  `json:"max_body_bytes"`
-	RawRetentionDays      int    `json:"raw_retention_days"`
-	MetadataRetentionDays int    `json:"metadata_retention_days"`
+	Enabled                 bool   `json:"enabled"`
+	AuditOnly               bool   `json:"audit_only"`
+	Ready                   bool   `json:"ready"`
+	Error                   string `json:"error,omitempty"`
+	PolicyVersion           string `json:"policy_version,omitempty"`
+	KeywordCount            int    `json:"keyword_count"`
+	DatabaseAvailable       bool   `json:"database_available"`
+	RequireSignedIdentity   bool   `json:"require_signed_identity"`
+	AllowUnauditedWebsocket bool   `json:"allow_unaudited_websocket"`
+	BlockRuleCount          int    `json:"block_rule_count"`
+	ObserveRuleCount        int    `json:"observe_rule_count"`
+	DisabledRuleCount       int    `json:"disabled_rule_count"`
+	MaxBodyBytes            int64  `json:"max_body_bytes"`
+	RawRetentionDays        int    `json:"raw_retention_days"`
+	MetadataRetentionDays   int    `json:"metadata_retention_days"`
 }
 
 // Service owns the immutable request-time matcher snapshot and encrypted store.
 type Service struct {
 	state     atomic.Pointer[runtimeState]
 	pruneOnce sync.Once
+	policyMu  sync.Mutex
 }
 
 // NewService initializes a service. Invalid enabled configuration is fail-closed at request time.
@@ -73,6 +79,8 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	if s == nil {
 		return
 	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
 	baseDir := filepath.Dir(configFilePath)
 	if strings.TrimSpace(configFilePath) == "" || baseDir == "." {
 		if cwd, err := os.Getwd(); err == nil {
@@ -86,6 +94,7 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	state.evidenceKeyFingerprint = sha256.Sum256([]byte(evidenceKey))
 
 	policyPath := resolveAuditPath(baseDir, cfg.PolicyFile)
+	state.policyPath = policyPath
 	state.storePath = resolveAuditPath(baseDir, cfg.DatabasePath)
 	previous := s.state.Load()
 	if evidenceKey != "" {
@@ -120,6 +129,11 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 		}
 	}
 	s.state.Store(state)
+	if state.store != nil && state.matcher != nil {
+		if err := ensurePolicyBaseline(state); err != nil {
+			log.WithError(err).Warn("content audit policy baseline persistence failed")
+		}
+	}
 	if state.store != nil {
 		s.pruneOnce.Do(func() { go s.pruneLoop() })
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -199,18 +213,20 @@ func (s *Service) Status() Status {
 		return Status{}
 	}
 	status := Status{
-		Enabled:               state.cfg.Enabled,
-		AuditOnly:             state.cfg.AuditOnly,
-		Ready:                 state.initErr == nil,
-		DatabaseAvailable:     state.store != nil,
-		RequireSignedIdentity: state.cfg.RequireSignedIdentity,
-		MaxBodyBytes:          state.cfg.MaxBodyBytes,
-		RawRetentionDays:      state.cfg.RawRetentionDays,
-		MetadataRetentionDays: state.cfg.MetadataRetentionDays,
+		Enabled:                 state.cfg.Enabled,
+		AuditOnly:               state.cfg.AuditOnly,
+		Ready:                   state.initErr == nil,
+		DatabaseAvailable:       state.store != nil,
+		RequireSignedIdentity:   state.cfg.RequireSignedIdentity,
+		AllowUnauditedWebsocket: state.cfg.AllowUnauditedWebsocket,
+		MaxBodyBytes:            state.cfg.MaxBodyBytes,
+		RawRetentionDays:        state.cfg.RawRetentionDays,
+		MetadataRetentionDays:   state.cfg.MetadataRetentionDays,
 	}
 	if state.matcher != nil {
 		status.PolicyVersion = state.matcher.Version()
 		status.KeywordCount = state.matcher.KeywordCount()
+		status.BlockRuleCount, status.ObserveRuleCount, status.DisabledRuleCount = state.matcher.RuleActionCounts()
 	}
 	if state.initErr != nil {
 		status.Error = state.initErr.Error()
@@ -230,7 +246,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if state.cfg.AuditOnly && isAuditWebSocketRequest(c.Request) {
+		if isAuditWebSocketRequest(c.Request) && (state.cfg.AuditOnly || state.cfg.AllowUnauditedWebsocket) {
 			StripIdentityHeaders(c.Request.Header)
 			c.Next()
 			return
@@ -279,6 +295,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		if model == "" {
 			model = identity.Model
 		}
+		shouldBlock := !state.cfg.AuditOnly && decision.Action == RuleActionBlock
 		event := Event{
 			ID:               auditID,
 			CreatedAt:        time.Now().Unix(),
@@ -298,7 +315,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			PolicyVersion:    decision.PolicyVersion,
 			RequestBytes:     requestBytes,
 			IdentityVerified: identity.Verified,
-			UpstreamSent:     state.cfg.AuditOnly,
+			UpstreamSent:     !shouldBlock,
 			EvidenceStatus:   "encrypted",
 			EvidenceKeyID:    state.cfg.EvidenceKeyID,
 			ReviewLabel:      defaultReviewLabel,
@@ -315,7 +332,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			}).WithError(err).Error("failed to persist matched content audit event")
 			c.Header("X-CPA-Audit-Evidence-Status", "storage_failed")
 		}
-		if state.cfg.AuditOnly {
+		if !shouldBlock {
 			c.Next()
 			return
 		}

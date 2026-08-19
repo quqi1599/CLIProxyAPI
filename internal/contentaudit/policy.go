@@ -12,21 +12,29 @@ import (
 
 const maxPolicyKeywords = 100_000
 
+const (
+	RuleActionBlock   = "block"
+	RuleActionObserve = "observe"
+)
+
 // Policy is the immutable source document compiled into a Matcher.
 type Policy struct {
 	Version         string   `yaml:"version" json:"version"`
-	GlobalAllowlist []string `yaml:"global-allowlist" json:"global-allowlist"`
+	GlobalAllowlist []string `yaml:"global-allowlist" json:"global_allowlist"`
 	Rules           []Rule   `yaml:"rules" json:"rules"`
 }
 
 // Rule groups terms that share the same enforcement category and severity.
 type Rule struct {
-	ID        string   `yaml:"id" json:"id"`
-	Category  string   `yaml:"category" json:"category"`
-	Severity  string   `yaml:"severity" json:"severity"`
-	Keywords  []string `yaml:"keywords" json:"keywords"`
-	Allowlist []string `yaml:"allowlist" json:"allowlist"`
-	Disabled  bool     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+	ID         string   `yaml:"id" json:"id"`
+	Category   string   `yaml:"category" json:"category"`
+	Severity   string   `yaml:"severity" json:"severity"`
+	Action     string   `yaml:"action,omitempty" json:"action"`
+	Keywords   []string `yaml:"keywords" json:"keywords"`
+	RequireAny []string `yaml:"require-any,omitempty" json:"require_any,omitempty"`
+	ExcludeAny []string `yaml:"exclude-any,omitempty" json:"exclude_any,omitempty"`
+	Allowlist  []string `yaml:"allowlist" json:"allowlist"`
+	Disabled   bool     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 // Decision is the non-sensitive result of a policy scan.
@@ -35,6 +43,7 @@ type Decision struct {
 	RuleID        string `json:"rule_id,omitempty"`
 	Category      string `json:"category,omitempty"`
 	Severity      string `json:"severity,omitempty"`
+	Action        string `json:"action,omitempty"`
 	MatchedTerm   string `json:"-"`
 	PolicyVersion string `json:"policy_version,omitempty"`
 }
@@ -96,6 +105,7 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		rule.ID = strings.TrimSpace(rule.ID)
 		rule.Category = strings.TrimSpace(rule.Category)
 		rule.Severity = normalizeSeverity(rule.Severity)
+		rule.Action = normalizeRuleAction(rule.Action)
 		if rule.Disabled {
 			continue
 		}
@@ -108,6 +118,9 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		seenRuleIDs[rule.ID] = struct{}{}
 		if rule.Severity == "" {
 			return nil, fmt.Errorf("content audit rule %q has invalid severity", rule.ID)
+		}
+		if rule.Action == "" {
+			return nil, fmt.Errorf("content audit rule %q has invalid action", rule.ID)
 		}
 
 		for _, rawTerm := range rule.Keywords {
@@ -126,6 +139,8 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 				return nil, fmt.Errorf("content audit policy exceeds %d keywords", maxPolicyKeywords)
 			}
 		}
+		rawKeywords = append(rawKeywords, rule.RequireAny...)
+		rawKeywords = append(rawKeywords, rule.ExcludeAny...)
 	}
 	if len(preparedTerms) == 0 {
 		return nil, fmt.Errorf("content audit policy has no enabled keywords")
@@ -154,6 +169,8 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 	}
 	for ruleIndex := range m.policy.Rules {
 		m.policy.Rules[ruleIndex].Allowlist = normalizeTermList(m.policy.Rules[ruleIndex].Allowlist, analyzer)
+		m.policy.Rules[ruleIndex].RequireAny = normalizeTermList(m.policy.Rules[ruleIndex].RequireAny, analyzer)
+		m.policy.Rules[ruleIndex].ExcludeAny = normalizeTermList(m.policy.Rules[ruleIndex].ExcludeAny, analyzer)
 	}
 	m.policy.GlobalAllowlist = normalizeTermList(m.policy.GlobalAllowlist, analyzer)
 	m.buildFailureLinks()
@@ -190,6 +207,28 @@ func normalizeSeverity(value string) string {
 		return "low"
 	default:
 		return ""
+	}
+}
+
+func normalizeRuleAction(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", RuleActionBlock:
+		return RuleActionBlock
+	case RuleActionObserve:
+		return RuleActionObserve
+	default:
+		return ""
+	}
+}
+
+func ruleActionRank(value string) int {
+	switch value {
+	case RuleActionBlock:
+		return 2
+	case RuleActionObserve:
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -288,7 +327,8 @@ func (m *Matcher) Match(text string) Decision {
 
 	nodeIndex := 0
 	best := Decision{PolicyVersion: m.policy.Version}
-	bestRank := 0
+	bestActionRank := 0
+	bestSeverityRank := 0
 	bestLength := 0
 	for position, r := range normalized {
 		for nodeIndex != 0 {
@@ -307,8 +347,14 @@ func (m *Matcher) Match(text string) Decision {
 				continue
 			}
 			rule := m.policy.Rules[term.ruleIndex]
-			rank := severityRank(rule.Severity)
-			if rank < bestRank || rank == bestRank && term.runeLen <= bestLength {
+			if !ruleMatchesContext(normalized, rule) {
+				continue
+			}
+			actionRank := ruleActionRank(rule.Action)
+			severity := severityRank(rule.Severity)
+			if actionRank < bestActionRank ||
+				actionRank == bestActionRank && severity < bestSeverityRank ||
+				actionRank == bestActionRank && severity == bestSeverityRank && term.runeLen <= bestLength {
 				continue
 			}
 			best = Decision{
@@ -316,14 +362,34 @@ func (m *Matcher) Match(text string) Decision {
 				RuleID:        rule.ID,
 				Category:      rule.Category,
 				Severity:      rule.Severity,
+				Action:        rule.Action,
 				MatchedTerm:   term.term,
 				PolicyVersion: m.policy.Version,
 			}
-			bestRank = rank
+			bestActionRank = actionRank
+			bestSeverityRank = severity
 			bestLength = term.runeLen
 		}
 	}
 	return best
+}
+
+func ruleMatchesContext(text []rune, rule Rule) bool {
+	normalized := string(text)
+	for _, excluded := range rule.ExcludeAny {
+		if strings.Contains(normalized, excluded) {
+			return false
+		}
+	}
+	if len(rule.RequireAny) == 0 {
+		return true
+	}
+	for _, required := range rule.RequireAny {
+		if strings.Contains(normalized, required) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Matcher) hasCandidate(normalized string) bool {
@@ -412,4 +478,40 @@ func (m *Matcher) KeywordCount() int {
 		return 0
 	}
 	return m.keywordCount
+}
+
+// Policy returns a detached copy of the active source policy.
+func (m *Matcher) Policy() Policy {
+	if m == nil {
+		return Policy{}
+	}
+	policy := m.policy
+	policy.GlobalAllowlist = append([]string(nil), m.policy.GlobalAllowlist...)
+	policy.Rules = make([]Rule, len(m.policy.Rules))
+	for index, rule := range m.policy.Rules {
+		policy.Rules[index] = rule
+		policy.Rules[index].Keywords = append([]string(nil), rule.Keywords...)
+		policy.Rules[index].RequireAny = append([]string(nil), rule.RequireAny...)
+		policy.Rules[index].ExcludeAny = append([]string(nil), rule.ExcludeAny...)
+		policy.Rules[index].Allowlist = append([]string(nil), rule.Allowlist...)
+	}
+	return policy
+}
+
+// RuleActionCounts returns active block, observe, and disabled rule counts.
+func (m *Matcher) RuleActionCounts() (block, observe, disabled int) {
+	if m == nil {
+		return 0, 0, 0
+	}
+	for _, rule := range m.policy.Rules {
+		switch {
+		case rule.Disabled:
+			disabled++
+		case rule.Action == RuleActionBlock:
+			block++
+		case rule.Action == RuleActionObserve:
+			observe++
+		}
+	}
+	return block, observe, disabled
 }

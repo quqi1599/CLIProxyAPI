@@ -21,6 +21,15 @@ type contentAuditAccessRequest struct {
 	Reason string `json:"reason"`
 }
 
+type contentAuditPolicyRequest struct {
+	Policy contentaudit.Policy `json:"policy"`
+	Reason string              `json:"reason"`
+}
+
+type contentAuditPolicyRollbackRequest struct {
+	Reason string `json:"reason"`
+}
+
 func (h *Handler) contentAuditService() *contentaudit.Service {
 	if h == nil {
 		return nil
@@ -38,6 +47,66 @@ func (h *Handler) GetContentAuditStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, service.Status())
+}
+
+// GetContentAuditPolicy returns the active managed policy and rollback history.
+func (h *Handler) GetContentAuditPolicy(c *gin.Context) {
+	service := h.contentAuditService()
+	if service == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content audit service is unavailable"})
+		return
+	}
+	document, err := service.CurrentPolicy(c.Request.Context())
+	if err != nil {
+		writeContentAuditManagementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, document)
+}
+
+// UpdateContentAuditPolicy validates, persists, and hot-reloads a managed policy.
+func (h *Handler) UpdateContentAuditPolicy(c *gin.Context) {
+	service := h.contentAuditService()
+	if service == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content audit service is unavailable"})
+		return
+	}
+	var request contentAuditPolicyRequest
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &request); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	document, err := service.ApplyPolicy(c.Request.Context(), request.Policy, request.Reason, c.ClientIP())
+	if err != nil {
+		writeContentAuditManagementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, document)
+}
+
+// RollbackContentAuditPolicy activates a prior policy snapshot as a new revision.
+func (h *Handler) RollbackContentAuditPolicy(c *gin.Context) {
+	service := h.contentAuditService()
+	if service == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content audit service is unavailable"})
+		return
+	}
+	versionID, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || versionID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid content audit policy version"})
+		return
+	}
+	var request contentAuditPolicyRollbackRequest
+	if err = decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &request); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	document, err := service.RollbackPolicy(c.Request.Context(), versionID, request.Reason, c.ClientIP())
+	if err != nil {
+		writeContentAuditManagementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, document)
 }
 
 // ListContentAuditEvents returns metadata only; raw prompts are never included.

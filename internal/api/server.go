@@ -678,6 +678,9 @@ func (s *Server) registerManagementRoutes() {
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/content-audit/status", s.mgmt.GetContentAuditStatus)
+		mgmt.GET("/content-audit/policy", s.mgmt.GetContentAuditPolicy)
+		mgmt.PUT("/content-audit/policy", s.mgmt.UpdateContentAuditPolicy)
+		mgmt.POST("/content-audit/policy/rollback/:id", s.mgmt.RollbackContentAuditPolicy)
 		mgmt.GET("/content-audit/events", s.mgmt.ListContentAuditEvents)
 		mgmt.GET("/content-audit/events/:id", s.mgmt.GetContentAuditEvent)
 		mgmt.POST("/content-audit/events/:id/reveal", s.mgmt.RevealContentAuditEvidence)

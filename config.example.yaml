@@ -104,6 +104,8 @@ content-audit:
   policy-file: "content-audit-policy.yaml"
   database-path: "content-audit/audit.db"
   require-signed-identity: true
+  # Keep true for mixed block/observe policies until WebSocket frames can be inspected.
+  allow-unaudited-websocket: true
   evidence-key-id: "primary-v1"
   max-body-bytes: 33554432
   raw-retention-days: 30

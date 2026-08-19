@@ -56,6 +56,60 @@ func TestMatcherReturnsHighestSeverityThenLongestTerm(t *testing.T) {
 	}
 }
 
+func TestMatcherPrefersBlockActionAndHonorsContext(t *testing.T) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{
+			{ID: "observe", Category: "sexual", Severity: "critical", Action: RuleActionObserve, Keywords: []string{"explicit phrase"}},
+			{
+				ID:         "block",
+				Category:   "sexual",
+				Severity:   "high",
+				Action:     RuleActionBlock,
+				Keywords:   []string{"explicit phrase"},
+				RequireAny: []string{"generate story", "roleplay"},
+				ExcludeAny: []string{"academic abstract"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompilePolicy() error = %v", err)
+	}
+
+	blocked := matcher.Match("generate story with explicit phrase")
+	if !blocked.Matched || blocked.RuleID != "block" || blocked.Action != RuleActionBlock {
+		t.Fatalf("blocked Match() = %#v", blocked)
+	}
+	observed := matcher.Match("academic abstract discusses explicit phrase")
+	if !observed.Matched || observed.RuleID != "observe" || observed.Action != RuleActionObserve {
+		t.Fatalf("observed Match() = %#v", observed)
+	}
+	withoutIntent := matcher.Match("quoted explicit phrase")
+	if !withoutIntent.Matched || withoutIntent.RuleID != "observe" {
+		t.Fatalf("without-intent Match() = %#v", withoutIntent)
+	}
+	block, observe, disabled := matcher.RuleActionCounts()
+	if block != 1 || observe != 1 || disabled != 0 {
+		t.Fatalf("RuleActionCounts() = %d, %d, %d", block, observe, disabled)
+	}
+}
+
+func TestCompilePolicyRejectsInvalidAction(t *testing.T) {
+	_, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:       "invalid",
+			Category: "synthetic",
+			Severity: "high",
+			Action:   "drop",
+			Keywords: []string{"synthetic phrase"},
+		}},
+	})
+	if err == nil {
+		t.Fatal("CompilePolicy() error = nil")
+	}
+}
+
 func TestMatcherUsesEnglishTermBoundaries(t *testing.T) {
 	matcher, err := CompilePolicy(Policy{
 		Version: "test-v1",

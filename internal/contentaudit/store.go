@@ -73,6 +73,16 @@ type AccessLog struct {
 	Actor     string `json:"actor"`
 }
 
+// PolicyVersion describes one persisted policy revision without returning its YAML body.
+type PolicyVersion struct {
+	ID        int64  `json:"id"`
+	CreatedAt int64  `json:"created_at"`
+	Version   string `json:"version"`
+	Reason    string `json:"reason"`
+	Actor     string `json:"actor"`
+	Active    bool   `json:"active"`
+}
+
 // EventDetail is the metadata view returned without decrypted evidence.
 type EventDetail struct {
 	Event
@@ -208,6 +218,15 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS audit_policy_versions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at INTEGER NOT NULL,
+			version TEXT NOT NULL,
+			policy_yaml TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			actor TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_policy_versions_created_at ON audit_policy_versions(created_at DESC, id DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -215,6 +234,86 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// EnsurePolicyVersion records the boot policy once so it can be used as a rollback point.
+func (s *Store) EnsurePolicyVersion(ctx context.Context, version string, policyYAML []byte) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("content audit store is unavailable")
+	}
+	version = strings.TrimSpace(version)
+	if version == "" || len(policyYAML) == 0 {
+		return fmt.Errorf("content audit policy version and body are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO audit_policy_versions(created_at, version, policy_yaml, reason, actor)
+		SELECT ?, ?, ?, 'service startup baseline', 'system'
+		WHERE NOT EXISTS (SELECT 1 FROM audit_policy_versions WHERE version = ?)`,
+		time.Now().Unix(), version, string(policyYAML), version)
+	if err != nil {
+		return fmt.Errorf("record content audit policy baseline: %w", err)
+	}
+	return nil
+}
+
+// RecordPolicyVersion appends one operator-managed policy revision.
+func (s *Store) RecordPolicyVersion(ctx context.Context, version string, policyYAML []byte, reason, actor string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("content audit store is unavailable")
+	}
+	version = strings.TrimSpace(version)
+	reason = strings.TrimSpace(reason)
+	actor = strings.TrimSpace(actor)
+	if version == "" || len(policyYAML) == 0 || len([]rune(reason)) < 4 {
+		return fmt.Errorf("content audit policy version, body, and a reason of at least four characters are required")
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO audit_policy_versions(created_at, version, policy_yaml, reason, actor)
+		VALUES (?, ?, ?, ?, ?)`, time.Now().Unix(), version, string(policyYAML), reason, actor); err != nil {
+		return fmt.Errorf("record content audit policy version: %w", err)
+	}
+	return nil
+}
+
+// ListPolicyVersions returns recent policy metadata for rollback selection.
+func (s *Store) ListPolicyVersions(ctx context.Context, activeVersion string, limit int) ([]PolicyVersion, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("content audit store is unavailable")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, created_at, version, reason, actor
+		FROM audit_policy_versions ORDER BY created_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list content audit policy versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	versions := make([]PolicyVersion, 0, limit)
+	for rows.Next() {
+		var version PolicyVersion
+		if err = rows.Scan(&version.ID, &version.CreatedAt, &version.Version, &version.Reason, &version.Actor); err != nil {
+			return nil, fmt.Errorf("scan content audit policy version: %w", err)
+		}
+		version.Active = version.Version == activeVersion
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+// GetPolicyVersion returns one stored YAML policy body.
+func (s *Store) GetPolicyVersion(ctx context.Context, id int64) (PolicyVersion, []byte, error) {
+	if s == nil || s.db == nil {
+		return PolicyVersion{}, nil, fmt.Errorf("content audit store is unavailable")
+	}
+	var version PolicyVersion
+	var body string
+	err := s.db.QueryRowContext(ctx, `SELECT id, created_at, version, reason, actor, policy_yaml
+		FROM audit_policy_versions WHERE id = ?`, id).Scan(
+		&version.ID, &version.CreatedAt, &version.Version, &version.Reason, &version.Actor, &body,
+	)
+	if err != nil {
+		return PolicyVersion{}, nil, err
+	}
+	return version, []byte(body), nil
 }
 
 func (s *Store) verifyEvidenceKey(ctx context.Context, derivedKey []byte) error {
