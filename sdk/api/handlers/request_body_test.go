@@ -51,6 +51,44 @@ func TestReadRequestBodyWithLimitsBoundsIdentityAndRestoresBody(t *testing.T) {
 	}
 }
 
+func TestReadRequestBodyWithLimitsReusesDecodedBodyWithinRequest(t *testing.T) {
+	payload := []byte(`{"model":"test","input":"hello"}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	reader := &countingRequestBody{Reader: bytes.NewReader(payload)}
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Body = reader
+	c.Request.ContentLength = int64(len(payload))
+
+	first, err := ReadRequestBodyWithLimits(c, 1024, 1024)
+	if err != nil {
+		t.Fatalf("first ReadRequestBodyWithLimits() error = %v", err)
+	}
+	readsAfterFirst := reader.reads
+	second, err := ReadRequestBodyWithLimits(c, 1024, 1024)
+	if err != nil {
+		t.Fatalf("second ReadRequestBodyWithLimits() error = %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("cached body mismatch: first=%q second=%q", first, second)
+	}
+	if reader.reads != readsAfterFirst {
+		t.Fatalf("underlying body reads = %d after cached read, want %d", reader.reads, readsAfterFirst)
+	}
+}
+
+type countingRequestBody struct {
+	*bytes.Reader
+	reads int
+}
+
+func (r *countingRequestBody) Read(buffer []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(buffer)
+}
+
+func (r *countingRequestBody) Close() error { return nil }
+
 func TestNormalizeRequestBodyLimitAlwaysKeepsAHardCeiling(t *testing.T) {
 	t.Parallel()
 

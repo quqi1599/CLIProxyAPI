@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/contentaudit"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
@@ -63,6 +64,7 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginReleaseCacheMu    sync.Mutex
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	contentAudit            *contentaudit.Service
 }
 
 type configReloadSnapshot struct {
@@ -154,6 +156,16 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	}
 	h.mu.Lock()
 	h.pluginHost = host
+	h.mu.Unlock()
+}
+
+// SetContentAuditService attaches the local request audit service to Management API handlers.
+func (h *Handler) SetContentAuditService(service *contentaudit.Service) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.contentAudit = service
 	h.mu.Unlock()
 }
 

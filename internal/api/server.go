@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/contentaudit"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
@@ -65,6 +66,11 @@ var corsExposedResponseHeaders = []string{
 	"X-CPA-HOME-BUILD-DATE",
 	"X-SERVER-VERSION",
 	"X-SERVER-BUILD-DATE",
+	"X-CPA-Local-Guard",
+	"X-CPA-Local-Guard-Category",
+	"X-CPA-Audit-ID",
+	"X-CPA-Audit-Evidence-Status",
+	"X-CPA-Retryable",
 }
 
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
@@ -251,6 +257,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	// contentAudit performs pre-upstream request policy checks and stores encrypted hit evidence.
+	contentAudit *contentaudit.Service
+
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
 
@@ -372,6 +381,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.contentAudit = contentaudit.NewService(cfg.ContentAudit, configFilePath)
+	s.mgmt.SetContentAuditService(s.contentAudit)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
@@ -486,7 +497,7 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
+	v1.Use(AuthMiddleware(s.accessManager), s.contentAudit.Middleware(), s.handlers.IngressAdmissionMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -507,7 +518,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
-	openaiV1.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
+	openaiV1.Use(AuthMiddleware(s.accessManager), s.contentAudit.Middleware(), s.handlers.IngressAdmissionMiddleware())
 	{
 		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
 		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
@@ -516,7 +527,7 @@ func (s *Server) setupRoutes() {
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
+	codexDirect.Use(AuthMiddleware(s.accessManager), s.contentAudit.Middleware(), s.handlers.IngressAdmissionMiddleware())
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
@@ -526,7 +537,7 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager), s.handlers.IngressAdmissionMiddleware())
+	v1beta.Use(AuthMiddleware(s.accessManager), s.contentAudit.Middleware(), s.handlers.IngressAdmissionMiddleware())
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -666,6 +677,12 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/content-audit/status", s.mgmt.GetContentAuditStatus)
+		mgmt.GET("/content-audit/events", s.mgmt.ListContentAuditEvents)
+		mgmt.GET("/content-audit/events/:id", s.mgmt.GetContentAuditEvent)
+		mgmt.POST("/content-audit/events/:id/reveal", s.mgmt.RevealContentAuditEvidence)
+		mgmt.PATCH("/content-audit/events/:id/review", s.mgmt.ReviewContentAuditEvent)
+		mgmt.POST("/content-audit/events/:id/access", s.mgmt.RecordContentAuditAccess)
 		mgmt.GET("/custom/monitor/request-logs", s.mgmt.GetMonitorRequestLogs)
 		mgmt.GET("/custom/monitor/channel-stats", s.mgmt.GetMonitorChannelStats)
 		mgmt.GET("/custom/monitor/failure-analysis", s.mgmt.GetMonitorFailureAnalysis)
@@ -1818,6 +1835,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	applySignatureCacheConfig(oldCfg, cfg)
+	if s.contentAudit != nil {
+		s.contentAudit.Update(cfg.ContentAudit, s.configFilePath)
+	}
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)

@@ -1,0 +1,13 @@
+# Copy this file to content-audit-policy.yaml and replace the synthetic test terms
+# with the reviewed keyword library. Keep rule identifiers stable across revisions.
+version: "1"
+global-allowlist: []
+rules:
+  - id: "synthetic-high-risk-action"
+    category: "cyber_abuse"
+    severity: "high"
+    keywords:
+      - "synthetic prohibited action"
+      - "敏感测试短语"
+    allowlist:
+      - "synthetic prohibited action false-positive fixture"

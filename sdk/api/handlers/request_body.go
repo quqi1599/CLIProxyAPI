@@ -227,6 +227,12 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 	maxDecodedBytes := normalizeRequestBodyLimit(decision.maxDecodedBytes)
 	decision.maxWireBytes = maxWireBytes
 	decision.maxDecodedBytes = maxDecodedBytes
+	if cached, ok := decodedRequestBodyFromContext(c); ok {
+		if maxWireBytes > 0 && cached.wireBytes > maxWireBytes {
+			return nil, NewRequestBodyLimitError(maxWireBytes, false)
+		}
+		return enforceRequestBodyLimit(cached.body, maxDecodedBytes, true)
+	}
 	wireBytes := max(c.Request.ContentLength, 0)
 	decodedBytes := unknownPayloadBodyBytes
 	if identityContentEncoding(c.Request.Header.Get("Content-Encoding")) && c.Request.ContentLength >= 0 {
@@ -268,6 +274,7 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 		if errCache := cacheRequestComplexity(c, body, int64(len(raw))); errCache != nil {
 			return nil, errCache
 		}
+		cacheDecodedRequestBody(c, body, int64(len(raw)))
 		return body, nil
 	}
 
@@ -282,6 +289,7 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 			if errCache := cacheRequestComplexity(c, body, int64(len(raw))); errCache != nil {
 				return nil, errCache
 			}
+			cacheDecodedRequestBody(c, body, int64(len(raw)))
 			return body, nil
 		}
 		return nil, err
@@ -291,10 +299,37 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 	if errCache := cacheRequestComplexity(c, decoded, int64(len(raw))); errCache != nil {
 		return nil, errCache
 	}
+	cacheDecodedRequestBody(c, body, int64(len(raw)))
 	return body, nil
 }
 
 const requestComplexityGinKey = "cliproxy_request_complexity"
+
+const decodedRequestBodyGinKey = "cliproxy_decoded_request_body"
+
+type cachedDecodedRequestBody struct {
+	body      []byte
+	wireBytes int64
+}
+
+func cacheDecodedRequestBody(c *gin.Context, body []byte, wireBytes int64) {
+	if c == nil {
+		return
+	}
+	c.Set(decodedRequestBodyGinKey, cachedDecodedRequestBody{body: body, wireBytes: wireBytes})
+}
+
+func decodedRequestBodyFromContext(c *gin.Context) (cachedDecodedRequestBody, bool) {
+	if c == nil {
+		return cachedDecodedRequestBody{}, false
+	}
+	value, exists := c.Get(decodedRequestBodyGinKey)
+	if !exists {
+		return cachedDecodedRequestBody{}, false
+	}
+	cached, ok := value.(cachedDecodedRequestBody)
+	return cached, ok
+}
 
 type cachedRequestComplexity struct {
 	vector complexityVector

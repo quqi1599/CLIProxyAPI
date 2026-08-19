@@ -81,6 +81,9 @@ type Config struct {
 	// UsageRetentionDays controls how many days of persisted usage records are retained.
 	UsageRetentionDays int `yaml:"usage-retention-days" json:"usage-retention-days"`
 
+	// ContentAudit controls the local pre-upstream content safety audit.
+	ContentAudit ContentAuditConfig `yaml:"content-audit" json:"content-audit"`
+
 	// RedisUsageQueueRetentionSeconds controls how long usage queue items are retained
 	// in memory for Management API consumers.
 	// Default: 60. Max: 3600.
@@ -193,6 +196,22 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// ContentAuditConfig controls request-time policy matching and encrypted hit evidence.
+// Secret fields should normally be supplied through the matching environment variables.
+type ContentAuditConfig struct {
+	Enabled               bool   `yaml:"enabled" json:"enabled"`
+	PolicyFile            string `yaml:"policy-file" json:"policy-file"`
+	DatabasePath          string `yaml:"database-path" json:"database-path"`
+	RequireSignedIdentity bool   `yaml:"require-signed-identity" json:"require-signed-identity"`
+	IdentitySecret        string `yaml:"identity-secret,omitempty" json:"-"`
+	EvidenceKey           string `yaml:"evidence-key,omitempty" json:"-"`
+	EvidenceKeyID         string `yaml:"evidence-key-id" json:"evidence-key-id"`
+	EvidenceViewSecret    string `yaml:"evidence-view-secret,omitempty" json:"-"`
+	MaxBodyBytes          int64  `yaml:"max-body-bytes" json:"max-body-bytes"`
+	RawRetentionDays      int    `yaml:"raw-retention-days" json:"raw-retention-days"`
+	MetadataRetentionDays int    `yaml:"metadata-retention-days" json:"metadata-retention-days"`
 }
 
 // EmptyResponseRetryConfig controls targeted detection of upstream responses

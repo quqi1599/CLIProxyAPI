@@ -1,0 +1,167 @@
+package contentaudit
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+)
+
+func TestMiddlewareBlocksBeforeNextAndPersistsCustomerEvidence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(identitySecretEnv, "identity-shared-secret")
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	policy := `version: test-v1
+rules:
+  - id: synthetic-rule
+    category: cyber_abuse
+    severity: high
+    keywords: ["sensitive synthetic phrase"]
+`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:               true,
+		PolicyFile:            policyPath,
+		DatabasePath:          filepath.Join(tempDir, "audit.db"),
+		RequireSignedIdentity: true,
+		EvidenceKeyID:         "test-key",
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	if state == nil || state.initErr != nil {
+		t.Fatalf("service state error = %v", state.initErr)
+	}
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+
+	body := `{"model":"gpt-test","stream":true,"input":"sensitive synthetic phrase"}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	signAuditTestRequest(request, time.Now(), "42", "73", "production-token", "req-1", "gpt-test", "identity-shared-secret")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if nextCalls != 0 {
+		t.Fatalf("next handler calls = %d, want 0", nextCalls)
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte("cpa_content_audit_blocked")) {
+		t.Fatalf("response body = %s", response.Body.String())
+	}
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if list.Total != 1 || list.Items[0].UserID != 42 || list.Items[0].TokenID != 73 || list.Items[0].TokenName != "production-token" || list.Items[0].UpstreamSent {
+		t.Fatalf("stored event = %#v", list)
+	}
+	if _, err = service.Reveal(t.Context(), list.Items[0].ID, "investigate false positive", "127.0.0.1", "wrong-key"); err == nil {
+		t.Fatal("Reveal() wrong key error = nil")
+	}
+	evidence, err := service.Reveal(t.Context(), list.Items[0].ID, "investigate false positive", "127.0.0.1", "evidence-view-secret-0123456789")
+	if err != nil || !bytes.Contains(evidence, []byte("sensitive synthetic phrase")) {
+		t.Fatalf("Reveal() evidence=%s err=%v", evidence, err)
+	}
+}
+
+func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(identitySecretEnv, "identity-shared-secret")
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{Enabled: true, PolicyFile: policyPath, DatabasePath: filepath.Join(tempDir, "audit.db"), EvidenceKeyID: "test-key"}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || list.Total != 0 {
+		t.Fatalf("List() = %#v err=%v", list, err)
+	}
+}
+
+func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(identitySecretEnv, "identity-shared-secret")
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	t.Setenv(evidenceViewSecretEnv, "evidence-view-secret-0123456789")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{Enabled: true, PolicyFile: policyPath, DatabasePath: filepath.Join(tempDir, "audit.db"), EvidenceKeyID: "test-key"}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.GET("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusSwitchingProtocols)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Upgrade", "websocket")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || nextCalls != 0 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+}
+
+func signAuditTestRequest(request *http.Request, now time.Time, userID, tokenID, tokenName, requestID, model, secret string) {
+	timestamp := strconv.FormatInt(now.Unix(), 10)
+	request.Header.Set(auditHeaderVersion, "1")
+	request.Header.Set(auditHeaderUserID, userID)
+	request.Header.Set(auditHeaderTokenID, tokenID)
+	request.Header.Set(auditHeaderTokenName, tokenName)
+	request.Header.Set(auditHeaderRequestID, requestID)
+	request.Header.Set(auditHeaderTimestamp, timestamp)
+	request.Header.Set(auditHeaderModel, model)
+	canonical := identityCanonicalValues("1", timestamp, requestID, userID, tokenID, tokenName, request.Method, request.URL.EscapedPath(), model, "0")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(canonical))
+	request.Header.Set(auditHeaderSignature, hex.EncodeToString(mac.Sum(nil)))
+}

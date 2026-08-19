@@ -94,6 +94,19 @@ usage-statistics-enabled: false
 # Number of days to retain persisted monitor/usage records.
 usage-retention-days: 30
 
+# Local request content audit. Disabled until a reviewed policy and three independent secrets are configured.
+# Recommended secrets are environment variables rather than values in this YAML:
+#   CPA_AUDIT_IDENTITY_SECRET, CPA_AUDIT_EVIDENCE_KEY, CPA_AUDIT_EVIDENCE_VIEW_SECRET
+content-audit:
+  enabled: false
+  policy-file: "content-audit-policy.yaml"
+  database-path: "content-audit/audit.db"
+  require-signed-identity: true
+  evidence-key-id: "primary-v1"
+  max-body-bytes: 33554432
+  raw-retention-days: 30
+  metadata-retention-days: 180
+
 # How long (in seconds) usage queue items are retained in memory for the Management API.
 # The local Redis RESP usage output is disabled.
 # Default: 60. Max: 3600.
