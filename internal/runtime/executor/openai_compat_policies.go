@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -20,6 +21,7 @@ const (
 	openAICompatQwen38FormalPolicyID         = "openai_compat.qwen38.formal_hybrid_thinking"
 	openAICompatQwen38PreviewPolicyID        = "openai_compat.qwen38.preview_thinking_only"
 	openAICompatXiaomiPolicyID               = "openai_compat.xiaomi.request_quirks"
+	openAICompatZhipuGLM53PolicyID           = "openai_compat.zhipu.glm53_forced_thinking"
 	openAICompatPostConfigRevalidatePolicyID = "openai_compat.post_config_revalidate"
 	openAICompatPostConfigRevalidateStage    = "compat/" + string(compat.PostConfigRevalidate)
 	openAICompatProviderPreQuirkStage        = "request_plan.openai_compat.provider_pre_quirk_scrub"
@@ -40,6 +42,7 @@ const (
 	openAICompatXiaomiReasoningDowngrade    = "openai_compat.xiaomi.reasoning_normalized"
 	openAICompatXiaomiTokenDowngrade        = "openai_compat.xiaomi.token_limits_normalized"
 	openAICompatXiaomiToolSchemaDowngrade   = "openai_compat.xiaomi.tool_schema_normalized"
+	openAICompatZhipuGLM53ThinkingDowngrade = "openai_compat.zhipu.glm53.thinking_normalized"
 )
 
 var (
@@ -51,6 +54,7 @@ var (
 		openAICompatQwen38FormalPolicy(),
 		openAICompatQwen38PreviewPolicy(),
 		openAICompatXiaomiPolicy(),
+		openAICompatZhipuGLM53Policy(),
 	)
 	openAICompatPolicyPipeline                                        = compat.NewPipeline(openAICompatPolicyRegistry)
 	openAICompatPostConfigRegistry, openAICompatPostConfigRegistryErr = compat.NewRegistry(
@@ -236,6 +240,7 @@ func openAICompatPostConfigRevalidatePolicy() compat.Policy {
 			openAICompatXiaomiReasoningDowngrade,
 			openAICompatXiaomiTokenDowngrade,
 			openAICompatXiaomiToolSchemaDowngrade,
+			openAICompatZhipuGLM53ThinkingDowngrade,
 		},
 		Apply: applyOpenAICompatPostConfigRevalidatePolicy,
 	}
@@ -268,6 +273,8 @@ func openAICompatPostConfigDowngrades(ctx context.Context, input, output []byte,
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatQwen38PreviewPolicyDowngrades(ctx, input, output))
 	case "xiaomi":
 		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatXiaomiPolicyDowngrades(input, output))
+	case "zhipu":
+		downgrades = appendOpenAICompatDowngrades(downgrades, openAICompatZhipuGLM53PolicyDowngrades(input, output, openAICompatPolicyModel(ctx, input)))
 	}
 	return downgrades
 }
@@ -586,6 +593,44 @@ func openAICompatXiaomiPolicy() compat.Policy {
 	}
 }
 
+func openAICompatZhipuGLM53Policy() compat.Policy {
+	return compat.Policy{
+		ID:    openAICompatZhipuGLM53PolicyID,
+		Owner: "runtime/executor",
+		Match: compat.MatchSpec{
+			ProviderFamily: "openai-compatibility",
+			CompatKind:     "zhipu",
+			ModelPattern:   "glm-5.3",
+		},
+		Phase:    compat.ProviderQuirkPatch,
+		Priority: 100,
+		Cost: compat.CostContract{
+			Complexity:         "O(bytes)",
+			MaxExpansionBytes:  internalpayload.DefaultMaxExpansionBytes,
+			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
+			MayCopyLargeFields: true,
+		},
+		RemovalCondition: "Remove when GLM-5.3 accepts disabled thinking and the full OpenAI reasoning effort vocabulary.",
+		Lifecycle: compat.LifecycleMetadata{
+			IntroducedVersion: "release:2026-08-19",
+			Fixture:           "internal/runtime/executor/testdata/compat/zhipu_glm53_forced_thinking.json",
+			UpstreamEvidence:  "GLM-5.3 forces thinking on and accepts only low, high, or max reasoning_effort values; Coding Plan maps common compatibility values into those levels.",
+			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
+			ReviewDate:        "2026-11-19",
+		},
+		MutatedFields: []string{
+			"body.enable_thinking",
+			"body.output_config",
+			"body.reasoning",
+			"body.reasoning_effort",
+			"body.thinking",
+			"body.thinking_budget",
+		},
+		DowngradeIDs: []string{openAICompatZhipuGLM53ThinkingDowngrade},
+		Apply:        applyOpenAICompatZhipuGLM53Policy,
+	}
+}
+
 func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
 	state := openAICompatPolicyState(ctx, input)
 	output := input
@@ -654,6 +699,15 @@ func applyOpenAICompatXiaomiPolicy(ctx context.Context, input []byte) (compat.Tr
 	return compat.TransformResult{
 		Payload:    output,
 		Downgrades: openAICompatXiaomiPolicyDowngrades(input, output),
+	}, nil
+}
+
+func applyOpenAICompatZhipuGLM53Policy(ctx context.Context, input []byte) (compat.TransformResult, error) {
+	model := openAICompatPolicyModel(ctx, input)
+	output := normalizeZhipuGLM53Thinking(input, model)
+	return compat.TransformResult{
+		Payload:    output,
+		Downgrades: openAICompatZhipuGLM53PolicyDowngrades(input, output, model),
 	}, nil
 }
 
@@ -765,6 +819,13 @@ func openAICompatXiaomiPolicyDowngrades(input, output []byte) []string {
 		downgrades = append(downgrades, openAICompatXiaomiToolSchemaDowngrade)
 	}
 	return downgrades
+}
+
+func openAICompatZhipuGLM53PolicyDowngrades(input, output []byte, model string) []string {
+	if !isZhipuGLM53Model(model) || !zhipuGLM53ThinkingControlsNeedNormalization(input) || bytes.Equal(input, output) {
+		return nil
+	}
+	return []string{openAICompatZhipuGLM53ThinkingDowngrade}
 }
 
 func openAICompatJSONValueChanged(input, output []byte, path string) bool {

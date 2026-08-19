@@ -88,8 +88,8 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Model mapping to specify which Claude Code model to use
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
-	// Max tokens configuration with fallback to default value
-	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
+	// Prefer the legacy field when both spellings are present.
+	if maxTokens := firstExisting(root.Get("max_tokens"), root.Get("max_completion_tokens")); maxTokens.Exists() {
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
@@ -462,4 +462,13 @@ func convertOpenAIToolResultContent(content gjson.Result) (string, bool) {
 	}
 
 	return content.Raw, false
+}
+
+func firstExisting(values ...gjson.Result) gjson.Result {
+	for _, value := range values {
+		if value.Exists() {
+			return value
+		}
+	}
+	return gjson.Result{}
 }

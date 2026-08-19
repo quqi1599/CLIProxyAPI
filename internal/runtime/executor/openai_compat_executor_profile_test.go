@@ -434,6 +434,7 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 		{model: "vendor/mimo-v2.5(high)", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "kimi-k3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.2", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "glm-5.3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "deepseek-v4-pro[1m]", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "deepseek-v4-flash(high)", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 	}
@@ -448,7 +449,7 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 }
 
 func TestSanitizeOpenAICompatHTTPRequestBodyAllowsExtendedToolHistoryForLongContextModels(t *testing.T) {
-	for _, model := range []string{"mimo-v2.5", "mimo-v2.5-pro", "kimi-k3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"} {
+	for _, model := range []string{"mimo-v2.5", "mimo-v2.5-pro", "kimi-k3", "glm-5.2", "glm-5.3", "deepseek-v4-pro", "deepseek-v4-flash"} {
 		t.Run(model, func(t *testing.T) {
 			body := buildOpenAICompatToolHistoryBody(model, 305, strings.Repeat("x", 35*1024))
 			req := httptest.NewRequest(http.MethodPost, "https://example.test/v1/chat/completions", strings.NewReader(body))

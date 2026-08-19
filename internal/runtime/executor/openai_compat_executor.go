@@ -358,6 +358,9 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if req.URL != nil {
 		path = req.URL.Path
 	}
+	if errValidate := validateZhipuGLM53PreservedThinkingHistory(body, profile.Kind, baseURL, model); errValidate != nil {
+		return errValidate
+	}
 	if errReject := rejectDeepSeekUnsupportedResponsesTools(req.Context(), body, profile, model, path, path, openAICompatSourceFormatForPath(path)); errReject != nil {
 		return errReject
 	}
@@ -430,6 +433,7 @@ func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOut
 	if strings.HasPrefix(baseModel, "mimo-v2.5") ||
 		strings.HasPrefix(baseModel, "kimi-k3") ||
 		strings.HasPrefix(baseModel, "glm-5.2") ||
+		strings.HasPrefix(baseModel, "glm-5.3") ||
 		strings.HasPrefix(baseModel, "deepseek-v4-pro") ||
 		strings.HasPrefix(baseModel, "deepseek-v4-flash") {
 		return largeOpenAICompatLongContextToolHistoryPayloadBytes,
@@ -995,8 +999,16 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerResolveStarted := time.Now()
 	providerResolveInput := body
+	var providerResolveDowngrades []string
 	if plan.endpoint != "/completions" {
 		thinkingProviderKey := profile.KindOrFallback(auth)
+		if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
+			input := body
+			body = normalizeZhipuGLM53Thinking(body, baseModel)
+			if zhipuGLM53ThinkingControlsNeedNormalization(input) && !bytes.Equal(input, body) {
+				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatZhipuGLM53ThinkingDowngrade)
+			}
+		}
 		body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
 		body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey)
 		if err != nil {
@@ -1010,7 +1022,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		body,
 		providerResolveStarted,
 		[]string{openAICompatProviderResolvePolicy},
-		nil,
+		providerResolveDowngrades,
 		internalpayload.AmplificationOverride{},
 	); err != nil {
 		return plan, err
@@ -1018,6 +1030,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 
 	historyStarted := time.Now()
 	historyInput := body
+	if err = validateZhipuGLM53PreservedThinkingHistory(body, profile.Kind, baseURL, baseModel); err != nil {
+		return plan, err
+	}
 	var xiaomiHistoryDowngraded bool
 	body, xiaomiHistoryDowngraded, err = normalizeXiaomiMimoThinkingHistory(body, profile.Kind, baseModel)
 	if err != nil {
@@ -1855,6 +1870,9 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 
 	thinkingProviderKey := profile.KindOrFallback(auth)
 	if openAICompatCountTokensNeedsThinking(req, opts, translated, baseModel) {
+		if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
+			translated = normalizeZhipuGLM53Thinking(translated, modelForCounting)
+		}
 		translated = normalizeOpenAICompatRouteReasoningEffort(translated, opts, modelForCounting, thinkingProviderKey, baseURL, profile.Kind)
 		translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), thinkingProviderKey)
 		if err != nil {

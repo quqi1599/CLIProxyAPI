@@ -35,6 +35,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	}
 
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "truncation")
+	rawJSON = stripUnsupportedCodexPromptCacheFields(rawJSON)
 	rawJSON = applyResponsesCompactionCompatibility(rawJSON)
 	rawJSON = normalizeResponsesStructuredOutputSchema(rawJSON)
 
@@ -66,6 +67,34 @@ func normalizeResponsesStructuredOutputSchema(rawJSON []byte) []byte {
 		return rawJSON
 	}
 	return updated
+}
+
+func stripUnsupportedCodexPromptCacheFields(rawJSON []byte) []byte {
+	result, errDelete := sjson.DeleteBytes(rawJSON, "prompt_cache_options")
+	if errDelete != nil {
+		result = rawJSON
+	}
+
+	input := gjson.GetBytes(result, "input")
+	if !input.IsArray() {
+		return result
+	}
+	for inputIndex, item := range input.Array() {
+		content := item.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for contentIndex, part := range content.Array() {
+			if !part.Get("prompt_cache_breakpoint").Exists() {
+				continue
+			}
+			path := fmt.Sprintf("input.%d.content.%d.prompt_cache_breakpoint", inputIndex, contentIndex)
+			if updated, errNestedDelete := sjson.DeleteBytes(result, path); errNestedDelete == nil {
+				result = updated
+			}
+		}
+	}
+	return result
 }
 
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction

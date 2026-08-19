@@ -1343,6 +1343,32 @@ func TestSessionAffinitySelector_MultiModelSession(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySelector_ThinkingSuffixesShareBinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-b"}, {ID: "auth-a"}}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_suffix-binding-test"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	first, err := selector.Pick(context.Background(), "provider", "test-model(high)", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() high suffix error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "provider", "test-model(low)", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() low suffix error = %v", err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("thinking suffixes selected different auths: high=%q low=%q", first.ID, second.ID)
+	}
+}
+
 func TestExtractSessionID_MultimodalContent(t *testing.T) {
 	t.Parallel()
 

@@ -1847,7 +1847,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	modelKey := canonicalModelKey(model)
+	cacheKey := provider + "::" + primaryID + "::" + modelKey
 	deferBinding := gptRoute && requestAttemptTraceFromContext(ctx) != nil
 
 	pickFallback := func(excludedAuthID, excludedChannelKey string) (*Auth, error) {
@@ -1932,7 +1933,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+		fallbackKey := provider + "::" + fallbackID + "::" + modelKey
 		if cachedAuthID, cachedChannelKey, ok := s.cache.GetBinding(fallbackKey); ok {
 			auth, keep, errPick := pickBound(cachedAuthID, cachedChannelKey)
 			if errPick != nil {

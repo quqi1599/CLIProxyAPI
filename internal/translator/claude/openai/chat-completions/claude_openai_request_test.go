@@ -6,6 +6,28 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIRequestToClaude_MaxTokenFieldCompatibility(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int64
+	}{
+		{name: "legacy field", body: `{"max_tokens":123,"messages":[]}`, want: 123},
+		{name: "modern field", body: `{"max_completion_tokens":456,"messages":[]}`, want: 456},
+		{name: "legacy field wins", body: `{"max_tokens":123,"max_completion_tokens":456,"messages":[]}`, want: 123},
+		{name: "default", body: `{"messages":[]}`, want: 32000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", []byte(tt.body), false)
+			if got := gjson.GetBytes(output, "max_tokens").Int(); got != tt.want {
+				t.Fatalf("max_tokens = %d, want %d: %s", got, tt.want, output)
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

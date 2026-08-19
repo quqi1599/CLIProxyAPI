@@ -223,6 +223,37 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_StripsUnsupportedPromptCacheFields(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.4",
+		"prompt_cache_options":{"retention":"24h"},
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"input_text","text":"hello","prompt_cache_breakpoint":{"type":"ephemeral"},"keep":"yes"},
+					{"type":"input_text","text":"world"}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+	if gjson.GetBytes(output, "prompt_cache_options").Exists() {
+		t.Fatalf("prompt_cache_options reached Codex upstream: %s", output)
+	}
+	if gjson.GetBytes(output, "input.0.content.0.prompt_cache_breakpoint").Exists() {
+		t.Fatalf("nested prompt_cache_breakpoint reached Codex upstream: %s", output)
+	}
+	if got := gjson.GetBytes(output, "input.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("input text = %q, want hello: %s", got, output)
+	}
+	if got := gjson.GetBytes(output, "input.0.content.0.keep").String(); got != "yes" {
+		t.Fatalf("unrelated content field = %q, want yes: %s", got, output)
+	}
+}
+
 // TestConvertSystemRoleToDeveloper_AssistantRole tests that assistant role is preserved
 func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	inputJSON := []byte(`{

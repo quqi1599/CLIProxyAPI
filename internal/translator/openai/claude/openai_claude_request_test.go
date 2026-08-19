@@ -10,6 +10,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertClaudeRequestToOpenAI_KeepsSingleStopAsArray(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"max_tokens":1024,
+		"stop_sequences":["END"],
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("openai-model", input, false)
+	stop := gjson.GetBytes(output, "stop")
+	if !stop.IsArray() {
+		t.Fatalf("stop must remain an array: %s", output)
+	}
+	if values := stop.Array(); len(values) != 1 || values[0].String() != "END" {
+		t.Fatalf("stop = %s, want [END]", stop.Raw)
+	}
+}
+
 // TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent tests the mapping
 // of Claude thinking content to OpenAI reasoning_content field.
 func TestConvertClaudeRequestToOpenAI_ThinkingToReasoningContent(t *testing.T) {

@@ -28,6 +28,7 @@ import (
 )
 
 const kimiRequestPlanTransformStage = "request_plan.kimi"
+const openAICompatReasoningUnavailable = "[reasoning unavailable]"
 
 // KimiExecutor is a stateless executor for Kimi API using OpenAI-compatible chat completions.
 type KimiExecutor struct {
@@ -1036,7 +1037,7 @@ func normalizeOpenAICompatToolMessageLinksWithReasoningRepair(body []byte, logSc
 			reasoning := msg.Get("reasoning_content")
 			if reasoning.Exists() {
 				reasoningText := reasoning.String()
-				if strings.TrimSpace(reasoningText) != "" {
+				if isUsableOpenAICompatReasoning(reasoningText) {
 					latestReasoning = reasoningText
 					hasLatestReasoning = true
 				}
@@ -1047,7 +1048,7 @@ func normalizeOpenAICompatToolMessageLinksWithReasoningRepair(body []byte, logSc
 				continue
 			}
 
-			if repairMissingReasoning && (!reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "") {
+			if repairMissingReasoning && (!reasoning.Exists() || !isUsableOpenAICompatReasoning(reasoning.String())) {
 				reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
 				next, err := sjson.SetBytes(msgRaw, "reasoning_content", reasoningText)
 				if err != nil {
@@ -1175,6 +1176,11 @@ func hasOpenAICompatAssistantReasoning(msg gjson.Result) bool {
 	return reasoning.Exists() && strings.TrimSpace(reasoning.String()) != ""
 }
 
+func isUsableOpenAICompatReasoning(reasoning string) bool {
+	trimmed := strings.TrimSpace(reasoning)
+	return trimmed != "" && trimmed != openAICompatReasoningUnavailable
+}
+
 func isOpenAICompatAssistantContentEmpty(content gjson.Result) bool {
 	if !content.Exists() || content.Type == gjson.Null {
 		return true
@@ -1213,7 +1219,7 @@ func isOpenAICompatAssistantContentPartEmpty(part gjson.Result) bool {
 }
 
 func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string) string {
-	if hasLatest && strings.TrimSpace(latest) != "" {
+	if hasLatest && isUsableOpenAICompatReasoning(latest) {
 		return latest
 	}
 
@@ -1237,7 +1243,7 @@ func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string)
 		}
 	}
 
-	return "[reasoning unavailable]"
+	return openAICompatReasoningUnavailable
 }
 
 // Refresh refreshes the Kimi token using the refresh token.

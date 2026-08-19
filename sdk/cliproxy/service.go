@@ -2639,6 +2639,16 @@ func openAICompatibilityThinkingSupport(compat *config.OpenAICompatibility, mode
 		support = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 	}
 
+	if isZhipuGLM53OpenAICompatibility(compat, model) {
+		clone := *support
+		clone.Min = 0
+		clone.Max = 0
+		clone.ZeroAllowed = false
+		clone.DynamicAllowed = false
+		clone.Levels = []string{"low", "high", "max"}
+		return &clone
+	}
+
 	if !isDeepSeekOfficialOpenAICompatibility(compat, model) {
 		return support
 	}
@@ -2646,6 +2656,17 @@ func openAICompatibilityThinkingSupport(compat *config.OpenAICompatibility, mode
 	clone := *support
 	clone.Levels = []string{"low", "medium", "high", "xhigh", "max"}
 	return &clone
+}
+
+func isZhipuGLM53OpenAICompatibility(compat *config.OpenAICompatibility, model config.OpenAICompatibilityModel) bool {
+	if compat == nil {
+		return false
+	}
+	kind := internalconfig.NormalizeOpenAICompatibilityKind(compat.Kind)
+	if kind == "" {
+		kind = internalconfig.InferCompatKindFromBaseURL(compat.BaseURL)
+	}
+	return kind == "zhipu" && strings.EqualFold(strings.TrimSpace(model.Name), "glm-5.3")
 }
 
 func isDeepSeekOfficialOpenAICompatibility(compat *config.OpenAICompatibility, model config.OpenAICompatibilityModel) bool {

@@ -201,60 +201,41 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Peek at the first chunk
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				// Err channel closed cleanly; wait for data channel.
-				errChan = nil
-				continue
-			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				// Closed without data
-				if alt == "" {
-					setSSEHeaders()
-				}
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				flusher.Flush()
-				cliCancel(nil)
-				return
-			}
+	chunk, errMsg, streamDone, errBootstrap := handlers.AwaitStreamBootstrap(c.Request.Context(), dataChan, errChan)
+	if errBootstrap != nil {
+		cliCancel(errBootstrap)
+		return
+	}
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	if streamDone {
+		if alt == "" {
+			setSSEHeaders()
+		}
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		cliCancel(nil)
+		return
+	}
 
-			// Success! Set headers.
-			if alt == "" {
-				setSSEHeaders()
-			}
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-
-			// Write first chunk
-			handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
-				if alt == "" {
-					_, _ = w.Write([]byte("data: "))
-					_, _ = w.Write(chunk)
-					_, _ = w.Write([]byte("\n\n"))
-					return
-				}
-				_, _ = w.Write(chunk)
-			})
-
-			// Continue
-			h.forwardGeminiStream(cliCtx, c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+	if alt == "" {
+		setSSEHeaders()
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	handlers.WriteStreamChunkAndFlush(cliCtx, c.Writer, flusher, func(w handlers.StreamBodyWriter) {
+		if alt == "" {
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(chunk)
+			_, _ = w.Write([]byte("\n\n"))
 			return
 		}
-	}
+		_, _ = w.Write(chunk)
+	})
+
+	h.forwardGeminiStream(cliCtx, c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
 }
 
 // handleCountTokens handles token counting requests for Gemini models.

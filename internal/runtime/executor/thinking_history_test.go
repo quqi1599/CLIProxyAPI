@@ -435,6 +435,56 @@ func TestNormalizeOpenAIThinkingHistoryMiMoPreservesOnlyRealReasoning(t *testing
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryGLM53PreservesOnlyRealReasoning(t *testing.T) {
+	body := []byte(`{
+		"reasoning_effort":"max",
+		"thinking":{"type":"enabled","clear_thinking":true},
+		"messages":[
+			{"role":"assistant","content":"tool answer","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		]
+	}`)
+
+	out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReport(body, "openai", "provider/glm-5.3(max)")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModelWithReport() error = %v", err)
+	}
+	if changed || downgraded || !bytes.Equal(out, body) {
+		t.Fatalf("GLM-5.3 history should remain unchanged: changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if report.PatchedCount != 0 || report.SyntheticBytes != 0 || gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("GLM-5.3 history was synthesized: report=%+v body=%s", report, out)
+	}
+}
+
+func TestValidateZhipuGLM53PreservedThinkingHistory(t *testing.T) {
+	body := []byte(`{
+		"thinking":{"type":"enabled"},
+		"reasoning_effort":"max",
+		"messages":[
+			{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		]
+	}`)
+
+	err := validateZhipuGLM53PreservedThinkingHistory(body, "zhipu", "https://api.z.ai/api/coding/paas/v4", "glm-5.3")
+	if err == nil {
+		t.Fatal("missing GLM-5.3 preserved thinking history should be rejected")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.ProviderCode != zhipuGLM53InvalidThinkingHistoryCode || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
+		t.Fatalf("failure = %+v, want request-scoped GLM-5.3 history error", typed)
+	}
+	if !strings.Contains(err.Error(), "GLM-5.3 不支持通过关闭思考") {
+		t.Fatalf("error = %q, want forced-thinking guidance", err.Error())
+	}
+
+	clearBody := []byte(strings.Replace(string(body), `"type":"enabled"`, `"type":"enabled","clear_thinking":true`, 1))
+	if err = validateZhipuGLM53PreservedThinkingHistory(clearBody, "zhipu", "https://api.z.ai/api/coding/paas/v4", "glm-5.3"); err != nil {
+		t.Fatalf("clear_thinking=true should override Coding Plan preserved-thinking default: %v", err)
+	}
+}
+
 func TestNormalizeOpenAIThinkingHistoryModelCapabilityBoundaries(t *testing.T) {
 	body := []byte(`{
 		"reasoning_effort":"high",

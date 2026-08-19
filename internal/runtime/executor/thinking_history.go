@@ -34,11 +34,13 @@ const (
 	claudeThinkingUnavailablePlaceholder  = compathistory.ClaudeUnavailableValue
 	xiaomiMimoInvalidThinkingHistoryCode  = "mimo_incomplete_reasoning_history"
 	deepSeekInvalidThinkingHistoryCode    = "missing_reasoning_history"
+	zhipuGLM53InvalidThinkingHistoryCode  = "glm53_missing_reasoning_history"
 )
 
 const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少真实 reasoning_content，CPA 无法可靠还原。请新建会话、关闭思考或清理工具历史后重试；系统不会伪造思考内容、删除工具或跨渠道重试。"
 const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的原始推理内容。Codex 中重复重试或 /compact 无法修复；请切换到 OpenAI 原生 GPT 模型后继续并执行 /compact，或新建 DeepSeek 会话。若客户端支持，也可关闭思考模式后继续；这不是账号额度或网络错误。"
 const workBuddyDeepSeekInvalidThinkingHistoryMessage = "当前对话的深度思考记录不完整，暂时无法继续。请任选一种方式处理：\n1. 推荐：在 WorkBuddy 中点击“新建对话”，然后重新发送刚才的问题。\n2. 或关闭深度思考：打开 WorkBuddy 的“设置” → 进入“模型设置”或“自定义模型” → 选择当前 DeepSeek 模型 → 关闭“深度思考”“Thinking”或“Reasoning”开关 → 返回对话重试。不同版本的菜单名称可能略有不同。\n3. 如果仍然无法使用，请在模型列表中切换到 OpenAI 原生 GPT 模型，再重新发送。\n这不是账号余额或网络问题。"
+const zhipuGLM53InvalidThinkingHistoryMessage = "GLM-5.3 保留式思考的工具调用历史缺少原始 reasoning_content，CPA 不会伪造或重写思考内容。请新建对话，或确保客户端完整保留并按原顺序回传 reasoning_content 后重试；GLM-5.3 不支持通过关闭思考来绕过此问题。"
 
 type deepSeekThinkingIntent uint8
 
@@ -168,7 +170,32 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 
 func preservesOnlyRealReasoningHistory(model string) bool {
 	modelName := normalizedOpenAICompatPolicyModelName(model)
-	return strings.HasPrefix(modelName, "qwen") || isXiaomiMimoV25Model(modelName)
+	return strings.HasPrefix(modelName, "qwen") || isXiaomiMimoV25Model(modelName) || isZhipuGLM53Model(modelName)
+}
+
+func validateZhipuGLM53PreservedThinkingHistory(body []byte, compatKind, baseURL, model string) error {
+	kind := config.NormalizeOpenAICompatibilityKind(compatKind)
+	if kind == "" {
+		kind = config.InferCompatKindFromBaseURL(baseURL)
+	}
+	if kind != "zhipu" || !isZhipuGLM53Model(model) || !zhipuGLM53PreservedThinkingEnabled(body, baseURL) {
+		return nil
+	}
+
+	_, err := compathistory.Validate(body, compathistory.FormatOpenAI, true)
+	if err == nil {
+		return nil
+	}
+	return missingReasoningHistoryStatusErrorWithCode(err, zhipuGLM53InvalidThinkingHistoryMessage, zhipuGLM53InvalidThinkingHistoryCode)
+}
+
+func zhipuGLM53PreservedThinkingEnabled(body []byte, baseURL string) bool {
+	enabled := strings.Contains(strings.ToLower(strings.TrimSpace(baseURL)), "/api/coding/")
+	clearThinking := gjson.GetBytes(body, "thinking.clear_thinking")
+	if clearThinking.Exists() && clearThinking.Type != gjson.Null {
+		enabled = !clearThinking.Bool()
+	}
+	return enabled
 }
 
 func isXiaomiMimoV25Model(model string) bool {
@@ -379,6 +406,10 @@ func missingReasoningHistoryStatusError(err error) error {
 }
 
 func missingReasoningHistoryStatusErrorWithMessage(err error, publicMessage string) error {
+	return missingReasoningHistoryStatusErrorWithCode(err, publicMessage, deepSeekInvalidThinkingHistoryCode)
+}
+
+func missingReasoningHistoryStatusErrorWithCode(err error, publicMessage, errorCode string) error {
 	var missing *compathistory.MissingReasoningError
 	if !errors.As(err, &missing) {
 		return err
@@ -387,19 +418,23 @@ func missingReasoningHistoryStatusErrorWithMessage(err error, publicMessage stri
 	if publicMessage == "" {
 		publicMessage = deepSeekInvalidThinkingHistoryMessage
 	}
+	errorCode = strings.TrimSpace(errorCode)
+	if errorCode == "" {
+		errorCode = deepSeekInvalidThinkingHistoryCode
+	}
 	failure := &failurecontract.Failure{
 		Kind:          failurecontract.InvalidThinkingHistory,
 		Scope:         failurecontract.ScopeRequest,
 		HTTPStatus:    http.StatusBadRequest,
-		ProviderCode:  deepSeekInvalidThinkingHistoryCode,
-		SemanticCode:  deepSeekInvalidThinkingHistoryCode,
+		ProviderCode:  errorCode,
+		SemanticCode:  errorCode,
 		Retryable:     false,
 		Cause:         missing,
 		PublicMessage: publicMessage,
 	}
 	return statusErr{
 		code:      http.StatusBadRequest,
-		errorCode: deepSeekInvalidThinkingHistoryCode,
+		errorCode: errorCode,
 		msg:       publicMessage,
 		failure:   failure,
 	}

@@ -45,6 +45,7 @@ func TestOpenAICompatPolicyFixturesMatchLegacyBehavior(t *testing.T) {
 		"testdata/compat/qwen38_formal_thinking.json",
 		"testdata/compat/qwen38_preview_thinking.json",
 		"testdata/compat/xiaomi_request_quirks.json",
+		"testdata/compat/zhipu_glm53_forced_thinking.json",
 	}
 	for _, fixturePath := range fixturePaths {
 		fixture := readOpenAICompatPolicyFixture(t, fixturePath)
@@ -139,6 +140,42 @@ func TestOpenAICompatPostConfigSkipsPreCanonicalization(t *testing.T) {
 	full := scrubOpenAICompatPayloadForModel(payload, profile, "gpt-5", "https://api.openai.com/v1")
 	if bytes.Equal(full, payload) {
 		t.Fatal("fixture did not exercise the full scrub's schema canonicalization")
+	}
+}
+
+func TestOpenAICompatPostConfigRevalidatesZhipuGLM53Thinking(t *testing.T) {
+	input := []byte(`{
+		"model":"configured-glm53-alias",
+		"messages":[{"role":"user","content":"hi"}],
+		"thinking":{"type":"disabled","clear_thinking":true},
+		"reasoning_effort":"none"
+	}`)
+	profile := openAICompatProfileForKind("zhipu")
+	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(input)))
+	actual, err := revalidateOpenAICompatPayloadAfterConfig(
+		ctx,
+		input,
+		profile,
+		"glm-5.3",
+		"https://api.z.ai/api/coding/paas/v4",
+		compat.MatchContext{Endpoint: "chat", Mode: "non-stream", SourceFormat: "openai", TargetFormat: "openai"},
+	)
+	if err != nil {
+		t.Fatalf("revalidateOpenAICompatPayloadAfterConfig() error = %v", err)
+	}
+	if got := gjson.GetBytes(actual, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, actual)
+	}
+	if got := gjson.GetBytes(actual, "reasoning_effort").String(); got != "low" {
+		t.Fatalf("reasoning_effort = %q, want low: %s", got, actual)
+	}
+	if !gjson.GetBytes(actual, "thinking.clear_thinking").Exists() || gjson.GetBytes(actual, "thinking.clear_thinking").Bool() != true {
+		t.Fatalf("clear_thinking was not preserved: %s", actual)
+	}
+
+	report, ok := internalpayload.TransformReportFromContext(ctx)
+	if !ok || len(report.Stages) != 1 || !slices.Contains(report.Stages[0].Downgrades, openAICompatZhipuGLM53ThinkingDowngrade) {
+		t.Fatalf("transform report = %+v, want Zhipu GLM-5.3 downgrade", report)
 	}
 }
 
@@ -396,6 +433,7 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		openAICompatQwen38FormalPolicyID,
 		openAICompatQwen38PreviewPolicyID,
 		openAICompatXiaomiPolicyID,
+		openAICompatZhipuGLM53PolicyID,
 		openAICompatPostConfigRevalidatePolicyID,
 	}
 	if len(report.Policies) != len(wantIDs) {
@@ -421,6 +459,11 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		if policy.ID == openAICompatXiaomiPolicyID && !slices.Contains(policy.DowngradeIDs, openAICompatXiaomiToolSchemaDowngrade) {
 			t.Fatalf("Xiaomi policy does not declare tool schema downgrade: %+v", policy.DowngradeIDs)
 		}
+		if policy.ID == openAICompatZhipuGLM53PolicyID {
+			if policy.Match.ModelPattern != "glm-5.3" || !slices.Contains(policy.DowngradeIDs, openAICompatZhipuGLM53ThinkingDowngrade) {
+				t.Fatalf("Zhipu GLM-5.3 policy metadata is incomplete: %+v", policy)
+			}
+		}
 		if policy.ID == openAICompatQwen38FormalPolicyID {
 			if policy.Match.ModelPattern != qwen38MaxFormalModel || strings.Contains(strings.ToLower(policy.Lifecycle.UpstreamEvidence), "thinking-only") || len(policy.DowngradeIDs) != 0 {
 				t.Fatalf("formal Qwen policy must remain hybrid-thinking only: %+v", policy)
@@ -432,7 +475,7 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 			}
 		}
 		if policy.ID == openAICompatPostConfigRevalidatePolicyID {
-			if !slices.Contains(policy.MutatedFields, "body.metadata") || !slices.Contains(policy.DowngradeIDs, openAICompatKimiToolChoiceDowngrade) {
+			if !slices.Contains(policy.MutatedFields, "body.metadata") || !slices.Contains(policy.DowngradeIDs, openAICompatKimiToolChoiceDowngrade) || !slices.Contains(policy.DowngradeIDs, openAICompatZhipuGLM53ThinkingDowngrade) {
 				t.Fatalf("post-config policy inventory is incomplete: %+v", policy)
 			}
 		}

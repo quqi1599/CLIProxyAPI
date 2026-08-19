@@ -1,0 +1,162 @@
+{
+  "policy_id": "openai_compat.zhipu.glm53_forced_thinking",
+  "compat_kind": "zhipu",
+  "base_url": "https://api.z.ai/api/coding/paas/v4",
+  "cases": [
+    {
+      "name": "disabled thinking becomes low and keeps preserved mode",
+      "model": "glm-5.3",
+      "input": {
+        "model": "configured-glm53-alias",
+        "messages": [
+          {
+            "role": "assistant",
+            "reasoning_content": "real reasoning",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "enable_thinking": false,
+        "reasoning_effort": "none",
+        "reasoning": {
+          "effort": "none"
+        },
+        "thinking": {
+          "type": "disabled",
+          "clear_thinking": false,
+          "budget_tokens": 0
+        },
+        "thinking_budget": 0
+      },
+      "expected": {
+        "model": "configured-glm53-alias",
+        "messages": [
+          {
+            "role": "assistant",
+            "reasoning_content": "real reasoning",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ok"
+          }
+        ],
+        "reasoning_effort": "low",
+        "thinking": {
+          "type": "enabled",
+          "clear_thinking": false
+        }
+      },
+      "downgrades": [
+        "openai_compat.zhipu.glm53.thinking_normalized"
+      ]
+    },
+    {
+      "name": "medium effort becomes high",
+      "model": "glm-5.3",
+      "input": {
+        "model": "configured-glm53-medium-alias",
+        "reasoning_effort": "medium"
+      },
+      "expected": {
+        "model": "configured-glm53-medium-alias",
+        "reasoning_effort": "high",
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "downgrades": [
+        "openai_compat.zhipu.glm53.thinking_normalized"
+      ]
+    },
+    {
+      "name": "responses xhigh effort becomes max",
+      "model": "glm-5.3",
+      "input": {
+        "model": "configured-glm53-responses-alias",
+        "reasoning": {
+          "effort": "xhigh"
+        }
+      },
+      "expected": {
+        "model": "configured-glm53-responses-alias",
+        "reasoning_effort": "max",
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "downgrades": [
+        "openai_compat.zhipu.glm53.thinking_normalized"
+      ]
+    },
+    {
+      "name": "omitted controls use explicit max default",
+      "model": "glm-5.3",
+      "input": {
+        "model": "configured-glm53-default-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "expected": {
+        "model": "configured-glm53-default-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning_effort": "max",
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "downgrades": []
+    },
+    {
+      "name": "canonical low remains low",
+      "model": "provider/glm-5.3(low)",
+      "input": {
+        "model": "configured-glm53-low-alias",
+        "reasoning_effort": "low",
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "expected": {
+        "model": "configured-glm53-low-alias",
+        "reasoning_effort": "low",
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "downgrades": []
+    }
+  ]
+}

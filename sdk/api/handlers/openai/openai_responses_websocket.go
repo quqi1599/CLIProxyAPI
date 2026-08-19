@@ -1338,6 +1338,9 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		existingInput := gjson.GetBytes(lastRequest, "input")
 		existingInputRaw := normalizeJSONArrayRaw([]byte(existingInput.Raw))
 		normalizedLastResponseOutput := normalizeJSONArrayRaw(lastResponseOutput)
+		if inputContainsFullTranscript(gjson.Parse(normalizedLastResponseOutput)) {
+			existingInputRaw = inputWithoutCompactionTriggers(existingInput)
+		}
 		if websocketTranscriptReplayTooLarge(existingInputRaw, normalizedLastResponseOutput, appendInputRaw) {
 			return nil, lastRequest, &interfaces.ErrorMessage{
 				StatusCode: http.StatusRequestEntityTooLarge,
@@ -2131,6 +2134,16 @@ func inputWithoutCompactionItems(input gjson.Result) string {
 		return normalizeJSONArrayRaw([]byte(input.Raw))
 	}
 	return summary.withoutCompactionItems()
+}
+
+func inputWithoutCompactionTriggers(input gjson.Result) string {
+	summary, errScan := scanResponsesWebsocketInput(input)
+	if errScan != nil {
+		return normalizeJSONArrayRaw([]byte(input.Raw))
+	}
+	return buildResponsesWebsocketInput(summary.items, func(_ int, item responsesWebsocketInputItem) bool {
+		return item.itemType != "compaction_trigger"
+	})
 }
 
 func normalizeJSONArrayRaw(raw []byte) string {

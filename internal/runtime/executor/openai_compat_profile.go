@@ -286,7 +286,7 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoEffort, doubaoThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
-	capabilityProfile := profile
+	capabilityProfile := openAICompatCapabilityProfileForModel(profile, model)
 	if compatKind == "doubao" && hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoEffort, doubaoThinkingDisabled) {
 		capabilityProfile.SupportsReasoning = true
 	}
@@ -333,7 +333,7 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 		payload = normalizeKimiThinkingConfig(payload, model)
 	}
 	doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled := doubaoDeepSeekReasoningIntent(payload, model)
-	capabilityProfile := profile
+	capabilityProfile := openAICompatCapabilityProfileForModel(profile, model)
 	if compatKind == "doubao" && (registeredPolicies || hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)) {
 		capabilityProfile.SupportsReasoning = true
 	}
@@ -374,10 +374,26 @@ func scrubOpenAICompatLegacyProviderQuirks(payload []byte, profile openAICompatP
 	if compatKind == "qwen" {
 		payload = normalizeQwen38MaxThinking(payload, model)
 	}
+	if compatKind == "zhipu" {
+		payload = normalizeZhipuGLM53Thinking(payload, model)
+	}
 	if compatKind == "kimi" {
 		payload = scrubKimiPayloadForModel(payload, model)
 	}
 	return payload
+}
+
+func openAICompatCapabilityProfileForModel(profile openAICompatProfile, model string) openAICompatProfile {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "zhipu" || !isZhipuGLM53Model(model) {
+		return profile
+	}
+
+	// GLM-5.3 uses native thinking.type and reasoning_effort controls. Keep the
+	// fields until its model-specific compatibility policy canonicalizes them,
+	// and preserve only the real reasoning_content supplied by the client.
+	profile.SupportsNativeThinking = true
+	profile.PreserveReasoningContent = true
+	return profile
 }
 
 func scrubOpenAICompatPayloadAfterProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {
@@ -446,6 +462,120 @@ func normalizedOpenAICompatPolicyModelName(model string) string {
 		modelName = modelName[slash+1:]
 	}
 	return modelName
+}
+
+func isZhipuGLM53Model(model string) bool {
+	return normalizedOpenAICompatPolicyModelName(model) == "glm-5.3"
+}
+
+func normalizeZhipuGLM53Thinking(payload []byte, model string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !isZhipuGLM53Model(model) {
+		return payload
+	}
+
+	effort, ok := zhipuGLM53ReasoningEffort(payload)
+	if !ok {
+		return payload
+	}
+
+	return mutateOpenAICompatJSON(payload, []string{
+		"enable_thinking",
+		"reasoning",
+		"thinking.reasoning_effort",
+		"thinking.budget_tokens",
+		"thinking_budget",
+		"output_config.effort",
+	}, map[string]any{
+		"thinking.type":    "enabled",
+		"reasoning_effort": effort,
+	})
+}
+
+func zhipuGLM53ReasoningEffort(payload []byte) (string, bool) {
+	if zhipuGLM53ThinkingDisabled(payload) {
+		return "low", true
+	}
+
+	for _, path := range []string{"reasoning_effort", "reasoning.effort", "thinking.reasoning_effort", "output_config.effort"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		raw := strings.ToLower(strings.TrimSpace(value.String()))
+		if raw == "" {
+			continue
+		}
+		return normalizeZhipuGLM53Effort(raw)
+	}
+
+	for _, path := range []string{"thinking_budget", "thinking.budget_tokens"} {
+		value := gjson.GetBytes(payload, path)
+		if !value.Exists() {
+			continue
+		}
+		budget, valid := deepSeekThinkingBudgetValue(value)
+		if !valid {
+			return "", false
+		}
+		level, valid := thinking.ConvertBudgetToLevel(budget)
+		if !valid {
+			return "", false
+		}
+		return normalizeZhipuGLM53Effort(level)
+	}
+
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	if thinkingType != "" && thinkingType != "enabled" && thinkingType != "enable" && thinkingType != "true" {
+		return normalizeZhipuGLM53Effort(thinkingType)
+	}
+	return "max", true
+}
+
+func normalizeZhipuGLM53Effort(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "none", "off", "disabled", "disable", "false", "minimal", "low":
+		return "low", true
+	case "medium", "high":
+		return "high", true
+	case "auto", "adaptive", "enabled", "enable", "true", "xhigh", "max":
+		return "max", true
+	default:
+		return "", false
+	}
+}
+
+func zhipuGLM53ThinkingDisabled(payload []byte) bool {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	switch thinkingType {
+	case "none", "off", "disabled", "disable", "false":
+		return true
+	}
+
+	enabled := gjson.GetBytes(payload, "enable_thinking")
+	if !enabled.Exists() {
+		return false
+	}
+	if value, ok := deepSeekEnableThinkingAliasValue(enabled); ok {
+		return !value
+	}
+	return false
+}
+
+func zhipuGLM53ThinkingControlsNeedNormalization(payload []byte) bool {
+	if zhipuGLM53ThinkingDisabled(payload) {
+		return true
+	}
+	if gjson.GetBytes(payload, "enable_thinking").Exists() ||
+		gjson.GetBytes(payload, "reasoning.effort").Exists() ||
+		gjson.GetBytes(payload, "thinking.reasoning_effort").Exists() ||
+		gjson.GetBytes(payload, "thinking.budget_tokens").Exists() ||
+		gjson.GetBytes(payload, "thinking_budget").Exists() ||
+		gjson.GetBytes(payload, "output_config.effort").Exists() {
+		return true
+	}
+
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "reasoning_effort").String()))
+	return effort != "" && effort != "low" && effort != "high" && effort != "max"
 }
 
 func requiresKimiK25K26Compatibility(model string) bool {
