@@ -864,7 +864,7 @@ func providerExecutorName(executor ProviderExecutor) string {
 	return strings.TrimSpace(executor.Identifier())
 }
 
-func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace, finalSuccess bool, finalErr error) {
+func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace, finalSuccess bool, finalErr error, commercialMode bool) {
 	if trace == nil {
 		return
 	}
@@ -881,6 +881,9 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 	}
 	summary.FinalStatus = normalizeRequestExecutionFinalStatus(summary.FinalStatus, finalErr)
 	logFinalSuccess := finalSuccess && (summary.FinalStatus == 0 || summary.FinalStatus < http.StatusBadRequest)
+	if !shouldLogRequestExecutionSummary(summary, logFinalSuccess, commercialMode) {
+		return
+	}
 	finalErrorType, finalErrorCode := requestExecutionSummaryErrorFields(summary.FinalStatus, finalErr)
 
 	fields := log.Fields{
@@ -953,6 +956,25 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 		fields["retry_pressure_throttled"] = summary.GPTRetryPressureThrottled
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Info("request_execution_summary")
+}
+
+func shouldLogRequestExecutionSummary(summary requestExecutionSummary, finalSuccess, commercialMode bool) bool {
+	if !commercialMode || !finalSuccess {
+		return true
+	}
+	if summary.FinalStatus != 0 && summary.FinalStatus != http.StatusOK {
+		return true
+	}
+	if summary.AttemptCount > 1 || summary.FallbackCount > 0 || summary.TranslatorRuns > 1 || summary.GPTRoundCount > 1 {
+		return true
+	}
+	if summary.EmptyResponses > 0 || summary.GPTFirstEventTimeouts > 0 || summary.GPTFirstEventBudgetExhausted {
+		return true
+	}
+	if summary.GPTRetryPressureThrottled || summary.GPTRetryPressureWait >= time.Millisecond || summary.GPTRetryPressureReason != "" {
+		return true
+	}
+	return summary.GPTRetryPressureState != "" && summary.GPTRetryPressureState != gptRetryPressureStateNormal
 }
 
 func normalizeRequestExecutionFinalStatus(status int, err error) int {
@@ -2227,6 +2249,14 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if clearedCooldowns {
 		m.persistCooldownStates(context.Background())
 	}
+}
+
+func (m *Manager) commercialModeEnabled() bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg != nil && cfg.CommercialMode
 }
 
 func (m *Manager) cooldownDisabledForAuth(auth *Auth) bool {

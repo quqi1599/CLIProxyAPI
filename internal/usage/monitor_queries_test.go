@@ -4,9 +4,20 @@ import (
 	"context"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestPostgresMonitorKeyStatsBlocksQueryUsesTimestampRangePredicate(t *testing.T) {
+	query := postgresMonitorKeyStatsBlocksQuery(`"usage_records"`)
+	if !strings.Contains(query, "WHERE requested_at >= $3 AND requested_at <= $4") {
+		t.Fatalf("query does not use an indexable timestamp range: %s", query)
+	}
+	if strings.Contains(query, "WHERE EXTRACT(EPOCH FROM requested_at)") {
+		t.Fatalf("query applies a function to requested_at in the range predicate: %s", query)
+	}
+}
 
 func TestSQLiteUsageStoreQueryMonitorRequestLogs(t *testing.T) {
 	ctx := context.Background()

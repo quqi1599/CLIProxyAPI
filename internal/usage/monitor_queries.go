@@ -3451,18 +3451,15 @@ func (s *pgUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowSta
 	}
 
 	table := s.fullTableName("usage_records")
-	query := fmt.Sprintf(`
-		SELECT FLOOR((EXTRACT(EPOCH FROM requested_at) - %s) / %s)::INT AS block_idx,
-			COALESCE(NULLIF(source, ''), 'unknown'),
-			COALESCE(NULLIF(auth_index, ''), 'unknown'),
-			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0)
-		FROM %s
-		WHERE EXTRACT(EPOCH FROM requested_at) >= %s AND EXTRACT(EPOCH FROM requested_at) <= %s
-		GROUP BY block_idx, COALESCE(NULLIF(source, ''), 'unknown'), COALESCE(NULLIF(auth_index, ''), 'unknown')
-	`, pgPlaceholder(1), pgPlaceholder(2), table, pgPlaceholder(3), pgPlaceholder(4))
-
-	rows, err := s.db.QueryContext(ctx, query, windowStartUnix, blockSeconds, windowStartUnix, windowEndUnix)
+	query := postgresMonitorKeyStatsBlocksQuery(table)
+	rows, err := s.db.QueryContext(
+		ctx,
+		query,
+		windowStartUnix,
+		blockSeconds,
+		time.Unix(windowStartUnix, 0),
+		time.Unix(windowEndUnix, 0),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("usage store: query monitor key stats blocks: %w", err)
 	}
@@ -3480,4 +3477,17 @@ func (s *pgUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowSta
 		return nil, fmt.Errorf("usage store: iterate monitor key stats blocks: %w", err)
 	}
 	return items, nil
+}
+
+func postgresMonitorKeyStatsBlocksQuery(table string) string {
+	return fmt.Sprintf(`
+		SELECT FLOOR((EXTRACT(EPOCH FROM requested_at) - %s) / %s)::INT AS block_idx,
+			COALESCE(NULLIF(source, ''), 'unknown'),
+			COALESCE(NULLIF(auth_index, ''), 'unknown'),
+			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0)
+		FROM %s
+		WHERE requested_at >= %s AND requested_at <= %s
+		GROUP BY block_idx, COALESCE(NULLIF(source, ''), 'unknown'), COALESCE(NULLIF(auth_index, ''), 'unknown')
+	`, pgPlaceholder(1), pgPlaceholder(2), table, pgPlaceholder(3), pgPlaceholder(4))
 }

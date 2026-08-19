@@ -192,7 +192,7 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 			AttemptCount: trace.attemptCount(),
 			CompletedAt:  time.Now(),
 		})
-		logRequestExecutionSummary(ctx, trace, outcome.success, outcome.finalErr)
+		logRequestExecutionSummary(ctx, trace, outcome.success, outcome.finalErr, manager.commercialModeEnabled())
 	}()
 
 	if errPreflight := rejectMiMoV25ProImageInput(req, opts); errPreflight != nil {

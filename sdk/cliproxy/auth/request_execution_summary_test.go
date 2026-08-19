@@ -25,7 +25,7 @@ func TestLogRequestExecutionSummaryCanonicalizesOpaque500(t *testing.T) {
 
 	ctx := logging.WithRequestID(context.Background(), "req-summary-opaque-500")
 	trace := &requestAttemptTrace{requestID: "req-summary-opaque-500", attempts: 1, maxAttempts: 1}
-	logRequestExecutionSummary(ctx, trace, false, errors.New("opaque failure"))
+	logRequestExecutionSummary(ctx, trace, false, errors.New("opaque failure"), false)
 
 	entry := findExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["final_status"]; got != http.StatusInternalServerError {
@@ -55,7 +55,7 @@ func TestLogRequestExecutionSummaryTerminalCancellationOverridesStale503(t *test
 		maxAttempts: 1,
 		finalStatus: http.StatusServiceUnavailable,
 	}
-	logRequestExecutionSummary(ctx, trace, false, newCallerRequestFailure(context.DeadlineExceeded))
+	logRequestExecutionSummary(ctx, trace, false, newCallerRequestFailure(context.DeadlineExceeded), false)
 
 	entry := findExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["final_status"]; got != 499 {
@@ -179,7 +179,7 @@ func TestLogRequestExecutionSummaryTreatsFinal4xxAsFailure(t *testing.T) {
 		finalExecutor:  "ClaudeExecutor",
 	}
 
-	logRequestExecutionSummary(ctx, trace, true, nil)
+	logRequestExecutionSummary(ctx, trace, true, nil, false)
 
 	entry := findExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["final_success"]; got != false {
@@ -222,7 +222,7 @@ func TestLogRequestExecutionSummaryNormalizesContentSafetyError(t *testing.T) {
 		Message:    miniMaxNewSensitiveMessage,
 	}
 
-	logRequestExecutionSummary(ctx, trace, false, errSensitive)
+	logRequestExecutionSummary(ctx, trace, false, errSensitive, false)
 
 	entry := findExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["final_success"]; got != false {
@@ -271,7 +271,7 @@ func TestLogRequestExecutionSummaryIncludesGPTFirstEventMetrics(t *testing.T) {
 		},
 	}
 
-	logRequestExecutionSummary(ctx, trace, true, nil)
+	logRequestExecutionSummary(ctx, trace, true, nil, false)
 
 	entry := findExecutionSummaryEntry(t, hook.AllEntries())
 	if got := entry.Data["first_event_timeout_count"]; got != 1 {
@@ -285,6 +285,58 @@ func TestLogRequestExecutionSummaryIncludesGPTFirstEventMetrics(t *testing.T) {
 	}
 	if got := entry.Data["first_event_policy_state"]; got != gptFirstEventPolicyStateSlow30 {
 		t.Fatalf("first_event_policy_state = %#v, want %q", got, gptFirstEventPolicyStateSlow30)
+	}
+}
+
+func TestShouldLogRequestExecutionSummaryCommercialMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		summary requestExecutionSummary
+		success bool
+		want    bool
+	}{
+		{
+			name:    "routine success is suppressed",
+			summary: requestExecutionSummary{AttemptCount: 1, TranslatorRuns: 1, FinalStatus: http.StatusOK},
+			success: true,
+			want:    false,
+		},
+		{
+			name:    "failure is retained",
+			summary: requestExecutionSummary{AttemptCount: 1, TranslatorRuns: 1, FinalStatus: http.StatusInternalServerError},
+			success: false,
+			want:    true,
+		},
+		{
+			name:    "fallback success is retained",
+			summary: requestExecutionSummary{AttemptCount: 2, FallbackCount: 1, TranslatorRuns: 2, FinalStatus: http.StatusOK},
+			success: true,
+			want:    true,
+		},
+		{
+			name:    "first event timeout recovery is retained",
+			summary: requestExecutionSummary{AttemptCount: 1, TranslatorRuns: 1, FinalStatus: http.StatusOK, GPTFirstEventTimeouts: 1},
+			success: true,
+			want:    true,
+		},
+		{
+			name:    "retry pressure is retained",
+			summary: requestExecutionSummary{AttemptCount: 1, TranslatorRuns: 1, FinalStatus: http.StatusOK, GPTRetryPressureState: gptRetryPressureStateCongested},
+			success: true,
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldLogRequestExecutionSummary(tt.summary, tt.success, true); got != tt.want {
+				t.Fatalf("shouldLogRequestExecutionSummary() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+
+	if !shouldLogRequestExecutionSummary(tests[0].summary, true, false) {
+		t.Fatal("non-commercial mode must retain routine success summaries")
 	}
 }
 
