@@ -27,7 +27,7 @@ const (
 	identitySecretEnv = "CPA_AUDIT_IDENTITY_SECRET"
 	evidenceKeyEnv    = "CPA_AUDIT_EVIDENCE_KEY"
 
-	defaultMaxBodyBytes = 32 << 20
+	defaultMaxBodyBytes = 256 << 20
 )
 
 type runtimeState struct {
@@ -278,6 +278,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		extracted, requestBytes, err := readAuditRequest(c, state.cfg.MaxBodyBytes)
 		if err != nil {
 			handlers.WriteRequestBodyError(c, err)
+			c.Abort()
 			return
 		}
 		decision := state.matcher.Match(extracted.Text)

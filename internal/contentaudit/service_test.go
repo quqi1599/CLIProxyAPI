@@ -124,6 +124,55 @@ func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
 	}
 }
 
+func TestMiddlewareRequestTooLargeAbortsBeforeNext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	if err := os.WriteFile(policyPath, []byte("version: test-v1\nrules:\n  - id: synthetic-rule\n    category: synthetic\n    severity: high\n    keywords: [\"blocked fixture\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:       true,
+		PolicyFile:    policyPath,
+		DatabasePath:  filepath.Join(tempDir, "audit.db"),
+		EvidenceKeyID: "test-key",
+		MaxBodyBytes:  32,
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"request larger than the audit limit"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if nextCalls != 0 {
+		t.Fatalf("next handler calls=%d, want 0", nextCalls)
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte("request_too_large")) {
+		t.Fatalf("response body=%s", response.Body.String())
+	}
+}
+
+func TestNormalizeAuditConfigUsesPublicRequestBodyCeiling(t *testing.T) {
+	cfg := config.ContentAuditConfig{}
+	normalizeAuditConfig(&cfg)
+	if cfg.MaxBodyBytes != 256<<20 {
+		t.Fatalf("MaxBodyBytes=%d, want %d", cfg.MaxBodyBytes, 256<<20)
+	}
+}
+
 func TestMiddlewareAuditOnlyRecordsAndContinues(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")

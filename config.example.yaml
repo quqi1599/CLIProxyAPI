@@ -107,7 +107,7 @@ content-audit:
   # Keep true for mixed block/observe policies until WebSocket frames can be inspected.
   allow-unaudited-websocket: true
   evidence-key-id: "primary-v1"
-  max-body-bytes: 33554432
+  max-body-bytes: 268435456
   raw-retention-days: 30
   metadata-retention-days: 180
 
