@@ -281,7 +281,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		decision := state.matcher.Match(extracted.Text)
+		decision := state.matcher.MatchScoped(extracted.EnforcementText, extracted.Text, extracted.Continuation)
 		if !decision.Matched {
 			c.Next()
 			return

@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -314,6 +315,22 @@ func buildAhoFailureLinks(nodes []ahoNode) {
 
 // Match returns the highest-severity non-allowlisted rule match.
 func (m *Matcher) Match(text string) Decision {
+	return m.match(text, "", false)
+}
+
+// MatchScoped evaluates block rules against the current user scope while
+// retaining full request coverage for observation rules.
+func (m *Matcher) MatchScoped(enforcementText, observationText string, continuation bool) Decision {
+	if !continuation && enforcementText == observationText {
+		return m.Match(observationText)
+	}
+	if decision := m.match(enforcementText, RuleActionBlock, continuation); decision.Matched {
+		return decision
+	}
+	return m.match(observationText, RuleActionObserve, false)
+}
+
+func (m *Matcher) match(text, action string, continuation bool) Decision {
 	if m == nil || len(m.nodes) == 0 {
 		return Decision{}
 	}
@@ -343,11 +360,17 @@ func (m *Matcher) Match(text string) Decision {
 		for _, termIndex := range m.nodes[nodeIndex].out {
 			term := m.terms[termIndex]
 			start := position - term.runeLen + 1
-			if start < 0 || !matchOnTermBoundaries(normalized, start, position+1) || m.allowlisted(normalized, start, position+1, term.ruleIndex) {
+			if start < 0 {
 				continue
 			}
 			rule := m.policy.Rules[term.ruleIndex]
-			if !ruleMatchesContext(normalized, rule) {
+			if !matchOnRuleBoundaries(normalized, start, position+1, rule) || m.allowlisted(normalized, start, position+1, term.ruleIndex) {
+				continue
+			}
+			if action != "" && rule.Action != action {
+				continue
+			}
+			if !ruleMatchesContext(normalized, start, position+1, rule, continuation) {
 				continue
 			}
 			actionRank := ruleActionRank(rule.Action)
@@ -374,8 +397,11 @@ func (m *Matcher) Match(text string) Decision {
 	return best
 }
 
-func ruleMatchesContext(text []rune, rule Rule) bool {
-	normalized := string(text)
+func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, continuation bool) bool {
+	const contextRunes = 192
+	start := max(0, matchStart-contextRunes)
+	end := min(len(text), matchEnd+contextRunes)
+	normalized := string(text[start:end])
 	for _, excluded := range rule.ExcludeAny {
 		if strings.Contains(normalized, excluded) {
 			return false
@@ -389,7 +415,7 @@ func ruleMatchesContext(text []rune, rule Rule) bool {
 			return true
 		}
 	}
-	return false
+	return continuation
 }
 
 func (m *Matcher) hasCandidate(normalized string) bool {
@@ -418,6 +444,39 @@ func matchOnTermBoundaries(text []rune, start, end int) bool {
 	return start >= 0 && end <= len(text) &&
 		(start == 0 || text[start-1] == ' ') &&
 		(end == len(text) || text[end] == ' ')
+}
+
+func matchOnRuleBoundaries(text []rune, start, end int, rule Rule) bool {
+	if matchOnTermBoundaries(text, start, end) {
+		return true
+	}
+	if start < 0 || end > len(text) || !containsHanRune(text[start:end]) || len(rule.RequireAny) == 0 {
+		return false
+	}
+	leftBoundary := start == 0 || text[start-1] == ' '
+	rightBoundary := end == len(text) || text[end] == ' '
+	for _, required := range rule.RequireAny {
+		requiredRunes := []rune(required)
+		if !leftBoundary && len(requiredRunes) <= start && string(text[start-len(requiredRunes):start]) == required {
+			leftBoundary = true
+		}
+		if !rightBoundary && end+len(requiredRunes) <= len(text) && string(text[end:end+len(requiredRunes)]) == required {
+			rightBoundary = true
+		}
+		if leftBoundary && rightBoundary {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHanRune(value []rune) bool {
+	for _, character := range value {
+		if unicode.Is(unicode.Han, character) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Matcher) allowlisted(text []rune, matchStart, matchEnd, ruleIndex int) bool {

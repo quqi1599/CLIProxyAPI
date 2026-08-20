@@ -31,6 +31,14 @@ func TestExtractJSONRequestScansOnlyUntrustedConversationContent(t *testing.T) {
 			t.Fatalf("extracted text %q contains trusted text %q", extracted.Text, excluded)
 		}
 	}
+	if extracted.EnforcementText != "untrusted missing-role text" {
+		t.Fatalf("enforcement text = %q, want latest user-like content", extracted.EnforcementText)
+	}
+	for _, excluded := range []string{"untrusted tool result", "untrusted dynamic tool arguments"} {
+		if strings.Contains(extracted.EnforcementText, excluded) {
+			t.Fatalf("enforcement text %q contains non-user content %q", extracted.EnforcementText, excluded)
+		}
+	}
 }
 
 func TestExtractJSONRequestIncludesTypedToolOutput(t *testing.T) {
@@ -38,5 +46,59 @@ func TestExtractJSONRequestIncludesTypedToolOutput(t *testing.T) {
 	extracted := ExtractJSONRequest(body)
 	if !strings.Contains(extracted.Text, "tool output text") || !strings.Contains(extracted.Text, "gemini user text") {
 		t.Fatalf("extracted text = %q", extracted.Text)
+	}
+	if extracted.EnforcementText != "gemini user text" {
+		t.Fatalf("enforcement text = %q, want gemini user text", extracted.EnforcementText)
+	}
+}
+
+func TestExtractJSONRequestIgnoresResponsesTextConfigurationForEnforcement(t *testing.T) {
+	body := []byte(`{"input":[{"role":"user","content":"current user prompt"}],"text":{"format":{"type":"text"},"verbosity":"medium"}}`)
+	extracted := ExtractJSONRequest(body)
+	if extracted.EnforcementText != "current user prompt" {
+		t.Fatalf("enforcement text = %q, want current user prompt", extracted.EnforcementText)
+	}
+}
+
+func TestExtractJSONRequestUsesLatestUserMessageForEnforcement(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"refusal"},{"role":"tool","content":"tool sensitive phrase"},{"role":"user","content":"ordinary new question"}]}`)
+	extracted := ExtractJSONRequest(body)
+	if extracted.EnforcementText != "ordinary new question" {
+		t.Fatalf("enforcement text = %q", extracted.EnforcementText)
+	}
+	if extracted.Continuation {
+		t.Fatal("Continuation = true, want false")
+	}
+}
+
+func TestExtractJSONRequestIncludesPreviousUserMessageForContinuation(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"answer"},{"role":"user","content":"继续上面的内容"}]}`)
+	extracted := ExtractJSONRequest(body)
+	if !extracted.Continuation {
+		t.Fatal("Continuation = false, want true")
+	}
+	for _, expected := range []string{"older sensitive phrase", "继续上面的内容"} {
+		if !strings.Contains(extracted.EnforcementText, expected) {
+			t.Fatalf("enforcement text %q does not contain %q", extracted.EnforcementText, expected)
+		}
+	}
+	if len(extracted.EnforcementFields) != 2 {
+		t.Fatalf("enforcement fields = %#v", extracted.EnforcementFields)
+	}
+}
+
+func TestExtractJSONRequestDetectsLongContinuationPrompt(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"answer"},{"role":"user","content":"请保持前文的剧情设定并继续完成后续章节，同时遵循这里附加的格式规则和角色约束。"}]}`)
+	extracted := ExtractJSONRequest(body)
+	if !extracted.Continuation || !strings.Contains(extracted.EnforcementText, "older sensitive phrase") {
+		t.Fatalf("extracted = %#v", extracted)
+	}
+}
+
+func TestExtractJSONRequestDoesNotTreatScopedWorkAsContinuation(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"answer"},{"role":"user","content":"继续修复代码中的并发问题"}]}`)
+	extracted := ExtractJSONRequest(body)
+	if extracted.Continuation || extracted.EnforcementText != "继续修复代码中的并发问题" {
+		t.Fatalf("extracted = %#v", extracted)
 	}
 }

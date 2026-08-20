@@ -73,3 +73,37 @@ func BenchmarkMatcherCandidateSegmentation(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkMatcherScoped(b *testing.B) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "benchmark",
+		Rules: []Rule{
+			{ID: "block", Category: "synthetic", Severity: "high", Action: RuleActionBlock, Keywords: []string{"synthetic blocked phrase"}},
+			{ID: "observe", Category: "synthetic", Severity: "medium", Action: RuleActionObserve, Keywords: []string{"synthetic observed phrase"}},
+		},
+	})
+	if err != nil {
+		b.Fatalf("CompilePolicy() error = %v", err)
+	}
+	current := strings.Repeat("normal current user content. ", 80)
+	history := strings.Repeat("normal historical user and tool content. ", 400) + current
+	for _, benchmark := range []struct {
+		name        string
+		enforcement string
+		observation string
+	}{
+		{name: "single_turn_fast_path", enforcement: current, observation: current},
+		{name: "multi_turn_scoped", enforcement: current, observation: history},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(benchmark.observation)))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if decision := matcher.MatchScoped(benchmark.enforcement, benchmark.observation, false); decision.Matched {
+					b.Fatalf("unexpected benchmark match: %#v", decision)
+				}
+			}
+		})
+	}
+}

@@ -15,11 +15,19 @@ const maxEvidenceStringRunes = 200_000
 // ExtractedRequest contains the text scanned by policy and a redacted evidence payload.
 type ExtractedRequest struct {
 	Text              string
+	EnforcementText   string
 	Model             string
 	Stream            bool
 	Evidence          []byte
 	ExtractedFields   []string
+	EnforcementFields []string
+	Continuation      bool
 	EvidenceSanitized bool
+}
+
+type enforcementSegment struct {
+	text   string
+	fields []string
 }
 
 var promptBearingKeys = map[string]struct{}{
@@ -31,6 +39,15 @@ var promptBearingKeys = map[string]struct{}{
 	"prompt":   {},
 	"query":    {},
 	"text":     {},
+}
+
+var enforcementPromptBearingKeys = map[string]struct{}{
+	"content":  {},
+	"contents": {},
+	"input":    {},
+	"messages": {},
+	"prompt":   {},
+	"query":    {},
 }
 
 var skippedContentKeys = map[string]struct{}{
@@ -77,7 +94,7 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 			"invalid_json": true,
 			"raw_text":     text,
 		})
-		return ExtractedRequest{Text: text, Evidence: evidence, EvidenceSanitized: true}
+		return ExtractedRequest{Text: text, EnforcementText: text, Evidence: evidence, EvidenceSanitized: true}
 	}
 
 	model := ""
@@ -90,23 +107,135 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 	parts := make([]string, 0, 16)
 	fields := make([]string, 0, 16)
 	collectPromptFields(root, "$", false, &parts, &fields)
+	enforcementSegments := make([]enforcementSegment, 0, 8)
+	collectEnforcementSegments(root, "$", false, &enforcementSegments)
+	if len(enforcementSegments) == 0 {
+		if object, ok := root.(map[string]any); ok {
+			if text, exists := object["text"].(string); exists {
+				appendEnforcementSegment(text, []string{"$.text"}, &enforcementSegments)
+			}
+		}
+	}
+	enforcementText, enforcementFields, continuation := enforcementScope(enforcementSegments)
 	sanitized := sanitizeEvidenceValue(root, "")
 	evidence, err := json.Marshal(map[string]any{
-		"request_body":   sanitized,
-		"extracted_text": strings.Join(parts, "\n"),
-		"fields":         fields,
+		"request_body":       sanitized,
+		"extracted_text":     strings.Join(parts, "\n"),
+		"fields":             fields,
+		"enforcement_fields": enforcementFields,
+		"continuation":       continuation,
 	})
 	if err != nil {
 		evidence = []byte(`{"evidence_error":"marshal_failed"}`)
 	}
 	return ExtractedRequest{
 		Text:              strings.Join(parts, "\n"),
+		EnforcementText:   enforcementText,
 		Model:             strings.TrimSpace(model),
 		Stream:            stream,
 		Evidence:          evidence,
 		ExtractedFields:   fields,
+		EnforcementFields: enforcementFields,
+		Continuation:      continuation,
 		EvidenceSanitized: true,
 	}
+}
+
+func collectEnforcementSegments(value any, path string, active bool, segments *[]enforcementSegment) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if role, exists := typed["role"].(string); exists {
+			if !strings.EqualFold(strings.TrimSpace(role), "user") {
+				return
+			}
+			parts := make([]string, 0, 4)
+			fields := make([]string, 0, 4)
+			collectPromptFields(typed, path, true, &parts, &fields)
+			appendEnforcementSegment(strings.Join(parts, "\n"), fields, segments)
+			return
+		}
+		if rawType, exists := typed["type"].(string); exists && isToolPromptType(rawType) {
+			return
+		}
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			lowerKey := strings.ToLower(strings.TrimSpace(key))
+			if _, skipped := skippedContentKeys[lowerKey]; skipped {
+				continue
+			}
+			_, promptBearing := enforcementPromptBearingKeys[lowerKey]
+			collectEnforcementSegments(typed[key], path+"."+key, active || promptBearing, segments)
+		}
+	case []any:
+		for index, item := range typed {
+			collectEnforcementSegments(item, fmt.Sprintf("%s[%d]", path, index), active, segments)
+		}
+	case string:
+		if active {
+			appendEnforcementSegment(typed, []string{path}, segments)
+		}
+	}
+}
+
+func appendEnforcementSegment(text string, fields []string, segments *[]enforcementSegment) {
+	text = strings.TrimSpace(text)
+	if text == "" || isURLOrData(text) {
+		return
+	}
+	if utf8.RuneCountInString(text) > maxEvidenceStringRunes {
+		text = string([]rune(text)[:maxEvidenceStringRunes])
+	}
+	*segments = append(*segments, enforcementSegment{text: text, fields: append([]string(nil), fields...)})
+}
+
+func enforcementScope(segments []enforcementSegment) (string, []string, bool) {
+	if len(segments) == 0 {
+		return "", nil, false
+	}
+	current := segments[len(segments)-1]
+	if len(segments) == 1 || !isContinuationPrompt(current.text) {
+		return current.text, append([]string(nil), current.fields...), false
+	}
+	previous := segments[len(segments)-2]
+	fields := append([]string(nil), previous.fields...)
+	fields = append(fields, current.fields...)
+	return previous.text + "\n" + current.text, fields, true
+}
+
+func isContinuationPrompt(text string) bool {
+	normalized := moderationCandidateText(text)
+	if normalized == "" {
+		return false
+	}
+	shortCues := []string{
+		"继续", "继续写", "继续上面", "继续刚才", "继续前文", "继续内容", "继续剧情", "继续故事",
+		"接着", "接着写", "接着上面", "接着前文", "续写", "往下写", "不要停",
+		"continue", "continueabove", "continueprevious", "continuethestory", "continuewriting",
+		"keepgoing", "carryon", "keepwriting", "sameasbefore",
+	}
+	if utf8.RuneCountInString(normalized) <= 64 {
+		for _, cue := range shortCues {
+			if normalized == cue {
+				return true
+			}
+		}
+	}
+	referencesPrevious := containsAny(normalized, []string{"前文", "上文", "上面内容", "上面的内容", "之前内容", "之前的内容", "刚才内容", "刚才的内容", "previous", "above", "earlier"})
+	continues := containsAny(normalized, []string{"继续", "接着", "续写", "延续", "保持", "continue", "keepgoing", "carryon", "keepwriting"})
+	return referencesPrevious && continues
+}
+
+func containsAny(text string, values []string) bool {
+	for _, value := range values {
+		if strings.Contains(text, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func collectPromptFields(value any, path string, active bool, parts, fields *[]string) {
@@ -161,6 +290,16 @@ func collectPromptFields(value any, path string, active bool, parts, fields *[]s
 func isAssistantPromptRole(role string) bool {
 	role = strings.TrimSpace(role)
 	return strings.EqualFold(role, "assistant") || strings.EqualFold(role, "model")
+}
+
+func isToolPromptType(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Contains(value, "tool") ||
+		strings.Contains(value, "function_call") ||
+		strings.Contains(value, "mcp_call") ||
+		strings.Contains(value, "computer_") ||
+		strings.Contains(value, "web_search_call") ||
+		value == "reasoning"
 }
 
 func isTrustedPromptRole(role string) bool {
@@ -283,9 +422,11 @@ func ExtractMultipartRequest(form *multipart.Form) ExtractedRequest {
 	})
 	return ExtractedRequest{
 		Text:              strings.Join(parts, "\n"),
+		EnforcementText:   strings.Join(parts, "\n"),
 		Model:             model,
 		Evidence:          evidence,
 		ExtractedFields:   fields,
+		EnforcementFields: append([]string(nil), fields...),
 		EvidenceSanitized: true,
 	}
 }

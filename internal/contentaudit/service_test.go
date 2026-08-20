@@ -291,6 +291,81 @@ rules:
 	}
 }
 
+func TestMiddlewareScopesHardBlockToCurrentUserAndContinuation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	policy := `version: scoped-v1
+rules:
+  - id: observe-rule
+    category: sexual
+    severity: medium
+    action: observe
+    keywords: ["explicit phrase"]
+  - id: block-rule
+    category: sexual
+    severity: high
+    action: block
+    keywords: ["explicit phrase"]
+    require-any: ["generate story"]
+`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:       true,
+		PolicyFile:    policyPath,
+		DatabasePath:  filepath.Join(tempDir, "audit.db"),
+		EvidenceKeyID: "test-key",
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+
+	toolRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"type":"custom_tool_call_output","output":"generate story explicit phrase"},{"role":"user","content":"ordinary current question"}]}`))
+	toolRequest.Header.Set("Content-Type", "application/json")
+	toolResponse := httptest.NewRecorder()
+	router.ServeHTTP(toolResponse, toolRequest)
+	if toolResponse.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("tool-output status=%d next=%d body=%s", toolResponse.Code, nextCalls, toolResponse.Body.String())
+	}
+
+	continuationRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"继续"}]}`))
+	continuationRequest.Header.Set("Content-Type", "application/json")
+	continuationResponse := httptest.NewRecorder()
+	router.ServeHTTP(continuationResponse, continuationRequest)
+	if continuationResponse.Code != http.StatusBadRequest || nextCalls != 1 {
+		t.Fatalf("continuation status=%d next=%d body=%s", continuationResponse.Code, nextCalls, continuationResponse.Body.String())
+	}
+
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || list.Total != 2 {
+		t.Fatalf("List() = %#v err=%v", list, err)
+	}
+	for _, item := range list.Items {
+		switch item.RuleID {
+		case "observe-rule":
+			if !item.UpstreamSent {
+				t.Fatalf("tool output observe event was blocked: %#v", item)
+			}
+		case "block-rule":
+			if item.UpstreamSent {
+				t.Fatalf("continuation block event was sent upstream: %#v", item)
+			}
+		default:
+			t.Fatalf("unexpected event: %#v", item)
+		}
+	}
+}
+
 func TestMiddlewareFailsClosedForUnauditedWebSocketFrames(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
