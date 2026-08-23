@@ -8,6 +8,7 @@ import (
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
@@ -16,12 +17,155 @@ const (
 	compactionBreakerFailureThreshold = 3
 	compactionBreakerTransientOpen    = time.Minute
 	compactionBreakerProtocolOpen     = 10 * time.Minute
+	remoteCompactionMaxAttempts       = 2
 )
 
 type compactionBreakerState struct {
 	ConsecutiveFailures int
 	OpenUntil           time.Time
 	LastErrorCode       string
+}
+
+type remoteCompactionFallbackGuard struct {
+	enabled            bool
+	compatibilityGroup string
+	attempts           int
+}
+
+func newRemoteCompactionFallbackGuard(intent cliproxyexecutor.CompactionIntent) *remoteCompactionFallbackGuard {
+	return &remoteCompactionFallbackGuard{enabled: cliproxyexecutor.IsRemoteCompactionIntent(intent)}
+}
+
+func (g *remoteCompactionFallbackGuard) shouldSkipAuth(auth *Auth) bool {
+	if g == nil || !g.enabled || g.attempts == 0 {
+		return false
+	}
+	if g.attempts >= remoteCompactionMaxAttempts {
+		return true
+	}
+	if g.compatibilityGroup == "" {
+		return true
+	}
+	capability := ResolveResponsesCompactionCapability(auth)
+	return strings.TrimSpace(capability.CompatibilityGroup) != g.compatibilityGroup
+}
+
+func (g *remoteCompactionFallbackGuard) markAuth(auth *Auth) {
+	if g == nil || !g.enabled || auth == nil {
+		return
+	}
+	if g.attempts == 0 {
+		capability := ResolveResponsesCompactionCapability(auth)
+		g.compatibilityGroup = strings.TrimSpace(capability.CompatibilityGroup)
+	}
+	g.attempts++
+}
+
+func (g *remoteCompactionFallbackGuard) canFallback(err error) bool {
+	if g == nil || !g.enabled || g.attempts != 1 || g.compatibilityGroup == "" || err == nil {
+		return false
+	}
+	if failure, ok := failurecontract.As(err); ok {
+		if failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest {
+			return false
+		}
+		if failure.Retryable {
+			return true
+		}
+	}
+	if isRequestInvalidError(err) {
+		return false
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden,
+		http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return isTransientRoutingError(err)
+	}
+}
+
+func (m *Manager) prepareRemoteCompactionFallback(ctx context.Context, providers []string, model string, intent cliproxyexecutor.CompactionIntent, guard *remoteCompactionFallbackGuard, auth *Auth, tried map[string]struct{}, err error) bool {
+	if m == nil || !guard.canFallback(err) {
+		return false
+	}
+	m.markRetryChannelTried(ctx, tried, auth, err)
+	return m.hasRemoteCompactionFallback(providers, model, intent, guard.compatibilityGroup, tried, time.Now())
+}
+
+func (m *Manager) hasRemoteCompactionFallback(providers []string, model string, intent cliproxyexecutor.CompactionIntent, compatibilityGroup string, tried map[string]struct{}, now time.Time) bool {
+	compatibilityGroup = strings.TrimSpace(compatibilityGroup)
+	if m == nil || compatibilityGroup == "" || !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+		return false
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range normalizeProviderKeys(providers) {
+		providerSet[provider] = struct{}{}
+	}
+	type fallbackCandidate struct {
+		auth       *Auth
+		checkModel string
+	}
+	candidates := make([]fallbackCandidate, 0)
+	registryRef := registry.GetGlobalRegistry()
+	m.mu.RLock()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
+			continue
+		}
+		if _, used := tried[candidate.ID]; used {
+			continue
+		}
+		if executorKeyForProviderSet(candidate, providerSet, m.executors) == "" {
+			continue
+		}
+		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		capability := ResolveResponsesCompactionCapability(candidate)
+		if !remoteCompactionCandidateAllowed(candidate, intent) || strings.TrimSpace(capability.CompatibilityGroup) != compatibilityGroup {
+			continue
+		}
+		candidates = append(candidates, fallbackCandidate{
+			auth:       candidate.Clone(),
+			checkModel: m.selectionModelForAuth(candidate, model),
+		})
+	}
+	m.mu.RUnlock()
+
+	for _, candidate := range candidates {
+		if blocked, _ := m.remoteCompactionBreakerBlockState(candidate.auth, model, intent, now); blocked {
+			continue
+		}
+		includeHealth := !isGPTRetryRoute([]string{candidate.auth.Provider}, candidate.checkModel)
+		blocked, _, _ := isAuthBlockedForModelRoute(candidate.auth, candidate.checkModel, now, includeHealth)
+		if !blocked {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) logRemoteCompactionFallback(ctx context.Context, model string, guard *remoteCompactionFallbackGuard, err error) {
+	if guard == nil || !guard.enabled {
+		return
+	}
+	fields := log.Fields{
+		"event":                          "remote_compaction_failover",
+		"model":                          canonicalModelKey(model),
+		"compaction_compatibility_group": guard.compatibilityGroup,
+		"failed_attempt":                 guard.attempts,
+	}
+	if code := strings.TrimSpace(errorCodeFromError(err)); code != "" {
+		fields["error_code"] = code
+	}
+	if status := statusCodeFromError(err); status > 0 {
+		fields["status"] = status
+		fields["status_code"] = status
+	}
+	logEntryWithRequestID(ctx).WithFields(fields).Warn("remote_compaction_failover")
 }
 
 const (
@@ -154,22 +298,141 @@ func (m *Manager) remoteCompactionCandidateAllowed(auth *Auth, model string, int
 	if m == nil || auth == nil || !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
 		return true
 	}
+	blocked, _ := m.remoteCompactionBreakerBlockState(auth, model, intent, time.Now())
+	return !blocked
+}
+
+func (m *Manager) remoteCompactionBreakerBlockState(auth *Auth, model string, intent cliproxyexecutor.CompactionIntent, now time.Time) (bool, time.Time) {
+	if m == nil || auth == nil || !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+		return false, time.Time{}
+	}
 	key := compactionBreakerKey(auth, model, intent)
 	if key == "" {
-		return true
+		return false, time.Time{}
 	}
-	now := time.Now()
 	m.compactionBreakerMu.Lock()
 	defer m.compactionBreakerMu.Unlock()
 	state := m.compactionBreakers[key]
 	if state == nil || state.OpenUntil.IsZero() {
-		return true
+		return false, time.Time{}
 	}
 	if !now.Before(state.OpenUntil) {
 		delete(m.compactionBreakers, key)
-		return true
+		return false, time.Time{}
 	}
-	return false
+	return true, state.OpenUntil
+}
+
+func (m *Manager) remoteCompactionRouteAvailabilitySnapshot(providers []string, model string, intent cliproxyexecutor.CompactionIntent, now time.Time) gptRouteAvailabilitySnapshot {
+	snapshot := gptRouteAvailabilitySnapshot{
+		candidateRoutes: make(map[string]struct{}),
+		eligibleRoutes:  make(map[string]struct{}),
+		blockedRoutes:   make(map[string]string),
+		breakerRoutes:   make(map[string]int),
+	}
+	if m == nil || !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+		return snapshot
+	}
+
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range normalizeProviderKeys(providers) {
+		providerSet[provider] = struct{}{}
+	}
+	registryRef := registry.GetGlobalRegistry()
+	type availabilityCandidate struct {
+		auth       *Auth
+		checkModel string
+	}
+	candidates := make([]availabilityCandidate, 0)
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if auth == nil || executorKeyForProviderSet(auth, providerSet, m.executors) == "" {
+			continue
+		}
+		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+			continue
+		}
+		if !remoteCompactionCandidateAllowed(auth, intent) {
+			continue
+		}
+		candidates = append(candidates, availabilityCandidate{
+			auth:       auth.Clone(),
+			checkModel: m.selectionModelForAuth(auth, model),
+		})
+	}
+	m.mu.RUnlock()
+
+	for _, candidate := range candidates {
+		auth := candidate.auth
+		routeKey := routingChannelBaseKey(auth)
+		if routeKey == "" {
+			continue
+		}
+		snapshot.candidateRoutes[routeKey] = struct{}{}
+		if blocked, next := m.remoteCompactionBreakerBlockState(auth, model, intent, now); blocked {
+			snapshot.blockedRoutes[routeKey] = "compaction_breaker"
+			snapshot.breakerRoutes[routeKey] = 0
+			if next.After(now) && (snapshot.earliestRecovery.IsZero() || next.Before(snapshot.earliestRecovery)) {
+				snapshot.earliestRecovery = next
+			}
+			continue
+		}
+
+		checkModel := candidate.checkModel
+		includeHealth := !isGPTRetryRoute([]string{auth.Provider}, checkModel)
+		blocked, reason, next := isAuthBlockedForModelRoute(auth, checkModel, now, includeHealth)
+		if !blocked && includeHealth {
+			var healthNext time.Time
+			blocked, healthNext = m.healthSelectionBlocked(auth, checkModel, now)
+			if blocked {
+				reason = blockReasonOther
+				next = healthNext
+			}
+		}
+		if !blocked {
+			snapshot.eligibleRoutes[routeKey] = struct{}{}
+			continue
+		}
+
+		if _, exists := snapshot.blockedRoutes[routeKey]; !exists {
+			snapshot.blockedRoutes[routeKey] = blockReasonLabel(reason)
+		}
+		if next.After(now) && (snapshot.earliestRecovery.IsZero() || next.Before(snapshot.earliestRecovery)) {
+			snapshot.earliestRecovery = next
+		}
+		health := resolveHealthState(auth, checkModel)
+		if health.BreakerState == HealthBreakerOpen && health.OpenUntil.After(now) {
+			snapshot.breakerRoutes[routeKey] = health.LastStatusCode
+			if snapshot.earliestRecovery.IsZero() || health.OpenUntil.Before(snapshot.earliestRecovery) {
+				snapshot.earliestRecovery = health.OpenUntil
+			}
+		}
+	}
+
+	for routeKey := range snapshot.eligibleRoutes {
+		delete(snapshot.blockedRoutes, routeKey)
+		delete(snapshot.breakerRoutes, routeKey)
+	}
+	return snapshot
+}
+
+func (m *Manager) remoteCompactionAvailabilityError(providers []string, model string, intent cliproxyexecutor.CompactionIntent, cause error) error {
+	if cause == nil || !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+		return cause
+	}
+	now := time.Now()
+	snapshot := m.remoteCompactionRouteAvailabilitySnapshot(providers, model, intent, now)
+	if len(snapshot.candidateRoutes) == 0 || len(snapshot.eligibleRoutes) > 0 {
+		return cause
+	}
+
+	retryAfter := compactionBreakerTransientOpen
+	if hinted := retryAfterFromError(cause); hinted != nil && *hinted > 0 {
+		retryAfter = *hinted
+	} else if snapshot.earliestRecovery.After(now) {
+		retryAfter = snapshot.earliestRecovery.Sub(now)
+	}
+	return newRemoteCompactionRouteUnavailableError(retryAfter, cause)
 }
 
 func compactionBreakerKey(auth *Auth, model string, intent cliproxyexecutor.CompactionIntent) string {
@@ -289,7 +552,13 @@ func remoteCompactionSelectionError(intent cliproxyexecutor.CompactionIntent) er
 }
 
 func remoteCompactionRouteUnavailableError() error {
-	retryAfter := compactionBreakerTransientOpen
+	return newRemoteCompactionRouteUnavailableError(compactionBreakerTransientOpen, nil)
+}
+
+func newRemoteCompactionRouteUnavailableError(retryAfter time.Duration, cause error) error {
+	if retryAfter <= 0 {
+		retryAfter = compactionBreakerTransientOpen
+	}
 	return &failurecontract.Failure{
 		Kind:          failurecontract.ProviderUnavailable,
 		Scope:         failurecontract.ScopeModel,
@@ -301,6 +570,7 @@ func remoteCompactionRouteUnavailableError() error {
 		StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
 		RetryAfter:    &retryAfter,
 		Retryable:     true,
+		Cause:         cause,
 		PublicMessage: "compaction_route_unavailable: all compatible remote-compaction routes are temporarily unavailable",
 	}
 }

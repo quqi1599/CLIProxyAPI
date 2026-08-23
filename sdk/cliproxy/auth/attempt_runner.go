@@ -212,9 +212,9 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 
 	requestRetry, maxRetryCredentials, maxWait := manager.retrySettings()
 	if remoteCompaction {
-		maxRetryCredentials = 0
+		maxRetryCredentials = remoteCompactionMaxAttempts - 1
 		maxWait = 0
-		trace.configureBudget(1, 0)
+		trace.configureBudget(remoteCompactionMaxAttempts, remoteCompactionMaxAttempts-1)
 	} else if gptRoute {
 		if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
 			trace.configureBudget(gptLargeToolHistoryMaxRetryCredentials+1, gptLargeToolHistoryMaxRetryCredentials)

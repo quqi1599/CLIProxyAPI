@@ -3,6 +3,8 @@ package failure
 
 import (
 	"errors"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -112,6 +114,22 @@ func (f *Failure) StatusCode() int {
 		return f.HTTPStatus
 	}
 	return legacyHTTPStatus(f.Cause)
+}
+
+// Headers exposes a downstream Retry-After hint when the canonical failure
+// carries one. The API layer filters addon headers before forwarding them.
+func (f *Failure) Headers() http.Header {
+	if f == nil || f.RetryAfter == nil {
+		return nil
+	}
+	wait := *f.RetryAfter
+	seconds := int64(0)
+	if wait > 0 {
+		seconds = int64((wait + time.Second - 1) / time.Second)
+	}
+	headers := make(http.Header)
+	headers.Set("Retry-After", strconv.FormatInt(seconds, 10))
+	return headers
 }
 
 // ErrorCode preserves the provider-code accessor used by existing auth code.

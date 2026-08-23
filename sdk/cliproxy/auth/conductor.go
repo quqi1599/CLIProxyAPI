@@ -5441,7 +5441,11 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	compactionIntent := compactionIntentFromRequest(req, opts)
 	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
 	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
-	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	var fallbackGuard *gptLargeToolHistoryFallbackGuard
+	if !remoteCompaction {
+		fallbackGuard = newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	}
+	compactionFallback := newRemoteCompactionFallbackGuard(compactionIntent)
 	if gptRoute {
 		maxRetryCredentials = gptImmediateFailoverMaxChannels - 1
 	}
@@ -5482,13 +5486,18 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
-			m.logAuthSelectionFailureMetric(ctx, providers, routeModel, errPick)
+			m.logAuthSelectionFailureMetric(ctx, providers, routeModel, opts, errPick)
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
 		tried[auth.ID] = struct{}{}
+		if compactionFallback.shouldSkipAuth(auth) {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			continue
+		}
+		compactionFallback.markAuth(auth)
 		if fallbackGuard.shouldSkipAuth(auth) {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
@@ -5527,6 +5536,14 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			if remoteCompaction {
+				if m.prepareRemoteCompactionFallback(ctx, providers, routeModel, compactionIntent, compactionFallback, auth, tried, errPrepare) {
+					lastErr = errPrepare
+					nextRetryReason = retryReasonFromError(errPrepare)
+					trace.recordFinalStatus(statusCodeFromError(errPrepare))
+					trace.recordFallback()
+					m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, errPrepare)
+					continue
+				}
 				return cliproxyexecutor.Response{}, errPrepare
 			}
 			lastErr = errPrepare
@@ -5652,7 +5669,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				authErr = errExec
 				countAttempt = true
 				if remoteCompaction {
-					return cliproxyexecutor.Response{}, errExec
+					break modelLoop
 				}
 				if channelFailover {
 					if !shouldFailoverGPTChannel(errExec, providers, routeModel) {
@@ -5692,6 +5709,19 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			return resp, nil
 		}
 		if authErr != nil {
+			if remoteCompaction {
+				if !m.prepareRemoteCompactionFallback(ctx, providers, routeModel, compactionIntent, compactionFallback, auth, tried, authErr) {
+					return cliproxyexecutor.Response{}, authErr
+				}
+				if countAttempt {
+					attempted[auth.ID] = struct{}{}
+				}
+				lastErr = authErr
+				nextRetryReason = retryReasonFromError(authErr)
+				trace.recordFallback()
+				m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, authErr)
+				continue
+			}
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(authErr) {
@@ -5732,7 +5762,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	compactionIntent := compactionIntentFromRequest(req, opts)
 	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
 	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
-	fallbackGuard := newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	var fallbackGuard *gptLargeToolHistoryFallbackGuard
+	if !remoteCompaction {
+		fallbackGuard = newGPTLargeToolHistoryFallbackGuard(providers, routeModel, opts)
+	}
+	compactionFallback := newRemoteCompactionFallbackGuard(compactionIntent)
 	trace := requestAttemptTraceFromContext(ctx)
 	if gptRoute {
 		maxChannels, _ := trace.gptFirstEventRetryLimits()
@@ -5780,13 +5814,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
-			m.logAuthSelectionFailureMetric(ctx, providers, routeModel, errPick)
+			m.logAuthSelectionFailureMetric(ctx, providers, routeModel, opts, errPick)
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}
 			return nil, errPick
 		}
 		tried[auth.ID] = struct{}{}
+		if compactionFallback.shouldSkipAuth(auth) {
+			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
+			continue
+		}
+		compactionFallback.markAuth(auth)
 		if fallbackGuard.shouldSkipAuth(auth) {
 			m.markSelectorLoadDone(ctx, auth.ID, routeModel)
 			continue
@@ -5824,6 +5863,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromCause(errPrepare), Cause: errPrepare}
 			m.MarkResult(execCtx, result)
 			if remoteCompaction {
+				if m.prepareRemoteCompactionFallback(ctx, providers, routeModel, compactionIntent, compactionFallback, auth, tried, errPrepare) {
+					lastErr = errPrepare
+					nextRetryReason = retryReasonFromError(errPrepare)
+					trace.recordFinalStatus(statusCodeFromError(errPrepare))
+					trace.recordFallback()
+					m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, errPrepare)
+					continue
+				}
 				return nil, errPrepare
 			}
 			lastErr = errPrepare
@@ -5865,6 +5912,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if remoteCompaction {
+				if m.prepareRemoteCompactionFallback(ctx, providers, routeModel, compactionIntent, compactionFallback, auth, tried, errStream) {
+					lastErr = errStream
+					nextRetryReason = retryReasonFromError(errStream)
+					trace.recordFinalStatus(statusCodeFromError(errStream))
+					trace.recordFallback()
+					m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, errStream)
+					continue
+				}
 				return nil, errStream
 			}
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
@@ -10884,6 +10939,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			errAvailable = m.remoteCompactionAvailabilityError([]string{provider}, model, intent, errAvailable)
+		}
 		return nil, nil, errAvailable
 	}
 	available = cloneAuthSlice(available)
@@ -10895,11 +10953,17 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 	if errPick != nil {
+		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			errPick = m.remoteCompactionAvailabilityError([]string{provider}, model, intent, errPick)
+		}
 		return nil, nil, errPick
 	}
 	if !handled {
 		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
 		if errPick != nil {
+			if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+				errPick = m.remoteCompactionAvailabilityError([]string{provider}, model, intent, errPick)
+			}
 			return nil, nil, errPick
 		}
 	}
@@ -11136,6 +11200,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			errAvailable = m.remoteCompactionAvailabilityError(providers, model, intent, errAvailable)
+		}
 		return nil, nil, "", errAvailable
 	}
 	available = cloneAuthSlice(available)
@@ -11147,11 +11214,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
+		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+			errPick = m.remoteCompactionAvailabilityError(providers, model, intent, errPick)
+		}
 		return nil, nil, "", errPick
 	}
 	if !handled {
 		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
 		if errPick != nil {
+			if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+				errPick = m.remoteCompactionAvailabilityError(providers, model, intent, errPick)
+			}
 			return nil, nil, "", errPick
 		}
 	}
@@ -12820,7 +12893,7 @@ func (m *Manager) logAuthSelectionMetric(ctx context.Context, auth *Auth, provid
 	logEntryWithRequestID(ctx).WithFields(fields).Info("auth_selection")
 }
 
-func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers []string, model string, err error) {
+func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, err error) {
 	if err == nil {
 		return
 	}
@@ -12834,9 +12907,13 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 		fields["status"] = status
 		fields["status_code"] = status
 	}
+	terminalCode := strings.TrimSpace(errorCodeFromError(err))
+	if terminalCode != "" {
+		fields["error_code"] = terminalCode
+	}
 	var authErr *Error
 	if errors.As(err, &authErr) && authErr != nil {
-		if authErr.Code != "" {
+		if terminalCode == "" && authErr.Code != "" {
 			fields["error_code"] = authErr.Code
 		}
 		if authErr.Retryable {
@@ -12845,10 +12922,15 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 	}
 	var cooldownErr *modelCooldownError
 	if errors.As(err, &cooldownErr) && cooldownErr != nil {
-		fields["error_code"] = "model_cooldown"
-		fields["reset_ms"] = cooldownErr.resetIn.Milliseconds()
+		if terminalCode == "" {
+			fields["error_code"] = "model_cooldown"
+			fields["reset_ms"] = cooldownErr.resetIn.Milliseconds()
+		} else {
+			fields["cause_error_code"] = "model_cooldown"
+			fields["cause_reset_ms"] = cooldownErr.resetIn.Milliseconds()
+		}
 	}
-	for key, value := range m.authAvailabilityMetricFields(providers, model, time.Now()) {
+	for key, value := range m.authAvailabilityMetricFieldsForRequest(providers, model, opts, time.Now()) {
 		fields[key] = value
 	}
 	logEntryWithRequestID(ctx).WithFields(fields).Warn("auth_selection_failed")
@@ -12856,6 +12938,26 @@ func (m *Manager) logAuthSelectionFailureMetric(ctx context.Context, providers [
 
 func (m *Manager) authAvailabilityMetricFields(providers []string, model string, now time.Time) log.Fields {
 	return m.gptRouteAvailabilitySnapshot(providers, model, now).logFields(now)
+}
+
+func (m *Manager) authAvailabilityMetricFieldsForRequest(providers []string, model string, opts cliproxyexecutor.Options, now time.Time) log.Fields {
+	ordinaryFields := m.authAvailabilityMetricFields(providers, model, now)
+	intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
+	if !cliproxyexecutor.IsRemoteCompactionIntent(intent) {
+		return ordinaryFields
+	}
+
+	compactionFields := m.remoteCompactionRouteAvailabilitySnapshot(providers, model, intent, now).logFields(now)
+	fields := make(log.Fields, len(ordinaryFields)+len(compactionFields)*2+1)
+	for key, value := range ordinaryFields {
+		fields["ordinary_"+key] = value
+	}
+	for key, value := range compactionFields {
+		fields[key] = value
+		fields["compaction_"+key] = value
+	}
+	fields["compaction_intent"] = string(intent)
+	return fields
 }
 
 func blockReasonLabel(reason blockReason) string {
