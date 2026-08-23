@@ -6208,6 +6208,58 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	}
 }
 
+func pinnedAuthFallbackFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[cliproxyexecutor.PinnedAuthFallbackMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		parsed, errParse := strconv.ParseBool(strings.TrimSpace(value))
+		return errParse == nil && parsed
+	case []byte:
+		parsed, errParse := strconv.ParseBool(strings.TrimSpace(string(value)))
+		return errParse == nil && parsed
+	default:
+		return false
+	}
+}
+
+func (m *Manager) relaxPinnedAuthForFallback(ctx context.Context, opts cliproxyexecutor.Options, model string, tried map[string]struct{}) cliproxyexecutor.Options {
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	if pinnedAuthID == "" || !pinnedAuthFallbackFromMetadata(opts.Metadata) {
+		return opts
+	}
+	_, alreadyTried := tried[pinnedAuthID]
+	if !alreadyTried && m.IsAuthSchedulableForModel(pinnedAuthID, model) {
+		return opts
+	}
+
+	metadata := make(map[string]any, len(opts.Metadata))
+	for key, value := range opts.Metadata {
+		if key == cliproxyexecutor.PinnedAuthMetadataKey {
+			continue
+		}
+		metadata[key] = value
+	}
+	opts.Metadata = metadata
+	reason := "pinned_auth_ineligible"
+	if alreadyTried {
+		reason = "pinned_auth_already_tried"
+	}
+	logEntryWithRequestID(ctx).WithFields(log.Fields{
+		"event":  "auth_affinity_escape",
+		"model":  canonicalModelKey(model),
+		"reason": reason,
+	}).Info("auth selection: relaxed stale pinned auth")
+	return opts
+}
+
 func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -10576,6 +10628,44 @@ func authSupportsDirectProviderRouteModel(auth *Auth, routeModel string) bool {
 	}
 }
 
+// IsAuthSchedulableForModel reports whether the current manager state would
+// admit an auth for a model before any half-open fallback is considered.
+// Long-lived transports use this to discard stale affinity pins without
+// duplicating the manager's cooldown and breaker rules.
+func (m *Manager) IsAuthSchedulableForModel(authID, routeModel string) bool {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return false
+	}
+
+	m.mu.RLock()
+	auth := m.auths[strings.TrimSpace(authID)]
+	if auth != nil {
+		auth = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if auth == nil {
+		return false
+	}
+	if strings.TrimSpace(routeModel) != "" &&
+		!m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, routeModel) {
+		return false
+	}
+
+	checkModel := m.selectionModelForAuth(auth, routeModel)
+	gptRoute := isGPTRetryRoute([]string{executorKeyFromAuth(auth)}, routeModel)
+	includeHealth := gptRoute || !isGPTRetryRoute([]string{auth.Provider}, checkModel)
+	now := time.Now()
+	if blocked, _, _ := isAuthBlockedForModelRoute(auth, checkModel, now, includeHealth); blocked {
+		return false
+	}
+	if includeHealth {
+		if blocked, _ := m.healthSelectionBlocked(auth, checkModel, now); blocked {
+			return false
+		}
+	}
+	return true
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
@@ -10885,6 +10975,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if m.HomeEnabled() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
+	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
@@ -11095,6 +11186,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if m.HomeEnabled() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
+	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}

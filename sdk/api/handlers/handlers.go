@@ -65,6 +65,7 @@ const (
 )
 
 type pinnedAuthContextKey struct{}
+type pinnedAuthFallbackContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type preparedModelRouteContextKey struct{}
 type executionSessionContextKey struct{}
@@ -132,6 +133,15 @@ func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, pinnedAuthContextKey{}, authID)
+}
+
+// WithPinnedAuthFallback allows a pinned request to use another eligible auth
+// when the pin fails before any output is committed.
+func WithPinnedAuthFallback(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, pinnedAuthFallbackContextKey{}, true)
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -521,6 +531,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
+	if pinnedAuthFallbackFromContext(ctx) {
+		meta[coreexecutor.PinnedAuthFallbackMetadataKey] = true
+	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
@@ -610,6 +623,14 @@ func pinnedAuthIDFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func pinnedAuthFallbackFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(pinnedAuthFallbackContextKey{}).(bool)
+	return value
 }
 
 func selectedAuthIDCallbackFromContext(ctx context.Context) func(string) {

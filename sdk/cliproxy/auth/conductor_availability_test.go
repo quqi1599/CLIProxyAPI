@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestUpdateAggregatedAvailability_UnavailableWithoutNextRetryDoesNotBlockAuth(t *testing.T) {
@@ -102,6 +103,91 @@ func TestManager_AvailableProvidersAndHasProviderAuth_ExcludeDisabled(t *testing
 	}
 	if manager.HasProviderAuth("codex") {
 		t.Errorf("HasProviderAuth(codex) = true, want false (only StatusDisabled auth registered)")
+	}
+}
+
+func TestManagerIsAuthSchedulableForModelRejectsOpenCodexAPIKeyBreaker(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	const (
+		authID = "breaker-open-codex-api-key"
+		model  = "gpt-5.6-sol"
+	)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   StatusError,
+		Attributes: map[string]string{
+			AttributeAPIKey: "test-key",
+		},
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:      StatusError,
+				Unavailable: false,
+				Health: HealthState{
+					Observed:     true,
+					BreakerState: HealthBreakerOpen,
+					OpenUntil:    time.Now().Add(time.Minute),
+				},
+			},
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	if manager.IsAuthSchedulableForModel(authID, model) {
+		t.Fatal("breaker-open Codex API-key auth must not remain schedulable")
+	}
+}
+
+func TestManagerPinnedAuthFallbackEscapesAlreadyTriedAuth(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&authFallbackExecutor{id: "codex"})
+
+	reg := registry.GetGlobalRegistry()
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		if _, errRegister := manager.Register(context.Background(), &Auth{
+			ID:       authID,
+			Provider: "codex",
+			Status:   StatusActive,
+			Attributes: map[string]string{
+				AttributeAPIKey: "test-key-" + authID,
+				"base_url":      "https://" + authID + ".example/v1",
+			},
+		}); errRegister != nil {
+			t.Fatalf("register %s: %v", authID, errRegister)
+		}
+		reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		reg.UnregisterClient("auth-a")
+		reg.UnregisterClient("auth-b")
+	})
+
+	tried := map[string]struct{}{"auth-a": {}}
+	hardPin := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey: "auth-a",
+	}}
+	if _, _, _, errPick := manager.pickNextMixed(context.Background(), []string{"codex"}, model, hardPin, tried); errPick == nil {
+		t.Fatal("hard pin unexpectedly escaped an already-tried auth")
+	}
+
+	fallbackPin := hardPin
+	fallbackPin.Metadata = map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey:         "auth-a",
+		cliproxyexecutor.PinnedAuthFallbackMetadataKey: true,
+	}
+	selected, _, _, errPick := manager.pickNextMixed(context.Background(), []string{"codex"}, model, fallbackPin, tried)
+	if errPick != nil {
+		t.Fatalf("fallback pin pick: %v", errPick)
+	}
+	if selected == nil || selected.ID != "auth-b" {
+		t.Fatalf("fallback pin selected = %+v, want auth-b", selected)
 	}
 }
 
