@@ -117,14 +117,17 @@ func (h *Handler) ListContentAuditEvents(c *gin.Context) {
 		return
 	}
 	filter := contentaudit.ListFilter{
-		Search:      c.Query("search"),
-		Category:    c.Query("category"),
-		Severity:    c.Query("severity"),
-		ReviewLabel: c.Query("review_label"),
-		UserID:      parseAuditInt64(c.Query("user_id")),
-		TokenID:     parseAuditInt64(c.Query("token_id")),
-		Page:        int(parseAuditInt64(c.Query("page"))),
-		PageSize:    int(parseAuditInt64(c.Query("page_size"))),
+		Search:         c.Query("search"),
+		Category:       c.Query("category"),
+		Severity:       c.Query("severity"),
+		ReviewLabel:    c.Query("review_label"),
+		UserID:         parseAuditInt64(c.Query("user_id")),
+		TokenID:        parseAuditInt64(c.Query("token_id")),
+		MatchedRole:    c.Query("matched_role"),
+		Fingerprint:    c.Query("content_fingerprint"),
+		DuplicatesOnly: strings.EqualFold(strings.TrimSpace(c.Query("duplicates_only")), "true") || c.Query("duplicates_only") == "1",
+		Page:           int(parseAuditInt64(c.Query("page"))),
+		PageSize:       int(parseAuditInt64(c.Query("page_size"))),
 	}
 	result, err := service.List(c.Request.Context(), filter)
 	if err != nil {

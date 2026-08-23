@@ -10,12 +10,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -34,33 +37,49 @@ var validReviewLabels = map[string]struct{}{
 	"out_of_scope":        {},
 }
 
-// Event is the plaintext metadata stored for one locally blocked request.
+// Event is the plaintext metadata stored for one matched request.
 type Event struct {
-	ID               string `json:"id"`
-	CreatedAt        int64  `json:"created_at"`
-	RequestID        string `json:"request_id"`
-	UserID           int64  `json:"user_id,omitempty"`
-	TokenID          int64  `json:"token_id,omitempty"`
-	TokenName        string `json:"token_name,omitempty"`
-	Method           string `json:"method"`
-	Path             string `json:"path"`
-	Protocol         string `json:"protocol"`
-	Model            string `json:"model,omitempty"`
-	Stream           bool   `json:"stream"`
-	Category         string `json:"category"`
-	Severity         string `json:"severity"`
-	RuleID           string `json:"rule_id"`
-	MatchedTerm      string `json:"matched_term,omitempty"`
-	PolicyVersion    string `json:"policy_version"`
-	RequestBytes     int64  `json:"request_bytes"`
-	IdentityVerified bool   `json:"identity_verified"`
-	UpstreamSent     bool   `json:"upstream_sent"`
-	EvidenceStatus   string `json:"evidence_status"`
-	EvidenceKeyID    string `json:"evidence_key_id"`
-	ReviewLabel      string `json:"review_label"`
-	ReviewNote       string `json:"review_note,omitempty"`
-	ReviewedAt       int64  `json:"reviewed_at,omitempty"`
-	ReviewedBy       string `json:"reviewed_by,omitempty"`
+	ID                    string   `json:"id"`
+	CreatedAt             int64    `json:"created_at"`
+	RequestID             string   `json:"request_id"`
+	UserID                int64    `json:"user_id,omitempty"`
+	TokenID               int64    `json:"token_id,omitempty"`
+	TokenName             string   `json:"token_name,omitempty"`
+	Method                string   `json:"method"`
+	Path                  string   `json:"path"`
+	Protocol              string   `json:"protocol"`
+	Model                 string   `json:"model,omitempty"`
+	Stream                bool     `json:"stream"`
+	Category              string   `json:"category"`
+	Severity              string   `json:"severity"`
+	RuleID                string   `json:"rule_id"`
+	Action                string   `json:"action"`
+	FinalAction           string   `json:"final_action"`
+	MatchedTerm           string   `json:"matched_term,omitempty"`
+	MatchedRoles          []string `json:"matched_roles,omitempty"`
+	ContentFingerprint    string   `json:"content_fingerprint,omitempty"`
+	PolicyVersion         string   `json:"policy_version"`
+	RequestBytes          int64    `json:"request_bytes"`
+	IdentityVerified      bool     `json:"identity_verified"`
+	UpstreamSent          bool     `json:"upstream_sent"`
+	EvidenceStatus        string   `json:"evidence_status"`
+	EvidenceKeyID         string   `json:"evidence_key_id"`
+	EvidenceRefID         string   `json:"evidence_ref_id,omitempty"`
+	DuplicateCount        int64    `json:"duplicate_count"`
+	ModelReviewMode       string   `json:"model_review_mode,omitempty"`
+	ModelReviewModel      string   `json:"model_review_model,omitempty"`
+	ModelReviewDecision   string   `json:"model_review_decision,omitempty"`
+	ModelReviewCategory   string   `json:"model_review_category,omitempty"`
+	ModelReviewConfidence float64  `json:"model_review_confidence,omitempty"`
+	ModelReviewLatencyMS  int64    `json:"model_review_latency_ms,omitempty"`
+	ModelReviewCacheHit   bool     `json:"model_review_cache_hit,omitempty"`
+	ModelReviewFallback   string   `json:"model_review_fallback,omitempty"`
+	ReviewLabel           string   `json:"review_label"`
+	ReviewNote            string   `json:"review_note,omitempty"`
+	ReviewedAt            int64    `json:"reviewed_at,omitempty"`
+	ReviewedBy            string   `json:"reviewed_by,omitempty"`
+	fingerprintMaterial   string
+	dedupeWindow          time.Duration
 }
 
 // AccessLog records sensitive evidence reveals and operator annotations.
@@ -91,14 +110,17 @@ type EventDetail struct {
 
 // ListFilter selects audit events for the Management API.
 type ListFilter struct {
-	Search      string
-	Category    string
-	Severity    string
-	ReviewLabel string
-	UserID      int64
-	TokenID     int64
-	Page        int
-	PageSize    int
+	Search         string
+	Category       string
+	Severity       string
+	ReviewLabel    string
+	UserID         int64
+	TokenID        int64
+	MatchedRole    string
+	Fingerprint    string
+	DuplicatesOnly bool
+	Page           int
+	PageSize       int
 }
 
 // ListResult is a stable paginated Management API envelope.
@@ -111,10 +133,12 @@ type ListResult struct {
 
 // Store owns the isolated SQLite metadata database and AES-GCM evidence key.
 type Store struct {
-	db    *sql.DB
-	path  string
-	aead  cipher.AEAD
-	keyID string
+	db             *sql.DB
+	path           string
+	aead           cipher.AEAD
+	keyID          string
+	fingerprintKey [32]byte
+	recordMu       sync.Mutex
 }
 
 // NewStore opens the isolated audit database and initializes its schema.
@@ -145,7 +169,7 @@ func NewStore(path, evidenceKey, keyID string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
-	store := &Store{db: db, path: path, aead: aead, keyID: strings.TrimSpace(keyID)}
+	store := &Store{db: db, path: path, aead: aead, keyID: strings.TrimSpace(keyID), fingerprintKey: keyDigest}
 	if store.keyID == "" {
 		store.keyID = "primary"
 	}
@@ -186,13 +210,27 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			category TEXT NOT NULL,
 			severity TEXT NOT NULL,
 			rule_id TEXT NOT NULL,
+			action TEXT NOT NULL DEFAULT '',
+			final_action TEXT NOT NULL DEFAULT '',
 			matched_term TEXT NOT NULL DEFAULT '',
+			matched_roles TEXT NOT NULL DEFAULT '[]',
+			content_fingerprint TEXT NOT NULL DEFAULT '',
 			policy_version TEXT NOT NULL DEFAULT '',
 			request_bytes INTEGER NOT NULL DEFAULT 0,
 			identity_verified INTEGER NOT NULL DEFAULT 0,
 			upstream_sent INTEGER NOT NULL DEFAULT 0,
 			evidence_status TEXT NOT NULL DEFAULT 'encrypted',
 			evidence_key_id TEXT NOT NULL DEFAULT '',
+			evidence_ref_id TEXT NOT NULL DEFAULT '',
+			duplicate_count INTEGER NOT NULL DEFAULT 1,
+			model_review_mode TEXT NOT NULL DEFAULT '',
+			model_review_model TEXT NOT NULL DEFAULT '',
+			model_review_decision TEXT NOT NULL DEFAULT '',
+			model_review_category TEXT NOT NULL DEFAULT '',
+			model_review_confidence REAL NOT NULL DEFAULT 0,
+			model_review_latency_ms INTEGER NOT NULL DEFAULT 0,
+			model_review_cache_hit INTEGER NOT NULL DEFAULT 0,
+			model_review_fallback TEXT NOT NULL DEFAULT '',
 			evidence_nonce BLOB,
 			evidence_ciphertext BLOB,
 			review_label TEXT NOT NULL DEFAULT 'unreviewed',
@@ -232,6 +270,68 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize content audit schema: %w", err)
 		}
+	}
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "action", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "final_action", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "matched_roles", definition: "TEXT NOT NULL DEFAULT '[]'"},
+		{name: "content_fingerprint", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "evidence_ref_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "duplicate_count", definition: "INTEGER NOT NULL DEFAULT 1"},
+		{name: "model_review_mode", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_model", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_decision", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_category", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_confidence", definition: "REAL NOT NULL DEFAULT 0"},
+		{name: "model_review_latency_ms", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "model_review_cache_hit", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "model_review_fallback", definition: "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, column := range columns {
+		if err := ensureSQLiteColumn(ctx, s.db, "audit_events", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_audit_events_fingerprint
+		ON audit_events(action, rule_id, matched_term, policy_version, content_fingerprint, created_at DESC)`); err != nil {
+		return fmt.Errorf("create content audit fingerprint index: %w", err)
+	}
+	return nil
+}
+
+func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("inspect content audit schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan content audit schema: %w", err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate content audit schema: %w", err)
+	}
+	if err = rows.Close(); err != nil {
+		return fmt.Errorf("close content audit schema rows: %w", err)
+	}
+	if found {
+		return nil
+	}
+	if _, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+		return fmt.Errorf("add content audit column %s: %w", column, err)
 	}
 	return nil
 }
@@ -380,29 +480,158 @@ func (s *Store) Record(ctx context.Context, event Event, evidence []byte) error 
 	if s == nil || s.db == nil {
 		return fmt.Errorf("content audit store is unavailable")
 	}
-	nonce, ciphertext, err := s.encryptEvidence(event.ID, evidence)
-	if err != nil {
-		return err
+	event.ContentFingerprint = s.contentFingerprint(event.fingerprintMaterial)
+	event.MatchedRoles = normalizeMatchedRoles(event.MatchedRoles)
+	if event.DuplicateCount <= 0 {
+		event.DuplicateCount = 1
 	}
 	if event.ReviewLabel == "" {
 		event.ReviewLabel = defaultReviewLabel
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO audit_events (
-		id, created_at, request_id, user_id, token_id, token_name, method, path, protocol,
-		model, stream, category, severity, rule_id, matched_term, policy_version,
-		request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
-		evidence_nonce, evidence_ciphertext, review_label
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'encrypted', ?, ?, ?, ?)`,
-		event.ID, event.CreatedAt, event.RequestID, event.UserID, event.TokenID, event.TokenName,
-		event.Method, event.Path, event.Protocol, event.Model, boolInt(event.Stream), event.Category,
-		event.Severity, event.RuleID, event.MatchedTerm, event.PolicyVersion, event.RequestBytes,
-		boolInt(event.IdentityVerified), boolInt(event.UpstreamSent), s.keyID, nonce, ciphertext,
-		event.ReviewLabel,
-	)
+	dedupe := event.Action == RuleActionObserve && event.FinalAction != ModelReviewBlock && event.dedupeWindow > 0 && event.ContentFingerprint != ""
+	if dedupe {
+		stored, err := s.tryInsertDuplicate(ctx, event)
+		if err != nil || stored {
+			return err
+		}
+	}
+	nonce, ciphertext, err := s.encryptEvidence(event.ID, evidence)
 	if err != nil {
+		return err
+	}
+	event.EvidenceStatus = "encrypted"
+	event.EvidenceKeyID = s.keyID
+	if dedupe {
+		s.recordMu.Lock()
+		defer s.recordMu.Unlock()
+		canonicalID, errCanonical := s.findCanonicalEvidence(ctx, event)
+		if errCanonical != nil {
+			return errCanonical
+		}
+		if canonicalID != "" {
+			event.EvidenceRefID = canonicalID
+			return s.insertDuplicateEvent(ctx, event)
+		}
+	}
+	if err = insertAuditEvent(ctx, s.db, event, nonce, ciphertext); err != nil {
 		return fmt.Errorf("insert content audit event: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) tryInsertDuplicate(ctx context.Context, event Event) (bool, error) {
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	canonicalID, err := s.findCanonicalEvidence(ctx, event)
+	if err != nil {
+		return false, err
+	}
+	if canonicalID == "" {
+		return false, nil
+	}
+	event.EvidenceStatus = "encrypted"
+	event.EvidenceRefID = canonicalID
+	event.EvidenceKeyID = s.keyID
+	return true, s.insertDuplicateEvent(ctx, event)
+}
+
+func (s *Store) contentFingerprint(material string) string {
+	material = strings.TrimSpace(material)
+	if material == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, s.fingerprintKey[:])
+	_, _ = mac.Write([]byte("cpa-content-audit-fingerprint-v1\x00"))
+	_, _ = mac.Write([]byte(material))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func normalizeMatchedRoles(roles []string) []string {
+	seen := make(map[string]struct{}, len(roles))
+	out := make([]string, 0, len(roles))
+	for _, role := range roles {
+		role = normalizePromptSourceRole(role)
+		if _, exists := seen[role]; exists {
+			continue
+		}
+		seen[role] = struct{}{}
+		out = append(out, role)
+	}
+	if len(out) == 0 {
+		out = append(out, "unknown")
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (s *Store) findCanonicalEvidence(ctx context.Context, event Event) (string, error) {
+	windowStart := event.CreatedAt - int64(event.dedupeWindow/time.Second)
+	var canonicalID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM audit_events
+		WHERE action = ? AND rule_id = ? AND matched_term = ? AND policy_version = ?
+			AND content_fingerprint = ? AND created_at >= ? AND created_at <= ?
+			AND evidence_status = 'encrypted' AND evidence_ref_id = ''
+		ORDER BY created_at DESC, id DESC LIMIT 1`,
+		event.Action, event.RuleID, event.MatchedTerm, event.PolicyVersion,
+		event.ContentFingerprint, windowStart, event.CreatedAt,
+	).Scan(&canonicalID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("find content audit duplicate evidence: %w", err)
+	}
+	return canonicalID, nil
+}
+
+func (s *Store) insertDuplicateEvent(ctx context.Context, event Event) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start content audit duplicate insert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err = insertAuditEvent(ctx, tx, event, nil, nil); err != nil {
+		return fmt.Errorf("insert duplicate content audit event: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE audit_events SET duplicate_count = duplicate_count + 1 WHERE id = ?`, event.EvidenceRefID); err != nil {
+		return fmt.Errorf("update content audit duplicate count: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit content audit duplicate insert: %w", err)
+	}
+	return nil
+}
+
+type auditEventExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertAuditEvent(ctx context.Context, execer auditEventExecer, event Event, nonce, ciphertext []byte) error {
+	rolesJSON, err := json.Marshal(event.MatchedRoles)
+	if err != nil {
+		return fmt.Errorf("marshal content audit matched roles: %w", err)
+	}
+	_, err = execer.ExecContext(ctx, `INSERT INTO audit_events (
+		id, created_at, request_id, user_id, token_id, token_name, method, path, protocol,
+		model, stream, category, severity, rule_id, action, final_action, matched_term, matched_roles,
+		content_fingerprint, policy_version,
+		request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
+		evidence_ref_id, duplicate_count, model_review_mode, model_review_model,
+		model_review_decision, model_review_category, model_review_confidence,
+		model_review_latency_ms, model_review_cache_hit, model_review_fallback,
+		evidence_nonce, evidence_ciphertext, review_label
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.CreatedAt, event.RequestID, event.UserID, event.TokenID, event.TokenName,
+		event.Method, event.Path, event.Protocol, event.Model, boolInt(event.Stream), event.Category,
+		event.Severity, event.RuleID, event.Action, event.FinalAction, event.MatchedTerm, string(rolesJSON),
+		event.ContentFingerprint, event.PolicyVersion, event.RequestBytes, boolInt(event.IdentityVerified),
+		boolInt(event.UpstreamSent), event.EvidenceStatus, event.EvidenceKeyID, event.EvidenceRefID,
+		event.DuplicateCount, event.ModelReviewMode, event.ModelReviewModel,
+		event.ModelReviewDecision, event.ModelReviewCategory, event.ModelReviewConfidence,
+		event.ModelReviewLatencyMS, boolInt(event.ModelReviewCacheHit), event.ModelReviewFallback,
+		nonce, ciphertext, event.ReviewLabel,
+	)
+	return err
 }
 
 func boolInt(value bool) int {
@@ -418,23 +647,39 @@ type eventScanner interface {
 
 func scanEvent(scanner eventScanner) (Event, error) {
 	var event Event
-	var stream, identityVerified, upstreamSent int
+	var stream, identityVerified, upstreamSent, modelReviewCacheHit int
+	var matchedRoles string
 	err := scanner.Scan(
 		&event.ID, &event.CreatedAt, &event.RequestID, &event.UserID, &event.TokenID,
 		&event.TokenName, &event.Method, &event.Path, &event.Protocol, &event.Model, &stream,
-		&event.Category, &event.Severity, &event.RuleID, &event.MatchedTerm, &event.PolicyVersion, &event.RequestBytes,
+		&event.Category, &event.Severity, &event.RuleID, &event.Action, &event.FinalAction, &event.MatchedTerm,
+		&matchedRoles, &event.ContentFingerprint, &event.PolicyVersion, &event.RequestBytes,
 		&identityVerified, &upstreamSent, &event.EvidenceStatus, &event.EvidenceKeyID,
+		&event.EvidenceRefID, &event.DuplicateCount,
+		&event.ModelReviewMode, &event.ModelReviewModel, &event.ModelReviewDecision,
+		&event.ModelReviewCategory, &event.ModelReviewConfidence, &event.ModelReviewLatencyMS,
+		&modelReviewCacheHit, &event.ModelReviewFallback,
 		&event.ReviewLabel, &event.ReviewNote, &event.ReviewedAt, &event.ReviewedBy,
 	)
 	event.Stream = stream != 0
 	event.IdentityVerified = identityVerified != 0
 	event.UpstreamSent = upstreamSent != 0
+	event.ModelReviewCacheHit = modelReviewCacheHit != 0
+	if err == nil {
+		if errRoles := json.Unmarshal([]byte(matchedRoles), &event.MatchedRoles); errRoles != nil {
+			event.MatchedRoles = []string{"unknown"}
+		}
+	}
 	return event, err
 }
 
 const eventSelectColumns = `id, created_at, request_id, user_id, token_id, token_name,
-	method, path, protocol, model, stream, category, severity, rule_id, matched_term, policy_version,
+	method, path, protocol, model, stream, category, severity, rule_id, action, final_action, matched_term,
+	matched_roles, content_fingerprint, policy_version,
 	request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
+	evidence_ref_id, duplicate_count, model_review_mode, model_review_model,
+	model_review_decision, model_review_category, model_review_confidence,
+	model_review_latency_ms, model_review_cache_hit, model_review_fallback,
 	review_label, review_note, reviewed_at, reviewed_by`
 
 // List returns metadata only; evidence is never included in list responses.
@@ -453,8 +698,8 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (ListResult, error)
 	args := make([]any, 0, 12)
 	if value := strings.TrimSpace(filter.Search); value != "" {
 		like := "%" + value + "%"
-		clauses = append(clauses, `(id LIKE ? OR request_id LIKE ? OR token_name LIKE ? OR model LIKE ? OR rule_id LIKE ? OR matched_term LIKE ?)`)
-		args = append(args, like, like, like, like, like, like)
+		clauses = append(clauses, `(id LIKE ? OR request_id LIKE ? OR token_name LIKE ? OR model LIKE ? OR rule_id LIKE ? OR matched_term LIKE ? OR content_fingerprint LIKE ?)`)
+		args = append(args, like, like, like, like, like, like, like)
 	}
 	if value := strings.TrimSpace(filter.Category); value != "" {
 		clauses = append(clauses, "category = ?")
@@ -475,6 +720,17 @@ func (s *Store) List(ctx context.Context, filter ListFilter) (ListResult, error)
 	if filter.TokenID > 0 {
 		clauses = append(clauses, "token_id = ?")
 		args = append(args, filter.TokenID)
+	}
+	if value := normalizePromptSourceRole(filter.MatchedRole); strings.TrimSpace(filter.MatchedRole) != "" {
+		clauses = append(clauses, "matched_roles LIKE ?")
+		args = append(args, "%\""+value+"\"%")
+	}
+	if value := strings.TrimSpace(filter.Fingerprint); value != "" {
+		clauses = append(clauses, "content_fingerprint = ?")
+		args = append(args, value)
+	}
+	if filter.DuplicatesOnly {
+		clauses = append(clauses, "(duplicate_count > 1 OR evidence_ref_id <> '')")
 	}
 	where := strings.Join(clauses, " AND ")
 	var total int64
@@ -539,15 +795,23 @@ func (s *Store) listAccess(ctx context.Context, eventID string) ([]AccessLog, er
 // Reveal decrypts evidence and records the reason and actor.
 func (s *Store) Reveal(ctx context.Context, eventID, reason, actor string) (json.RawMessage, error) {
 	var nonce, ciphertext []byte
-	var status string
+	var status, evidenceRefID string
 	if err := s.db.QueryRowContext(ctx, `SELECT evidence_nonce, evidence_ciphertext, evidence_status
-		FROM audit_events WHERE id = ?`, eventID).Scan(&nonce, &ciphertext, &status); err != nil {
+		, evidence_ref_id FROM audit_events WHERE id = ?`, eventID).Scan(&nonce, &ciphertext, &status, &evidenceRefID); err != nil {
 		return nil, err
+	}
+	decryptID := eventID
+	if evidenceRefID != "" {
+		if err := s.db.QueryRowContext(ctx, `SELECT evidence_nonce, evidence_ciphertext, evidence_status
+			FROM audit_events WHERE id = ?`, evidenceRefID).Scan(&nonce, &ciphertext, &status); err != nil {
+			return nil, err
+		}
+		decryptID = evidenceRefID
 	}
 	if status != "encrypted" || len(nonce) == 0 || len(ciphertext) == 0 {
 		return nil, fmt.Errorf("content audit evidence is not available")
 	}
-	plain, err := s.decryptEvidence(eventID, nonce, ciphertext)
+	plain, err := s.decryptEvidence(decryptID, nonce, ciphertext)
 	if err != nil {
 		return nil, err
 	}
@@ -625,15 +889,18 @@ func (s *Store) Prune(ctx context.Context, rawRetentionDays, metadataRetentionDa
 	rawCutoff := now.Add(-time.Duration(rawRetentionDays) * 24 * time.Hour).Unix()
 	metadataCutoff := now.Add(-time.Duration(metadataRetentionDays) * 24 * time.Hour).Unix()
 	if _, err := s.db.ExecContext(ctx, `UPDATE audit_events SET evidence_nonce = NULL, evidence_ciphertext = NULL,
-		evidence_status = 'expired' WHERE created_at < ? AND evidence_status = 'encrypted'`, rawCutoff); err != nil {
+		evidence_status = 'expired' WHERE created_at < ? AND evidence_status = 'encrypted'
+		AND id NOT IN (SELECT evidence_ref_id FROM audit_events WHERE created_at >= ? AND evidence_ref_id <> '')`, rawCutoff, rawCutoff); err != nil {
 		return fmt.Errorf("expire content audit evidence: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM audit_access_log WHERE event_id IN (
 		SELECT id FROM audit_events WHERE created_at < ?
-	)`, metadataCutoff); err != nil {
+		AND id NOT IN (SELECT evidence_ref_id FROM audit_events WHERE created_at >= ? AND evidence_ref_id <> '')
+	)`, metadataCutoff, metadataCutoff); err != nil {
 		return fmt.Errorf("delete expired content audit access history: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < ?`, metadataCutoff); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < ?
+		AND id NOT IN (SELECT evidence_ref_id FROM audit_events WHERE created_at >= ? AND evidence_ref_id <> '')`, metadataCutoff, metadataCutoff); err != nil {
 		return fmt.Errorf("delete expired content audit metadata: %w", err)
 	}
 	return nil

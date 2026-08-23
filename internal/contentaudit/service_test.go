@@ -2,6 +2,7 @@ package contentaudit
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -77,6 +79,9 @@ rules:
 	if list.Total != 1 || list.Items[0].UserID != 42 || list.Items[0].TokenID != 73 || list.Items[0].TokenName != "production-token" || list.Items[0].MatchedTerm != "sensitive synthetic phrase" || list.Items[0].UpstreamSent {
 		t.Fatalf("stored event = %#v", list)
 	}
+	if list.Items[0].Action != RuleActionBlock || !slices.Equal(list.Items[0].MatchedRoles, []string{"user"}) || list.Items[0].ContentFingerprint == "" || list.Items[0].DuplicateCount != 1 {
+		t.Fatalf("stored grouping metadata = %#v", list.Items[0])
+	}
 	matchedList, err := service.List(t.Context(), ListFilter{Search: "synthetic phrase"})
 	if err != nil || matchedList.Total != 1 {
 		t.Fatalf("List() matched term search = %#v err=%v", matchedList, err)
@@ -121,6 +126,71 @@ func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
 	list, err := service.List(t.Context(), ListFilter{})
 	if err != nil || list.Total != 0 {
 		t.Fatalf("List() = %#v err=%v", list, err)
+	}
+}
+
+func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name            string
+		mode            string
+		keywordAction   string
+		modelDecision   string
+		wantStatus      int
+		wantNextCalls   int
+		wantFinalAction string
+	}{
+		{name: "shadow allow does not change block", mode: ModelReviewModeShadow, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce allow releases keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
+		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+			tempDir := t.TempDir()
+			policyPath := filepath.Join(tempDir, "policy.yaml")
+			policy := "version: test-review-v1\nrules:\n  - id: reviewed-rule\n    category: jailbreak\n    severity: high\n    action: " + test.keywordAction + "\n    model-review: true\n    keywords: [\"review fixture\"]\n"
+			if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			service := NewServiceWithReviewer(config.ContentAuditConfig{
+				Enabled:       true,
+				PolicyFile:    policyPath,
+				DatabasePath:  filepath.Join(tempDir, "audit.db"),
+				EvidenceKeyID: "test-key",
+				ModelReview: config.ContentAuditModelReviewConfig{
+					Mode:          test.mode,
+					Model:         "synthetic-reviewer",
+					MinConfidence: 0.9,
+				},
+			}, filepath.Join(tempDir, "config.yaml"), modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
+				return ModelReviewResult{Decision: test.modelDecision, Category: "jailbreak", Confidence: 0.99}, nil
+			}))
+			state := service.state.Load()
+			defer func() { _ = state.store.Close() }()
+			nextCalls := 0
+			router := gin.New()
+			router.Use(service.Middleware())
+			router.POST("/v1/responses", func(c *gin.Context) {
+				nextCalls++
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"review fixture"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.wantStatus || nextCalls != test.wantNextCalls {
+				t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+			}
+			list, err := service.List(t.Context(), ListFilter{})
+			if err != nil || list.Total != 1 {
+				t.Fatalf("List()=%#v err=%v", list, err)
+			}
+			event := list.Items[0]
+			if event.ModelReviewDecision != test.modelDecision || event.ModelReviewModel != "synthetic-reviewer" || event.FinalAction != test.wantFinalAction {
+				t.Fatalf("event=%#v", event)
+			}
+		})
 	}
 }
 
@@ -170,6 +240,19 @@ func TestNormalizeAuditConfigUsesPublicRequestBodyCeiling(t *testing.T) {
 	normalizeAuditConfig(&cfg)
 	if cfg.MaxBodyBytes != 256<<20 {
 		t.Fatalf("MaxBodyBytes=%d, want %d", cfg.MaxBodyBytes, 256<<20)
+	}
+	if cfg.EvidenceDedupeSeconds != 600 {
+		t.Fatalf("EvidenceDedupeSeconds=%d, want 600", cfg.EvidenceDedupeSeconds)
+	}
+	disabled := config.ContentAuditConfig{EvidenceDedupeSeconds: -1}
+	normalizeAuditConfig(&disabled)
+	if disabled.EvidenceDedupeSeconds != 0 {
+		t.Fatalf("disabled EvidenceDedupeSeconds=%d, want 0", disabled.EvidenceDedupeSeconds)
+	}
+	clamped := config.ContentAuditConfig{EvidenceDedupeSeconds: 100000}
+	normalizeAuditConfig(&clamped)
+	if clamped.EvidenceDedupeSeconds != 86400 {
+		t.Fatalf("clamped EvidenceDedupeSeconds=%d, want 86400", clamped.EvidenceDedupeSeconds)
 	}
 }
 

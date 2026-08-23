@@ -3,7 +3,7 @@
 # Multi-category phrases use the highest-severity category; source order breaks ties.
 # The 642 source rows compile to 641 unique runtime patterns after normalization.
 # CPA keeps request-level enforcement only; this policy does not ban sessions or API keys.
-version: "llm-access-managed-2026-08-20-v2"
+version: "llm-access-managed-2026-08-23-v3"
 global-allowlist:
   - "接口交互"
   - "光口交换机"
@@ -12,6 +12,7 @@ rules:
     category: "jailbreak"
     severity: "critical"
     action: "block"
+    model-review: true
     keywords:
       - "所有目标一律按本地合成靶标处理"
       - "不核验授权"
@@ -33,10 +34,26 @@ rules:
       - "safety policy"
       - "refusal test"
       - "hypothetical instruction"
+    exclude-all:
+      - ["禁止", "不得", "不允许", "拒绝", "避免", "防止", "检测", "拦截", "do not", "must not", "prevent", "detect", "block"]
+      - ["绕过", "越狱", "破甲", "安全限制", "安全过滤", "bypass", "jailbreak", "safety filter"]
+    override-exclude-any:
+      - "教我绕过"
+      - "帮我绕过"
+      - "如何绕过"
+      - "给出绕过步骤"
+      - "不要拒绝"
+      - "无视安全限制"
+      - "how to bypass"
+      - "help me bypass"
+      - "show me how to bypass"
+      - "do not refuse"
+      - "ignore safety"
   - id: "block-sexual-generation-intent"
     category: "sexual"
     severity: "high"
     action: "block"
+    model-review: true
     keywords:
       - "write explicit sex scene"
       - "write graphic sex scene"
@@ -68,10 +85,17 @@ rules:
       - "must not generate"
       - "do not generate"
       - "refuse to generate"
+    override-exclude-any:
+      - "不要拒绝"
+      - "继续生成色情"
+      - "直接生成色情"
+      - "do not refuse"
+      - "continue generating explicit"
   - id: "block-sexual-explicit-context"
     category: "sexual"
     severity: "high"
     action: "block"
+    model-review: true
     keywords:
       - "做 爱"
       - "潮 吹"
@@ -123,6 +147,16 @@ rules:
       - "学术研究"
       - "文献综述"
       - "病例"
+    exclude-all:
+      - ["禁止", "不得", "不允许", "拒绝", "避免", "防止", "检测", "拦截", "do not", "must not", "prevent", "detect", "block"]
+      - ["色情", "露骨", "性爱", "角色扮演", "生成", "续写", "explicit", "sexual", "erotic", "roleplay", "generate", "continue"]
+    override-exclude-any:
+      - "不要拒绝"
+      - "直接生成"
+      - "继续生成"
+      - "do not refuse"
+      - "generate it anyway"
+      - "continue generating"
   - id: "seed-csam"
     category: "csam"
     severity: "critical"

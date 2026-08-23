@@ -27,15 +27,18 @@ type Policy struct {
 
 // Rule groups terms that share the same enforcement category and severity.
 type Rule struct {
-	ID         string   `yaml:"id" json:"id"`
-	Category   string   `yaml:"category" json:"category"`
-	Severity   string   `yaml:"severity" json:"severity"`
-	Action     string   `yaml:"action,omitempty" json:"action"`
-	Keywords   []string `yaml:"keywords" json:"keywords"`
-	RequireAny []string `yaml:"require-any,omitempty" json:"require_any,omitempty"`
-	ExcludeAny []string `yaml:"exclude-any,omitempty" json:"exclude_any,omitempty"`
-	Allowlist  []string `yaml:"allowlist" json:"allowlist"`
-	Disabled   bool     `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+	ID                 string     `yaml:"id" json:"id"`
+	Category           string     `yaml:"category" json:"category"`
+	Severity           string     `yaml:"severity" json:"severity"`
+	Action             string     `yaml:"action,omitempty" json:"action"`
+	Keywords           []string   `yaml:"keywords" json:"keywords"`
+	RequireAny         []string   `yaml:"require-any,omitempty" json:"require_any,omitempty"`
+	ExcludeAny         []string   `yaml:"exclude-any,omitempty" json:"exclude_any,omitempty"`
+	ExcludeAll         [][]string `yaml:"exclude-all,omitempty" json:"exclude_all,omitempty"`
+	OverrideExcludeAny []string   `yaml:"override-exclude-any,omitempty" json:"override_exclude_any,omitempty"`
+	Allowlist          []string   `yaml:"allowlist" json:"allowlist"`
+	ModelReview        bool       `yaml:"model-review,omitempty" json:"model_review,omitempty"`
+	Disabled           bool       `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 // Decision is the non-sensitive result of a policy scan.
@@ -47,6 +50,7 @@ type Decision struct {
 	Action        string `json:"action,omitempty"`
 	MatchedTerm   string `json:"-"`
 	PolicyVersion string `json:"policy_version,omitempty"`
+	ModelReview   bool   `json:"-"`
 }
 
 type compiledTerm struct {
@@ -140,8 +144,6 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 				return nil, fmt.Errorf("content audit policy exceeds %d keywords", maxPolicyKeywords)
 			}
 		}
-		rawKeywords = append(rawKeywords, rule.RequireAny...)
-		rawKeywords = append(rawKeywords, rule.ExcludeAny...)
 	}
 	if len(preparedTerms) == 0 {
 		return nil, fmt.Errorf("content audit policy has no enabled keywords")
@@ -172,6 +174,10 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		m.policy.Rules[ruleIndex].Allowlist = normalizeTermList(m.policy.Rules[ruleIndex].Allowlist, analyzer)
 		m.policy.Rules[ruleIndex].RequireAny = normalizeTermList(m.policy.Rules[ruleIndex].RequireAny, analyzer)
 		m.policy.Rules[ruleIndex].ExcludeAny = normalizeTermList(m.policy.Rules[ruleIndex].ExcludeAny, analyzer)
+		m.policy.Rules[ruleIndex].OverrideExcludeAny = normalizeTermList(m.policy.Rules[ruleIndex].OverrideExcludeAny, analyzer)
+		for groupIndex := range m.policy.Rules[ruleIndex].ExcludeAll {
+			m.policy.Rules[ruleIndex].ExcludeAll[groupIndex] = normalizeTermList(m.policy.Rules[ruleIndex].ExcludeAll[groupIndex], analyzer)
+		}
 	}
 	m.policy.GlobalAllowlist = normalizeTermList(m.policy.GlobalAllowlist, analyzer)
 	m.buildFailureLinks()
@@ -388,6 +394,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 				Action:        rule.Action,
 				MatchedTerm:   term.term,
 				PolicyVersion: m.policy.Version,
+				ModelReview:   rule.ModelReview,
 			}
 			bestActionRank = actionRank
 			bestSeverityRank = severity
@@ -402,9 +409,24 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, contin
 	start := max(0, matchStart-contextRunes)
 	end := min(len(text), matchEnd+contextRunes)
 	normalized := string(text[start:end])
-	for _, excluded := range rule.ExcludeAny {
-		if strings.Contains(normalized, excluded) {
-			return false
+	overrideExclusions := containsAnyTerm(normalized, rule.OverrideExcludeAny)
+	if !overrideExclusions {
+		for _, excluded := range rule.ExcludeAny {
+			if strings.Contains(normalized, excluded) {
+				return false
+			}
+		}
+		if len(rule.ExcludeAll) > 0 {
+			matchedAllGroups := true
+			for _, group := range rule.ExcludeAll {
+				if len(group) == 0 || !containsAnyTerm(normalized, group) {
+					matchedAllGroups = false
+					break
+				}
+			}
+			if matchedAllGroups {
+				return false
+			}
 		}
 	}
 	if len(rule.RequireAny) == 0 {
@@ -416,6 +438,15 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, contin
 		}
 	}
 	return continuation
+}
+
+func containsAnyTerm(text string, terms []string) bool {
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Matcher) hasCandidate(normalized string) bool {

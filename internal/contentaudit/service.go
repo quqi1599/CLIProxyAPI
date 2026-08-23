@@ -39,6 +39,7 @@ type runtimeState struct {
 	storePath              string
 	evidenceKeyFingerprint [32]byte
 	initErr                error
+	modelReview            *modelReviewController
 }
 
 // Status reports whether enforcement is configured and ready without exposing secrets.
@@ -56,8 +57,13 @@ type Status struct {
 	ObserveRuleCount        int    `json:"observe_rule_count"`
 	DisabledRuleCount       int    `json:"disabled_rule_count"`
 	MaxBodyBytes            int64  `json:"max_body_bytes"`
+	EvidenceDedupeSeconds   int    `json:"evidence_dedupe_seconds"`
 	RawRetentionDays        int    `json:"raw_retention_days"`
 	MetadataRetentionDays   int    `json:"metadata_retention_days"`
+	ModelReviewMode         string `json:"model_review_mode"`
+	ModelReviewModel        string `json:"model_review_model,omitempty"`
+	ModelReviewReady        bool   `json:"model_review_ready"`
+	ModelReviewTimeoutMS    int    `json:"model_review_timeout_ms"`
 }
 
 // Service owns the immutable request-time matcher snapshot and encrypted store.
@@ -65,11 +71,17 @@ type Service struct {
 	state     atomic.Pointer[runtimeState]
 	pruneOnce sync.Once
 	policyMu  sync.Mutex
+	reviewer  Reviewer
 }
 
 // NewService initializes a service. Invalid enabled configuration is fail-closed at request time.
 func NewService(cfg config.ContentAuditConfig, configFilePath string) *Service {
-	service := &Service{}
+	return NewServiceWithReviewer(cfg, configFilePath, nil)
+}
+
+// NewServiceWithReviewer initializes a service with an optional direct semantic reviewer.
+func NewServiceWithReviewer(cfg config.ContentAuditConfig, configFilePath string, reviewer Reviewer) *Service {
+	service := &Service{reviewer: reviewer}
 	service.Update(cfg, configFilePath)
 	return service
 }
@@ -89,6 +101,7 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	}
 	normalizeAuditConfig(&cfg)
 	state := &runtimeState{cfg: cfg}
+	state.modelReview = newModelReviewController(cfg.ModelReview, s.reviewer)
 	state.identitySecret = firstNonEmptySecret(os.Getenv(identitySecretEnv), cfg.IdentitySecret)
 	evidenceKey := firstNonEmptySecret(os.Getenv(evidenceKeyEnv), cfg.EvidenceKey)
 	state.evidenceKeyFingerprint = sha256.Sum256([]byte(evidenceKey))
@@ -161,6 +174,13 @@ func normalizeAuditConfig(cfg *config.ContentAuditConfig) {
 	if cfg.RawRetentionDays <= 0 {
 		cfg.RawRetentionDays = 30
 	}
+	if cfg.EvidenceDedupeSeconds == 0 {
+		cfg.EvidenceDedupeSeconds = 600
+	} else if cfg.EvidenceDedupeSeconds < 0 {
+		cfg.EvidenceDedupeSeconds = 0
+	} else if cfg.EvidenceDedupeSeconds > 86400 {
+		cfg.EvidenceDedupeSeconds = 86400
+	}
 	if cfg.MetadataRetentionDays <= 0 {
 		cfg.MetadataRetentionDays = 180
 	}
@@ -169,6 +189,50 @@ func normalizeAuditConfig(cfg *config.ContentAuditConfig) {
 	}
 	if cfg.EvidenceKeyID == "" {
 		cfg.EvidenceKeyID = "primary-v1"
+	}
+	normalizeModelReviewConfig(&cfg.ModelReview)
+}
+
+func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	switch cfg.Mode {
+	case ModelReviewModeShadow, ModelReviewModeEnforce:
+	default:
+		cfg.Mode = ModelReviewModeOff
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		cfg.Model = "codex-auto-review"
+	}
+	if strings.TrimSpace(cfg.PromptVersion) == "" {
+		cfg.PromptVersion = "cpa-audit-review-v1"
+	}
+	if cfg.TimeoutMilliseconds <= 0 || cfg.TimeoutMilliseconds > 4000 {
+		cfg.TimeoutMilliseconds = 3500
+	}
+	if cfg.QueueTimeoutMilliseconds <= 0 || cfg.QueueTimeoutMilliseconds > 500 {
+		cfg.QueueTimeoutMilliseconds = 100
+	}
+	if cfg.MaxConcurrent <= 0 || cfg.MaxConcurrent > 128 {
+		cfg.MaxConcurrent = 16
+	}
+	if cfg.CacheSeconds < 0 {
+		cfg.CacheSeconds = 0
+	} else if cfg.CacheSeconds == 0 {
+		cfg.CacheSeconds = 600
+	} else if cfg.CacheSeconds > 3600 {
+		cfg.CacheSeconds = 3600
+	}
+	if cfg.MaxInputBytes <= 0 || cfg.MaxInputBytes > 256<<10 {
+		cfg.MaxInputBytes = 32 << 10
+	}
+	if cfg.MinConfidence <= 0 || cfg.MinConfidence > 1 {
+		cfg.MinConfidence = 0.90
+	}
+	if cfg.CircuitFailureThreshold <= 0 || cfg.CircuitFailureThreshold > 100 {
+		cfg.CircuitFailureThreshold = 5
+	}
+	if cfg.CircuitOpenSeconds <= 0 || cfg.CircuitOpenSeconds > 300 {
+		cfg.CircuitOpenSeconds = 30
 	}
 }
 
@@ -220,8 +284,13 @@ func (s *Service) Status() Status {
 		RequireSignedIdentity:   state.cfg.RequireSignedIdentity,
 		AllowUnauditedWebsocket: state.cfg.AllowUnauditedWebsocket,
 		MaxBodyBytes:            state.cfg.MaxBodyBytes,
+		EvidenceDedupeSeconds:   state.cfg.EvidenceDedupeSeconds,
 		RawRetentionDays:        state.cfg.RawRetentionDays,
 		MetadataRetentionDays:   state.cfg.MetadataRetentionDays,
+		ModelReviewMode:         state.cfg.ModelReview.Mode,
+		ModelReviewModel:        state.cfg.ModelReview.Model,
+		ModelReviewReady:        state.modelReview != nil,
+		ModelReviewTimeoutMS:    state.cfg.ModelReview.TimeoutMilliseconds,
 	}
 	if state.matcher != nil {
 		status.PolicyVersion = state.matcher.Version()
@@ -296,30 +365,66 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		if model == "" {
 			model = identity.Model
 		}
-		shouldBlock := !state.cfg.AuditOnly && decision.Action == RuleActionBlock
+		modelReview := modelReviewOutcome{}
+		if decision.ModelReview && state.modelReview != nil {
+			modelReview = state.modelReview.review(c.Request.Context(), ModelReviewRequest{
+				Text:     extracted.EnforcementText,
+				RuleID:   decision.RuleID,
+				Category: decision.Category,
+				Severity: decision.Severity,
+			})
+		}
+		keywordShouldBlock := decision.Action == RuleActionBlock
+		shouldBlock := keywordShouldBlock
+		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed && modelReview.Confidence >= state.cfg.ModelReview.MinConfidence {
+			switch modelReview.Decision {
+			case ModelReviewBlock:
+				shouldBlock = true
+			case ModelReviewAllow:
+				shouldBlock = false
+			}
+		}
+		shouldBlock = !state.cfg.AuditOnly && shouldBlock
+		finalAction := ModelReviewAllow
+		if shouldBlock {
+			finalAction = ModelReviewBlock
+		}
 		event := Event{
-			ID:               auditID,
-			CreatedAt:        time.Now().Unix(),
-			RequestID:        requestID,
-			UserID:           identity.UserID,
-			TokenID:          identity.TokenID,
-			TokenName:        identity.TokenName,
-			Method:           c.Request.Method,
-			Path:             c.Request.URL.Path,
-			Protocol:         protocolForPath(c.Request.URL.Path),
-			Model:            model,
-			Stream:           extracted.Stream,
-			Category:         decision.Category,
-			Severity:         decision.Severity,
-			RuleID:           decision.RuleID,
-			MatchedTerm:      decision.MatchedTerm,
-			PolicyVersion:    decision.PolicyVersion,
-			RequestBytes:     requestBytes,
-			IdentityVerified: identity.Verified,
-			UpstreamSent:     !shouldBlock,
-			EvidenceStatus:   "encrypted",
-			EvidenceKeyID:    state.cfg.EvidenceKeyID,
-			ReviewLabel:      defaultReviewLabel,
+			ID:                    auditID,
+			CreatedAt:             time.Now().Unix(),
+			RequestID:             requestID,
+			UserID:                identity.UserID,
+			TokenID:               identity.TokenID,
+			TokenName:             identity.TokenName,
+			Method:                c.Request.Method,
+			Path:                  c.Request.URL.Path,
+			Protocol:              protocolForPath(c.Request.URL.Path),
+			Model:                 model,
+			Stream:                extracted.Stream,
+			Category:              decision.Category,
+			Severity:              decision.Severity,
+			RuleID:                decision.RuleID,
+			Action:                decision.Action,
+			FinalAction:           finalAction,
+			MatchedTerm:           decision.MatchedTerm,
+			MatchedRoles:          extracted.MatchedRoles(decision.MatchedTerm),
+			PolicyVersion:         decision.PolicyVersion,
+			RequestBytes:          requestBytes,
+			IdentityVerified:      identity.Verified,
+			UpstreamSent:          !shouldBlock,
+			EvidenceStatus:        "encrypted",
+			EvidenceKeyID:         state.cfg.EvidenceKeyID,
+			ReviewLabel:           defaultReviewLabel,
+			ModelReviewMode:       state.cfg.ModelReview.Mode,
+			ModelReviewModel:      modelReview.Model,
+			ModelReviewDecision:   modelReview.Decision,
+			ModelReviewCategory:   modelReview.Category,
+			ModelReviewConfidence: modelReview.Confidence,
+			ModelReviewLatencyMS:  modelReview.Latency.Milliseconds(),
+			ModelReviewCacheHit:   modelReview.CacheHit,
+			ModelReviewFallback:   modelReview.Fallback,
+			fingerprintMaterial:   extracted.FingerprintMaterial(),
+			dedupeWindow:          time.Duration(state.cfg.EvidenceDedupeSeconds) * time.Second,
 		}
 		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 3*time.Second)
 		err = state.store.Record(storeCtx, event, extracted.Evidence)

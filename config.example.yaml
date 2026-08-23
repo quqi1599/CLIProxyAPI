@@ -108,8 +108,24 @@ content-audit:
   allow-unaudited-websocket: true
   evidence-key-id: "primary-v1"
   max-body-bytes: 268435456
+  # Reuse encrypted evidence for identical observe-only hits in the same window; use -1 to disable.
+  evidence-dedupe-seconds: 600
   raw-retention-days: 30
   metadata-retention-days: 180
+  # Optional second-stage semantic review for rules with model-review: true.
+  # Keep shadow until precision and availability are verified; enforce may change the final action.
+  model-review:
+    mode: "off" # off, shadow, or enforce
+    model: "codex-auto-review"
+    prompt-version: "cpa-audit-review-v1"
+    timeout-milliseconds: 3500
+    queue-timeout-milliseconds: 100
+    max-concurrent: 16
+    cache-seconds: 600
+    max-input-bytes: 32768
+    min-confidence: 0.90
+    circuit-failure-threshold: 5
+    circuit-open-seconds: 30
 
 # How long (in seconds) usage queue items are retained in memory for the Management API.
 # The local Redis RESP usage output is disabled.

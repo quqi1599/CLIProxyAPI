@@ -381,7 +381,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
-	s.contentAudit = contentaudit.NewService(cfg.ContentAudit, configFilePath)
+	s.contentAudit = contentaudit.NewServiceWithReviewer(cfg.ContentAudit, configFilePath, newCodexContentAuditReviewer(authManager))
 	s.mgmt.SetContentAuditService(s.contentAudit)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)

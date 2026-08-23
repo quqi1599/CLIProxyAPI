@@ -1,6 +1,7 @@
 package contentaudit
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,16 @@ func TestExtractJSONRequestScansOnlyUntrustedConversationContent(t *testing.T) {
 			t.Fatalf("enforcement text %q contains non-user content %q", extracted.EnforcementText, excluded)
 		}
 	}
+	for term, want := range map[string][]string{
+		"untrusted user text":              {"user"},
+		"untrusted tool result":            {"tool"},
+		"untrusted dynamic tool arguments": {"assistant_tool_call"},
+		"untrusted missing-role text":      {"unknown"},
+	} {
+		if got := extracted.MatchedRoles(term); !slices.Equal(got, want) {
+			t.Fatalf("MatchedRoles(%q) = %#v, want %#v", term, got, want)
+		}
+	}
 }
 
 func TestExtractJSONRequestIncludesTypedToolOutput(t *testing.T) {
@@ -49,6 +60,17 @@ func TestExtractJSONRequestIncludesTypedToolOutput(t *testing.T) {
 	}
 	if extracted.EnforcementText != "gemini user text" {
 		t.Fatalf("enforcement text = %q, want gemini user text", extracted.EnforcementText)
+	}
+	if got := extracted.MatchedRoles("tool output text"); !slices.Equal(got, []string{"function_call_output"}) {
+		t.Fatalf("MatchedRoles(tool output) = %#v", got)
+	}
+}
+
+func TestExtractJSONRequestFingerprintIgnoresOpaqueRequestIdentifiers(t *testing.T) {
+	first := ExtractJSONRequest([]byte(`{"model":"gpt-a","request_id":"req-a","input":[{"type":"function_call_output","call_id":"call-a","output":"stable result"},{"role":"user","content":"stable prompt"}]}`))
+	second := ExtractJSONRequest([]byte(`{"model":"gpt-b","request_id":"req-b","input":[{"type":"function_call_output","call_id":"call-b","output":"stable result"},{"role":"user","content":"stable prompt"}]}`))
+	if first.FingerprintMaterial() == "" || first.FingerprintMaterial() != second.FingerprintMaterial() {
+		t.Fatalf("fingerprints differ:\n%s\n%s", first.FingerprintMaterial(), second.FingerprintMaterial())
 	}
 }
 

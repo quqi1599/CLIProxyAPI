@@ -23,6 +23,12 @@ type ExtractedRequest struct {
 	EnforcementFields []string
 	Continuation      bool
 	EvidenceSanitized bool
+	promptSegments    []promptSegment
+}
+
+type promptSegment struct {
+	text string
+	role string
 }
 
 type enforcementSegment struct {
@@ -53,6 +59,7 @@ var enforcementPromptBearingKeys = map[string]struct{}{
 var skippedContentKeys = map[string]struct{}{
 	"api_key":            {},
 	"authorization":      {},
+	"call_id":            {},
 	"cookie":             {},
 	"credentials":        {},
 	"id":                 {},
@@ -68,6 +75,8 @@ var skippedContentKeys = map[string]struct{}{
 	"system_instruction": {},
 	"tools":              {},
 	"type":               {},
+	"request_id":         {},
+	"tool_call_id":       {},
 	"url":                {},
 }
 
@@ -94,7 +103,13 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 			"invalid_json": true,
 			"raw_text":     text,
 		})
-		return ExtractedRequest{Text: text, EnforcementText: text, Evidence: evidence, EvidenceSanitized: true}
+		return ExtractedRequest{
+			Text:              text,
+			EnforcementText:   text,
+			Evidence:          evidence,
+			EvidenceSanitized: true,
+			promptSegments:    []promptSegment{{text: text, role: "unknown"}},
+		}
 	}
 
 	model := ""
@@ -106,7 +121,8 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 
 	parts := make([]string, 0, 16)
 	fields := make([]string, 0, 16)
-	collectPromptFields(root, "$", false, &parts, &fields)
+	promptSegments := make([]promptSegment, 0, 16)
+	collectPromptFieldsWithRoles(root, "$", false, "unknown", &parts, &fields, &promptSegments)
 	enforcementSegments := make([]enforcementSegment, 0, 8)
 	collectEnforcementSegments(root, "$", false, &enforcementSegments)
 	if len(enforcementSegments) == 0 {
@@ -138,7 +154,53 @@ func ExtractJSONRequest(body []byte) ExtractedRequest {
 		EnforcementFields: enforcementFields,
 		Continuation:      continuation,
 		EvidenceSanitized: true,
+		promptSegments:    promptSegments,
 	}
+}
+
+// MatchedRoles returns stable role categories for prompt segments containing a matched term.
+func (r ExtractedRequest) MatchedRoles(term string) []string {
+	needle := moderationCandidateText(term)
+	if needle == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for _, segment := range r.promptSegments {
+		if strings.Contains(moderationCandidateText(segment.text), needle) {
+			seen[segment.role] = struct{}{}
+		}
+	}
+	if len(seen) == 0 && strings.Contains(moderationCandidateText(r.Text), needle) {
+		seen["unknown"] = struct{}{}
+	}
+	roles := make([]string, 0, len(seen))
+	for role := range seen {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	return roles
+}
+
+// FingerprintMaterial returns normalized role-bound prompt text for keyed deduplication.
+func (r ExtractedRequest) FingerprintMaterial() string {
+	segments := r.promptSegments
+	if len(segments) == 0 && strings.TrimSpace(r.Text) != "" {
+		segments = []promptSegment{{text: r.Text, role: "unknown"}}
+	}
+	var output strings.Builder
+	for _, segment := range segments {
+		text := moderationCandidateText(segment.text)
+		if text == "" {
+			continue
+		}
+		if output.Len() > 0 {
+			output.WriteByte('\n')
+		}
+		output.WriteString(segment.role)
+		output.WriteByte(':')
+		output.WriteString(text)
+	}
+	return output.String()
 }
 
 func collectEnforcementSegments(value any, path string, active bool, segments *[]enforcementSegment) {
@@ -239,6 +301,10 @@ func containsAny(text string, values []string) bool {
 }
 
 func collectPromptFields(value any, path string, active bool, parts, fields *[]string) {
+	collectPromptFieldsWithRoles(value, path, active, "unknown", parts, fields, nil)
+}
+
+func collectPromptFieldsWithRoles(value any, path string, active bool, sourceRole string, parts, fields *[]string, segments *[]promptSegment) {
 	switch typed := value.(type) {
 	case map[string]any:
 		if role, exists := typed["role"].(string); exists {
@@ -246,12 +312,17 @@ func collectPromptFields(value any, path string, active bool, parts, fields *[]s
 				if isAssistantPromptRole(role) {
 					for _, key := range []string{"tool_calls", "function_call", "functionCall"} {
 						if dynamicCall, ok := typed[key]; ok {
-							collectPromptFields(dynamicCall, path+"."+key, true, parts, fields)
+							collectPromptFieldsWithRoles(dynamicCall, path+"."+key, true, "assistant_tool_call", parts, fields, segments)
 						}
 					}
 				}
 				return
 			}
+			sourceRole = normalizePromptSourceRole(role)
+			active = true
+		}
+		if rawType, exists := typed["type"].(string); exists && isToolPromptType(rawType) {
+			sourceRole = normalizePromptSourceRole(rawType)
 			active = true
 		}
 		keys := make([]string, 0, len(typed))
@@ -265,11 +336,15 @@ func collectPromptFields(value any, path string, active bool, parts, fields *[]s
 				continue
 			}
 			_, promptBearing := promptBearingKeys[lowerKey]
-			collectPromptFields(typed[key], path+"."+key, active || promptBearing, parts, fields)
+			childRole := sourceRole
+			if childRole == "unknown" && (lowerKey == "input" || lowerKey == "prompt" || lowerKey == "query") {
+				childRole = "user"
+			}
+			collectPromptFieldsWithRoles(typed[key], path+"."+key, active || promptBearing, childRole, parts, fields, segments)
 		}
 	case []any:
 		for index, item := range typed {
-			collectPromptFields(item, fmt.Sprintf("%s[%d]", path, index), active, parts, fields)
+			collectPromptFieldsWithRoles(item, fmt.Sprintf("%s[%d]", path, index), active, sourceRole, parts, fields, segments)
 		}
 	case string:
 		if !active {
@@ -284,6 +359,38 @@ func collectPromptFields(value any, path string, active bool, parts, fields *[]s
 		}
 		*parts = append(*parts, text)
 		*fields = append(*fields, path)
+		if segments != nil {
+			*segments = append(*segments, promptSegment{text: text, role: sourceRole})
+		}
+	}
+}
+
+func normalizePromptSourceRole(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "user", "tool", "function", "custom_tool_call_output", "function_call_output", "tool_result", "mcp_result", "computer_result", "web_search_result", "assistant_tool_call":
+		return value
+	case "assistant", "model":
+		return "assistant"
+	case "system", "developer":
+		return value
+	default:
+		if strings.Contains(value, "tool") {
+			return "tool"
+		}
+		if strings.Contains(value, "function") {
+			return "function_call_output"
+		}
+		if strings.Contains(value, "mcp") {
+			return "mcp_result"
+		}
+		if strings.Contains(value, "computer") {
+			return "computer_result"
+		}
+		if strings.Contains(value, "web_search") {
+			return "web_search_result"
+		}
+		return "unknown"
 	}
 }
 
@@ -382,6 +489,7 @@ func ExtractMultipartRequest(form *multipart.Form) ExtractedRequest {
 	}
 	parts := make([]string, 0, len(form.Value))
 	fields := make([]string, 0, len(form.Value))
+	promptSegments := make([]promptSegment, 0, len(form.Value))
 	values := make(map[string][]string, len(form.Value))
 	for key, entries := range form.Value {
 		values[key] = append([]string(nil), entries...)
@@ -395,6 +503,7 @@ func ExtractMultipartRequest(form *multipart.Form) ExtractedRequest {
 			}
 			parts = append(parts, entry)
 			fields = append(fields, "form."+key)
+			promptSegments = append(promptSegments, promptSegment{text: entry, role: "user"})
 		}
 	}
 	files := make(map[string][]map[string]any, len(form.File))
@@ -428,5 +537,6 @@ func ExtractMultipartRequest(form *multipart.Form) ExtractedRequest {
 		ExtractedFields:   fields,
 		EnforcementFields: append([]string(nil), fields...),
 		EvidenceSanitized: true,
+		promptSegments:    promptSegments,
 	}
 }

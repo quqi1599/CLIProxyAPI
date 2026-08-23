@@ -201,18 +201,36 @@ type Config struct {
 // ContentAuditConfig controls request-time policy matching and encrypted hit evidence.
 // Secret fields should normally be supplied through the matching environment variables.
 type ContentAuditConfig struct {
-	Enabled                 bool   `yaml:"enabled" json:"enabled"`
-	AuditOnly               bool   `yaml:"audit-only" json:"audit-only"`
-	PolicyFile              string `yaml:"policy-file" json:"policy-file"`
-	DatabasePath            string `yaml:"database-path" json:"database-path"`
-	RequireSignedIdentity   bool   `yaml:"require-signed-identity" json:"require-signed-identity"`
-	AllowUnauditedWebsocket bool   `yaml:"allow-unaudited-websocket" json:"allow-unaudited-websocket"`
-	IdentitySecret          string `yaml:"identity-secret,omitempty" json:"-"`
-	EvidenceKey             string `yaml:"evidence-key,omitempty" json:"-"`
-	EvidenceKeyID           string `yaml:"evidence-key-id" json:"evidence-key-id"`
-	MaxBodyBytes            int64  `yaml:"max-body-bytes" json:"max-body-bytes"`
-	RawRetentionDays        int    `yaml:"raw-retention-days" json:"raw-retention-days"`
-	MetadataRetentionDays   int    `yaml:"metadata-retention-days" json:"metadata-retention-days"`
+	Enabled                 bool                          `yaml:"enabled" json:"enabled"`
+	AuditOnly               bool                          `yaml:"audit-only" json:"audit-only"`
+	PolicyFile              string                        `yaml:"policy-file" json:"policy-file"`
+	DatabasePath            string                        `yaml:"database-path" json:"database-path"`
+	RequireSignedIdentity   bool                          `yaml:"require-signed-identity" json:"require-signed-identity"`
+	AllowUnauditedWebsocket bool                          `yaml:"allow-unaudited-websocket" json:"allow-unaudited-websocket"`
+	IdentitySecret          string                        `yaml:"identity-secret,omitempty" json:"-"`
+	EvidenceKey             string                        `yaml:"evidence-key,omitempty" json:"-"`
+	EvidenceKeyID           string                        `yaml:"evidence-key-id" json:"evidence-key-id"`
+	MaxBodyBytes            int64                         `yaml:"max-body-bytes" json:"max-body-bytes"`
+	EvidenceDedupeSeconds   int                           `yaml:"evidence-dedupe-seconds" json:"evidence-dedupe-seconds"`
+	RawRetentionDays        int                           `yaml:"raw-retention-days" json:"raw-retention-days"`
+	MetadataRetentionDays   int                           `yaml:"metadata-retention-days" json:"metadata-retention-days"`
+	ModelReview             ContentAuditModelReviewConfig `yaml:"model-review" json:"model-review"`
+}
+
+// ContentAuditModelReviewConfig controls the bounded semantic review of keyword matches.
+// The reviewer is an optional second-stage signal; keyword matching remains available when it is off.
+type ContentAuditModelReviewConfig struct {
+	Mode                     string  `yaml:"mode" json:"mode"`
+	Model                    string  `yaml:"model" json:"model"`
+	PromptVersion            string  `yaml:"prompt-version" json:"prompt-version"`
+	TimeoutMilliseconds      int     `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`
+	QueueTimeoutMilliseconds int     `yaml:"queue-timeout-milliseconds" json:"queue-timeout-milliseconds"`
+	MaxConcurrent            int     `yaml:"max-concurrent" json:"max-concurrent"`
+	CacheSeconds             int     `yaml:"cache-seconds" json:"cache-seconds"`
+	MaxInputBytes            int     `yaml:"max-input-bytes" json:"max-input-bytes"`
+	MinConfidence            float64 `yaml:"min-confidence" json:"min-confidence"`
+	CircuitFailureThreshold  int     `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
+	CircuitOpenSeconds       int     `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
 }
 
 // EmptyResponseRetryConfig controls targeted detection of upstream responses
