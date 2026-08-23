@@ -9,17 +9,14 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-type contentAuditReviewExecutorFunc func(context.Context, []string, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error)
+type contentAuditReviewExecutorFunc func(context.Context, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error)
 
-func (f contentAuditReviewExecutorFunc) Execute(ctx context.Context, providers []string, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
-	return f(ctx, providers, request, options)
+func (f contentAuditReviewExecutorFunc) ExecuteContentAuditReview(ctx context.Context, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
+	return f(ctx, request, options)
 }
 
 func TestCodexContentAuditReviewerUsesDirectCodexExecution(t *testing.T) {
-	reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, providers []string, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
-		if len(providers) != 1 || providers[0] != "codex" {
-			t.Fatalf("providers=%v", providers)
-		}
+	reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
 		if request.Model != "codex-auto-review" || options.Stream {
 			t.Fatalf("request=%#v options=%#v", request, options)
 		}

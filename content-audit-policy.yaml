@@ -3,7 +3,7 @@
 # Multi-category phrases use the highest-severity category; source order breaks ties.
 # The 642 source rows compile to 641 unique runtime patterns after normalization.
 # CPA keeps request-level enforcement only; this policy does not ban sessions or API keys.
-version: "llm-access-managed-2026-08-23-v3"
+version: "llm-access-managed-2026-08-23-v4"
 global-allowlist:
   - "接口交互"
   - "光口交换机"
@@ -161,6 +161,7 @@ rules:
     category: "csam"
     severity: "critical"
     action: "observe"
+    model-review: true
     keywords:
       - "child porn"
       - "child pornography"
@@ -193,6 +194,7 @@ rules:
     category: "sexual"
     severity: "high"
     action: "observe"
+    model-review: true
     keywords:
       - "jailbreak prompt nsfw"
       - "ignore safety guidelines nsfw"
@@ -537,6 +539,7 @@ rules:
     category: "weapons"
     severity: "critical"
     action: "observe"
+    model-review: true
     keywords:
       - "how to make a bomb"
       - "build a pipe bomb"
@@ -567,6 +570,7 @@ rules:
     category: "extremism"
     severity: "critical"
     action: "observe"
+    model-review: true
     keywords:
       - "mass shooting plan"
       - "school shooting plan"
@@ -581,6 +585,7 @@ rules:
     category: "drugs"
     severity: "high"
     action: "observe"
+    model-review: true
     keywords:
       - "methamphetamine synthesis"
       - "how to make meth"
@@ -597,6 +602,7 @@ rules:
     category: "criminal"
     severity: "critical"
     action: "observe"
+    model-review: true
     keywords:
       - "hire a hitman"
       - "human trafficking"
@@ -617,6 +623,7 @@ rules:
     category: "fraud"
     severity: "high"
     action: "observe"
+    model-review: true
     keywords:
       - "money laundering method"
       - "how to launder money"
@@ -679,6 +686,7 @@ rules:
     category: "cyber"
     severity: "high"
     action: "observe"
+    model-review: true
     keywords:
       - "ransomware source code"
       - "build a ransomware"
@@ -779,6 +787,7 @@ rules:
     category: "piracy"
     severity: "medium"
     action: "observe"
+    model-review: true
     keywords:
       - "software cracking tool"
       - "crack license key"
@@ -847,6 +856,7 @@ rules:
     category: "self_harm"
     severity: "critical"
     action: "observe"
+    model-review: true
     keywords:
       - "painless suicide method"
       - "most lethal way to kill myself"
@@ -857,6 +867,7 @@ rules:
     category: "jailbreak"
     severity: "medium"
     action: "observe"
+    model-review: true
     keywords:
       - "dan jailbreak"
       - "uncensored ai mode"

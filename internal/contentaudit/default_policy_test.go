@@ -26,6 +26,9 @@ func TestDefaultPolicyManagedCountsAndActions(t *testing.T) {
 	rawKeywordCount := 0
 	for _, rule := range policy.Rules {
 		rawKeywordCount += len(rule.Keywords)
+		if !rule.ModelReview {
+			t.Fatalf("rule %q does not enable model review", rule.ID)
+		}
 	}
 	if rawKeywordCount != 684 {
 		t.Fatalf("raw keyword count = %d, want 684", rawKeywordCount)
