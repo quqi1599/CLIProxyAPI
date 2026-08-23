@@ -303,6 +303,10 @@ type Options struct {
 	Metadata map[string]any
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
+	// InternalAuthSelectionCapability carries an opaque in-process auth-selection capability.
+	// HTTP request metadata must never be copied into this field. Auth managers only honor
+	// private capability values that cannot be synthesized from request data.
+	InternalAuthSelectionCapability any
 }
 
 // ResponseFormatOrSource returns the response target format for an execution.

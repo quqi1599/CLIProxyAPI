@@ -1648,6 +1648,12 @@ type Manager struct {
 	gptPolicyPersistMu    sync.Mutex
 }
 
+const contentAuditReviewModel = "codex-auto-review"
+
+type internalAuthSelectionCapability struct{}
+
+var contentAuditReviewAuthSelectionCapability = &internalAuthSelectionCapability{}
+
 // NewManager constructs a manager with optional custom selector and hook.
 func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if selector == nil {
@@ -5317,17 +5323,46 @@ func (m *Manager) Load(ctx context.Context) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if strings.TrimSpace(req.Model) == contentAuditReviewModel {
+		return cliproxyexecutor.Response{}, contentAuditReviewPublicRouteError()
+	}
 	return m.runExecuteAttempts(ctx, providers, req, opts)
+}
+
+// ExecuteContentAuditReview executes the fixed internal Codex safety reviewer route.
+// The private pointer capability cannot be created from HTTP headers, query values, or metadata.
+func (m *Manager) ExecuteContentAuditReview(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if strings.TrimSpace(req.Model) != contentAuditReviewModel || opts.Stream {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review request", HTTPStatus: http.StatusBadRequest}
+	}
+	opts.InternalAuthSelectionCapability = contentAuditReviewAuthSelectionCapability
+	return m.runExecuteAttempts(ctx, []string{"codex"}, req, opts)
+}
+
+func allowsContentAuditReviewExcludedModel(provider, model string, opts cliproxyexecutor.Options) bool {
+	return opts.InternalAuthSelectionCapability == contentAuditReviewAuthSelectionCapability &&
+		strings.EqualFold(strings.TrimSpace(provider), "codex") &&
+		strings.TrimSpace(model) == contentAuditReviewModel
+}
+
+func contentAuditReviewPublicRouteError() error {
+	return &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if strings.TrimSpace(req.Model) == contentAuditReviewModel {
+		return cliproxyexecutor.Response{}, contentAuditReviewPublicRouteError()
+	}
 	return m.runCountAttempts(ctx, providers, req, opts)
 }
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if strings.TrimSpace(req.Model) == contentAuditReviewModel {
+		return nil, contentAuditReviewPublicRouteError()
+	}
 	return m.runStreamAttempts(ctx, providers, req, opts)
 }
 
@@ -10913,7 +10948,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := localTried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" &&
+			!allowsContentAuditReviewExcludedModel(provider, model, opts) &&
+			!m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		if !remoteCompactionCandidateAllowed(candidate, intent) {
@@ -11047,7 +11084,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
-	if strings.TrimSpace(model) != "" {
+	if strings.TrimSpace(model) != "" && !allowsContentAuditReviewExcludedModel(provider, model, opts) {
 		providerSet := map[string]struct{}{provider: {}}
 		m.mu.RLock()
 		for _, candidate := range m.auths {
@@ -11077,7 +11114,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncSchedulerOnPickFailure(time.Now())
 			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-			if errPick != nil {
+			if errPick != nil && !allowsContentAuditReviewExcludedModel(provider, model, opts) {
 				if fallbackAuth, fallbackExecutor, errFallback := m.pickNextLegacy(ctx, provider, model, opts, tried); errFallback == nil {
 					return fallbackAuth, fallbackExecutor, nil
 				}
@@ -11174,7 +11211,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, used := localTried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" &&
+			!allowsContentAuditReviewExcludedModel(providerKey, model, opts) &&
+			!m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		if !remoteCompactionCandidateAllowed(candidate, intent) {
@@ -11297,7 +11336,8 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if strings.TrimSpace(model) != "" {
+	internalContentReview := len(eligibleProviders) == 1 && allowsContentAuditReviewExcludedModel(eligibleProviders[0], model, opts)
+	if strings.TrimSpace(model) != "" && !internalContentReview {
 		providerSet := make(map[string]struct{}, len(eligibleProviders))
 		for _, providerKey := range eligibleProviders {
 			providerSet[providerKey] = struct{}{}
@@ -11327,7 +11367,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncSchedulerOnPickFailure(time.Now())
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
-			if errPick != nil {
+			if errPick != nil && !internalContentReview {
 				if fallbackAuth, fallbackExecutor, fallbackProvider, errFallback := m.pickNextMixedLegacy(ctx, providers, model, opts, tried); errFallback == nil {
 					return fallbackAuth, fallbackExecutor, fallbackProvider, nil
 				}

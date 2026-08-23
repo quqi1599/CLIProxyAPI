@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
@@ -242,6 +243,15 @@ func normalizeTerminalManagerError(ctx context.Context, err error) error {
 	}
 	if _, ok := failurecontract.As(err); ok {
 		return err
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.HTTPStatus <= 0 {
+		switch strings.TrimSpace(authErr.Code) {
+		case "auth_not_found", "auth_unavailable":
+			normalized := cloneError(authErr)
+			normalized.HTTPStatus = http.StatusServiceUnavailable
+			return normalized
+		}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		status := http.StatusBadGateway

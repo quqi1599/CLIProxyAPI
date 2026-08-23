@@ -39,6 +39,50 @@ func TestLogRequestExecutionSummaryCanonicalizesOpaque500(t *testing.T) {
 	}
 }
 
+func TestNormalizeTerminalManagerErrorDefaultsAuthSelectionFailuresTo503(t *testing.T) {
+	for _, code := range []string{"auth_not_found", "auth_unavailable"} {
+		t.Run(code, func(t *testing.T) {
+			errNormalized := normalizeTerminalManagerError(t.Context(), &Error{Code: code, Message: "no auth available"})
+			var authErr *Error
+			if !errors.As(errNormalized, &authErr) || authErr == nil {
+				t.Fatalf("error = %T, want *Error", errNormalized)
+			}
+			if authErr.Code != code {
+				t.Fatalf("code = %q, want %q", authErr.Code, code)
+			}
+			if authErr.StatusCode() != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusServiceUnavailable)
+			}
+		})
+	}
+}
+
+func TestLogRequestExecutionSummaryUsesNormalizedAuthUnavailable503(t *testing.T) {
+	hook := logtest.NewGlobal()
+	hook.Reset()
+	t.Cleanup(hook.Reset)
+
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(previousLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-summary-auth-unavailable")
+	trace := &requestAttemptTrace{requestID: "req-summary-auth-unavailable", maxAttempts: 1}
+	errNormalized := normalizeTerminalManagerError(ctx, &Error{Code: "auth_unavailable", Message: "no auth available"})
+	logRequestExecutionSummary(ctx, trace, false, errNormalized, false)
+
+	entry := findExecutionSummaryEntry(t, hook.AllEntries())
+	if got := entry.Data["final_status"]; got != http.StatusServiceUnavailable {
+		t.Fatalf("final_status = %#v, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := entry.Data["final_error_type"]; got != "server_error" {
+		t.Fatalf("final_error_type = %#v, want server_error", got)
+	}
+	if got := entry.Data["final_error_code"]; got != "auth_unavailable" {
+		t.Fatalf("final_error_code = %#v, want auth_unavailable", got)
+	}
+}
+
 func TestLogRequestExecutionSummaryTerminalCancellationOverridesStale503(t *testing.T) {
 	hook := logtest.NewGlobal()
 	hook.Reset()
