@@ -34,6 +34,22 @@ func userFacingDeepSeekOfficialFileInputMessage() string {
 	return "当前选择的 DeepSeek 模型不支持本次 Codex 请求中的文件输入。这是模型能力兼容限制，不是账号、余额或网络问题。请在 Codex 中切换到支持文件的原生 GPT 模型；如果继续使用 DeepSeek，请先把文件内容转成文本摘要。"
 }
 
+func userFacingWorkBuddyDeepSeekToolHistoryMessage() string {
+	return "当前 WorkBuddy 对话已累积大量工具调用记录，DeepSeek 兼容接口无法继续完整接收。请点击“新建对话”后重新发送；“工具调用”可以继续勾选。若仍失败，请打开“模型设置”关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+}
+
+func userFacingWorkBuddyDeepSeekComplexToolsMessage() string {
+	return "当前 DeepSeek 兼容通道无法接收 WorkBuddy 一次发送的整套复杂工具定义，系统会尝试其他可用通道。如果仍失败，请点击“新建对话”后重新发送；“工具调用”可以继续勾选，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+}
+
+func userFacingWorkBuddyDeepSeekAttachmentMessage() string {
+	return "当前 WorkBuddy 对话包含图片或文件内容，DeepSeek 兼容接口无法接收。请打开“模型设置”→取消勾选“图片输入”→点击“新建对话”后重新发送；“工具调用”可以继续勾选。如果必须处理图片或文件，请切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+}
+
+func userFacingWorkBuddyDeepSeekContentFormatMessage() string {
+	return "当前 WorkBuddy 对话包含 DeepSeek 无法识别的分段内容。请点击“新建对话”后重试；“工具调用”可以继续勾选。若仍失败，请打开“模型设置”关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+}
+
 func userFacingDeepSeekResponsesNonFunctionToolsMessage(errText string) string {
 	toolNames := deepSeekUnsupportedToolChineseNames(errText)
 	return "DeepSeek V4 Pro 已支持函数调用、联网搜索和补丁应用，但当前 Codex 请求还使用了 DeepSeek 不支持的工具：" + strings.Join(toolNames, "、") + "。这是工具协议的兼容性限制，不是账号、余额或网络问题。请移除这些工具，或在 Codex 的模型选择器中切换到原生 GPT 模型后重试。"
@@ -167,6 +183,14 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 	message := UserFacingRequestFeatureUnsupportedMessage()
 	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
 		switch {
+		case hasWorkBuddyDeepSeekComplexToolsSignal(candidate):
+			message = userFacingWorkBuddyDeepSeekComplexToolsMessage()
+		case hasWorkBuddyDeepSeekToolHistorySignal(candidate):
+			message = userFacingWorkBuddyDeepSeekToolHistoryMessage()
+		case hasWorkBuddyDeepSeekAttachmentSignal(candidate):
+			message = userFacingWorkBuddyDeepSeekAttachmentMessage()
+		case hasWorkBuddyDeepSeekContentFormatSignal(candidate):
+			message = userFacingWorkBuddyDeepSeekContentFormatMessage()
 		case hasOpenAICompatToolHistorySignal(candidate):
 			message = userFacingOpenAICompatToolHistoryMessage()
 		case hasDeepSeekChatJSONSchemaSignal(candidate):
@@ -284,6 +308,26 @@ func hasDeepSeekOfficialImageInputSignal(text string) bool {
 func hasDeepSeekOfficialFileInputSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "deepseek_official_file_input")
+}
+
+func hasWorkBuddyDeepSeekToolHistorySignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "workbuddy_deepseek_tool_history_too_large")
+}
+
+func hasWorkBuddyDeepSeekComplexToolsSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "workbuddy_deepseek_akool_complex_tools")
+}
+
+func hasWorkBuddyDeepSeekAttachmentSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "workbuddy_deepseek_attachment_input")
+}
+
+func hasWorkBuddyDeepSeekContentFormatSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "workbuddy_deepseek_content_format")
 }
 
 func hasDeepSeekResponsesNonFunctionToolsSignal(text string) bool {

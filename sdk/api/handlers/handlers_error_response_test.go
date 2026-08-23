@@ -543,6 +543,36 @@ func TestBuildErrorResponseBody_NormalizesOpenAICompatToolHistoryRequestFeatureU
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesWorkBuddyDeepSeekTutorials(t *testing.T) {
+	tests := []struct {
+		name    string
+		code    string
+		message string
+	}{
+		{"complex tools", "workbuddy_deepseek_akool_complex_tools", userFacingWorkBuddyDeepSeekComplexToolsMessage()},
+		{"tool history", "workbuddy_deepseek_tool_history_too_large", userFacingWorkBuddyDeepSeekToolHistoryMessage()},
+		{"attachment", "workbuddy_deepseek_attachment_input", userFacingWorkBuddyDeepSeekAttachmentMessage()},
+		{"content format", "workbuddy_deepseek_content_format", userFacingWorkBuddyDeepSeekContentFormatMessage()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: `+test.code+`. unsupported","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+			var payload ErrorResponse
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if payload.Error.Message != test.message {
+				t.Fatalf("message = %q, want %q", payload.Error.Message, test.message)
+			}
+			for _, internal := range []string{"request_feature_unsupported", "workbuddy_deepseek_", "CPA", "reasoning_content", "tool_result"} {
+				if strings.Contains(payload.Error.Message, internal) {
+					t.Fatalf("message leaked internal marker %q: %s", internal, payload.Error.Message)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildErrorResponseBody_NormalizesGenericClientHints(t *testing.T) {
 	cases := []struct {
 		name    string
