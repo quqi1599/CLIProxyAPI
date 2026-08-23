@@ -209,6 +209,75 @@ func TestLogFormatterIncludesRoutingAvailabilityAndCanonicalFailureFields(t *tes
 	}
 }
 
+func TestLogFormatterIncludesRemoteCompactionAvailabilityFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 24, 2, 49, 27, 0, time.Local)
+	entry.Level = log.WarnLevel
+	entry.Message = "auth_selection_failed"
+	entry.Data["event"] = "auth_selection_failed"
+	entry.Data["compaction_intent"] = "legacy_endpoint"
+	entry.Data["candidate_route_count"] = 1
+	entry.Data["eligible_route_count"] = 0
+	entry.Data["compaction_candidate_route_count"] = 1
+	entry.Data["compaction_eligible_route_count"] = 0
+	entry.Data["compaction_blocked_route_count"] = 1
+	entry.Data["compaction_breaker_open_count"] = 1
+	entry.Data["compaction_blocked_reasons"] = "health_or_unavailable:1"
+	entry.Data["compaction_breaker_statuses"] = "401"
+	entry.Data["compaction_breaker_reasons"] = "status_401:1"
+	entry.Data["compaction_earliest_recovery_ms"] = int64(45000)
+	entry.Data["ordinary_candidate_route_count"] = 4
+	entry.Data["ordinary_eligible_route_count"] = 3
+	entry.Data["ordinary_blocked_route_count"] = 1
+	entry.Data["ordinary_breaker_open_count"] = 1
+	entry.Data["ordinary_blocked_reasons"] = "health_or_unavailable:1"
+	entry.Data["ordinary_breaker_statuses"] = "401"
+	entry.Data["ordinary_breaker_reasons"] = "status_401:1"
+	entry.Data["ordinary_earliest_recovery_ms"] = int64(45000)
+	entry.Data["compaction_compatibility_group"] = "opaque-state-v1"
+	entry.Data["failed_attempt"] = 1
+	entry.Data["consecutive_failures"] = 3
+	entry.Data["open_until"] = "2026-08-23T18:50:12Z"
+	entry.Data["cause_error_code"] = "model_cooldown"
+	entry.Data["cause_reset_ms"] = int64(45000)
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"compaction_intent=legacy_endpoint",
+		"compaction_candidate_route_count=1",
+		"compaction_eligible_route_count=0",
+		"compaction_blocked_route_count=1",
+		"compaction_breaker_open_count=1",
+		"compaction_blocked_reasons=health_or_unavailable:1",
+		"compaction_breaker_statuses=401",
+		"compaction_breaker_reasons=status_401:1",
+		"compaction_earliest_recovery_ms=45000",
+		"ordinary_candidate_route_count=4",
+		"ordinary_eligible_route_count=3",
+		"ordinary_blocked_route_count=1",
+		"ordinary_breaker_open_count=1",
+		"ordinary_blocked_reasons=health_or_unavailable:1",
+		"ordinary_breaker_statuses=401",
+		"ordinary_breaker_reasons=status_401:1",
+		"ordinary_earliest_recovery_ms=45000",
+		"compaction_compatibility_group=opaque-state-v1",
+		"failed_attempt=1",
+		"consecutive_failures=3",
+		"open_until=2026-08-23T18:50:12Z",
+		"cause_error_code=model_cooldown",
+		"cause_reset_ms=45000",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %q", line, want)
+		}
+	}
+}
+
 func TestLogFormatterIncludesGPTRetryPressureFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 8, 13, 17, 52, 32, 0, time.Local)
