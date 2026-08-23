@@ -415,7 +415,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if err = enforceThinkingHistoryTransform(ctx, "claude", historyReport, time.Since(historyStarted)); err != nil {
 		return plan, err
 	}
-	if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, plan.providerIdentity.Kind, plan.baseURL, baseModel); err != nil {
+	if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, plan.providerIdentity.Kind, plan.baseURL, baseModel, executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)); err != nil {
 		return plan, err
 	}
 
@@ -926,7 +926,7 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if useProviderCapabilityPolicies {
 		body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, identity.Kind)
 		body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, identity.Kind)
-		if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, identity.Kind, baseURL, baseModel); err != nil {
+		if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, identity.Kind, baseURL, baseModel, executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)); err != nil {
 			return cliproxyexecutor.Response{}, err
 		}
 	}
@@ -2651,7 +2651,7 @@ func isDeepSeekV4LongContextModel(model string) bool {
 	return strings.HasPrefix(baseModel, "deepseek-v4-pro") || strings.HasPrefix(baseModel, "deepseek-v4-flash")
 }
 
-func rejectDeepSeekAnthropicUnsupportedImageInput(ctx context.Context, body []byte, compatKind, baseURL, model string) error {
+func rejectDeepSeekAnthropicUnsupportedImageInput(ctx context.Context, body []byte, compatKind, baseURL, model string, clientProfiles ...string) error {
 	if !isOfficialDeepSeekAnthropicRoute(compatKind, baseURL) {
 		return nil
 	}
@@ -2668,10 +2668,14 @@ func rejectDeepSeekAnthropicUnsupportedImageInput(ctx context.Context, body []by
 		"image_parts":   imageParts,
 	}
 	helps.LogWithRequestID(ctx).WithFields(fields).Warn("DeepSeek official Anthropic route rejected image content before capability conversion")
+	message := "DeepSeek 官方 Anthropic API 当前不支持图片内容块。系统不会把图片伪装成文本继续转发；请移除当前请求及历史消息中的图片，或在 Codex 中切换到原生 GPT 模型。"
+	if len(clientProfiles) > 0 && strings.EqualFold(strings.TrimSpace(clientProfiles[0]), "workbuddy") {
+		message = "request_feature_unsupported: workbuddy_deepseek_attachment_input. 当前 WorkBuddy 对话包含图片或文件内容，DeepSeek 兼容接口无法接收。请打开“模型设置”→取消勾选“图片输入”→点击“新建对话”后重新发送；“工具调用”可以继续勾选。如果必须处理图片或文件，请切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+	}
 	return statusErr{
 		code:      http.StatusBadRequest,
 		errorCode: "request_feature_unsupported",
-		msg:       "DeepSeek 官方 Anthropic API 当前不支持图片内容块。系统不会把图片伪装成文本继续转发；请移除当前请求及历史消息中的图片，或在 Codex 中切换到原生 GPT 模型。",
+		msg:       message,
 	}
 }
 

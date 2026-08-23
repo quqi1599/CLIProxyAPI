@@ -53,6 +53,15 @@ func TestDeepSeekAnthropicImageGuardOnlyAppliesToOfficialHost(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "不支持图片内容块") {
 		t.Fatalf("official DeepSeek Anthropic image guard error = %v", err)
 	}
+	workBuddyErr := rejectDeepSeekAnthropicUnsupportedImageInput(context.Background(), body, "deepseek", "https://api.deepseek.com/anthropic", "deepseek-v4-pro", "workbuddy")
+	if workBuddyErr == nil {
+		t.Fatal("WorkBuddy official DeepSeek Anthropic image guard error = nil")
+	}
+	for _, want := range []string{"模型设置", "取消勾选“图片输入”", "新建对话", "“工具调用”可以继续勾选", "OpenAI 原生 GPT 模型"} {
+		if !strings.Contains(workBuddyErr.Error(), want) {
+			t.Fatalf("WorkBuddy message %q missing %q", workBuddyErr.Error(), want)
+		}
+	}
 }
 
 func TestPrepareClaudeRequestDeepSeekDowngradesIncompleteDefaultHistory(t *testing.T) {
