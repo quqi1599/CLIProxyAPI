@@ -1,0 +1,61 @@
+name: trusted-ci
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "codex/**"
+      - "fix/**"
+      - "feat/**"
+      - "chore/**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  trusted-push:
+    name: Go test and build (trusted push)
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, ci-vps]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build server
+        run: go build -buildvcs=false -o "$RUNNER_TEMP/cli-proxy-api" ./cmd/server
+
+  untrusted-pr:
+    name: Go test and build (public PR isolation)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build server
+        run: go build -buildvcs=false -o "$RUNNER_TEMP/cli-proxy-api" ./cmd/server

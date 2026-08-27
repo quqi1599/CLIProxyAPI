@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
@@ -212,9 +213,9 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 
 	requestRetry, maxRetryCredentials, maxWait := manager.retrySettings()
 	if remoteCompaction {
-		maxRetryCredentials = 0
+		maxRetryCredentials = remoteCompactionMaxAttempts - 1
 		maxWait = 0
-		trace.configureBudget(1, 0)
+		trace.configureBudget(remoteCompactionMaxAttempts, remoteCompactionMaxAttempts-1)
 	} else if gptRoute {
 		if isGPTLargeToolHistoryResponsesRequest(providers, req.Model, opts) {
 			trace.configureBudget(gptLargeToolHistoryMaxRetryCredentials+1, gptLargeToolHistoryMaxRetryCredentials)
@@ -242,6 +243,15 @@ func normalizeTerminalManagerError(ctx context.Context, err error) error {
 	}
 	if _, ok := failurecontract.As(err); ok {
 		return err
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.HTTPStatus <= 0 {
+		switch strings.TrimSpace(authErr.Code) {
+		case "auth_not_found", "auth_unavailable":
+			normalized := cloneError(authErr)
+			normalized.HTTPStatus = http.StatusServiceUnavailable
+			return normalized
+		}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		status := http.StatusBadGateway

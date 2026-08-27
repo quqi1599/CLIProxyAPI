@@ -20,6 +20,23 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 	}
 }
 
+func TestRequestExecutionMetadataCarriesPinnedAuthFallbackOnlyWhenEnabled(t *testing.T) {
+	hardPinned := WithPinnedAuthID(context.Background(), "auth-1")
+	hardMetadata := requestExecutionMetadata(hardPinned)
+	if got := hardMetadata[coreexecutor.PinnedAuthMetadataKey]; got != "auth-1" {
+		t.Fatalf("PinnedAuthMetadataKey = %v, want auth-1", got)
+	}
+	if _, ok := hardMetadata[coreexecutor.PinnedAuthFallbackMetadataKey]; ok {
+		t.Fatal("hard pin unexpectedly enabled fallback")
+	}
+
+	fallbackPinned := WithPinnedAuthFallback(hardPinned)
+	fallbackMetadata := requestExecutionMetadata(fallbackPinned)
+	if got := fallbackMetadata[coreexecutor.PinnedAuthFallbackMetadataKey]; got != true {
+		t.Fatalf("PinnedAuthFallbackMetadataKey = %v, want true", got)
+	}
+}
+
 func TestInferClientProfileFromHeadersDetectsWorkBuddy(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("User-Agent", "WorkBuddy/5.1")

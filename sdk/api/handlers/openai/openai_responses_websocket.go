@@ -776,6 +776,22 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		pinnedAuthID = ""
 	}
+	releasePinnedAuth := func(modelName, reason string) {
+		auth, _ := sessionAuthByID(pinnedAuthID)
+		fields := log.Fields{
+			"event":  "websocket_affinity_escape",
+			"model":  strings.TrimSpace(modelName),
+			"reason": strings.TrimSpace(reason),
+		}
+		if auth != nil {
+			fields["provider"] = strings.ToLower(strings.TrimSpace(auth.Provider))
+			if auth.Index != "" {
+				fields["auth_index"] = auth.Index
+			}
+		}
+		log.WithFields(fields).Info("responses websocket: released stale pinned auth")
+		forgetPinnedAuth()
+	}
 	var activeFrameLease *responsesWebsocketFrameLease
 	defer func() {
 		activeFrameLease.release()
@@ -846,7 +862,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			state, hasState := pinnedAuthByProvider[providerKey]
 			if !ok || !hasState || state.authID != pinnedAuthID ||
 				!responsesWebsocketPinnedAuthMatchesModel(pinnedAuth, requestModelName, state.modelKey, homeRuntime, h.AuthManager) {
-				pinnedAuthID = ""
+				releasePinnedAuth(requestModelName, "pinned_auth_ineligible")
 			}
 		}
 		if pinnedAuthID == "" {
@@ -1016,7 +1032,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		lastAttemptedAuthID := pinnedAuthID
 		attemptedUpstreamMode := responsesWebsocketUpstreamModeUnknown
 		selectedAuthObserved := false
-		pinnedAuthAttempted := false
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		if nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket {
@@ -1030,22 +1045,25 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			lastAttemptedAuthID = authID
 			selectedAuthObserved = true
-			pinnedAuthAttempted = pinnedAuthAttempted || (pinnedAuthID != "" && authID == pinnedAuthID)
 			selectedAuth, ok := sessionAuthByID(authID)
 			if !ok || selectedAuth == nil {
 				return
 			}
 			attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
 		})
-		if pinnedAuthID != "" && !routeOverridesModelResolution {
+		pinnedAuthApplied := pinnedAuthID != "" && !routeOverridesModelResolution
+		if pinnedAuthApplied {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+			if !requestRequiresCurrentUpstreamWebsocket {
+				cliCtx = handlers.WithPinnedAuthFallback(cliCtx)
+			}
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 		if !selectedAuthObserved {
 			attemptedUpstreamMode = responsesWebsocketUpstreamModeHTTP
 		}
 		replayPinnedAuthFailure := func(errMsg *interfaces.ErrorMessage) bool {
-			return nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket && pinnedAuthAttempted &&
+			return nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket && pinnedAuthApplied &&
 				shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg)
 		}
 
@@ -1106,8 +1124,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				lastResponseID = previousLastResponseID
 				lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			}
-			if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
-				forgetPinnedAuth()
+			if pinnedAuthApplied && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+				releasePinnedAuth(modelName, "pinned_auth_request_failed")
 			}
 			if replayPinnedAuthFailure(forwardErrMsg) {
 				wsTerminateErr = responsesWebsocketHTTPReplayRequiredError()
@@ -1794,11 +1812,10 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketAvailableAuthsForModel(mod
 	}
 
 	registryRef := registry.GetGlobalRegistry()
-	now := time.Now()
 	auths := h.AuthManager.List()
 	available := make([]*coreauth.Auth, 0, len(auths))
 	for _, auth := range auths {
-		if !responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, now) {
+		if !responsesWebsocketAuthMatchesModel(auth, providerSet, modelKey, registryRef, h.AuthManager) {
 			continue
 		}
 		available = append(available, auth)
@@ -1852,13 +1869,16 @@ func responsesWebsocketPinnedAuthMatchesModel(auth *coreauth.Auth, modelName str
 	}
 	providerSet, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName), authManager)
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if _, ok := providerSet[providerKey]; !ok || !responsesWebsocketAuthAvailableForModel(auth, modelKey, time.Now()) {
+	if _, ok := providerSet[providerKey]; !ok {
 		return false
 	}
 	if homeRuntime {
-		return strings.EqualFold(strings.TrimSpace(pinnedModelKey), strings.TrimSpace(modelKey))
+		return strings.EqualFold(strings.TrimSpace(pinnedModelKey), strings.TrimSpace(modelKey)) &&
+			responsesWebsocketHomeAuthAvailableForModel(auth, modelKey, time.Now())
 	}
-	return registry.GetGlobalRegistry().ClientSupportsModel(auth.ID, modelKey)
+	return authManager != nil &&
+		authManager.IsAuthSchedulableForModel(auth.ID, modelKey) &&
+		registry.GetGlobalRegistry().ClientSupportsModel(auth.ID, modelKey)
 }
 
 func normalizeResponsesWebsocketPassthroughRequest(rawJSON []byte, modelName string) ([]byte, *interfaces.ErrorMessage) {
@@ -1943,7 +1963,7 @@ func responsesWebsocketProviderSetForModel(resolvedModelName string, authManager
 	return providerSet, modelKey
 }
 
-func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[string]struct{}, modelKey string, registryRef *registry.ModelRegistry, now time.Time) bool {
+func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[string]struct{}, modelKey string, registryRef *registry.ModelRegistry, authManager *coreauth.Manager) bool {
 	if auth == nil {
 		return false
 	}
@@ -1954,7 +1974,7 @@ func responsesWebsocketAuthMatchesModel(auth *coreauth.Auth, providerSet map[str
 	if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(auth.ID, modelKey) {
 		return false
 	}
-	return responsesWebsocketAuthAvailableForModel(auth, modelKey, now)
+	return authManager != nil && authManager.IsAuthSchedulableForModel(auth.ID, modelKey)
 }
 
 func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
@@ -1964,7 +1984,7 @@ func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
 }
 
-func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
+func responsesWebsocketHomeAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
 	if auth == nil {
 		return false
 	}
@@ -2328,7 +2348,7 @@ func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
 
 func shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg *interfaces.ErrorMessage) bool {
 	switch responsesWebsocketErrorStatus(errMsg) {
-	case http.StatusUnauthorized, http.StatusTooManyRequests:
+	case http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusServiceUnavailable:
 		return true
 	default:
 		return false

@@ -8,12 +8,53 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestExecutionErrorMessageIncludesTypedRetryAfter(t *testing.T) {
+	retryAfter := 1500 * time.Millisecond
+	errMsg := executionErrorMessage(&failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeModel,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		SemanticCode:  "compaction_route_unavailable",
+		RetryAfter:    &retryAfter,
+		Retryable:     true,
+		PublicMessage: "compaction_route_unavailable: compatible route is cooling",
+	})
+
+	if errMsg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want 503", errMsg.StatusCode)
+	}
+	if got := errMsg.Addon.Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	NewBaseAPIHandlers(nil, nil).WriteErrorResponse(c, errMsg)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response status = %d, want 503", recorder.Code)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("response Retry-After = %q, want 2", got)
+	}
+	var payload ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if payload.Error.Code != "compaction_route_unavailable" {
+		t.Fatalf("response error code = %q, want compaction_route_unavailable", payload.Error.Code)
+	}
+}
 
 func TestWriteErrorResponse_OnlyRetryAfterAllowedByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)

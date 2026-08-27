@@ -51,7 +51,7 @@ func TestShouldReplayResponsesWebsocketPinnedAuthFailure(t *testing.T) {
 		{status: http.StatusUnauthorized, want: true},
 		{status: http.StatusTooManyRequests, want: true},
 		{status: http.StatusForbidden, want: false},
-		{status: http.StatusServiceUnavailable, want: false},
+		{status: http.StatusServiceUnavailable, want: true},
 	}
 	for _, tc := range cases {
 		if got := shouldReplayResponsesWebsocketPinnedAuthFailure(&interfaces.ErrorMessage{StatusCode: tc.status}); got != tc.want {
@@ -126,11 +126,21 @@ type websocketAuthCaptureExecutor struct {
 	authIDs []string
 }
 
+type websocketCodexAuthCaptureExecutor struct {
+	websocketAuthCaptureExecutor
+}
+
 type websocketPinnedFailoverExecutor struct {
-	mu       sync.Mutex
-	authIDs  []string
-	calls    map[string]int
-	payloads map[string][][]byte
+	mu                      sync.Mutex
+	authIDs                 []string
+	calls                   map[string]int
+	payloads                map[string][][]byte
+	failAuthAAfterFirst     bool
+	failAuthAAfterFirstCode int
+}
+
+type websocketCodexPinnedFailoverExecutor struct {
+	websocketPinnedFailoverExecutor
 }
 
 type websocketBootstrapFallbackExecutor struct {
@@ -358,6 +368,8 @@ func (e *websocketUpstreamDisconnectExecutor) HttpRequest(context.Context, *core
 
 func (e *websocketAuthCaptureExecutor) Identifier() string { return "test-provider" }
 
+func (e *websocketCodexAuthCaptureExecutor) Identifier() string { return "codex" }
+
 func (e *websocketAuthCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
 	return coreexecutor.Response{}, errors.New("not implemented")
 }
@@ -395,6 +407,8 @@ func (e *websocketAuthCaptureExecutor) AuthIDs() []string {
 
 func (e *websocketPinnedFailoverExecutor) Identifier() string { return "test-provider" }
 
+func (e *websocketCodexPinnedFailoverExecutor) Identifier() string { return "codex" }
+
 func (e *websocketPinnedFailoverExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
 	return coreexecutor.Response{}, errors.New("not implemented")
 }
@@ -416,12 +430,17 @@ func (e *websocketPinnedFailoverExecutor) ExecuteStream(_ context.Context, auth 
 	e.calls[authID]++
 	call := e.calls[authID]
 	e.payloads[authID] = append(e.payloads[authID], bytes.Clone(req.Payload))
+	failAuthAAfterFirst := e.failAuthAAfterFirst
+	failStatus := e.failAuthAAfterFirstCode
 	e.mu.Unlock()
 
-	if authID == "auth-a" && call == 2 {
+	if failStatus == 0 {
+		failStatus = http.StatusTooManyRequests
+	}
+	if authID == "auth-a" && (call == 2 || (failAuthAAfterFirst && call > 1)) {
 		chunks := make(chan coreexecutor.StreamChunk, 1)
 		chunks <- coreexecutor.StreamChunk{Err: websocketPinnedFailoverStatusError{
-			status: http.StatusTooManyRequests,
+			status: failStatus,
 			msg:    `{"error":{"message":"quota exhausted","type":"rate_limit_error","code":"rate_limit_exceeded"}}`,
 		}}
 		close(chunks)
@@ -3395,6 +3414,305 @@ func TestResponsesWebsocketHTTPModeFailsOverWithinRequest(t *testing.T) {
 			t.Fatalf("rollback retained bytes after close = %d, want 0", retainedBytes)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestResponsesWebsocketEscapesPinnedAuthWithOpenBreaker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const model = "gpt-5.6-sol"
+	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-b"}}
+	executor := &websocketCodexAuthCaptureExecutor{}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.RegisterExecutor(executor)
+
+	authA := &coreauth.Auth{
+		ID:       "auth-a",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-a",
+			"base_url":               "https://route-a.example/v1",
+			"websockets":             "true",
+		},
+	}
+	authB := &coreauth.Auth{
+		ID:       "auth-b",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-b",
+			"base_url":               "https://route-b.example/v1",
+			"websockets":             "true",
+		},
+	}
+	for _, candidate := range []*coreauth.Auth{authA, authB} {
+		if _, errRegister := manager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("Register %s: %v", candidate.ID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(candidate.ID, candidate.Provider, []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+		registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	firstRequest := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-1"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, firstRequest); errWrite != nil {
+		t.Fatalf("write first request: %v", errWrite)
+	}
+	_, firstPayload, errReadFirst := conn.ReadMessage()
+	if errReadFirst != nil {
+		t.Fatalf("read first response: %v", errReadFirst)
+	}
+	if got := gjson.GetBytes(firstPayload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("first response type = %q, want %q: %s", got, wsEventTypeCompleted, firstPayload)
+	}
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   authA.ID,
+		Provider: authA.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &coreauth.Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    "unauthorized",
+		},
+	})
+	blocked, okBlocked := manager.GetByID(authA.ID)
+	if !okBlocked || blocked.ModelStates[model] == nil || blocked.ModelStates[model].Health.BreakerState != coreauth.HealthBreakerOpen {
+		t.Fatalf("auth A breaker state = %+v, want open", blocked)
+	}
+	if blocked.ModelStates[model].Unavailable {
+		t.Fatal("Codex API-key breaker fixture must keep Unavailable=false")
+	}
+
+	secondRequest := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-2"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, secondRequest); errWrite != nil {
+		t.Fatalf("write second request: %v", errWrite)
+	}
+	_, secondPayload, errReadSecond := conn.ReadMessage()
+	if errReadSecond != nil {
+		t.Fatalf("read second response: %v", errReadSecond)
+	}
+	if got := gjson.GetBytes(secondPayload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("second response type = %q, want %q: %s", got, wsEventTypeCompleted, secondPayload)
+	}
+
+	if got := executor.AuthIDs(); len(got) != 2 || got[0] != authA.ID || got[1] != authB.ID {
+		t.Fatalf("selected auth IDs = %v, want [%s %s]", got, authA.ID, authB.ID)
+	}
+}
+
+func TestResponsesWebsocketPinnedAuthFailureFallsBackWithinCurrentRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const model = "gpt-5.6-sol"
+	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-a", "auth-b"}}
+	executor := &websocketCodexPinnedFailoverExecutor{websocketPinnedFailoverExecutor: websocketPinnedFailoverExecutor{
+		failAuthAAfterFirst:     true,
+		failAuthAAfterFirstCode: http.StatusUnauthorized,
+	}}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.RegisterExecutor(executor)
+
+	authA := &coreauth.Auth{
+		ID:       "auth-a",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-a",
+			"base_url":               "https://route-a.example/v1",
+			"websockets":             "true",
+		},
+	}
+	authB := &coreauth.Auth{
+		ID:       "auth-b",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-b",
+			"base_url":               "https://route-b.example/v1",
+			"websockets":             "true",
+		},
+	}
+	for _, candidate := range []*coreauth.Auth{authA, authB} {
+		if _, errRegister := manager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("Register %s: %v", candidate.ID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(candidate.ID, candidate.Provider, []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+		registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	requests := [][]byte{
+		[]byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-1"}]}`),
+		[]byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-2"}]}`),
+	}
+	for index, request := range requests {
+		if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+			t.Fatalf("write request %d: %v", index+1, errWrite)
+		}
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Fatalf("read response %d: %v", index+1, errRead)
+		}
+		if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+			t.Fatalf("response %d type = %q, want %q: %s", index+1, got, wsEventTypeCompleted, payload)
+		}
+	}
+
+	if got := executor.AuthIDs(); len(got) != 3 || got[0] != authA.ID || got[1] != authA.ID || got[2] != authB.ID {
+		t.Fatalf("selected auth IDs = %v, want [%s %s %s]", got, authA.ID, authA.ID, authB.ID)
+	}
+	backupPayloads := executor.Payloads(authB.ID)
+	if len(backupPayloads) != 1 {
+		t.Fatalf("backup payload count = %d, want 1", len(backupPayloads))
+	}
+	if gjson.GetBytes(backupPayloads[0], "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked to fallback auth: %s", backupPayloads[0])
+	}
+}
+
+func TestResponsesWebsocketPinnedStateFailureRequiresSafeReplayBeforeFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const model = "gpt-5.6-sol"
+	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-a", "auth-b"}}
+	executor := &websocketCodexPinnedFailoverExecutor{websocketPinnedFailoverExecutor: websocketPinnedFailoverExecutor{
+		failAuthAAfterFirst:     true,
+		failAuthAAfterFirstCode: http.StatusUnauthorized,
+	}}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.RegisterExecutor(executor)
+
+	authA := &coreauth.Auth{
+		ID:       "auth-a",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-a",
+			"base_url":               "https://route-a.example/v1",
+			"websockets":             "true",
+		},
+	}
+	authB := &coreauth.Auth{
+		ID:       "auth-b",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAPIKey: "test-key-b",
+			"base_url":               "https://route-b.example/v1",
+			"websockets":             "true",
+		},
+	}
+	for _, candidate := range []*coreauth.Auth{authA, authB} {
+		if _, errRegister := manager.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("Register %s: %v", candidate.ID, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(candidate.ID, candidate.Provider, []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+		registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	firstRequest := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-1"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, firstRequest); errWrite != nil {
+		t.Fatalf("write first request: %v", errWrite)
+	}
+	if _, payload, errRead := conn.ReadMessage(); errRead != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		t.Fatalf("first response = %s, %v", payload, errRead)
+	}
+
+	incrementalRequest := []byte(`{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, incrementalRequest); errWrite != nil {
+		t.Fatalf("write incremental request: %v", errWrite)
+	}
+	_, _, errReadIncremental := conn.ReadMessage()
+	if !websocket.IsCloseError(errReadIncremental, websocket.CloseServiceRestart) {
+		t.Fatalf("incremental failure read error = %v, want service-restart replay close", errReadIncremental)
+	}
+	_ = conn.Close()
+
+	beforeReplay := executor.AuthIDs()
+	if len(beforeReplay) < 2 {
+		t.Fatalf("auth IDs before replay = %v, want repeated pinned auth", beforeReplay)
+	}
+	for _, authID := range beforeReplay {
+		if authID != authA.ID {
+			t.Fatalf("unsafe fallback before replay = %v, want only %s", beforeReplay, authA.ID)
+		}
+	}
+
+	replayConn, _, errReplayDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errReplayDial != nil {
+		t.Fatalf("dial replay websocket: %v", errReplayDial)
+	}
+	defer func() { _ = replayConn.Close() }()
+	fullReplay := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-1"},{"type":"message","id":"msg-2"}]}`)
+	if errWrite := replayConn.WriteMessage(websocket.TextMessage, fullReplay); errWrite != nil {
+		t.Fatalf("write full replay: %v", errWrite)
+	}
+	_, replayPayload, errReadReplay := replayConn.ReadMessage()
+	if errReadReplay != nil {
+		t.Fatalf("read full replay response: %v", errReadReplay)
+	}
+	if got := gjson.GetBytes(replayPayload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("full replay response type = %q, want %q: %s", got, wsEventTypeCompleted, replayPayload)
+	}
+
+	if got := executor.AuthIDs(); len(got) != len(beforeReplay)+1 || got[len(got)-1] != authB.ID {
+		t.Fatalf("auth IDs after replay = %v, want one fallback to %s", got, authB.ID)
+	}
+	backupPayloads := executor.Payloads(authB.ID)
+	if len(backupPayloads) != 1 || gjson.GetBytes(backupPayloads[0], "previous_response_id").Exists() {
+		t.Fatalf("fallback payload retained stale previous_response_id: %v", backupPayloads)
 	}
 }
 
