@@ -70,6 +70,8 @@ type modelReviewCacheEntry struct {
 type modelReviewController struct {
 	cfg       config.ContentAuditModelReviewConfig
 	reviewer  Reviewer
+	rules     map[string]struct{}
+	ruleGate  bool
 	semaphore chan struct{}
 	cacheKey  [32]byte
 	cacheMu   sync.Mutex
@@ -94,6 +96,8 @@ func newModelReviewController(cfg config.ContentAuditModelReviewConfig, reviewer
 	controller := &modelReviewController{
 		cfg:       cfg,
 		reviewer:  reviewer,
+		rules:     makeRuleSelection(cfg.Rules),
+		ruleGate:  cfg.Rules != nil,
 		semaphore: make(chan struct{}, cfg.MaxConcurrent),
 		cache:     make(map[string]modelReviewCacheEntry),
 	}
@@ -106,6 +110,14 @@ func newModelReviewController(cfg config.ContentAuditModelReviewConfig, reviewer
 func (c *modelReviewController) review(ctx context.Context, request ModelReviewRequest) modelReviewOutcome {
 	if c == nil || c.reviewer == nil {
 		return modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Fallback: "reviewer_disabled"}
+	}
+	if c.ruleGate {
+		if _, ok := c.rules[strings.TrimSpace(request.RuleID)]; !ok {
+			return modelReviewOutcome{
+				ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain},
+				Fallback:          "rule_not_selected",
+			}
+		}
 	}
 	request.Model = c.cfg.Model
 	request.PromptVersion = c.cfg.PromptVersion
@@ -171,6 +183,16 @@ func (c *modelReviewController) review(ctx context.Context, request ModelReviewR
 		}
 	}
 	return modelReviewOutcome{ModelReviewResult: result, Model: request.Model, Latency: latency, Reviewed: true}
+}
+
+func makeRuleSelection(rules []string) map[string]struct{} {
+	selected := make(map[string]struct{}, len(rules))
+	for _, rule := range rules {
+		if rule = strings.TrimSpace(rule); rule != "" {
+			selected[rule] = struct{}{}
+		}
+	}
+	return selected
 }
 
 func (c *modelReviewController) beginCircuitAttempt() bool {

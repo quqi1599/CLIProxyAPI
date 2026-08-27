@@ -421,24 +421,28 @@ rules:
 		t.Fatalf("tool-output status=%d next=%d body=%s", toolResponse.Code, nextCalls, toolResponse.Body.String())
 	}
 
+	historyRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"ordinary current question"}]}`))
+	historyRequest.Header.Set("Content-Type", "application/json")
+	historyResponse := httptest.NewRecorder()
+	router.ServeHTTP(historyResponse, historyRequest)
+	if historyResponse.Code != http.StatusNoContent || nextCalls != 2 {
+		t.Fatalf("history status=%d next=%d body=%s", historyResponse.Code, nextCalls, historyResponse.Body.String())
+	}
+
 	continuationRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"继续"}]}`))
 	continuationRequest.Header.Set("Content-Type", "application/json")
 	continuationResponse := httptest.NewRecorder()
 	router.ServeHTTP(continuationResponse, continuationRequest)
-	if continuationResponse.Code != http.StatusBadRequest || nextCalls != 1 {
+	if continuationResponse.Code != http.StatusBadRequest || nextCalls != 2 {
 		t.Fatalf("continuation status=%d next=%d body=%s", continuationResponse.Code, nextCalls, continuationResponse.Body.String())
 	}
 
 	list, err := service.List(t.Context(), ListFilter{})
-	if err != nil || list.Total != 2 {
+	if err != nil || list.Total != 1 {
 		t.Fatalf("List() = %#v err=%v", list, err)
 	}
 	for _, item := range list.Items {
 		switch item.RuleID {
-		case "observe-rule":
-			if !item.UpstreamSent {
-				t.Fatalf("tool output observe event was blocked: %#v", item)
-			}
 		case "block-rule":
 			if item.UpstreamSent {
 				t.Fatalf("continuation block event was sent upstream: %#v", item)

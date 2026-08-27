@@ -42,6 +42,51 @@ func TestModelReviewControllerCachesIdenticalContent(t *testing.T) {
 	}
 }
 
+func TestModelReviewControllerOnlyCallsSelectedRules(t *testing.T) {
+	var calls int
+	controller := newModelReviewController(config.ContentAuditModelReviewConfig{
+		Mode:                     ModelReviewModeEnforce,
+		Model:                    "synthetic-reviewer",
+		Rules:                    []string{"selected-rule"},
+		PromptVersion:            "v1",
+		TimeoutMilliseconds:      100,
+		QueueTimeoutMilliseconds: 20,
+		MaxConcurrent:            1,
+	}, modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
+		calls++
+		return ModelReviewResult{Decision: ModelReviewAllow, Confidence: 0.99}, nil
+	}))
+
+	skipped := controller.review(t.Context(), ModelReviewRequest{Text: "synthetic request", RuleID: "other-rule"})
+	if skipped.Reviewed || skipped.Fallback != "rule_not_selected" || calls != 0 {
+		t.Fatalf("skipped review = %#v, calls = %d", skipped, calls)
+	}
+
+	selected := controller.review(t.Context(), ModelReviewRequest{Text: "synthetic request", RuleID: "selected-rule"})
+	if !selected.Reviewed || selected.Decision != ModelReviewAllow || calls != 1 {
+		t.Fatalf("selected review = %#v, calls = %d", selected, calls)
+	}
+}
+
+func TestModelReviewControllerExplicitEmptyRuleSelectionDisablesCalls(t *testing.T) {
+	var calls int
+	controller := newModelReviewController(config.ContentAuditModelReviewConfig{
+		Mode:                     ModelReviewModeEnforce,
+		Rules:                    []string{},
+		TimeoutMilliseconds:      100,
+		QueueTimeoutMilliseconds: 20,
+		MaxConcurrent:            1,
+	}, modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
+		calls++
+		return ModelReviewResult{Decision: ModelReviewAllow, Confidence: 0.99}, nil
+	}))
+
+	outcome := controller.review(t.Context(), ModelReviewRequest{Text: "synthetic request", RuleID: "any-rule"})
+	if outcome.Reviewed || outcome.Fallback != "rule_not_selected" || calls != 0 {
+		t.Fatalf("review = %#v, calls = %d", outcome, calls)
+	}
+}
+
 func TestModelReviewControllerSingleflightAndTimeout(t *testing.T) {
 	var calls atomic.Int32
 	controller := newModelReviewController(config.ContentAuditModelReviewConfig{

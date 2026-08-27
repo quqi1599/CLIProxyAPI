@@ -203,6 +203,22 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	if strings.TrimSpace(cfg.Model) == "" {
 		cfg.Model = "codex-auto-review"
 	}
+	if cfg.Rules != nil {
+		selectedRules := make([]string, 0, len(cfg.Rules))
+		seenRules := make(map[string]struct{}, len(cfg.Rules))
+		for _, rule := range cfg.Rules {
+			rule = strings.TrimSpace(rule)
+			if rule == "" {
+				continue
+			}
+			if _, exists := seenRules[rule]; exists {
+				continue
+			}
+			seenRules[rule] = struct{}{}
+			selectedRules = append(selectedRules, rule)
+		}
+		cfg.Rules = selectedRules
+	}
 	if strings.TrimSpace(cfg.PromptVersion) == "" {
 		cfg.PromptVersion = "cpa-audit-review-v1"
 	}
@@ -407,7 +423,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			Action:                decision.Action,
 			FinalAction:           finalAction,
 			MatchedTerm:           decision.MatchedTerm,
-			MatchedRoles:          extracted.MatchedRoles(decision.MatchedTerm),
+			MatchedRoles:          extracted.EnforcementMatchedRoles(decision.MatchedTerm),
 			PolicyVersion:         decision.PolicyVersion,
 			RequestBytes:          requestBytes,
 			IdentityVerified:      identity.Verified,

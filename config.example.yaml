@@ -117,6 +117,9 @@ content-audit:
   model-review:
     mode: "off" # off, shadow, or enforce
     model: "codex-auto-review"
+    # Optional second gate: only these rule IDs may call the reviewer. Omit this field
+    # to review every policy rule marked model-review: true; an explicit [] disables calls.
+    # rules: ["review-ambiguous-rule"]
     prompt-version: "cpa-audit-review-v1"
     timeout-milliseconds: 3500
     queue-timeout-milliseconds: 100

@@ -100,7 +100,7 @@ func TestMatcherPrefersBlockActionAndHonorsContext(t *testing.T) {
 	}
 }
 
-func TestMatcherScopedUsesCurrentUserForBlockAndFullTextForObserve(t *testing.T) {
+func TestMatcherScopedUsesCurrentUserForBlockAndObserve(t *testing.T) {
 	matcher, err := CompilePolicy(Policy{
 		Version: "test-v1",
 		Rules: []Rule{
@@ -113,13 +113,18 @@ func TestMatcherScopedUsesCurrentUserForBlockAndFullTextForObserve(t *testing.T)
 	}
 
 	decision := matcher.MatchScoped("ordinary current question", "high confidence jailbreak\ntool safety marker\nordinary current question", false)
-	if !decision.Matched || decision.RuleID != "observe" || decision.Action != RuleActionObserve {
-		t.Fatalf("MatchScoped() = %#v, want observe", decision)
+	if decision.Matched {
+		t.Fatalf("MatchScoped() = %#v, want no non-user observation", decision)
 	}
 
 	decision = matcher.MatchScoped("high confidence jailbreak", "high confidence jailbreak", false)
 	if !decision.Matched || decision.RuleID != "block" || decision.Action != RuleActionBlock {
 		t.Fatalf("current-user MatchScoped() = %#v, want block", decision)
+	}
+
+	decision = matcher.MatchScoped("tool safety marker", "tool safety marker", false)
+	if !decision.Matched || decision.RuleID != "observe" || decision.Action != RuleActionObserve {
+		t.Fatalf("current-user observation MatchScoped() = %#v, want observe", decision)
 	}
 }
 

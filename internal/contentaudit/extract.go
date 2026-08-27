@@ -173,6 +173,33 @@ func (r ExtractedRequest) MatchedRoles(term string) []string {
 	if len(seen) == 0 && strings.Contains(moderationCandidateText(r.Text), needle) {
 		seen["unknown"] = struct{}{}
 	}
+	return sortedRoles(seen)
+}
+
+// EnforcementMatchedRoles reports only roles that can contribute to a scoped
+// audit decision. Tool, system, developer, and assistant content remains in
+// encrypted evidence but cannot be attributed as the reason for a match.
+func (r ExtractedRequest) EnforcementMatchedRoles(term string) []string {
+	needle := moderationCandidateText(term)
+	if needle == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for _, segment := range r.promptSegments {
+		if segment.role != "user" && segment.role != "unknown" {
+			continue
+		}
+		if strings.Contains(moderationCandidateText(segment.text), needle) {
+			seen[segment.role] = struct{}{}
+		}
+	}
+	if len(seen) == 0 && strings.Contains(moderationCandidateText(r.EnforcementText), needle) {
+		seen["unknown"] = struct{}{}
+	}
+	return sortedRoles(seen)
+}
+
+func sortedRoles(seen map[string]struct{}) []string {
 	roles := make([]string, 0, len(seen))
 	for role := range seen {
 		roles = append(roles, role)
