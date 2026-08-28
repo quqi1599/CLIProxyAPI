@@ -224,8 +224,10 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	if strings.TrimSpace(cfg.PromptVersion) == "" {
 		cfg.PromptVersion = "cpa-audit-review-v1"
 	}
-	if cfg.TimeoutMilliseconds <= 0 || cfg.TimeoutMilliseconds > 4000 {
+	if cfg.TimeoutMilliseconds <= 0 {
 		cfg.TimeoutMilliseconds = 3500
+	} else if cfg.TimeoutMilliseconds > 10000 {
+		cfg.TimeoutMilliseconds = 10000
 	}
 	if cfg.QueueTimeoutMilliseconds <= 0 || cfg.QueueTimeoutMilliseconds > 500 {
 		cfg.QueueTimeoutMilliseconds = 100

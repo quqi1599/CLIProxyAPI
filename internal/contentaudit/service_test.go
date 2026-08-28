@@ -20,6 +20,27 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
+func TestNormalizeModelReviewConfigAllowsBoundedExtendedTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    int
+		expected int
+	}{
+		{name: "default", input: 0, expected: 3500},
+		{name: "extended", input: 8000, expected: 8000},
+		{name: "bounded", input: 12000, expected: 10000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.ContentAuditModelReviewConfig{Mode: ModelReviewModeEnforce, TimeoutMilliseconds: test.input}
+			normalizeModelReviewConfig(&cfg)
+			if cfg.TimeoutMilliseconds != test.expected {
+				t.Fatalf("timeout = %d, want %d", cfg.TimeoutMilliseconds, test.expected)
+			}
+		})
+	}
+}
+
 func TestMiddlewareBlocksBeforeNextAndPersistsCustomerEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
