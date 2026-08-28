@@ -412,7 +412,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if err != nil {
 		return plan, err
 	}
-	if err = enforceThinkingHistoryTransform(ctx, "claude", historyReport, time.Since(historyStarted)); err != nil {
+	if err = enforceThinkingHistoryTransform(ctx, "claude", executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey), historyReport, time.Since(historyStarted)); err != nil {
 		return plan, err
 	}
 	if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, plan.providerIdentity.Kind, plan.baseURL, baseModel, executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)); err != nil {

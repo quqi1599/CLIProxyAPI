@@ -14,7 +14,7 @@ import (
 
 const testAkoolDeepSeekBaseURL = "https://akool.com/interface/maas-backend/api/v1/llm/v1"
 
-func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadFlattensTextPartsAndKeepsTools(t *testing.T) {
+func TestNormalizeAkoolDeepSeekChatPayloadFlattensTextPartsAndKeepsTools(t *testing.T) {
 	payload := []byte(`{
 		"model":"DeepSeek-V4-Flash",
 		"messages":[
@@ -23,23 +23,27 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadFlattensTextPartsAndKeepsTool
 		],
 		"tools":[{"type":"function","function":{"name":"echo","parameters":{"type":"object","properties":{"text":{"type":"string"}}}}}]
 	}`)
-	got, err := normalizeWorkBuddyAkoolDeepSeekChatPayload(
-		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "workbuddy",
-	)
-	if err != nil {
-		t.Fatalf("normalize error: %v", err)
-	}
-	if content := gjson.GetBytes(got, "messages.1.content").String(); content != "first\nsecond" {
-		t.Fatalf("content = %q, want flattened text; body=%s", content, got)
-	}
-	if toolName := gjson.GetBytes(got, "tools.0.function.name").String(); toolName != "echo" {
-		t.Fatalf("tool name = %q, want preserved; body=%s", toolName, got)
+	for _, profile := range []string{"workbuddy", "claude_code"} {
+		t.Run(profile, func(t *testing.T) {
+			got, err := normalizeAkoolDeepSeekChatPayload(
+				context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", profile,
+			)
+			if err != nil {
+				t.Fatalf("normalize error: %v", err)
+			}
+			if content := gjson.GetBytes(got, "messages.1.content").String(); content != "first\nsecond" {
+				t.Fatalf("content = %q, want flattened text; body=%s", content, got)
+			}
+			if toolName := gjson.GetBytes(got, "tools.0.function.name").String(); toolName != "echo" {
+				t.Fatalf("tool name = %q, want preserved; body=%s", toolName, got)
+			}
+		})
 	}
 }
 
-func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadLeavesOtherClientsUnchanged(t *testing.T) {
+func TestNormalizeAkoolDeepSeekChatPayloadLeavesOtherClientsUnchanged(t *testing.T) {
 	payload := []byte(`{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	got, err := normalizeWorkBuddyAkoolDeepSeekChatPayload(
+	got, err := normalizeAkoolDeepSeekChatPayload(
 		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "other-client",
 	)
 	if err != nil {
@@ -51,8 +55,8 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadLeavesOtherClientsUnchanged(t
 }
 
 func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadFallsBackForComplexTools(t *testing.T) {
-	tools := make([]any, 0, workBuddyAkoolComplexToolDefinitions)
-	for i := 0; i < workBuddyAkoolComplexToolDefinitions; i++ {
+	tools := make([]any, 0, akoolDeepSeekComplexToolDefinitions)
+	for i := 0; i < akoolDeepSeekComplexToolDefinitions; i++ {
 		tools = append(tools, map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -69,7 +73,7 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadFallsBackForComplexTools(t *t
 	if errMarshal != nil {
 		t.Fatalf("marshal payload: %v", errMarshal)
 	}
-	_, err := normalizeWorkBuddyAkoolDeepSeekChatPayload(
+	_, err := normalizeAkoolDeepSeekChatPayload(
 		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "workbuddy",
 	)
 	if err == nil {
@@ -86,9 +90,48 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadFallsBackForComplexTools(t *t
 	}
 }
 
+func TestNormalizeClaudeCodeAkoolDeepSeekChatPayloadFallsBackForComplexTools(t *testing.T) {
+	tools := make([]any, 0, akoolDeepSeekComplexToolDefinitions)
+	for i := 0; i < akoolDeepSeekComplexToolDefinitions; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":       fmt.Sprintf("tool_%d", i),
+				"parameters": map[string]any{"type": "object"},
+			},
+		})
+	}
+	payload, errMarshal := json.Marshal(map[string]any{
+		"model":    "DeepSeek-V4-Flash",
+		"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "help"}}}},
+		"tools":    tools,
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal payload: %v", errMarshal)
+	}
+	_, err := normalizeAkoolDeepSeekChatPayload(
+		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "claude_code",
+	)
+	if err == nil {
+		t.Fatal("normalize error = nil, want provider fallback")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Scope != failurecontract.ScopeModel || !typed.Retryable || typed.StreamPhase != failurecontract.StreamPhaseBeforeOutput || typed.SemanticCode != "claude_code_deepseek_akool_complex_tools" {
+		t.Fatalf("failure = %#v, want retryable Claude Code model fallback", typed)
+	}
+	for _, want := range []string{"Claude Code", "其他 DeepSeek 通道", "OpenAI 原生 GPT 模型", "不是 API Key"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "WorkBuddy") || strings.Contains(err.Error(), "Codex") {
+		t.Fatalf("message used wrong client name: %q", err.Error())
+	}
+}
+
 func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadRejectsAttachmentsWithTutorial(t *testing.T) {
 	payload := []byte(`{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`)
-	_, err := normalizeWorkBuddyAkoolDeepSeekChatPayload(
+	_, err := normalizeAkoolDeepSeekChatPayload(
 		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "workbuddy",
 	)
 	if err == nil {
@@ -107,9 +150,26 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadRejectsAttachmentsWithTutoria
 	}
 }
 
+func TestNormalizeClaudeCodeAkoolDeepSeekChatPayloadFallsBackForAttachments(t *testing.T) {
+	payload := []byte(`{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`)
+	_, err := normalizeAkoolDeepSeekChatPayload(
+		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "claude_code",
+	)
+	if err == nil {
+		t.Fatal("normalize error = nil, want provider fallback")
+	}
+	typed, ok := failurecontract.As(err)
+	if !ok || typed.Scope != failurecontract.ScopeModel || !typed.Retryable || typed.StreamPhase != failurecontract.StreamPhaseBeforeOutput || typed.SemanticCode != "claude_code_deepseek_akool_attachment_input" {
+		t.Fatalf("failure = %#v, want retryable Claude Code attachment fallback", typed)
+	}
+	if !strings.Contains(err.Error(), "Claude Code") || strings.Contains(err.Error(), "WorkBuddy") || strings.Contains(err.Error(), "Codex") {
+		t.Fatalf("unexpected client message: %q", err.Error())
+	}
+}
+
 func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadRejectsOversizedToolHistoryWithTutorial(t *testing.T) {
 	messages := []any{map[string]any{"role": "user", "content": "start"}}
-	for i := 0; i < workBuddyAkoolToolOutputMessages; i++ {
+	for i := 0; i < akoolDeepSeekToolOutputMessages; i++ {
 		callID := fmt.Sprintf("call_%d", i)
 		messages = append(messages,
 			map[string]any{
@@ -132,10 +192,10 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadRejectsOversizedToolHistoryWi
 	if errMarshal != nil {
 		t.Fatalf("marshal payload: %v", errMarshal)
 	}
-	if len(payload) < workBuddyAkoolToolHistoryPayloadBytes {
-		t.Fatalf("payload bytes = %d, want at least %d", len(payload), workBuddyAkoolToolHistoryPayloadBytes)
+	if len(payload) < akoolDeepSeekToolHistoryPayloadBytes {
+		t.Fatalf("payload bytes = %d, want at least %d", len(payload), akoolDeepSeekToolHistoryPayloadBytes)
 	}
-	_, err := normalizeWorkBuddyAkoolDeepSeekChatPayload(
+	_, err := normalizeAkoolDeepSeekChatPayload(
 		context.Background(), payload, testAkoolDeepSeekBaseURL, "DeepSeek-V4-Flash", "/chat/completions", "workbuddy",
 	)
 	if err == nil {
@@ -149,9 +209,11 @@ func TestNormalizeWorkBuddyAkoolDeepSeekChatPayloadRejectsOversizedToolHistoryWi
 	}
 }
 
-func TestIsWorkBuddyAkoolDeepSeekChatRoute(t *testing.T) {
-	if !isWorkBuddyAkoolDeepSeekChatRoute(testAkoolDeepSeekBaseURL, "deepseek-v4-flash", "/chat/completions", "WorkBuddy") {
-		t.Fatal("expected Akool WorkBuddy DeepSeek Chat route")
+func TestIsAkoolDeepSeekChatRouteForClient(t *testing.T) {
+	for _, profile := range []string{"WorkBuddy", "claude_code"} {
+		if !isAkoolDeepSeekChatRouteForClient(testAkoolDeepSeekBaseURL, "deepseek-v4-flash", "/chat/completions", profile) {
+			t.Fatalf("expected Akool DeepSeek Chat route for %s", profile)
+		}
 	}
 	for _, tc := range []struct {
 		baseURL, model, endpoint, profile string
@@ -161,7 +223,7 @@ func TestIsWorkBuddyAkoolDeepSeekChatRoute(t *testing.T) {
 		{testAkoolDeepSeekBaseURL, "deepseek-v4-flash", "/responses", "workbuddy"},
 		{testAkoolDeepSeekBaseURL, "deepseek-v4-flash", "/chat/completions", "other"},
 	} {
-		if isWorkBuddyAkoolDeepSeekChatRoute(tc.baseURL, tc.model, tc.endpoint, tc.profile) {
+		if isAkoolDeepSeekChatRouteForClient(tc.baseURL, tc.model, tc.endpoint, tc.profile) {
 			t.Fatalf("unexpected route match: %+v", tc)
 		}
 	}

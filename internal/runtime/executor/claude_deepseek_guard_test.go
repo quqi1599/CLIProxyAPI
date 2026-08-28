@@ -148,3 +148,36 @@ func TestPrepareClaudeRequestDeepSeekWorkBuddyDowngradesIncompleteExplicitHistor
 		t.Fatalf("missing thinking history was synthesized: %s", plan.bodyForUpstream)
 	}
 }
+
+func TestPrepareClaudeRequestDeepSeekClaudeCodeDowngradesIncompleteExplicitHistory(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{DisableClaudeCloakMode: true})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{
+		"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "compat_kind": "deepseek",
+	}}
+	payload := []byte(`{
+		"model":"deepseek-v4-flash",
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
+	}`)
+	plan, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "deepseek-v4-flash", Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ClientProfileMetadataKey: "claude_code",
+		},
+	}, "deepseek-v4-flash", false)
+	if err != nil {
+		t.Fatalf("prepareClaudeRequest() error = %v", err)
+	}
+	if got := gjson.GetBytes(plan.bodyForUpstream, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, plan.bodyForUpstream)
+	}
+	if gjson.GetBytes(plan.bodyForUpstream, "output_config.effort").Exists() {
+		t.Fatalf("output_config.effort should be removed after downgrade: %s", plan.bodyForUpstream)
+	}
+	if gjson.GetBytes(plan.bodyForUpstream, "messages.0.content.#(type==\"thinking\")").Exists() {
+		t.Fatalf("missing thinking history was synthesized: %s", plan.bodyForUpstream)
+	}
+}

@@ -55,6 +55,38 @@ func TestInferClientProfileFromHeadersDetectsCodeBuddy(t *testing.T) {
 	}
 }
 
+func TestInferClientProfileFromHeadersDetectsClaudeCode(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "official cli user agent", header: "User-Agent", value: "claude-cli/2.1.153 (external, cli)"},
+		{name: "client name", header: "X-Client-Name", value: "Claude Code"},
+		{name: "hyphenated app name", header: "X-App-Name", value: "claude-code"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := http.Header{}
+			headers.Set(test.header, test.value)
+
+			if got := inferClientProfileFromHeaders(headers); got != "claude_code" {
+				t.Fatalf("profile = %q, want claude_code", got)
+			}
+		})
+	}
+}
+
+func TestInferClientProfileFromHeadersPrefersWorkBuddyWrapper(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("User-Agent", "claude-cli/2.1.153 (external, cli)")
+	headers.Set("X-App-Name", "WorkBuddy")
+
+	if got := inferClientProfileFromHeaders(headers); got != "workbuddy" {
+		t.Fatalf("profile = %q, want workbuddy", got)
+	}
+}
+
 func TestSetReasoningEffortMetadataUsesSuffixOverBody(t *testing.T) {
 	meta := make(map[string]any)
 
