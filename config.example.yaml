@@ -126,7 +126,11 @@ content-audit:
     max-concurrent: 16
     cache-seconds: 600
     max-input-bytes: 32768
+    # Releasing a local block should require stronger confidence than escalating
+    # an observe rule. min-confidence remains the backward-compatible default.
     min-confidence: 0.90
+    allow-min-confidence: 0.98
+    block-min-confidence: 0.90
     circuit-failure-threshold: 5
     circuit-open-seconds: 30
 

@@ -44,26 +44,28 @@ type runtimeState struct {
 
 // Status reports whether enforcement is configured and ready without exposing secrets.
 type Status struct {
-	Enabled                 bool   `json:"enabled"`
-	AuditOnly               bool   `json:"audit_only"`
-	Ready                   bool   `json:"ready"`
-	Error                   string `json:"error,omitempty"`
-	PolicyVersion           string `json:"policy_version,omitempty"`
-	KeywordCount            int    `json:"keyword_count"`
-	DatabaseAvailable       bool   `json:"database_available"`
-	RequireSignedIdentity   bool   `json:"require_signed_identity"`
-	AllowUnauditedWebsocket bool   `json:"allow_unaudited_websocket"`
-	BlockRuleCount          int    `json:"block_rule_count"`
-	ObserveRuleCount        int    `json:"observe_rule_count"`
-	DisabledRuleCount       int    `json:"disabled_rule_count"`
-	MaxBodyBytes            int64  `json:"max_body_bytes"`
-	EvidenceDedupeSeconds   int    `json:"evidence_dedupe_seconds"`
-	RawRetentionDays        int    `json:"raw_retention_days"`
-	MetadataRetentionDays   int    `json:"metadata_retention_days"`
-	ModelReviewMode         string `json:"model_review_mode"`
-	ModelReviewModel        string `json:"model_review_model,omitempty"`
-	ModelReviewReady        bool   `json:"model_review_ready"`
-	ModelReviewTimeoutMS    int    `json:"model_review_timeout_ms"`
+	Enabled                 bool    `json:"enabled"`
+	AuditOnly               bool    `json:"audit_only"`
+	Ready                   bool    `json:"ready"`
+	Error                   string  `json:"error,omitempty"`
+	PolicyVersion           string  `json:"policy_version,omitempty"`
+	KeywordCount            int     `json:"keyword_count"`
+	DatabaseAvailable       bool    `json:"database_available"`
+	RequireSignedIdentity   bool    `json:"require_signed_identity"`
+	AllowUnauditedWebsocket bool    `json:"allow_unaudited_websocket"`
+	BlockRuleCount          int     `json:"block_rule_count"`
+	ObserveRuleCount        int     `json:"observe_rule_count"`
+	DisabledRuleCount       int     `json:"disabled_rule_count"`
+	MaxBodyBytes            int64   `json:"max_body_bytes"`
+	EvidenceDedupeSeconds   int     `json:"evidence_dedupe_seconds"`
+	RawRetentionDays        int     `json:"raw_retention_days"`
+	MetadataRetentionDays   int     `json:"metadata_retention_days"`
+	ModelReviewMode         string  `json:"model_review_mode"`
+	ModelReviewModel        string  `json:"model_review_model,omitempty"`
+	ModelReviewReady        bool    `json:"model_review_ready"`
+	ModelReviewTimeoutMS    int     `json:"model_review_timeout_ms"`
+	ModelReviewAllowMin     float64 `json:"model_review_allow_min_confidence"`
+	ModelReviewBlockMin     float64 `json:"model_review_block_min_confidence"`
 }
 
 // Service owns the immutable request-time matcher snapshot and encrypted store.
@@ -244,6 +246,12 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	if cfg.MinConfidence <= 0 || cfg.MinConfidence > 1 {
 		cfg.MinConfidence = 0.90
 	}
+	if cfg.AllowMinConfidence <= 0 || cfg.AllowMinConfidence > 1 {
+		cfg.AllowMinConfidence = cfg.MinConfidence
+	}
+	if cfg.BlockMinConfidence <= 0 || cfg.BlockMinConfidence > 1 {
+		cfg.BlockMinConfidence = cfg.MinConfidence
+	}
 	if cfg.CircuitFailureThreshold <= 0 || cfg.CircuitFailureThreshold > 100 {
 		cfg.CircuitFailureThreshold = 5
 	}
@@ -307,6 +315,8 @@ func (s *Service) Status() Status {
 		ModelReviewModel:        state.cfg.ModelReview.Model,
 		ModelReviewReady:        state.modelReview != nil,
 		ModelReviewTimeoutMS:    state.cfg.ModelReview.TimeoutMilliseconds,
+		ModelReviewAllowMin:     state.cfg.ModelReview.AllowMinConfidence,
+		ModelReviewBlockMin:     state.cfg.ModelReview.BlockMinConfidence,
 	}
 	if state.matcher != nil {
 		status.PolicyVersion = state.matcher.Version()
@@ -384,20 +394,25 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		modelReview := modelReviewOutcome{}
 		if decision.ModelReview && state.modelReview != nil {
 			modelReview = state.modelReview.review(c.Request.Context(), ModelReviewRequest{
-				Text:     extracted.EnforcementText,
-				RuleID:   decision.RuleID,
-				Category: decision.Category,
-				Severity: decision.Severity,
+				Text:        extracted.EnforcementText,
+				MatchedTerm: decision.MatchedTerm,
+				RuleID:      decision.RuleID,
+				Category:    decision.Category,
+				Severity:    decision.Severity,
 			})
 		}
 		keywordShouldBlock := decision.Action == RuleActionBlock
 		shouldBlock := keywordShouldBlock
-		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed && modelReview.Confidence >= state.cfg.ModelReview.MinConfidence {
+		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed {
 			switch modelReview.Decision {
 			case ModelReviewBlock:
-				shouldBlock = true
+				if modelReview.Confidence >= state.cfg.ModelReview.BlockMinConfidence {
+					shouldBlock = true
+				}
 			case ModelReviewAllow:
-				shouldBlock = false
+				if modelReview.Confidence >= state.cfg.ModelReview.AllowMinConfidence {
+					shouldBlock = false
+				}
 			}
 		}
 		shouldBlock = !state.cfg.AuditOnly && shouldBlock

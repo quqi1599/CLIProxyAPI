@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -35,6 +36,7 @@ type ModelReviewRequest struct {
 	Model         string
 	PromptVersion string
 	Text          string
+	MatchedTerm   string
 	RuleID        string
 	Category      string
 	Severity      string
@@ -121,7 +123,7 @@ func (c *modelReviewController) review(ctx context.Context, request ModelReviewR
 	}
 	request.Model = c.cfg.Model
 	request.PromptVersion = c.cfg.PromptVersion
-	request.Text = truncateReviewText(request.Text, c.cfg.MaxInputBytes)
+	request.Text = compactReviewText(request.Text, request.MatchedTerm, c.cfg.MaxInputBytes)
 	cacheKey := c.fingerprint(request)
 	if result, ok := c.cached(cacheKey); ok {
 		return modelReviewOutcome{ModelReviewResult: result, Model: request.Model, CacheHit: true, Reviewed: true}
@@ -259,6 +261,8 @@ func (c *modelReviewController) fingerprint(request ModelReviewRequest) string {
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(request.RuleID))
 	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(request.MatchedTerm))
+	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(request.Text))
 	return hex.EncodeToString(mac.Sum(nil))
 }
@@ -310,6 +314,91 @@ func truncateReviewText(text string, maxBytes int) string {
 		text = text[:len(text)-1]
 	}
 	return text
+}
+
+func compactReviewText(text, matchedTerm string, maxBytes int) string {
+	text = strings.TrimSpace(text)
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	term := strings.TrimSpace(matchedTerm)
+	if term == "" {
+		return truncateReviewText(text, maxBytes)
+	}
+	matchIndex := findReviewMatchIndex(text, term)
+	if matchIndex < 0 {
+		return truncateReviewText(text, maxBytes)
+	}
+	const marker = "[...content omitted...]\n"
+	available := maxBytes - len(marker)*2
+	if available <= 0 {
+		return truncateReviewText(text, maxBytes)
+	}
+	beforeBytes := available / 3
+	start := max(0, matchIndex-beforeBytes)
+	end := min(len(text), start+available)
+	if end == len(text) {
+		start = max(0, end-available)
+	}
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	if end < len(text) {
+		for end > start && !utf8.RuneStart(text[end]) {
+			end--
+		}
+	}
+	var builder strings.Builder
+	if start > 0 {
+		builder.WriteString(marker)
+	}
+	builder.WriteString(text[start:end])
+	if end < len(text) {
+		builder.WriteByte('\n')
+		builder.WriteString(strings.TrimSpace(marker))
+	}
+	return truncateReviewText(builder.String(), maxBytes)
+}
+
+func findReviewMatchIndex(text, term string) int {
+	if index := strings.Index(strings.ToLower(text), strings.ToLower(term)); index >= 0 {
+		return index
+	}
+	needle := []rune(moderationCandidateText(term))
+	if len(needle) == 0 {
+		return -1
+	}
+	failure := make([]int, len(needle))
+	for index, matched := 1, 0; index < len(needle); index++ {
+		for matched > 0 && needle[index] != needle[matched] {
+			matched = failure[matched-1]
+		}
+		if needle[index] == needle[matched] {
+			matched++
+		}
+		failure[index] = matched
+	}
+	positions := make([]int, len(needle))
+	matched := 0
+	processed := 0
+	for byteIndex, character := range text {
+		if isModerationInvisible(character) || (!unicode.IsLetter(character) && !unicode.IsNumber(character)) {
+			continue
+		}
+		character = unicode.ToLower(character)
+		positions[processed%len(positions)] = byteIndex
+		processed++
+		for matched > 0 && character != needle[matched] {
+			matched = failure[matched-1]
+		}
+		if character == needle[matched] {
+			matched++
+		}
+		if matched == len(needle) {
+			return positions[(processed-len(needle))%len(positions)]
+		}
+	}
+	return -1
 }
 
 func modelReviewFallbackReason(err error) string {

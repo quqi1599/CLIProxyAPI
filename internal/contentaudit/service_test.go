@@ -136,13 +136,18 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 		mode            string
 		keywordAction   string
 		modelDecision   string
+		modelConfidence float64
+		allowMin        float64
+		blockMin        float64
 		wantStatus      int
 		wantNextCalls   int
 		wantFinalAction string
 	}{
-		{name: "shadow allow does not change block", mode: ModelReviewModeShadow, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
-		{name: "enforce allow releases keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
-		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "shadow allow does not change block", mode: ModelReviewModeShadow, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.99, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce allow releases keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.99, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
+		{name: "enforce low confidence allow keeps keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.95, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.91, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce low confidence block keeps observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.89, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -159,12 +164,14 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 				DatabasePath:  filepath.Join(tempDir, "audit.db"),
 				EvidenceKeyID: "test-key",
 				ModelReview: config.ContentAuditModelReviewConfig{
-					Mode:          test.mode,
-					Model:         "synthetic-reviewer",
-					MinConfidence: 0.9,
+					Mode:               test.mode,
+					Model:              "synthetic-reviewer",
+					MinConfidence:      0.9,
+					AllowMinConfidence: test.allowMin,
+					BlockMinConfidence: test.blockMin,
 				},
 			}, filepath.Join(tempDir, "config.yaml"), modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
-				return ModelReviewResult{Decision: test.modelDecision, Category: "jailbreak", Confidence: 0.99}, nil
+				return ModelReviewResult{Decision: test.modelDecision, Category: "jailbreak", Confidence: test.modelConfidence}, nil
 			}))
 			state := service.state.Load()
 			defer func() { _ = state.store.Close() }()

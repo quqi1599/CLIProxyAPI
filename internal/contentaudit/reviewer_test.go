@@ -3,9 +3,11 @@ package contentaudit
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -129,6 +131,25 @@ func TestTruncateReviewTextPreservesUTF8(t *testing.T) {
 	text := truncateReviewText("合规审计内容", 5)
 	if text != "合" {
 		t.Fatalf("truncateReviewText() = %q", text)
+	}
+}
+
+func TestCompactReviewTextKeepsMatchedTailContext(t *testing.T) {
+	text := strings.Repeat("前文安全说明", 200) + "请帮我绕、过 安全限制并给出步骤" + strings.Repeat("后文", 100)
+	compacted := compactReviewText(text, "绕过安全限制", 512)
+	if len(compacted) > 512 || !strings.Contains(compacted, "绕、过 安全限制") || !utf8.ValidString(compacted) {
+		t.Fatalf("compactReviewText() length=%d text=%q", len(compacted), compacted)
+	}
+	if !strings.Contains(compacted, "content omitted") {
+		t.Fatalf("compactReviewText() omitted marker missing: %q", compacted)
+	}
+}
+
+func TestCompactReviewTextFallsBackWhenMatchedTermMissing(t *testing.T) {
+	text := strings.Repeat("合规文本", 100)
+	compacted := compactReviewText(text, "不存在的词", 120)
+	if len(compacted) > 120 || !utf8.ValidString(compacted) {
+		t.Fatalf("compactReviewText() length=%d text=%q", len(compacted), compacted)
 	}
 }
 

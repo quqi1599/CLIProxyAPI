@@ -230,6 +230,8 @@ type ContentAuditModelReviewConfig struct {
 	CacheSeconds             int      `yaml:"cache-seconds" json:"cache-seconds"`
 	MaxInputBytes            int      `yaml:"max-input-bytes" json:"max-input-bytes"`
 	MinConfidence            float64  `yaml:"min-confidence" json:"min-confidence"`
+	AllowMinConfidence       float64  `yaml:"allow-min-confidence" json:"allow-min-confidence"`
+	BlockMinConfidence       float64  `yaml:"block-min-confidence" json:"block-min-confidence"`
 	CircuitFailureThreshold  int      `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
 	CircuitOpenSeconds       int      `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
 }
