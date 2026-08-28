@@ -2,8 +2,11 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,11 +24,7 @@ type contentAuditReviewRouteExecutor struct {
 func (e *contentAuditReviewRouteExecutor) Identifier() string { return "codex" }
 
 func (e *contentAuditReviewRouteExecutor) Execute(_ context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.authIDs = append(e.authIDs, auth.ID)
-	e.models = append(e.models, req.Model)
-	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+	return cliproxyexecutor.Response{}, errors.New("unexpected translated review execution")
 }
 
 func (e *contentAuditReviewRouteExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -40,8 +39,30 @@ func (e *contentAuditReviewRouteExecutor) CountTokens(context.Context, *Auth, cl
 	return cliproxyexecutor.Response{}, errors.New("unexpected count review")
 }
 
-func (e *contentAuditReviewRouteExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
-	return nil, errors.New("unexpected raw review")
+func (e *contentAuditReviewRouteExecutor) HttpRequest(_ context.Context, auth *Auth, request *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	if err = json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Stream {
+		return nil, errors.New("internal review unexpectedly enabled streaming")
+	}
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, auth.ID)
+	e.models = append(e.models, payload.Model)
+	e.mu.Unlock()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+	}, nil
 }
 
 func (e *contentAuditReviewRouteExecutor) calls() ([]string, []string) {
@@ -63,6 +84,7 @@ func TestContentAuditReviewRouteBypassesOnlyRegistryExclusion(t *testing.T) {
 			Provider: "codex",
 			Attributes: map[string]string{
 				"auth_kind":                     "oauth",
+				"base_url":                      "https://review.test/v1",
 				"excluded_models":               contentAuditReviewModel,
 				contentAuditReviewAuthAttribute: "true",
 			},
@@ -75,6 +97,7 @@ func TestContentAuditReviewRouteBypassesOnlyRegistryExclusion(t *testing.T) {
 			Provider: "codex",
 			Attributes: map[string]string{
 				"auth_kind":                     "oauth",
+				"base_url":                      "https://review.test/v1",
 				"excluded_models":               contentAuditReviewModel,
 				contentAuditReviewAuthAttribute: "true",
 			},
@@ -145,6 +168,7 @@ func TestContentAuditReviewRouteSelectsOnlyDedicatedCredential(t *testing.T) {
 			ID:       "dedicated-review",
 			Provider: "codex",
 			Attributes: map[string]string{
+				"base_url":                      "https://review.test/v1",
 				"excluded_models":               contentAuditReviewModel,
 				"priority":                      "1",
 				contentAuditReviewAuthAttribute: "true",

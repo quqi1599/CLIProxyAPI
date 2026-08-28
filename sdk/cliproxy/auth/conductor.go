@@ -5342,7 +5342,59 @@ func (m *Manager) ExecuteContentAuditReview(ctx context.Context, req cliproxyexe
 		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review request", HTTPStatus: http.StatusBadRequest}
 	}
 	opts.InternalAuthSelectionCapability = contentAuditReviewAuthSelectionCapability
-	return m.runExecuteAttempts(ctx, []string{"codex"}, req, opts)
+	auth, executor, err := m.pickNext(ctx, "codex", contentAuditReviewModel, opts, nil)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if auth == nil || executor == nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	baseURL := strings.TrimSpace(auth.Attributes["base_url"])
+	if baseURL == "" {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_route", Message: "content audit review base URL is unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	body, err := sjson.SetBytes(req.Payload, "model", contentAuditReviewModel)
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review payload", HTTPStatus: http.StatusBadRequest}
+	}
+	body, err = sjson.SetBytes(body, "stream", false)
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review payload", HTTPStatus: http.StatusBadRequest}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_route", Message: "content audit review route is invalid", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpResp, err := executor.HttpRequest(ctx, auth, httpReq)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if httpResp == nil || httpResp.Body == nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "content audit review returned an empty response", HTTPStatus: http.StatusBadGateway}
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close content audit review response body")
+		}
+	}()
+	const maxReviewResponseBytes = 2 << 20
+	responseBody, err := io.ReadAll(io.LimitReader(httpResp.Body, maxReviewResponseBytes+1))
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "failed to read content audit review response", HTTPStatus: http.StatusBadGateway}
+	}
+	if len(responseBody) > maxReviewResponseBytes {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "content audit review response is too large", HTTPStatus: http.StatusBadGateway}
+	}
+	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		return cliproxyexecutor.Response{}, &Error{
+			Code:       fmt.Sprintf("content_audit_review_upstream_%d", httpResp.StatusCode),
+			Message:    "content audit review upstream rejected the request",
+			HTTPStatus: httpResp.StatusCode,
+		}
+	}
+	return cliproxyexecutor.Response{Payload: responseBody, Headers: httpResp.Header.Clone()}, nil
 }
 
 func allowsContentAuditReviewExcludedModel(provider, model string, opts cliproxyexecutor.Options) bool {
