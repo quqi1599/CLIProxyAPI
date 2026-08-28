@@ -63,9 +63,9 @@ const (
 	openAICompatReasoningRemovedDowngrade           = "openai_compat.reasoning_controls_removed"
 	openAICompatStreamUsageRemovedDowngrade         = "openai_compat.stream_usage_removed"
 	openAICompatCompactStreamRemovedDowngrade       = "openai_compat.compact_stream_removed"
-	workBuddyAkoolToolHistoryPayloadBytes           = 512 * 1024
-	workBuddyAkoolToolOutputMessages                = 100
-	workBuddyAkoolComplexToolDefinitions            = 8
+	akoolDeepSeekToolHistoryPayloadBytes            = 512 * 1024
+	akoolDeepSeekToolOutputMessages                 = 100
+	akoolDeepSeekComplexToolDefinitions             = 8
 )
 
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
@@ -1052,7 +1052,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		historyReport.OutputBytes = len(body)
 		historyReport.DowngradeReason = thinkingHistoryUnrepairableReason
 	}
-	if err = enforceThinkingHistoryTransform(ctx, "openai", historyReport, time.Since(historyStarted)); err != nil {
+	if err = enforceThinkingHistoryTransform(ctx, "openai", clientProfile, historyReport, time.Since(historyStarted)); err != nil {
 		return plan, err
 	}
 
@@ -1147,7 +1147,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		}
 		body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", body)
 	}
-	body, err = normalizeWorkBuddyAkoolDeepSeekChatPayload(ctx, body, baseURL, baseModel, plan.endpoint, clientProfile)
+	body, err = normalizeAkoolDeepSeekChatPayload(ctx, body, baseURL, baseModel, plan.endpoint, clientProfile)
 	if err != nil {
 		return plan, err
 	}
@@ -1216,52 +1216,43 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	return plan, nil
 }
 
-func normalizeWorkBuddyAkoolDeepSeekChatPayload(ctx context.Context, body []byte, baseURL, model, endpoint, clientProfile string) ([]byte, error) {
-	if !isWorkBuddyAkoolDeepSeekChatRoute(baseURL, model, endpoint, clientProfile) || len(body) == 0 || !gjson.ValidBytes(body) {
+func normalizeAkoolDeepSeekChatPayload(ctx context.Context, body []byte, baseURL, model, endpoint, clientProfile string) ([]byte, error) {
+	if !isAkoolDeepSeekChatRouteForClient(baseURL, model, endpoint, clientProfile) || len(body) == 0 || !gjson.ValidBytes(body) {
 		return body, nil
 	}
+	clientProfile = strings.ToLower(strings.TrimSpace(clientProfile))
 	toolDefinitions := len(gjson.GetBytes(body, "tools").Array())
-	if toolDefinitions >= workBuddyAkoolComplexToolDefinitions {
-		message := workBuddyDeepSeekComplexToolsUserMessage()
+	if toolDefinitions >= akoolDeepSeekComplexToolDefinitions {
+		message, semanticCode := akoolDeepSeekComplexToolsUserMessage(clientProfile)
 		helps.LogWithRequestID(ctx).WithFields(log.Fields{
-			"event":                       "workbuddy_akool_complex_tools_fallback",
+			"event":                       akoolDeepSeekClientEvent(clientProfile, "workbuddy_akool_complex_tools_fallback", "claude_code_akool_complex_tools_fallback"),
+			"client_profile":              clientProfile,
 			"model":                       model,
 			"tool_definition_count":       toolDefinitions,
-			"tool_definition_count_limit": workBuddyAkoolComplexToolDefinitions,
+			"tool_definition_count_limit": akoolDeepSeekComplexToolDefinitions,
 			"payload_bytes":               len(body),
-		}).Warn("WorkBuddy complex tools bypassed incompatible Akool DeepSeek route")
+		}).Warn("client complex tools bypassed incompatible Akool DeepSeek route")
+		return body, akoolDeepSeekModelFallbackError(message, semanticCode)
+	}
+	toolOutputs := countOpenAICompatToolOutputMessages(body)
+	if len(body) >= akoolDeepSeekToolHistoryPayloadBytes && toolOutputs >= akoolDeepSeekToolOutputMessages {
+		message, semanticCode := akoolDeepSeekToolHistoryUserMessage(clientProfile)
+		helps.LogWithRequestID(ctx).WithFields(log.Fields{
+			"event":                      akoolDeepSeekClientEvent(clientProfile, "workbuddy_akool_tool_history_guard", "claude_code_akool_tool_history_fallback"),
+			"client_profile":             clientProfile,
+			"model":                      model,
+			"payload_bytes":              len(body),
+			"tool_output_messages":       toolOutputs,
+			"payload_bytes_limit":        akoolDeepSeekToolHistoryPayloadBytes,
+			"tool_output_messages_limit": akoolDeepSeekToolOutputMessages,
+		}).Warn("client Akool DeepSeek tool history rejected before upstream request")
+		if clientProfile == "claude_code" {
+			return body, akoolDeepSeekModelFallbackError(message, semanticCode)
+		}
 		return body, statusErr{
 			code:      http.StatusBadRequest,
 			errorCode: "request_feature_unsupported",
 			msg:       message,
-			failure: &failurecontract.Failure{
-				Kind:          failurecontract.UnsupportedFeature,
-				Scope:         failurecontract.ScopeModel,
-				HTTPStatus:    http.StatusBadRequest,
-				OuterStatus:   http.StatusBadRequest,
-				ProviderCode:  "request_feature_unsupported",
-				SemanticCode:  "workbuddy_deepseek_akool_complex_tools",
-				SemanticType:  "invalid_request_error",
-				StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
-				Retryable:     true,
-				PublicMessage: message,
-			},
-		}
-	}
-	toolOutputs := countOpenAICompatToolOutputMessages(body)
-	if len(body) >= workBuddyAkoolToolHistoryPayloadBytes && toolOutputs >= workBuddyAkoolToolOutputMessages {
-		helps.LogWithRequestID(ctx).WithFields(log.Fields{
-			"event":                      "workbuddy_akool_tool_history_guard",
-			"model":                      model,
-			"payload_bytes":              len(body),
-			"tool_output_messages":       toolOutputs,
-			"payload_bytes_limit":        workBuddyAkoolToolHistoryPayloadBytes,
-			"tool_output_messages_limit": workBuddyAkoolToolOutputMessages,
-		}).Warn("WorkBuddy Akool DeepSeek tool history rejected before upstream request")
-		return body, statusErr{
-			code:      http.StatusBadRequest,
-			errorCode: "request_feature_unsupported",
-			msg:       workBuddyDeepSeekToolHistoryUserMessage(),
 		}
 	}
 
@@ -1294,24 +1285,12 @@ func normalizeWorkBuddyAkoolDeepSeekChatPayload(ctx context.Context, body []byte
 				case "text", "input_text", "output_text":
 					textParts = append(textParts, compatStringValue(part["text"]))
 				case "image", "image_url", "input_image", "input_file", "file", "document":
-					return body, statusErr{
-						code:      http.StatusBadRequest,
-						errorCode: "request_feature_unsupported",
-						msg:       workBuddyDeepSeekAttachmentUserMessage(),
-					}
+					return body, akoolDeepSeekUnsupportedContentError(ctx, clientProfile, model, true)
 				default:
-					return body, statusErr{
-						code:      http.StatusBadRequest,
-						errorCode: "request_feature_unsupported",
-						msg:       workBuddyDeepSeekUnsupportedContentUserMessage(),
-					}
+					return body, akoolDeepSeekUnsupportedContentError(ctx, clientProfile, model, false)
 				}
 			default:
-				return body, statusErr{
-					code:      http.StatusBadRequest,
-					errorCode: "request_feature_unsupported",
-					msg:       workBuddyDeepSeekUnsupportedContentUserMessage(),
-				}
+				return body, akoolDeepSeekUnsupportedContentError(ctx, clientProfile, model, false)
 			}
 		}
 		message["content"] = strings.Join(textParts, "\n")
@@ -1326,16 +1305,18 @@ func normalizeWorkBuddyAkoolDeepSeekChatPayload(ctx context.Context, body []byte
 		return body, nil
 	}
 	helps.LogWithRequestID(ctx).WithFields(log.Fields{
-		"event":              "workbuddy_akool_text_parts_flattened",
+		"event":              akoolDeepSeekClientEvent(clientProfile, "workbuddy_akool_text_parts_flattened", "claude_code_akool_text_parts_flattened"),
+		"client_profile":     clientProfile,
 		"model":              model,
 		"flattened_messages": flattened,
 		"payload_bytes":      len(body),
-	}).Info("flattened WorkBuddy text content for Akool DeepSeek Chat compatibility")
+	}).Info("flattened client text content for Akool DeepSeek Chat compatibility")
 	return out, nil
 }
 
-func isWorkBuddyAkoolDeepSeekChatRoute(baseURL, model, endpoint, clientProfile string) bool {
-	if !strings.EqualFold(strings.TrimSpace(clientProfile), "workbuddy") || strings.TrimSpace(endpoint) != "/chat/completions" {
+func isAkoolDeepSeekChatRouteForClient(baseURL, model, endpoint, clientProfile string) bool {
+	clientProfile = strings.ToLower(strings.TrimSpace(clientProfile))
+	if (clientProfile != "workbuddy" && clientProfile != "claude_code") || strings.TrimSpace(endpoint) != "/chat/completions" {
 		return false
 	}
 	modelName := normalizedOpenAICompatPolicyModelName(model)
@@ -1351,20 +1332,72 @@ func isWorkBuddyAkoolDeepSeekChatRoute(baseURL, model, endpoint, clientProfile s
 		strings.Contains(strings.ToLower(parsed.Path), "/maas-backend/api/v1/llm/v1")
 }
 
-func workBuddyDeepSeekToolHistoryUserMessage() string {
-	return "request_feature_unsupported: workbuddy_deepseek_tool_history_too_large. 当前 WorkBuddy 对话已累积大量工具调用记录，DeepSeek 兼容接口无法继续完整接收。请点击“新建对话”后重新发送；“工具调用”可以继续勾选。若仍失败，请在模型设置中关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+func akoolDeepSeekModelFallbackError(message, semanticCode string) error {
+	return statusErr{
+		code:      http.StatusBadRequest,
+		errorCode: "request_feature_unsupported",
+		msg:       message,
+		failure: &failurecontract.Failure{
+			Kind:          failurecontract.UnsupportedFeature,
+			Scope:         failurecontract.ScopeModel,
+			HTTPStatus:    http.StatusBadRequest,
+			OuterStatus:   http.StatusBadRequest,
+			ProviderCode:  "request_feature_unsupported",
+			SemanticCode:  semanticCode,
+			SemanticType:  "invalid_request_error",
+			StreamPhase:   failurecontract.StreamPhaseBeforeOutput,
+			Retryable:     true,
+			PublicMessage: message,
+		},
+	}
 }
 
-func workBuddyDeepSeekComplexToolsUserMessage() string {
-	return "request_feature_unsupported: workbuddy_deepseek_akool_complex_tools. 当前 DeepSeek 兼容通道无法接收 WorkBuddy 一次发送的整套复杂工具定义，系统会尝试其他可用通道。如果仍失败，请点击“新建对话”后重新发送；“工具调用”可以继续勾选，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+func akoolDeepSeekUnsupportedContentError(ctx context.Context, clientProfile, model string, attachment bool) error {
+	message, semanticCode := akoolDeepSeekContentUserMessage(clientProfile, attachment)
+	if clientProfile == "claude_code" {
+		helps.LogWithRequestID(ctx).WithFields(log.Fields{
+			"event":          "claude_code_akool_content_fallback",
+			"client_profile": clientProfile,
+			"model":          model,
+			"reason":         semanticCode,
+		}).Warn("Claude Code content bypassed incompatible Akool DeepSeek route")
+		return akoolDeepSeekModelFallbackError(message, semanticCode)
+	}
+	return statusErr{code: http.StatusBadRequest, errorCode: "request_feature_unsupported", msg: message}
 }
 
-func workBuddyDeepSeekAttachmentUserMessage() string {
-	return "request_feature_unsupported: workbuddy_deepseek_attachment_input. 当前 WorkBuddy 对话包含图片或文件内容，DeepSeek 兼容接口无法接收。请打开“模型设置”→取消勾选“图片输入”→点击“新建对话”后重新发送；“工具调用”可以继续勾选。如果必须处理图片或文件，请切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+func akoolDeepSeekClientEvent(clientProfile, workBuddyEvent, claudeCodeEvent string) string {
+	if clientProfile == "claude_code" {
+		return claudeCodeEvent
+	}
+	return workBuddyEvent
 }
 
-func workBuddyDeepSeekUnsupportedContentUserMessage() string {
-	return "request_feature_unsupported: workbuddy_deepseek_content_format. 当前 WorkBuddy 对话包含 DeepSeek 无法识别的分段内容。请点击“新建对话”后重试；“工具调用”可以继续勾选。若仍失败，请在模型设置中关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
+func akoolDeepSeekToolHistoryUserMessage(clientProfile string) (string, string) {
+	if clientProfile == "claude_code" {
+		return "request_feature_unsupported: claude_code_deepseek_akool_tool_history. 当前 Claude Code 会话已累积大量工具调用记录，DeepSeek-艾俊 Flash 暂时无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。这不是 API Key、余额或网络问题。", "claude_code_deepseek_akool_tool_history"
+	}
+	return "request_feature_unsupported: workbuddy_deepseek_tool_history_too_large. 当前 WorkBuddy 对话已累积大量工具调用记录，DeepSeek 兼容接口无法继续完整接收。请点击“新建对话”后重新发送；“工具调用”可以继续勾选。若仍失败，请在模型设置中关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。", "workbuddy_deepseek_tool_history_too_large"
+}
+
+func akoolDeepSeekComplexToolsUserMessage(clientProfile string) (string, string) {
+	if clientProfile == "claude_code" {
+		return "request_feature_unsupported: claude_code_deepseek_akool_complex_tools. 当前 Claude Code 请求包含较多工具定义，DeepSeek-艾俊 Flash 暂时无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。这不是 API Key、余额或网络问题。", "claude_code_deepseek_akool_complex_tools"
+	}
+	return "request_feature_unsupported: workbuddy_deepseek_akool_complex_tools. 当前 DeepSeek 兼容通道无法接收 WorkBuddy 一次发送的整套复杂工具定义，系统会尝试其他可用通道。如果仍失败，请点击“新建对话”后重新发送；“工具调用”可以继续勾选，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。", "workbuddy_deepseek_akool_complex_tools"
+}
+
+func akoolDeepSeekContentUserMessage(clientProfile string, attachment bool) (string, string) {
+	if clientProfile == "claude_code" {
+		if attachment {
+			return "request_feature_unsupported: claude_code_deepseek_akool_attachment_input. 当前 Claude Code 请求包含图片或文件内容，DeepSeek-艾俊 Flash 无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请移除图片或文件后新建 Claude Code 会话，或切换到 OpenAI 原生 GPT 模型。", "claude_code_deepseek_akool_attachment_input"
+		}
+		return "request_feature_unsupported: claude_code_deepseek_akool_content_format. 当前 Claude Code 请求包含 DeepSeek-艾俊 Flash 无法可靠识别的分段内容，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。", "claude_code_deepseek_akool_content_format"
+	}
+	if attachment {
+		return "request_feature_unsupported: workbuddy_deepseek_attachment_input. 当前 WorkBuddy 对话包含图片或文件内容，DeepSeek 兼容接口无法接收。请打开“模型设置”→取消勾选“图片输入”→点击“新建对话”后重新发送；“工具调用”可以继续勾选。如果必须处理图片或文件，请切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。", "workbuddy_deepseek_attachment_input"
+	}
+	return "request_feature_unsupported: workbuddy_deepseek_content_format. 当前 WorkBuddy 对话包含 DeepSeek 无法识别的分段内容。请点击“新建对话”后重试；“工具调用”可以继续勾选。若仍失败，请在模型设置中关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。", "workbuddy_deepseek_content_format"
 }
 
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {

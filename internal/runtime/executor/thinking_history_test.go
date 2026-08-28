@@ -12,6 +12,7 @@ import (
 	compathistory "github.com/router-for-me/CLIProxyAPI/v7/internal/compat/history"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/tidwall/gjson"
 )
 
@@ -221,6 +222,33 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekWorkBuddyDowngradesExplicitThinki
 	}
 }
 
+func TestNormalizeOpenAIThinkingHistoryDeepSeekClaudeCodeDowngradesExplicitThinking(t *testing.T) {
+	body := []byte(`{
+		"reasoning_effort":"high",
+		"messages":[{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]
+	}`)
+
+	out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReportForClient(body, "openai", "deepseek-v4-pro", "claude_code")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModelWithReportForClient() error = %v", err)
+	}
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("Claude Code history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed after downgrade: %s", out)
+	}
+	if gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
+		t.Fatalf("missing reasoning history was synthesized: %s", out)
+	}
+	if report.DowngradeReason != thinkingHistoryClientDowngradeReason {
+		t.Fatalf("report = %+v, want Claude Code downgrade marker", report)
+	}
+}
+
 func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutExplicitThinking(t *testing.T) {
 	body := []byte(`{"messages":[
 		{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
@@ -293,6 +321,34 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekWorkBuddyDowngradesExplicitThinki
 	}
 }
 
+func TestNormalizeClaudeThinkingHistoryDeepSeekClaudeCodeDowngradesExplicitThinking(t *testing.T) {
+	body := []byte(`{
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
+	}`)
+
+	out, changed, downgraded, report, err := normalizeThinkingHistoryForModelWithReportForClient(body, "claude", "deepseek-v4-flash", "claude_code")
+	if err != nil {
+		t.Fatalf("normalizeThinkingHistoryForModelWithReportForClient() error = %v", err)
+	}
+	if !changed || !downgraded || bytes.Equal(out, body) {
+		t.Fatalf("Claude Code history changed=%v downgraded=%v body=%s", changed, downgraded, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
+	}
+	if gjson.GetBytes(out, "output_config.effort").Exists() {
+		t.Fatalf("output_config.effort should be removed after downgrade: %s", out)
+	}
+	if gjson.GetBytes(out, "messages.0.content.#(type==\"thinking\")").Exists() {
+		t.Fatalf("missing thinking history was synthesized: %s", out)
+	}
+	if report.DowngradeReason != thinkingHistoryClientDowngradeReason {
+		t.Fatalf("report = %+v, want Claude Code downgrade marker", report)
+	}
+}
+
 func TestWorkBuddyDeepSeekInvalidThinkingHistoryMessageIsTutorialStyle(t *testing.T) {
 	missing := &compathistory.MissingReasoningError{Format: compathistory.FormatOpenAI, MessageIndexes: []int{2}}
 	err := missingReasoningHistoryStatusErrorWithMessage(missing, workBuddyDeepSeekInvalidThinkingHistoryMessage)
@@ -315,7 +371,23 @@ func TestWorkBuddyDeepSeekInvalidThinkingHistoryMessageIsTutorialStyle(t *testin
 	}
 }
 
-func TestEnforceThinkingHistoryTransformRecordsWorkBuddyDowngrade(t *testing.T) {
+func TestClaudeCodeDeepSeekInvalidThinkingHistoryMessageUsesClientName(t *testing.T) {
+	message := deepSeekInvalidThinkingHistoryMessageForClient("claude_code")
+	for _, want := range []string{"Claude Code", "新建会话", "OpenAI 原生 GPT 模型", "/compact", "不是 API Key"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("message = %q, want %q", message, want)
+		}
+	}
+	for _, forbidden := range []string{"Codex", "CPA", "reasoning_content", "tool_result"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("message exposed internal or wrong client term %q: %q", forbidden, message)
+		}
+	}
+}
+
+func TestEnforceThinkingHistoryTransformRecordsClientDowngrade(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
 	ctx := internalpayload.WithTransformReport(context.Background(), 200)
 	report := thinkingHistoryTransformReport{
 		InputBytes:           200,
@@ -323,7 +395,7 @@ func TestEnforceThinkingHistoryTransformRecordsWorkBuddyDowngrade(t *testing.T) 
 		CheckedToolCallTurns: 1,
 		DowngradeReason:      thinkingHistoryClientDowngradeReason,
 	}
-	if err := enforceThinkingHistoryTransform(ctx, "openai", report, time.Millisecond); err != nil {
+	if err := enforceThinkingHistoryTransform(ctx, "openai", "claude_code", report, time.Millisecond); err != nil {
 		t.Fatalf("enforceThinkingHistoryTransform() error = %v", err)
 	}
 	transformReport, ok := internalpayload.TransformReportFromContext(ctx)
@@ -333,6 +405,19 @@ func TestEnforceThinkingHistoryTransformRecordsWorkBuddyDowngrade(t *testing.T) 
 	stage := transformReport.Stages[0]
 	if len(stage.Downgrades) != 1 || stage.Downgrades[0] != thinkingHistoryClientDowngradeReason {
 		t.Fatalf("downgrades = %v, want %q", stage.Downgrades, thinkingHistoryClientDowngradeReason)
+	}
+	entries := hook.AllEntries()
+	found := false
+	for _, entry := range entries {
+		if entry.Data["event"] == thinkingHistoryClientDowngradeReason {
+			found = true
+			if entry.Data["client_profile"] != "claude_code" || entry.Data["provider"] != "openai" {
+				t.Fatalf("downgrade log fields = %+v", entry.Data)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing %q log event: %+v", thinkingHistoryClientDowngradeReason, entries)
 	}
 }
 
@@ -751,7 +836,7 @@ func TestNormalizeThinkingHistorySyntheticBudgetDowngradesMultipleMessages(t *te
 
 			ctx := internalpayload.WithTransformReport(context.Background(), int64(len(tt.body)))
 			const stageDuration = 2 * time.Millisecond
-			if errRecord := enforceThinkingHistoryTransform(ctx, tt.provider, report, stageDuration); errRecord != nil {
+			if errRecord := enforceThinkingHistoryTransform(ctx, tt.provider, "", report, stageDuration); errRecord != nil {
 				t.Fatalf("enforceThinkingHistoryTransform() error = %v", errRecord)
 			}
 			transformReport, ok := internalpayload.TransformReportFromContext(ctx)
