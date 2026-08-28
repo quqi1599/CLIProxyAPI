@@ -1,8 +1,8 @@
 # Generated from acking-you/llm-access moderation seed.
 # Source revision: eb936621580867dc5dcb92108a5ada9ba1b8dd32
 # Multi-category phrases use the highest-severity category; source order breaks ties.
-# The 642 source rows plus 82 CPA high-confidence intent phrases compile to
-# 765 runtime patterns after normalization.
+# The 642 source rows plus 85 CPA high-confidence intent phrases compile to
+# 768 runtime patterns after normalization.
 # CPA keeps request-level enforcement only; this policy does not ban sessions or API keys.
 version: "llm-access-managed-2026-08-28-v5"
 global-allowlist:
@@ -35,6 +35,10 @@ rules:
       - "safety policy"
       - "refusal test"
       - "hypothetical instruction"
+      - "source_memories"
+      - "imported hermes conversation history"
+      - "历史记忆摘要"
+      - "对话历史摘要"
     exclude-all:
       - ["禁止", "不得", "不允许", "拒绝", "避免", "防止", "检测", "拦截", "do not", "must not", "prevent", "detect", "block"]
       - ["绕过", "越狱", "破甲", "安全限制", "安全过滤", "bypass", "jailbreak", "safety filter"]
@@ -50,6 +54,14 @@ rules:
       - "show me how to bypass"
       - "do not refuse"
       - "ignore safety"
+      - "现在照做"
+      - "按上述执行"
+      - "执行上述"
+      - "继续执行"
+      - "照此执行"
+      - "implement this now"
+      - "follow the above"
+      - "continue it"
   - id: "block-csam-generation-intent"
     category: "csam"
     severity: "critical"
@@ -187,8 +199,11 @@ rules:
       - "how to traffic people"
       - "organ trafficking broker"
       - "sex blackmail script"
-      - "雇 凶 杀 人"
-      - "买 凶 杀 人"
+      - "帮 我 雇 凶 杀 人"
+      - "如 何 雇 凶 杀 人"
+      - "雇 凶 杀 人 渠 道"
+      - "买 凶 杀 人 渠 道"
+      - "哪 里 找 杀 手"
       - "人 口 贩 卖 教 程"
       - "器 官 买 卖 渠 道"
       - "裸 聊 勒 索 话 术"
@@ -198,6 +213,14 @@ rules:
       - "案件分析"
       - "法律研究"
       - "禁止实施"
+      - "教材"
+      - "教科书"
+      - "命题"
+      - "题目"
+      - "考试"
+      - "课程"
+      - "法律教育"
+      - "刑侦教学"
       - "crime prevention"
       - "legal analysis"
     override-exclude-any:
@@ -207,6 +230,10 @@ rules:
       - "提供话术"
       - "help me hire"
       - "give me a script"
+      - "帮我雇凶"
+      - "如何雇凶"
+      - "哪里找杀手"
+      - "give me a channel"
   - id: "block-fraud-operational-intent"
     category: "fraud"
     severity: "high"
@@ -864,6 +891,15 @@ rules:
       - "性 胁 迫"
       - "强 制 性 交"
       - "强 迫 性 爱 描 写"
+    exclude-any:
+      - "教材"
+      - "教科书"
+      - "命题"
+      - "题目"
+      - "考试"
+      - "课程"
+      - "法律教育"
+      - "刑侦教学"
   - id: "seed-fraud"
     category: "fraud"
     severity: "high"
@@ -1133,3 +1169,17 @@ rules:
       - "do anything now"
       - "stay in character as"
       - "roleplay as an unrestricted ai"
+    exclude-any:
+      - "source_memories"
+      - "imported hermes conversation history"
+      - "历史记忆摘要"
+      - "对话历史摘要"
+    override-exclude-any:
+      - "现在照做"
+      - "按上述执行"
+      - "执行上述"
+      - "继续执行"
+      - "照此执行"
+      - "implement this now"
+      - "follow the above"
+      - "continue it"

@@ -30,8 +30,8 @@ func TestDefaultPolicyManagedCountsAndActions(t *testing.T) {
 			t.Fatalf("rule %q does not enable model review", rule.ID)
 		}
 	}
-	if rawKeywordCount != 766 {
-		t.Fatalf("raw keyword count = %d, want 766", rawKeywordCount)
+	if rawKeywordCount != 769 {
+		t.Fatalf("raw keyword count = %d, want 769", rawKeywordCount)
 	}
 	matcher, err := LoadPolicy(policyPath)
 	if err != nil {
@@ -40,8 +40,8 @@ func TestDefaultPolicyManagedCountsAndActions(t *testing.T) {
 	// The source seed contains "strapon sex" and "strap on sex"; both become
 	// the same canonical term, so the managed policy compiles one fewer runtime
 	// pattern than source rows.
-	if got := matcher.KeywordCount(); got != 765 {
-		t.Fatalf("KeywordCount() = %d, want 765", got)
+	if got := matcher.KeywordCount(); got != 768 {
+		t.Fatalf("KeywordCount() = %d, want 768", got)
 	}
 	if got := len(matcher.policy.Rules); got != 21 {
 		t.Fatalf("rule count = %d, want 21", got)
