@@ -334,6 +334,9 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 					ProxyURL:       "http://proxy.local",
 					Websockets:     true,
 					DisableCooling: true,
+					Models: []config.CodexModel{
+						{Name: coreauth.ContentAuditReviewModel},
+					},
 				},
 			},
 		},
@@ -363,6 +366,9 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	}
 	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
 		t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+	}
+	if auths[0].Attributes["internal_content_audit_review"] != "true" {
+		t.Errorf("expected internal content audit review capability, got %q", auths[0].Attributes["internal_content_audit_review"])
 	}
 }
 

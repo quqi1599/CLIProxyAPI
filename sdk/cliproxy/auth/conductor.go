@@ -1648,7 +1648,13 @@ type Manager struct {
 	gptPolicyPersistMu    sync.Mutex
 }
 
-const contentAuditReviewModel = "codex-auto-review"
+// ContentAuditReviewModel is reserved for CPA's internal content-review route.
+const ContentAuditReviewModel = "codex-auto-review"
+
+const (
+	contentAuditReviewModel         = ContentAuditReviewModel
+	contentAuditReviewAuthAttribute = "internal_content_audit_review"
+)
 
 type internalAuthSelectionCapability struct{}
 
@@ -5343,6 +5349,14 @@ func allowsContentAuditReviewExcludedModel(provider, model string, opts cliproxy
 	return opts.InternalAuthSelectionCapability == contentAuditReviewAuthSelectionCapability &&
 		strings.EqualFold(strings.TrimSpace(provider), "codex") &&
 		strings.TrimSpace(model) == contentAuditReviewModel
+}
+
+func supportsContentAuditReview(auth *Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(auth.Attributes[contentAuditReviewAuthAttribute]))
+	return err == nil && value
 }
 
 func contentAuditReviewPublicRouteError() error {
@@ -10937,6 +10951,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+			continue
+		}
+		if allowsContentAuditReviewExcludedModel(provider, model, opts) && !supportsContentAuditReview(candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {

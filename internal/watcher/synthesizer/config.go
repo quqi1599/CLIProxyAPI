@@ -216,6 +216,13 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
+		for _, model := range ck.Models {
+			if strings.EqualFold(strings.TrimSpace(model.Name), coreauth.ContentAuditReviewModel) ||
+				strings.EqualFold(strings.TrimSpace(model.Alias), coreauth.ContentAuditReviewModel) {
+				attrs["internal_content_audit_review"] = "true"
+				break
+			}
+		}
 		addConfigHeadersToAttrs(ck.Headers, attrs)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		status := coreauth.StatusActive

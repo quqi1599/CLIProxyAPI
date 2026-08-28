@@ -226,6 +226,9 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		if entry == nil || entry.auth == nil {
 			return false
 		}
+		if allowsContentAuditReviewExcludedModel(providerKey, model, opts) && !supportsContentAuditReview(entry.auth) {
+			return false
+		}
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
 			return false
 		}
