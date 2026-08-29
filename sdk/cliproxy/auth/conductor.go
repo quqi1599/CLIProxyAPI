@@ -151,6 +151,7 @@ type requestAttemptTrace struct {
 	gptRetryPressureDegraded     int
 	gptRetryPressureThrottled    bool
 	zeroEligibleProbeKey         string
+	kimiQuotaAccounts            map[string]struct{}
 }
 
 type requestExecutionSummary struct {
@@ -4671,6 +4672,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				trace.recordFinalStatus(statusCodeFromError(errStream))
 			}
 			m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, errStream)
+			if isKimiInsufficientQuotaError(auth, errStream) {
+				return nil, errStream
+			}
 			if channelFailover {
 				if !directFailover {
 					return nil, markGPTChannelFailoverError(errStream)
@@ -4811,6 +4815,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
 			}
 			cleanupAttempt()
+			if isKimiInsufficientQuotaError(auth, bootstrapErr) {
+				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
+			}
 			if channelFailover || unauthorized {
 				if channelFailover && !directFailover {
 					bootstrapErr = markGPTChannelFailoverError(bootstrapErr)
@@ -5555,6 +5562,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	kimiQuotaAccounts := make(map[string]struct{})
 	trace := requestAttemptTraceFromContext(ctx)
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
@@ -5769,6 +5777,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
 				authErr = errExec
 				countAttempt = true
+				if isKimiInsufficientQuotaError(auth, errExec) {
+					break modelLoop
+				}
 				if remoteCompaction {
 					break modelLoop
 				}
@@ -5823,6 +5834,13 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, authErr)
 				continue
 			}
+			kimiQuotaFallback := false
+			if isKimiInsufficientQuotaError(auth, authErr) {
+				if !m.prepareKimiInsufficientQuotaFallback(ctx, tried, kimiQuotaAccounts, auth, authErr) {
+					return cliproxyexecutor.Response{}, authErr
+				}
+				kimiQuotaFallback = true
+			}
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(authErr) {
@@ -5844,7 +5862,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
+			} else if !kimiQuotaFallback && !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
 				}
@@ -5878,6 +5896,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	kimiQuotaAccounts := make(map[string]struct{})
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
@@ -6023,6 +6042,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, errStream
 			}
+			kimiQuotaFallback := false
+			if isKimiInsufficientQuotaError(auth, errStream) {
+				if !m.prepareKimiInsufficientQuotaFallback(ctx, tried, kimiQuotaAccounts, auth, errStream) {
+					return nil, errStream
+				}
+				kimiQuotaFallback = true
+			}
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
 				m.markRetryChannelTried(ctx, tried, auth, errStream)
 			}
@@ -6057,7 +6083,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
+			} else if !kimiQuotaFallback && !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return nil, errWait
 				}
@@ -7689,6 +7715,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
+		}
+		if shouldShareKimiAccountQuota(auth, result) {
+			schedulerSnapshots = append(schedulerSnapshots, m.applyKimiSharedAccountQuotaLocked(ctx, auth, result.Error, result.RetryAfter, now)...)
 		}
 		schedulerSnapshots = append(schedulerSnapshots, m.applyChannelBreakerResultLocked(ctx, auth, result, requestedModelAlias, now)...)
 		if slowPenalty > 0 {

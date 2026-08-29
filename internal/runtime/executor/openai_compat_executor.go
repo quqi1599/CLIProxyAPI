@@ -2434,6 +2434,10 @@ func openAICompatFailureSemantics(statusCode, providerStatusCode int, message, e
 	if openAICompatModelAccessFailure(message, errorCode) {
 		return failurecontract.ModelUnavailable, failurecontract.ScopeModel, true
 	}
+	if (providerStatusCode == http.StatusPaymentRequired || providerStatusCode == http.StatusForbidden || providerStatusCode == http.StatusTooManyRequests) &&
+		openAICompatQuotaErrorCode(errorCode) {
+		return failurecontract.QuotaExceeded, failurecontract.ScopeCredential, true
+	}
 	switch statusCode {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		return failurecontract.InvalidRequest, failurecontract.ScopeRequest, false

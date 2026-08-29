@@ -87,9 +87,10 @@ routing:
 
 混用 Kimi OpenAI-compatible key 和 Kimi Coding Agent key 时，要把两类上游
 入口分清楚。有些 Kimi Coding key 只能走 Claude-compatible `/v1/messages`
-入口，普通 OpenAI-compatible key 才走 `/chat/completions`。如果同一个 key
-同时放在两个池子里，额度耗尽或失效时需要在两边同时禁用或移除，避免路由
-状态和管理面板测试结果分叉。
+入口，普通 OpenAI-compatible key 才走 `/chat/completions`。如果同一个 Kimi key
+同时放在两个池子里，账号配额冷却会在两个协议记录间共享。单个
+`insufficient_quota` 请求最多再切换 1 个不同的 Kimi 底层账号，
+不会重试已耗尽账号的另一个协议别名。普通限流仍保持模型级冷却。
 
 ### 空成功响应自动恢复
 
