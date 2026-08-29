@@ -161,47 +161,51 @@ func TestOpenAICompatExecutorCompactUsesExplicitNativeEndpoint(t *testing.T) {
 }
 
 func TestOpenAICompatExecutorQwen38FormalPreservesDisabledThinkingIntent(t *testing.T) {
-	var gotBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-qwen","object":"chat.completion","created":1,"model":"qwen3.8-max","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
-	}))
-	defer server.Close()
+	for _, model := range []string{qwen38MaxFormalModel, qwen38FlashFormalModel} {
+		t.Run(model, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				gotBody = body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"chatcmpl-qwen","object":"chat.completion","created":1,"model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			defer server.Close()
 
-	executor := NewOpenAICompatExecutor("qwen-provider", &config.Config{
-		OpenAICompatibility: []config.OpenAICompatibility{{
-			Name: "qwen-provider",
-			Kind: "qwen",
-		}},
-	})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"base_url":    server.URL + "/compatible-mode/v1",
-		"api_key":     "test",
-		"compat_name": "qwen-provider",
-		"compat_kind": "qwen",
-	}}
+			executor := NewOpenAICompatExecutor("qwen-provider", &config.Config{
+				OpenAICompatibility: []config.OpenAICompatibility{{
+					Name: "qwen-provider",
+					Kind: "qwen",
+				}},
+			})
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"base_url":    server.URL + "/compatible-mode/v1",
+				"api_key":     "test",
+				"compat_name": "qwen-provider",
+				"compat_kind": "qwen",
+			}}
 
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model: "qwen3.8-max",
-		Payload: []byte(`{
-			"model":"qwen3.8-max",
-			"messages":[{"role":"user","content":"Reply exactly OK"}],
-			"reasoning_effort":"none",
-			"stream":false
-		}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai"),
-	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
-	}
-	if enabled := gjson.GetBytes(gotBody, "enable_thinking"); !enabled.Exists() || enabled.Bool() {
-		t.Fatalf("enable_thinking should remain disabled: %s", string(gotBody))
-	}
-	if gjson.GetBytes(gotBody, "reasoning_effort").Exists() {
-		t.Fatalf("reasoning_effort should be removed when thinking is disabled: %s", string(gotBody))
+			_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model: model,
+				Payload: []byte(`{
+					"model":"` + model + `",
+					"messages":[{"role":"user","content":"Reply exactly OK"}],
+					"reasoning_effort":"none",
+					"stream":false
+				}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("openai"),
+			})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if enabled := gjson.GetBytes(gotBody, "enable_thinking"); !enabled.Exists() || enabled.Bool() {
+				t.Fatalf("enable_thinking should remain disabled: %s", string(gotBody))
+			}
+			if gjson.GetBytes(gotBody, "reasoning_effort").Exists() {
+				t.Fatalf("reasoning_effort should be removed when thinking is disabled: %s", string(gotBody))
+			}
+		})
 	}
 }
 

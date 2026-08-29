@@ -19,6 +19,7 @@ const (
 	openAICompatKimiPolicyID                 = "openai_compat.kimi.model_quirks"
 	openAICompatMiniMaxPolicyID              = "openai_compat.minimax.request_quirks"
 	openAICompatQwen38FormalPolicyID         = "openai_compat.qwen38.formal_hybrid_thinking"
+	openAICompatQwen38FlashPolicyID          = "openai_compat.qwen38.flash_hybrid_thinking"
 	openAICompatQwen38PreviewPolicyID        = "openai_compat.qwen38.preview_thinking_only"
 	openAICompatXiaomiPolicyID               = "openai_compat.xiaomi.request_quirks"
 	openAICompatZhipuGLM53PolicyID           = "openai_compat.zhipu.glm53_forced_thinking"
@@ -52,6 +53,7 @@ var (
 		openAICompatKimiPolicy(),
 		openAICompatMiniMaxPolicy(),
 		openAICompatQwen38FormalPolicy(),
+		openAICompatQwen38FlashPolicy(),
 		openAICompatQwen38PreviewPolicy(),
 		openAICompatXiaomiPolicy(),
 		openAICompatZhipuGLM53Policy(),
@@ -127,7 +129,7 @@ func openAICompatPolicyMatchContext(profile openAICompatProfile, payload []byte,
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	matchModel := normalizedOpenAICompatPolicyModelName(model)
 	if compatKind == "qwen" {
-		matchModel = qwen38MaxPolicyModel(payload, model)
+		matchModel = qwen38PolicyModel(payload, model)
 		if matchModel == "" {
 			matchModel = "__no_qwen38_match__"
 		}
@@ -475,13 +477,33 @@ func openAICompatMiniMaxPolicy() compat.Policy {
 }
 
 func openAICompatQwen38FormalPolicy() compat.Policy {
+	return newOpenAICompatQwen38FormalPolicy(
+		openAICompatQwen38FormalPolicyID,
+		qwen38MaxFormalModel,
+		"Qwen 3.8 Max",
+		"release:2026-08-03",
+		"internal/runtime/executor/testdata/compat/qwen38_formal_thinking.json",
+	)
+}
+
+func openAICompatQwen38FlashPolicy() compat.Policy {
+	return newOpenAICompatQwen38FormalPolicy(
+		openAICompatQwen38FlashPolicyID,
+		qwen38FlashFormalModel,
+		"Qwen 3.8 Flash",
+		"release:2026-08-26",
+		"internal/runtime/executor/testdata/compat/qwen38_flash_thinking.json",
+	)
+}
+
+func newOpenAICompatQwen38FormalPolicy(id, model, displayName, introducedVersion, fixture string) compat.Policy {
 	return compat.Policy{
-		ID:    openAICompatQwen38FormalPolicyID,
+		ID:    id,
 		Owner: "runtime/executor",
 		Match: compat.MatchSpec{
 			ProviderFamily: "openai-compatibility",
 			CompatKind:     "qwen",
-			ModelPattern:   qwen38MaxFormalModel,
+			ModelPattern:   model,
 		},
 		Phase:    compat.ProviderQuirkPatch,
 		Priority: 100,
@@ -491,11 +513,11 @@ func openAICompatQwen38FormalPolicy() compat.Policy {
 			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
 			MayCopyLargeFields: true,
 		},
-		RemovalCondition: "Remove when Qwen 3.8 Max accepts canonical OpenAI hybrid-thinking controls without normalization.",
+		RemovalCondition: "Remove when " + displayName + " accepts canonical OpenAI hybrid-thinking controls without normalization.",
 		Lifecycle: compat.LifecycleMetadata{
-			IntroducedVersion: "release:2026-08-03",
-			Fixture:           "internal/runtime/executor/testdata/compat/qwen38_formal_thinking.json",
-			UpstreamEvidence:  "The released Qwen 3.8 Max is a hybrid-thinking model: none or enable_thinking=false disables thinking, while low, medium, and xhigh are canonical efforts.",
+			IntroducedVersion: introducedVersion,
+			Fixture:           fixture,
+			UpstreamEvidence:  "The released " + displayName + " is a hybrid-thinking model: none or enable_thinking=false disables thinking, while low, medium, and xhigh are canonical efforts.",
 			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
 			ReviewDate:        "2026-10-22",
 		},
@@ -860,7 +882,7 @@ func openAICompatMiniMaxPolicyDowngrades(input, output []byte) []string {
 }
 
 func openAICompatQwen38PreviewPolicyDowngrades(ctx context.Context, input, output []byte) []string {
-	if qwen38MaxPolicyModel(input, openAICompatPolicyModel(ctx, input)) != qwen38MaxPreviewModel {
+	if qwen38PolicyModel(input, openAICompatPolicyModel(ctx, input)) != qwen38MaxPreviewModel {
 		return nil
 	}
 	_, _, disabledEffort := qwen38PreviewReasoningEffort(input)

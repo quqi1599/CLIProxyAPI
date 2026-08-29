@@ -372,7 +372,7 @@ func scrubOpenAICompatLegacyProviderQuirks(payload []byte, profile openAICompatP
 		payload = normalizeOpenAICompatToolCallArguments(payload)
 	}
 	if compatKind == "qwen" {
-		payload = normalizeQwen38MaxThinking(payload, model)
+		payload = normalizeQwen38Thinking(payload, model)
 	}
 	if compatKind == "zhipu" {
 		payload = normalizeZhipuGLM53Thinking(payload, model)
@@ -1903,16 +1903,17 @@ func normalizeMiniMaxM3Thinking(payload []byte, model string) []byte {
 }
 
 const (
-	qwen38MaxFormalModel  = "qwen3.8-max"
-	qwen38MaxPreviewModel = "qwen3.8-max-preview"
+	qwen38MaxFormalModel   = "qwen3.8-max"
+	qwen38FlashFormalModel = "qwen3.8-flash"
+	qwen38MaxPreviewModel  = "qwen3.8-max-preview"
 )
 
-func normalizeQwen38MaxThinking(payload []byte, model string) []byte {
+func normalizeQwen38Thinking(payload []byte, model string) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-	switch qwen38MaxPolicyModel(payload, model) {
-	case qwen38MaxFormalModel:
+	switch qwen38PolicyModel(payload, model) {
+	case qwen38MaxFormalModel, qwen38FlashFormalModel:
 		return normalizeQwen38FormalThinking(payload)
 	case qwen38MaxPreviewModel:
 		return normalizeQwen38PreviewThinking(payload)
@@ -1965,7 +1966,7 @@ func normalizeQwen38EnabledThinking(payload []byte, effort string, hasEffort boo
 	return mutateOpenAICompatJSON(payload, deletePaths, sets)
 }
 
-func qwen38MaxPolicyModel(payload []byte, model string) string {
+func qwen38PolicyModel(payload []byte, model string) string {
 	modelName := normalizedOpenAICompatPolicyModelName(model)
 	payloadModel := normalizedOpenAICompatPolicyModelName(gjson.GetBytes(payload, "model").String())
 	if modelName == qwen38MaxPreviewModel || payloadModel == qwen38MaxPreviewModel {
@@ -1974,12 +1975,15 @@ func qwen38MaxPolicyModel(payload []byte, model string) string {
 	if modelName == qwen38MaxFormalModel || payloadModel == qwen38MaxFormalModel {
 		return qwen38MaxFormalModel
 	}
+	if modelName == qwen38FlashFormalModel || payloadModel == qwen38FlashFormalModel {
+		return qwen38FlashFormalModel
+	}
 	return ""
 }
 
-func isQwen38MaxThinkingModel(model string) bool {
+func isQwen38ThinkingModel(model string) bool {
 	model = normalizedOpenAICompatPolicyModelName(model)
-	return model == qwen38MaxFormalModel || model == qwen38MaxPreviewModel
+	return model == qwen38MaxFormalModel || model == qwen38FlashFormalModel || model == qwen38MaxPreviewModel
 }
 
 func qwen38FormalReasoningEffort(payload []byte) (effort string, exists bool, disabled bool) {
