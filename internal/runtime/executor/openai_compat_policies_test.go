@@ -460,7 +460,7 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 			t.Fatalf("Xiaomi policy does not declare tool schema downgrade: %+v", policy.DowngradeIDs)
 		}
 		if policy.ID == openAICompatZhipuGLM53PolicyID {
-			if policy.Match.ModelPattern != "glm-5.3" || !slices.Contains(policy.DowngradeIDs, openAICompatZhipuGLM53ThinkingDowngrade) {
+			if policy.Match.ModelPattern != "glm-5.3*" || !slices.Contains(policy.DowngradeIDs, openAICompatZhipuGLM53ThinkingDowngrade) {
 				t.Fatalf("Zhipu GLM-5.3 policy metadata is incomplete: %+v", policy)
 			}
 		}

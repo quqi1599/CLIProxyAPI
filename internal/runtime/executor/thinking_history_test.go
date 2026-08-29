@@ -560,7 +560,7 @@ func TestValidateZhipuGLM53PreservedThinkingHistory(t *testing.T) {
 	if !ok || typed.ProviderCode != zhipuGLM53InvalidThinkingHistoryCode || typed.Scope != failurecontract.ScopeRequest || typed.Retryable {
 		t.Fatalf("failure = %+v, want request-scoped GLM-5.3 history error", typed)
 	}
-	if !strings.Contains(err.Error(), "GLM-5.3 不支持通过关闭思考") {
+	if !strings.Contains(err.Error(), "GLM-5.3 系列不支持通过关闭思考") {
 		t.Fatalf("error = %q, want forced-thinking guidance", err.Error())
 	}
 

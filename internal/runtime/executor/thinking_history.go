@@ -43,7 +43,7 @@ const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少�
 const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的完整记录。重复重试或 /compact 无法修复；请在当前客户端中新建 DeepSeek 会话，或切换到 OpenAI 原生 GPT 模型后继续。若客户端支持，也可关闭思考模式后重试；这不是账号额度或网络错误。"
 const workBuddyDeepSeekInvalidThinkingHistoryMessage = "当前对话的深度思考记录不完整，暂时无法继续。请任选一种方式处理：\n1. 推荐：在 WorkBuddy 中点击“新建对话”，然后重新发送刚才的问题。\n2. 或关闭深度思考：打开 WorkBuddy 的“设置” → 进入“模型设置”或“自定义模型” → 选择当前 DeepSeek 模型 → 关闭“深度思考”“Thinking”或“Reasoning”开关 → 返回对话重试。不同版本的菜单名称可能略有不同。\n3. 如果仍然无法使用，请在模型列表中切换到 OpenAI 原生 GPT 模型，再重新发送。\n这不是账号余额或网络问题。"
 const claudeCodeDeepSeekInvalidThinkingHistoryMessage = "当前 Claude Code 会话的深度思考记录不完整，系统未能安全关闭本次深度思考。请在 Claude Code 中新建会话后重新发送；如果必须保留当前上下文，请切换到 OpenAI 原生 GPT 模型后继续。重复重试或 /compact 无法补回已缺失的记录；这不是 API Key、账号余额或网络问题。"
-const zhipuGLM53InvalidThinkingHistoryMessage = "GLM-5.3 保留式思考的工具调用历史缺少原始 reasoning_content，CPA 不会伪造或重写思考内容。请新建对话，或确保客户端完整保留并按原顺序回传 reasoning_content 后重试；GLM-5.3 不支持通过关闭思考来绕过此问题。"
+const zhipuGLM53InvalidThinkingHistoryMessage = "GLM-5.3 系列保留式思考的工具调用历史缺少原始 reasoning_content，CPA 不会伪造或重写思考内容。请新建对话，或确保客户端完整保留并按原顺序回传 reasoning_content 后重试；GLM-5.3 系列不支持通过关闭思考来绕过此问题。"
 
 type deepSeekThinkingIntent uint8
 

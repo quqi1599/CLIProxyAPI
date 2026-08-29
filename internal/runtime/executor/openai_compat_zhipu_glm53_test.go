@@ -227,6 +227,49 @@ func TestOpenAICompatExecutorZhipuGLM53PreservesRealReasoningHistory(t *testing.
 	}
 }
 
+func TestOpenAICompatExecutorZhipuGLM53FlashUsesForcedThinkingCompatibility(t *testing.T) {
+	registerThinkingModelForProvider(t, "zhipu-glm53-flash", "zhipu", "glm-5.3-flash", []string{"low", "high", "max"})
+
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-glm53-flash","object":"chat.completion","model":"glm-5.3-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	payload := []byte(`{
+		"model":"glm-5.3-flash",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"describe"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+		]}],
+		"thinking":{"type":"disabled","clear_thinking":false},
+		"reasoning_effort":"xhigh",
+		"stream":true,
+		"tool_stream":true
+	}`)
+	_, err := newZhipuGLM53TestExecutor().Execute(context.Background(), zhipuGLM53TestAuth(server.URL+"/api/paas/v4"), cliproxyexecutor.Request{
+		Model:   "glm-5.3-flash",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "low" {
+		t.Fatalf("reasoning_effort = %q, want low after disabled thinking compatibility mapping: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "messages.0.content.1.image_url.url").String(); got != "data:image/png;base64,AAAA" {
+		t.Fatalf("image_url.url = %q, want complete data URL: %s", got, gotBody)
+	}
+	if !gjson.GetBytes(gotBody, "tool_stream").Bool() {
+		t.Fatalf("tool_stream was not preserved: %s", gotBody)
+	}
+}
+
 func newZhipuGLM53TestExecutor() *OpenAICompatExecutor {
 	return NewOpenAICompatExecutor("openai-compatibility", &config.Config{
 		OpenAICompatibility: []config.OpenAICompatibility{{

@@ -20,6 +20,11 @@ func TestOpenAICompatibilityThinkingSupportZhipuGLM53(t *testing.T) {
 			model:  config.OpenAICompatibilityModel{Name: "glm-5.3"},
 		},
 		{
+			name:   "GLM-5.3-Flash with explicit zhipu kind",
+			compat: config.OpenAICompatibility{Kind: "zhipu"},
+			model:  config.OpenAICompatibilityModel{Name: "glm-5.3-flash"},
+		},
+		{
 			name:   "zhipu inferred from base URL",
 			compat: config.OpenAICompatibility{BaseURL: "https://api.z.ai/api/coding/paas/v4"},
 			model: config.OpenAICompatibilityModel{
@@ -32,6 +37,11 @@ func TestOpenAICompatibilityThinkingSupportZhipuGLM53(t *testing.T) {
 					Levels:         []string{"none", "medium"},
 				},
 			},
+		},
+		{
+			name:   "GLM-5.3-Flash inferred from base URL",
+			compat: config.OpenAICompatibility{BaseURL: "https://api.z.ai/api/coding/paas/v4"},
+			model:  config.OpenAICompatibilityModel{Name: "GLM-5.3-FLASH"},
 		},
 	}
 

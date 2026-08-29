@@ -2666,7 +2666,15 @@ func isZhipuGLM53OpenAICompatibility(compat *config.OpenAICompatibility, model c
 	if kind == "" {
 		kind = internalconfig.InferCompatKindFromBaseURL(compat.BaseURL)
 	}
-	return kind == "zhipu" && strings.EqualFold(strings.TrimSpace(model.Name), "glm-5.3")
+	if kind != "zhipu" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(model.Name)) {
+	case "glm-5.3", "glm-5.3-flash":
+		return true
+	default:
+		return false
+	}
 }
 
 func isDeepSeekOfficialOpenAICompatibility(compat *config.OpenAICompatibility, model config.OpenAICompatibilityModel) bool {
