@@ -403,7 +403,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 	return best
 }
 
-func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, continuation bool) bool {
+func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool) bool {
 	const contextRunes = 192
 	start := max(0, matchStart-contextRunes)
 	end := min(len(text), matchEnd+contextRunes)
@@ -436,7 +436,7 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, contin
 			return true
 		}
 	}
-	return continuation
+	return false
 }
 
 func containsAnyTerm(text string, terms []string) bool {

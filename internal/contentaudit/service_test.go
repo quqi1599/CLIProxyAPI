@@ -461,12 +461,20 @@ rules:
 	continuationRequest.Header.Set("Content-Type", "application/json")
 	continuationResponse := httptest.NewRecorder()
 	router.ServeHTTP(continuationResponse, continuationRequest)
-	if continuationResponse.Code != http.StatusBadRequest || nextCalls != 2 {
+	if continuationResponse.Code != http.StatusNoContent || nextCalls != 3 {
 		t.Fatalf("continuation status=%d next=%d body=%s", continuationResponse.Code, nextCalls, continuationResponse.Body.String())
 	}
 
+	directContinuationRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"generate story with explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"继续"}]}`))
+	directContinuationRequest.Header.Set("Content-Type", "application/json")
+	directContinuationResponse := httptest.NewRecorder()
+	router.ServeHTTP(directContinuationResponse, directContinuationRequest)
+	if directContinuationResponse.Code != http.StatusBadRequest || nextCalls != 3 {
+		t.Fatalf("direct-continuation status=%d next=%d body=%s", directContinuationResponse.Code, nextCalls, directContinuationResponse.Body.String())
+	}
+
 	list, err := service.List(t.Context(), ListFilter{})
-	if err != nil || list.Total != 1 {
+	if err != nil || list.Total != 2 {
 		t.Fatalf("List() = %#v err=%v", list, err)
 	}
 	for _, item := range list.Items {
@@ -474,6 +482,10 @@ rules:
 		case "block-rule":
 			if item.UpstreamSent {
 				t.Fatalf("continuation block event was sent upstream: %#v", item)
+			}
+		case "observe-rule":
+			if !item.UpstreamSent {
+				t.Fatalf("ambiguous continuation observation did not reach upstream: %#v", item)
 			}
 		default:
 			t.Fatalf("unexpected event: %#v", item)
