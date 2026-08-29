@@ -43,6 +43,7 @@ func TestOpenAICompatPolicyFixturesMatchLegacyBehavior(t *testing.T) {
 		"testdata/compat/kimi_model_quirks.json",
 		"testdata/compat/minimax_request_quirks.json",
 		"testdata/compat/qwen38_formal_thinking.json",
+		"testdata/compat/qwen38_flash_thinking.json",
 		"testdata/compat/qwen38_preview_thinking.json",
 		"testdata/compat/xiaomi_request_quirks.json",
 		"testdata/compat/zhipu_glm53_forced_thinking.json",
@@ -430,6 +431,7 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		openAICompatDoubaoPolicyID,
 		openAICompatKimiPolicyID,
 		openAICompatMiniMaxPolicyID,
+		openAICompatQwen38FlashPolicyID,
 		openAICompatQwen38FormalPolicyID,
 		openAICompatQwen38PreviewPolicyID,
 		openAICompatXiaomiPolicyID,
@@ -467,6 +469,11 @@ func TestOpenAICompatPolicyRegistryInventory(t *testing.T) {
 		if policy.ID == openAICompatQwen38FormalPolicyID {
 			if policy.Match.ModelPattern != qwen38MaxFormalModel || strings.Contains(strings.ToLower(policy.Lifecycle.UpstreamEvidence), "thinking-only") || len(policy.DowngradeIDs) != 0 {
 				t.Fatalf("formal Qwen policy must remain hybrid-thinking only: %+v", policy)
+			}
+		}
+		if policy.ID == openAICompatQwen38FlashPolicyID {
+			if policy.Match.ModelPattern != qwen38FlashFormalModel || strings.Contains(strings.ToLower(policy.Lifecycle.UpstreamEvidence), "thinking-only") || len(policy.DowngradeIDs) != 0 {
+				t.Fatalf("Qwen Flash policy must remain hybrid-thinking only: %+v", policy)
 			}
 		}
 		if policy.ID == openAICompatQwen38PreviewPolicyID {
@@ -979,8 +986,10 @@ func TestOpenAICompatQwenPolicyMatchAndApplyUseCanonicalModel(t *testing.T) {
 	}{
 		{name: "preview", model: "Qwen3.8-Max-Preview", payloadModel: "configured-preview-alias", wantPolicyID: openAICompatQwen38PreviewPolicyID},
 		{name: "formal namespaced suffix", model: "provider/Qwen3.8-Max(high)", payloadModel: "configured-namespaced-alias", wantPolicyID: openAICompatQwen38FormalPolicyID},
+		{name: "flash namespaced suffix", model: "provider/Qwen3.8-Flash(high)", payloadModel: "configured-flash-alias", wantPolicyID: openAICompatQwen38FlashPolicyID},
 		{name: "preview payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Max-Preview", wantPolicyID: openAICompatQwen38PreviewPolicyID},
 		{name: "formal payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Max", wantPolicyID: openAICompatQwen38FormalPolicyID},
+		{name: "flash payload model fallback", model: "configured-route-alias", payloadModel: "Qwen3.8-Flash", wantPolicyID: openAICompatQwen38FlashPolicyID},
 		{name: "preview wins conflicting aliases", model: "Qwen3.8-Max", payloadModel: "Qwen3.8-Max-Preview", wantPolicyID: openAICompatQwen38PreviewPolicyID},
 		{name: "earlier model", model: "qwen3.7-max", payloadModel: "qwen3.7-max"},
 		{name: "suffix lookalike", model: "qwen3.8-max-extra", payloadModel: "qwen3.8-max-extra"},
@@ -1013,7 +1022,7 @@ func TestOpenAICompatQwenPolicyMatchAndApplyUseCanonicalModel(t *testing.T) {
 				t.Fatalf("Apply stages = %+v, ok=%v, provider stages=%d, want policy=%q", report.Stages, ok, providerStages, test.wantPolicyID)
 			}
 			switch test.wantPolicyID {
-			case openAICompatQwen38FormalPolicyID:
+			case openAICompatQwen38FormalPolicyID, openAICompatQwen38FlashPolicyID:
 				if gjson.GetBytes(actual, "enable_thinking").Bool() || gjson.GetBytes(actual, "reasoning_effort").Exists() {
 					t.Fatalf("formal Qwen disabled thinking was not preserved: %s", actual)
 				}

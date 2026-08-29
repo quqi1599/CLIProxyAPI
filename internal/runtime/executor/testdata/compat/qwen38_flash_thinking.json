@@ -1,0 +1,89 @@
+{
+  "policy_id": "openai_compat.qwen38.flash_hybrid_thinking",
+  "compat_kind": "qwen",
+  "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "cases": [
+    {
+      "name": "flash disabled thinking remains disabled",
+      "model": "qwen3.8-flash",
+      "input": {
+        "model": "configured-qwen-flash-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": false,
+        "reasoning_effort": "none",
+        "reasoning": {
+          "effort": "none"
+        },
+        "thinking": {
+          "type": "disabled",
+          "budget_tokens": 0
+        },
+        "thinking_budget": 0,
+        "temperature": 0.2
+      },
+      "expected": {
+        "model": "configured-qwen-flash-alias",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "enable_thinking": false,
+        "temperature": 0.2
+      },
+      "downgrades": []
+    },
+    {
+      "name": "flash medium effort wins over budget",
+      "model": "qwen3.8-flash",
+      "input": {
+        "model": "configured-qwen-flash-medium-alias",
+        "reasoning_effort": "medium",
+        "thinking_budget": 4096
+      },
+      "expected": {
+        "model": "configured-qwen-flash-medium-alias",
+        "enable_thinking": true,
+        "reasoning_effort": "medium"
+      },
+      "downgrades": []
+    },
+    {
+      "name": "flash high effort becomes xhigh",
+      "model": "qwen3.8-flash",
+      "input": {
+        "model": "configured-qwen-flash-high-alias",
+        "reasoning_effort": "high"
+      },
+      "expected": {
+        "model": "configured-qwen-flash-high-alias",
+        "enable_thinking": true,
+        "reasoning_effort": "xhigh"
+      },
+      "downgrades": []
+    },
+    {
+      "name": "flash positive nested budget becomes canonical",
+      "model": "qwen3.8-flash",
+      "input": {
+        "model": "configured-qwen-flash-budget-alias",
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 4096
+        }
+      },
+      "expected": {
+        "model": "configured-qwen-flash-budget-alias",
+        "enable_thinking": true,
+        "thinking_budget": 4096
+      },
+      "downgrades": []
+    }
+  ]
+}

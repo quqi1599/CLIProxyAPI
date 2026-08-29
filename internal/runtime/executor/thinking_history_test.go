@@ -460,11 +460,13 @@ func TestNormalizeOpenAIThinkingHistoryQwenPreservesOnlyRealReasoning(t *testing
 	}`)
 	models := []string{
 		"qwen3.8-max",
+		"qwen3.8-flash",
 		"qwen3.8-max-preview",
 		"qwen3.7-max",
 		"qwen3.7-plus",
 		"provider/qwen-plus-latest(high)",
 		"provider/qwen3.8-max(high)",
+		"provider/qwen3.8-flash(medium)",
 		"provider/qwen3.8-max-preview(xhigh)",
 	}
 	for _, model := range models {
