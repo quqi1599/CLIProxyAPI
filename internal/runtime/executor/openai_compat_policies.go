@@ -600,7 +600,7 @@ func openAICompatZhipuGLM53Policy() compat.Policy {
 		Match: compat.MatchSpec{
 			ProviderFamily: "openai-compatibility",
 			CompatKind:     "zhipu",
-			ModelPattern:   "glm-5.3",
+			ModelPattern:   "glm-5.3*",
 		},
 		Phase:    compat.ProviderQuirkPatch,
 		Priority: 100,
@@ -610,11 +610,11 @@ func openAICompatZhipuGLM53Policy() compat.Policy {
 			MaxExpansionRatio:  internalpayload.DefaultMaxExpansionRatio,
 			MayCopyLargeFields: true,
 		},
-		RemovalCondition: "Remove when GLM-5.3 accepts disabled thinking and the full OpenAI reasoning effort vocabulary.",
+		RemovalCondition: "Remove when GLM-5.3 and GLM-5.3-Flash accept disabled thinking and the full OpenAI reasoning effort vocabulary.",
 		Lifecycle: compat.LifecycleMetadata{
 			IntroducedVersion: "release:2026-08-19",
 			Fixture:           "internal/runtime/executor/testdata/compat/zhipu_glm53_forced_thinking.json",
-			UpstreamEvidence:  "GLM-5.3 forces thinking on and accepts only low, high, or max reasoning_effort values; Coding Plan maps common compatibility values into those levels.",
+			UpstreamEvidence:  "GLM-5.3 and GLM-5.3-Flash force thinking on and accept only low, high, or max reasoning_effort values; Coding Plan maps common compatibility values into those levels.",
 			RetrySemantics:    "Request-local transform; no retry, cooldown, or credential eviction changes.",
 			ReviewDate:        "2026-11-19",
 		},

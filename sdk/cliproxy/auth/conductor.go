@@ -151,6 +151,7 @@ type requestAttemptTrace struct {
 	gptRetryPressureDegraded     int
 	gptRetryPressureThrottled    bool
 	zeroEligibleProbeKey         string
+	kimiQuotaAccounts            map[string]struct{}
 }
 
 type requestExecutionSummary struct {
@@ -1648,7 +1649,13 @@ type Manager struct {
 	gptPolicyPersistMu    sync.Mutex
 }
 
-const contentAuditReviewModel = "codex-auto-review"
+// ContentAuditReviewModel is reserved for CPA's internal content-review route.
+const ContentAuditReviewModel = "codex-auto-review"
+
+const (
+	contentAuditReviewModel         = ContentAuditReviewModel
+	contentAuditReviewAuthAttribute = "internal_content_audit_review"
+)
 
 type internalAuthSelectionCapability struct{}
 
@@ -4665,6 +4672,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				trace.recordFinalStatus(statusCodeFromError(errStream))
 			}
 			m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, errStream)
+			if isKimiInsufficientQuotaError(auth, errStream) {
+				return nil, errStream
+			}
 			if channelFailover {
 				if !directFailover {
 					return nil, markGPTChannelFailoverError(errStream)
@@ -4805,6 +4815,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
 			}
 			cleanupAttempt()
+			if isKimiInsufficientQuotaError(auth, bootstrapErr) {
+				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
+			}
 			if channelFailover || unauthorized {
 				if channelFailover && !directFailover {
 					bootstrapErr = markGPTChannelFailoverError(bootstrapErr)
@@ -5336,13 +5349,73 @@ func (m *Manager) ExecuteContentAuditReview(ctx context.Context, req cliproxyexe
 		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review request", HTTPStatus: http.StatusBadRequest}
 	}
 	opts.InternalAuthSelectionCapability = contentAuditReviewAuthSelectionCapability
-	return m.runExecuteAttempts(ctx, []string{"codex"}, req, opts)
+	auth, executor, err := m.pickNext(ctx, "codex", contentAuditReviewModel, opts, nil)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if auth == nil || executor == nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	baseURL := strings.TrimSpace(auth.Attributes["base_url"])
+	if baseURL == "" {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_route", Message: "content audit review base URL is unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	body, err := sjson.SetBytes(req.Payload, "model", contentAuditReviewModel)
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review payload", HTTPStatus: http.StatusBadRequest}
+	}
+	body, err = sjson.SetBytes(body, "stream", false)
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_request", Message: "invalid content audit review payload", HTTPStatus: http.StatusBadRequest}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_route", Message: "content audit review route is invalid", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpResp, err := executor.HttpRequest(ctx, auth, httpReq)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if httpResp == nil || httpResp.Body == nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "content audit review returned an empty response", HTTPStatus: http.StatusBadGateway}
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close content audit review response body")
+		}
+	}()
+	const maxReviewResponseBytes = 2 << 20
+	responseBody, err := io.ReadAll(io.LimitReader(httpResp.Body, maxReviewResponseBytes+1))
+	if err != nil {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "failed to read content audit review response", HTTPStatus: http.StatusBadGateway}
+	}
+	if len(responseBody) > maxReviewResponseBytes {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_internal_response", Message: "content audit review response is too large", HTTPStatus: http.StatusBadGateway}
+	}
+	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		return cliproxyexecutor.Response{}, &Error{
+			Code:       fmt.Sprintf("content_audit_review_upstream_%d", httpResp.StatusCode),
+			Message:    "content audit review upstream rejected the request",
+			HTTPStatus: httpResp.StatusCode,
+		}
+	}
+	return cliproxyexecutor.Response{Payload: responseBody, Headers: httpResp.Header.Clone()}, nil
 }
 
 func allowsContentAuditReviewExcludedModel(provider, model string, opts cliproxyexecutor.Options) bool {
 	return opts.InternalAuthSelectionCapability == contentAuditReviewAuthSelectionCapability &&
 		strings.EqualFold(strings.TrimSpace(provider), "codex") &&
 		strings.TrimSpace(model) == contentAuditReviewModel
+}
+
+func supportsContentAuditReview(auth *Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(auth.Attributes[contentAuditReviewAuthAttribute]))
+	return err == nil && value
 }
 
 func contentAuditReviewPublicRouteError() error {
@@ -5489,6 +5562,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	kimiQuotaAccounts := make(map[string]struct{})
 	trace := requestAttemptTraceFromContext(ctx)
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
@@ -5703,6 +5777,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
 				authErr = errExec
 				countAttempt = true
+				if isKimiInsufficientQuotaError(auth, errExec) {
+					break modelLoop
+				}
 				if remoteCompaction {
 					break modelLoop
 				}
@@ -5757,6 +5834,13 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.logRemoteCompactionFallback(ctx, routeModel, compactionFallback, authErr)
 				continue
 			}
+			kimiQuotaFallback := false
+			if isKimiInsufficientQuotaError(auth, authErr) {
+				if !m.prepareKimiInsufficientQuotaFallback(ctx, tried, kimiQuotaAccounts, auth, authErr) {
+					return cliproxyexecutor.Response{}, authErr
+				}
+				kimiQuotaFallback = true
+			}
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
 			if channelFailover || isGPTNetworkRoundFailure(authErr) {
@@ -5778,7 +5862,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
+			} else if !kimiQuotaFallback && !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(authErr) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return cliproxyexecutor.Response{}, errWait
 				}
@@ -5812,6 +5896,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	kimiQuotaAccounts := make(map[string]struct{})
 	m.markPreviouslyFailedGPTChannels(ctx, tried)
 	nextRetryReason := ""
 	var lastErr error
@@ -5957,6 +6042,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, errStream
 			}
+			kimiQuotaFallback := false
+			if isKimiInsufficientQuotaError(auth, errStream) {
+				if !m.prepareKimiInsufficientQuotaFallback(ctx, tried, kimiQuotaAccounts, auth, errStream) {
+					return nil, errStream
+				}
+				kimiQuotaFallback = true
+			}
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
 				m.markRetryChannelTried(ctx, tried, auth, errStream)
 			}
@@ -5991,7 +6083,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			trace.recordFallback()
 			if homeMode {
 				homeAuthCount++
-			} else if !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
+			} else if !kimiQuotaFallback && !channelFailover && !routeFallback && !transientNetworkFallback && !emptyUpstreamFallback && !typedFailureRequestsImmediateRetry(errStream) {
 				if errWait := m.waitForRetryQueue(ctx); errWait != nil {
 					return nil, errWait
 				}
@@ -7623,6 +7715,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
+		}
+		if shouldShareKimiAccountQuota(auth, result) {
+			schedulerSnapshots = append(schedulerSnapshots, m.applyKimiSharedAccountQuotaLocked(ctx, auth, result.Error, result.RetryAfter, now)...)
 		}
 		schedulerSnapshots = append(schedulerSnapshots, m.applyChannelBreakerResultLocked(ctx, auth, result, requestedModelAlias, now)...)
 		if slowPenalty > 0 {
@@ -10937,6 +11032,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+			continue
+		}
+		if allowsContentAuditReviewExcludedModel(provider, model, opts) && !supportsContentAuditReview(candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {

@@ -13,7 +13,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -38,9 +40,10 @@ const (
 )
 
 const xiaomiMimoInvalidThinkingHistoryMessage = "MiMo 工具调用历史缺少真实 reasoning_content，CPA 无法可靠还原。请新建会话、关闭思考或清理工具历史后重试；系统不会伪造思考内容、删除工具或跨渠道重试。"
-const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的原始推理内容。Codex 中重复重试或 /compact 无法修复；请切换到 OpenAI 原生 GPT 模型后继续并执行 /compact，或新建 DeepSeek 会话。若客户端支持，也可关闭思考模式后继续；这不是账号额度或网络错误。"
+const deepSeekInvalidThinkingHistoryMessage = "DeepSeek 兼容性提示：当前会话使用过文件读取、搜索、命令执行等工具，但会话历史未保留 DeepSeek 继续思考所需的完整记录。重复重试或 /compact 无法修复；请在当前客户端中新建 DeepSeek 会话，或切换到 OpenAI 原生 GPT 模型后继续。若客户端支持，也可关闭思考模式后重试；这不是账号额度或网络错误。"
 const workBuddyDeepSeekInvalidThinkingHistoryMessage = "当前对话的深度思考记录不完整，暂时无法继续。请任选一种方式处理：\n1. 推荐：在 WorkBuddy 中点击“新建对话”，然后重新发送刚才的问题。\n2. 或关闭深度思考：打开 WorkBuddy 的“设置” → 进入“模型设置”或“自定义模型” → 选择当前 DeepSeek 模型 → 关闭“深度思考”“Thinking”或“Reasoning”开关 → 返回对话重试。不同版本的菜单名称可能略有不同。\n3. 如果仍然无法使用，请在模型列表中切换到 OpenAI 原生 GPT 模型，再重新发送。\n这不是账号余额或网络问题。"
-const zhipuGLM53InvalidThinkingHistoryMessage = "GLM-5.3 保留式思考的工具调用历史缺少原始 reasoning_content，CPA 不会伪造或重写思考内容。请新建对话，或确保客户端完整保留并按原顺序回传 reasoning_content 后重试；GLM-5.3 不支持通过关闭思考来绕过此问题。"
+const claudeCodeDeepSeekInvalidThinkingHistoryMessage = "当前 Claude Code 会话的深度思考记录不完整，系统未能安全关闭本次深度思考。请在 Claude Code 中新建会话后重新发送；如果必须保留当前上下文，请切换到 OpenAI 原生 GPT 模型后继续。重复重试或 /compact 无法补回已缺失的记录；这不是 API Key、账号余额或网络问题。"
+const zhipuGLM53InvalidThinkingHistoryMessage = "GLM-5.3 系列保留式思考的工具调用历史缺少原始 reasoning_content，CPA 不会伪造或重写思考内容。请新建对话，或确保客户端完整保留并按原顺序回传 reasoning_content 后重试；GLM-5.3 系列不支持通过关闭思考来绕过此问题。"
 
 type deepSeekThinkingIntent uint8
 
@@ -52,7 +55,7 @@ const (
 
 type thinkingHistoryTransformReport = compathistory.Report
 
-func enforceThinkingHistoryTransform(ctx context.Context, provider string, report thinkingHistoryTransformReport, duration time.Duration) error {
+func enforceThinkingHistoryTransform(ctx context.Context, provider, clientProfile string, report thinkingHistoryTransformReport, duration time.Duration) error {
 	stage := ""
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
@@ -83,7 +86,7 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider string, repor
 			MaxExpansionRatio: internalpayload.DefaultMaxExpansionRatio,
 		}
 	}
-	return internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+	if err := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
 		Stage:           stage,
 		InputBytes:      int64(report.InputBytes),
 		OutputBytes:     int64(report.OutputBytes),
@@ -93,7 +96,21 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider string, repor
 		AppliedPolicies: appliedPolicies,
 		Downgrades:      downgrades,
 		ReusedInput:     report.PatchedCount == 0 && report.SyntheticBytes == 0 && report.InputBytes == report.OutputBytes,
-	}, override)
+	}, override); err != nil {
+		return err
+	}
+	if report.DowngradeReason == thinkingHistoryClientDowngradeReason {
+		helpers := helps.LogWithRequestID(ctx).WithFields(log.Fields{
+			"event":    thinkingHistoryClientDowngradeReason,
+			"provider": strings.ToLower(strings.TrimSpace(provider)),
+			"reason":   deepSeekInvalidThinkingHistoryCode,
+		})
+		if profile := strings.ToLower(strings.TrimSpace(clientProfile)); profile != "" {
+			helpers = helpers.WithField("client_profile", profile)
+		}
+		helpers.Warn("DeepSeek thinking disabled because client history was incomplete")
+	}
+	return nil
 }
 
 func normalizeThinkingHistory(body []byte, provider string) ([]byte, bool, bool, error) {
@@ -132,17 +149,17 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 			return body, false, false, report, nil
 		}
 		clientProfile = strings.ToLower(strings.TrimSpace(clientProfile))
-		workBuddyDowngrade := clientProfile == "workbuddy"
-		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault || workBuddyDowngrade {
+		clientDowngrade := clientProfile == "workbuddy" || clientProfile == "claude_code"
+		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault || clientDowngrade {
 			out, errDisable := disableDeepSeekThinkingForIncompleteHistory(body, provider)
 			if errDisable != nil {
-				if workBuddyDowngrade {
-					return body, false, false, report, missingReasoningHistoryStatusErrorWithMessage(err, workBuddyDeepSeekInvalidThinkingHistoryMessage)
+				if clientDowngrade {
+					return body, false, false, report, missingReasoningHistoryStatusErrorWithMessage(err, deepSeekInvalidThinkingHistoryMessageForClient(clientProfile))
 				}
 				return body, false, false, report, errDisable
 			}
 			report.OutputBytes = len(out)
-			if workBuddyDowngrade {
+			if clientDowngrade {
 				report.DowngradeReason = thinkingHistoryClientDowngradeReason
 			} else {
 				report.DowngradeReason = thinkingHistoryUnrepairableReason
@@ -165,6 +182,17 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 		return normalizeClaudeThinkingHistoryWithReport(body, false)
 	default:
 		return body, false, false, report, nil
+	}
+}
+
+func deepSeekInvalidThinkingHistoryMessageForClient(clientProfile string) string {
+	switch strings.ToLower(strings.TrimSpace(clientProfile)) {
+	case "workbuddy":
+		return workBuddyDeepSeekInvalidThinkingHistoryMessage
+	case "claude_code":
+		return claudeCodeDeepSeekInvalidThinkingHistoryMessage
+	default:
+		return deepSeekInvalidThinkingHistoryMessage
 	}
 }
 

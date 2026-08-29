@@ -50,6 +50,22 @@ func userFacingWorkBuddyDeepSeekContentFormatMessage() string {
 	return "当前 WorkBuddy 对话包含 DeepSeek 无法识别的分段内容。请点击“新建对话”后重试；“工具调用”可以继续勾选。若仍失败，请打开“模型设置”关闭“推理模式”，或切换到 OpenAI 原生 GPT 模型。这不是余额或网络问题。"
 }
 
+func userFacingClaudeCodeDeepSeekToolHistoryMessage() string {
+	return "当前 Claude Code 会话已累积大量工具调用记录，DeepSeek-艾俊 Flash 暂时无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。这不是 API Key、余额或网络问题。"
+}
+
+func userFacingClaudeCodeDeepSeekComplexToolsMessage() string {
+	return "当前 Claude Code 请求包含较多工具定义，DeepSeek-艾俊 Flash 暂时无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。这不是 API Key、余额或网络问题。"
+}
+
+func userFacingClaudeCodeDeepSeekAttachmentMessage() string {
+	return "当前 Claude Code 请求包含图片或文件内容，DeepSeek-艾俊 Flash 无法可靠接收，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请移除图片或文件后新建 Claude Code 会话，或切换到 OpenAI 原生 GPT 模型。"
+}
+
+func userFacingClaudeCodeDeepSeekContentFormatMessage() string {
+	return "当前 Claude Code 请求包含 DeepSeek-艾俊 Flash 无法可靠识别的分段内容，系统将自动尝试其他 DeepSeek 通道。如果仍失败，请在 Claude Code 中新建会话，或切换到 OpenAI 原生 GPT 模型。"
+}
+
 func userFacingDeepSeekResponsesNonFunctionToolsMessage(errText string) string {
 	toolNames := deepSeekUnsupportedToolChineseNames(errText)
 	return "DeepSeek V4 Pro 已支持函数调用、联网搜索和补丁应用，但当前 Codex 请求还使用了 DeepSeek 不支持的工具：" + strings.Join(toolNames, "、") + "。这是工具协议的兼容性限制，不是账号、余额或网络问题。请移除这些工具，或在 Codex 的模型选择器中切换到原生 GPT 模型后重试。"
@@ -183,6 +199,14 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 	message := UserFacingRequestFeatureUnsupportedMessage()
 	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
 		switch {
+		case hasClaudeCodeDeepSeekComplexToolsSignal(candidate):
+			message = userFacingClaudeCodeDeepSeekComplexToolsMessage()
+		case hasClaudeCodeDeepSeekToolHistorySignal(candidate):
+			message = userFacingClaudeCodeDeepSeekToolHistoryMessage()
+		case hasClaudeCodeDeepSeekAttachmentSignal(candidate):
+			message = userFacingClaudeCodeDeepSeekAttachmentMessage()
+		case hasClaudeCodeDeepSeekContentFormatSignal(candidate):
+			message = userFacingClaudeCodeDeepSeekContentFormatMessage()
 		case hasWorkBuddyDeepSeekComplexToolsSignal(candidate):
 			message = userFacingWorkBuddyDeepSeekComplexToolsMessage()
 		case hasWorkBuddyDeepSeekToolHistorySignal(candidate):
@@ -328,6 +352,26 @@ func hasWorkBuddyDeepSeekAttachmentSignal(text string) bool {
 func hasWorkBuddyDeepSeekContentFormatSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "workbuddy_deepseek_content_format")
+}
+
+func hasClaudeCodeDeepSeekToolHistorySignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "claude_code_deepseek_akool_tool_history")
+}
+
+func hasClaudeCodeDeepSeekComplexToolsSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "claude_code_deepseek_akool_complex_tools")
+}
+
+func hasClaudeCodeDeepSeekAttachmentSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "claude_code_deepseek_akool_attachment_input")
+}
+
+func hasClaudeCodeDeepSeekContentFormatSignal(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "claude_code_deepseek_akool_content_format")
 }
 
 func hasDeepSeekResponsesNonFunctionToolsSignal(text string) bool {

@@ -74,6 +74,7 @@ func (r *codexContentAuditReviewer) Review(ctx context.Context, request contenta
 func reviewEnvelope(request contentaudit.ModelReviewRequest) string {
 	metadata, _ := json.Marshal(map[string]string{
 		"category_hint": request.Category,
+		"matched_term":  request.MatchedTerm,
 		"rule_id":       request.RuleID,
 		"severity_hint": request.Severity,
 	})

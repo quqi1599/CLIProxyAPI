@@ -117,13 +117,20 @@ content-audit:
   model-review:
     mode: "off" # off, shadow, or enforce
     model: "codex-auto-review"
+    # Optional second gate: only these rule IDs may call the reviewer. Omit this field
+    # to review every policy rule marked model-review: true; an explicit [] disables calls.
+    # rules: ["review-ambiguous-rule"]
     prompt-version: "cpa-audit-review-v1"
     timeout-milliseconds: 3500
     queue-timeout-milliseconds: 100
     max-concurrent: 16
     cache-seconds: 600
     max-input-bytes: 32768
+    # Releasing a local block should require stronger confidence than escalating
+    # an observe rule. min-confidence remains the backward-compatible default.
     min-confidence: 0.90
+    allow-min-confidence: 0.98
+    block-min-confidence: 0.90
     circuit-failure-threshold: 5
     circuit-open-seconds: 30
 
@@ -427,8 +434,8 @@ nonstream-keepalive-interval: 0
 # OpenAI compatibility providers
 # Kimi has two common upstream surfaces: OpenAI-compatible /chat/completions
 # and Coding Agent /v1/messages compatibility. Keep keys in the surface they
-# are valid for; if the same Kimi key is duplicated across openai-compatibility
-# and claude-api-key, disable or remove it in both places when it is exhausted.
+# are valid for. If the same Kimi key is duplicated across openai-compatibility
+# and claude-api-key, account-quota cooldowns are shared across both records.
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.
 #     kind: "newapi" # optional built-in profile: kimi, minimax, qwen, zhipu, xfyun, maas, langengyun, newapi

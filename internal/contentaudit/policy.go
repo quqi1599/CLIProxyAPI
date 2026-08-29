@@ -324,16 +324,15 @@ func (m *Matcher) Match(text string) Decision {
 	return m.match(text, "", false)
 }
 
-// MatchScoped evaluates block rules against the current user scope while
-// retaining full request coverage for observation rules.
-func (m *Matcher) MatchScoped(enforcementText, observationText string, continuation bool) Decision {
-	if !continuation && enforcementText == observationText {
-		return m.Match(observationText)
-	}
+// MatchScoped evaluates both block and observation rules against the current
+// user scope. Explicit continuation prompts may include the previous user turn
+// in enforcementText, but non-user roles and ordinary history stay out of the
+// decision scope.
+func (m *Matcher) MatchScoped(enforcementText, _ string, continuation bool) Decision {
 	if decision := m.match(enforcementText, RuleActionBlock, continuation); decision.Matched {
 		return decision
 	}
-	return m.match(observationText, RuleActionObserve, false)
+	return m.match(enforcementText, RuleActionObserve, false)
 }
 
 func (m *Matcher) match(text, action string, continuation bool) Decision {
@@ -404,7 +403,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 	return best
 }
 
-func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, continuation bool) bool {
+func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool) bool {
 	const contextRunes = 192
 	start := max(0, matchStart-contextRunes)
 	end := min(len(text), matchEnd+contextRunes)
@@ -437,7 +436,7 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, contin
 			return true
 		}
 	}
-	return continuation
+	return false
 }
 
 func containsAnyTerm(text string, terms []string) bool {

@@ -2,8 +2,11 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,11 +24,7 @@ type contentAuditReviewRouteExecutor struct {
 func (e *contentAuditReviewRouteExecutor) Identifier() string { return "codex" }
 
 func (e *contentAuditReviewRouteExecutor) Execute(_ context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.authIDs = append(e.authIDs, auth.ID)
-	e.models = append(e.models, req.Model)
-	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+	return cliproxyexecutor.Response{}, errors.New("unexpected translated review execution")
 }
 
 func (e *contentAuditReviewRouteExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -40,8 +39,30 @@ func (e *contentAuditReviewRouteExecutor) CountTokens(context.Context, *Auth, cl
 	return cliproxyexecutor.Response{}, errors.New("unexpected count review")
 }
 
-func (e *contentAuditReviewRouteExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
-	return nil, errors.New("unexpected raw review")
+func (e *contentAuditReviewRouteExecutor) HttpRequest(_ context.Context, auth *Auth, request *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	if err = json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Stream {
+		return nil, errors.New("internal review unexpectedly enabled streaming")
+	}
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, auth.ID)
+	e.models = append(e.models, payload.Model)
+	e.mu.Unlock()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+	}, nil
 }
 
 func (e *contentAuditReviewRouteExecutor) calls() ([]string, []string) {
@@ -62,8 +83,10 @@ func TestContentAuditReviewRouteBypassesOnlyRegistryExclusion(t *testing.T) {
 			ID:       "content-review-disabled",
 			Provider: "codex",
 			Attributes: map[string]string{
-				"auth_kind":       "oauth",
-				"excluded_models": contentAuditReviewModel,
+				"auth_kind":                     "oauth",
+				"base_url":                      "https://review.test/v1",
+				"excluded_models":               contentAuditReviewModel,
+				contentAuditReviewAuthAttribute: "true",
 			},
 			ModelStates: map[string]*ModelState{
 				contentAuditReviewModel: {Status: StatusDisabled},
@@ -73,8 +96,10 @@ func TestContentAuditReviewRouteBypassesOnlyRegistryExclusion(t *testing.T) {
 			ID:       "content-review-healthy",
 			Provider: "codex",
 			Attributes: map[string]string{
-				"auth_kind":       "oauth",
-				"excluded_models": contentAuditReviewModel,
+				"auth_kind":                     "oauth",
+				"base_url":                      "https://review.test/v1",
+				"excluded_models":               contentAuditReviewModel,
+				contentAuditReviewAuthAttribute: "true",
 			},
 		},
 	}
@@ -124,6 +149,54 @@ func TestContentAuditReviewRouteBypassesOnlyRegistryExclusion(t *testing.T) {
 	}
 }
 
+func TestContentAuditReviewRouteSelectsOnlyDedicatedCredential(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &contentAuditReviewRouteExecutor{}
+	manager.RegisterExecutor(executor)
+
+	registryRef := registry.GetGlobalRegistry()
+	auths := []*Auth{
+		{
+			ID:       "unrelated-high-priority",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"excluded_models": contentAuditReviewModel,
+				"priority":        "100",
+			},
+		},
+		{
+			ID:       "dedicated-review",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"base_url":                      "https://review.test/v1",
+				"excluded_models":               contentAuditReviewModel,
+				"priority":                      "1",
+				contentAuditReviewAuthAttribute: "true",
+			},
+		},
+	}
+	for _, auth := range auths {
+		registryRef.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+		if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registryRef.UnregisterClient(auth.ID)
+		}
+	})
+
+	request := cliproxyexecutor.Request{Model: contentAuditReviewModel, Payload: []byte(`{"model":"codex-auto-review"}`)}
+	if _, errExecute := manager.ExecuteContentAuditReview(t.Context(), request, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("ExecuteContentAuditReview() error = %v", errExecute)
+	}
+	authIDs, _ := executor.calls()
+	if len(authIDs) != 1 || authIDs[0] != "dedicated-review" {
+		t.Fatalf("executor auth IDs = %v, want only dedicated-review", authIDs)
+	}
+}
+
 func TestContentAuditReviewRouteConcurrentIsolation(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(&contentAuditReviewRouteExecutor{})
@@ -132,8 +205,9 @@ func TestContentAuditReviewRouteConcurrentIsolation(t *testing.T) {
 		ID:       "content-review-concurrent",
 		Provider: "codex",
 		Attributes: map[string]string{
-			"auth_kind":       "oauth",
-			"excluded_models": contentAuditReviewModel,
+			"auth_kind":                     "oauth",
+			"excluded_models":               contentAuditReviewModel,
+			contentAuditReviewAuthAttribute: "true",
 		},
 	}
 	registryRef := registry.GetGlobalRegistry()
@@ -216,7 +290,7 @@ func TestContentAuditReviewPublicRouteRemainsDeniedWhenRegistryAdvertisesModel(t
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	executor := &contentAuditReviewRouteExecutor{}
 	manager.RegisterExecutor(executor)
-	auth := &Auth{ID: "content-review-public-denied", Provider: "codex"}
+	auth := &Auth{ID: "content-review-public-denied", Provider: "codex", Attributes: map[string]string{contentAuditReviewAuthAttribute: "true"}}
 	registryRef := registry.GetGlobalRegistry()
 	registryRef.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: contentAuditReviewModel}})
 	t.Cleanup(func() { registryRef.UnregisterClient(auth.ID) })
@@ -247,6 +321,9 @@ func TestContentAuditReviewRouteHonorsUnavailableAuth(t *testing.T) {
 	auth := &Auth{
 		ID:       "content-review-cooling",
 		Provider: "codex",
+		Attributes: map[string]string{
+			contentAuditReviewAuthAttribute: "true",
+		},
 		ModelStates: map[string]*ModelState{
 			contentAuditReviewModel: {
 				Status:         StatusError,

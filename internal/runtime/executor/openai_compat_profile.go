@@ -388,7 +388,7 @@ func openAICompatCapabilityProfileForModel(profile openAICompatProfile, model st
 		return profile
 	}
 
-	// GLM-5.3 uses native thinking.type and reasoning_effort controls. Keep the
+	// GLM-5.3 models use native thinking.type and reasoning_effort controls. Keep the
 	// fields until its model-specific compatibility policy canonicalizes them,
 	// and preserve only the real reasoning_content supplied by the client.
 	profile.SupportsNativeThinking = true
@@ -409,7 +409,7 @@ func scrubOpenAICompatPayloadAfterProviderQuirksMode(payload []byte, profile ope
 	if compatKind == "xiaomi" && !registeredPolicies {
 		payload = scrubXiaomiPayloadForModel(payload, model)
 	}
-	if compatKind == "zhipu" {
+	if compatKind == "zhipu" && !isZhipuGLM53FlashModel(model) {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
 	if compatKind == "doubao" && !registeredPolicies {
@@ -465,7 +465,16 @@ func normalizedOpenAICompatPolicyModelName(model string) string {
 }
 
 func isZhipuGLM53Model(model string) bool {
-	return normalizedOpenAICompatPolicyModelName(model) == "glm-5.3"
+	switch normalizedOpenAICompatPolicyModelName(model) {
+	case "glm-5.3", "glm-5.3-flash":
+		return true
+	default:
+		return false
+	}
+}
+
+func isZhipuGLM53FlashModel(model string) bool {
+	return normalizedOpenAICompatPolicyModelName(model) == "glm-5.3-flash"
 }
 
 func normalizeZhipuGLM53Thinking(payload []byte, model string) []byte {
@@ -2961,6 +2970,25 @@ func openAICompatMessageHasContent(message map[string]any) bool {
 						return true
 					}
 				} else if strings.TrimSpace(compatStringValue(part["image_url"])) != "" {
+					return true
+				}
+				if videoURL, okVideoURL := part["video_url"].(map[string]any); okVideoURL {
+					if strings.TrimSpace(compatStringValue(videoURL["url"])) != "" {
+						return true
+					}
+				} else if strings.TrimSpace(compatStringValue(part["video_url"])) != "" {
+					return true
+				}
+				if file, okFile := part["file"].(map[string]any); okFile {
+					for _, key := range []string{"file_id", "file_url", "file_data"} {
+						if strings.TrimSpace(compatStringValue(file[key])) != "" {
+							return true
+						}
+					}
+				} else if strings.TrimSpace(compatStringValue(part["file"])) != "" {
+					return true
+				}
+				if strings.TrimSpace(compatStringValue(part["file_url"])) != "" {
 					return true
 				}
 			default:

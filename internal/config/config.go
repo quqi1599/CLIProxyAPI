@@ -220,17 +220,20 @@ type ContentAuditConfig struct {
 // ContentAuditModelReviewConfig controls the bounded semantic review of keyword matches.
 // The reviewer is an optional second-stage signal; keyword matching remains available when it is off.
 type ContentAuditModelReviewConfig struct {
-	Mode                     string  `yaml:"mode" json:"mode"`
-	Model                    string  `yaml:"model" json:"model"`
-	PromptVersion            string  `yaml:"prompt-version" json:"prompt-version"`
-	TimeoutMilliseconds      int     `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`
-	QueueTimeoutMilliseconds int     `yaml:"queue-timeout-milliseconds" json:"queue-timeout-milliseconds"`
-	MaxConcurrent            int     `yaml:"max-concurrent" json:"max-concurrent"`
-	CacheSeconds             int     `yaml:"cache-seconds" json:"cache-seconds"`
-	MaxInputBytes            int     `yaml:"max-input-bytes" json:"max-input-bytes"`
-	MinConfidence            float64 `yaml:"min-confidence" json:"min-confidence"`
-	CircuitFailureThreshold  int     `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
-	CircuitOpenSeconds       int     `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
+	Mode                     string   `yaml:"mode" json:"mode"`
+	Model                    string   `yaml:"model" json:"model"`
+	Rules                    []string `yaml:"rules,omitempty" json:"rules,omitempty"`
+	PromptVersion            string   `yaml:"prompt-version" json:"prompt-version"`
+	TimeoutMilliseconds      int      `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`
+	QueueTimeoutMilliseconds int      `yaml:"queue-timeout-milliseconds" json:"queue-timeout-milliseconds"`
+	MaxConcurrent            int      `yaml:"max-concurrent" json:"max-concurrent"`
+	CacheSeconds             int      `yaml:"cache-seconds" json:"cache-seconds"`
+	MaxInputBytes            int      `yaml:"max-input-bytes" json:"max-input-bytes"`
+	MinConfidence            float64  `yaml:"min-confidence" json:"min-confidence"`
+	AllowMinConfidence       float64  `yaml:"allow-min-confidence" json:"allow-min-confidence"`
+	BlockMinConfidence       float64  `yaml:"block-min-confidence" json:"block-min-confidence"`
+	CircuitFailureThreshold  int      `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
+	CircuitOpenSeconds       int      `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
 }
 
 // EmptyResponseRetryConfig controls targeted detection of upstream responses

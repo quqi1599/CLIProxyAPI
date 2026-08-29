@@ -50,6 +50,12 @@ func TestExtractJSONRequestScansOnlyUntrustedConversationContent(t *testing.T) {
 			t.Fatalf("MatchedRoles(%q) = %#v, want %#v", term, got, want)
 		}
 	}
+	if got := extracted.EnforcementMatchedRoles("untrusted tool result"); len(got) != 0 {
+		t.Fatalf("EnforcementMatchedRoles(tool output) = %#v, want none", got)
+	}
+	if got := extracted.EnforcementMatchedRoles("untrusted missing-role text"); !slices.Equal(got, []string{"unknown"}) {
+		t.Fatalf("EnforcementMatchedRoles(user-like text) = %#v, want []string{\"unknown\"}", got)
+	}
 }
 
 func TestExtractJSONRequestIncludesTypedToolOutput(t *testing.T) {

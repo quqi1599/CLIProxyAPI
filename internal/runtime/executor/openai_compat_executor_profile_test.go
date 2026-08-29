@@ -435,6 +435,7 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 		{model: "kimi-k3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.2", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "glm-5.3-flash", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "deepseek-v4-pro[1m]", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "deepseek-v4-flash(high)", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 	}
@@ -1385,6 +1386,48 @@ func TestOpenAICompatPayloadZhipuConvertsDataURLImagesToRawBase64(t *testing.T) 
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.image_url.detail").String(); got != "high" {
 		t.Fatalf("image detail = %q, want high: %s", got, string(out))
+	}
+}
+
+func TestOpenAICompatPayloadZhipuGLM53FlashPreservesNativeMultimodalFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		path     string
+		expected string
+	}{
+		{
+			name:     "image data URL",
+			content:  `{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}`,
+			path:     "messages.0.content.0.image_url.url",
+			expected: "data:image/png;base64,AAAA",
+		},
+		{
+			name:     "video URL",
+			content:  `{"type":"video_url","video_url":{"url":"https://example.com/demo.mp4"}}`,
+			path:     "messages.0.content.0.video_url.url",
+			expected: "https://example.com/demo.mp4",
+		},
+		{
+			name:     "file data URL",
+			content:  `{"type":"file","file":{"file_data":"data:text/plain;base64,SGVsbG8=","filename":"demo.txt"}}`,
+			path:     "messages.0.content.0.file.file_data",
+			expected: "data:text/plain;base64,SGVsbG8=",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := []byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":[` + test.content + `]}],"stream":true,"tool_stream":true,"response_format":{"type":"json_object"}}`)
+			out := scrubOpenAICompatPayloadForModel(payload, openAICompatProfileForKind("zhipu"), "glm-5.3-flash", "https://api.z.ai/api/paas/v4")
+
+			if got := gjson.GetBytes(out, test.path).String(); got != test.expected {
+				t.Fatalf("%s = %q, want %q: %s", test.path, got, test.expected, string(out))
+			}
+			if !gjson.GetBytes(out, "tool_stream").Bool() || gjson.GetBytes(out, "response_format.type").String() != "json_object" {
+				t.Fatalf("Flash streaming or structured-output fields were not preserved: %s", string(out))
+			}
+		})
 	}
 }
 

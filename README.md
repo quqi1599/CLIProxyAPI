@@ -92,9 +92,11 @@ and aggregate disabled/cooldown/breaker/unavailable skip counts.
 When mixing Kimi OpenAI-compatible keys with Kimi Coding Agent keys, keep the
 two upstream surfaces separated. Some Kimi Coding keys only work through the
 Claude-compatible `/v1/messages` surface, while ordinary OpenAI-compatible keys
-work through `/chat/completions`. If a key is duplicated in both pools, disable
-or remove it in both places when it is exhausted so routing state and management
-tests do not diverge.
+work through `/chat/completions`. If the same Kimi key is present in both pools,
+account-quota cooldowns are shared across both protocol records. An
+`insufficient_quota` request may switch to at most one different physical Kimi
+account and never retries another protocol alias of the exhausted account.
+Ordinary rate limits remain model-scoped.
 
 ### Empty Successful Response Recovery
 

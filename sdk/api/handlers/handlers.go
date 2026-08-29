@@ -547,10 +547,18 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 }
 
 func inferClientProfileFromHeaders(headers http.Header) string {
+	values := make([]string, 0, 4)
 	for _, name := range []string{"User-Agent", "X-Client-Name", "X-App-Name", "X-Title"} {
-		value := strings.ToLower(headers.Get(name))
+		values = append(values, strings.ToLower(headers.Get(name)))
+	}
+	for _, value := range values {
 		if strings.Contains(value, "workbuddy") || strings.Contains(value, "codebuddy") {
 			return "workbuddy"
+		}
+	}
+	for _, value := range values {
+		if strings.Contains(value, "claude-cli/") || strings.Contains(value, "claude code") || strings.Contains(value, "claude-code") {
+			return "claude_code"
 		}
 	}
 	return ""

@@ -20,6 +20,27 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
+func TestNormalizeModelReviewConfigAllowsBoundedExtendedTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    int
+		expected int
+	}{
+		{name: "default", input: 0, expected: 3500},
+		{name: "extended", input: 8000, expected: 8000},
+		{name: "bounded", input: 12000, expected: 10000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.ContentAuditModelReviewConfig{Mode: ModelReviewModeEnforce, TimeoutMilliseconds: test.input}
+			normalizeModelReviewConfig(&cfg)
+			if cfg.TimeoutMilliseconds != test.expected {
+				t.Fatalf("timeout = %d, want %d", cfg.TimeoutMilliseconds, test.expected)
+			}
+		})
+	}
+}
+
 func TestMiddlewareBlocksBeforeNextAndPersistsCustomerEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")
@@ -136,13 +157,18 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 		mode            string
 		keywordAction   string
 		modelDecision   string
+		modelConfidence float64
+		allowMin        float64
+		blockMin        float64
 		wantStatus      int
 		wantNextCalls   int
 		wantFinalAction string
 	}{
-		{name: "shadow allow does not change block", mode: ModelReviewModeShadow, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
-		{name: "enforce allow releases keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
-		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "shadow allow does not change block", mode: ModelReviewModeShadow, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.99, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce allow releases keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.99, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
+		{name: "enforce low confidence allow keeps keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.95, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.91, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
+		{name: "enforce low confidence block keeps observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.89, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -159,12 +185,14 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 				DatabasePath:  filepath.Join(tempDir, "audit.db"),
 				EvidenceKeyID: "test-key",
 				ModelReview: config.ContentAuditModelReviewConfig{
-					Mode:          test.mode,
-					Model:         "synthetic-reviewer",
-					MinConfidence: 0.9,
+					Mode:               test.mode,
+					Model:              "synthetic-reviewer",
+					MinConfidence:      0.9,
+					AllowMinConfidence: test.allowMin,
+					BlockMinConfidence: test.blockMin,
 				},
 			}, filepath.Join(tempDir, "config.yaml"), modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
-				return ModelReviewResult{Decision: test.modelDecision, Category: "jailbreak", Confidence: 0.99}, nil
+				return ModelReviewResult{Decision: test.modelDecision, Category: "jailbreak", Confidence: test.modelConfidence}, nil
 			}))
 			state := service.state.Load()
 			defer func() { _ = state.store.Close() }()
@@ -421,12 +449,28 @@ rules:
 		t.Fatalf("tool-output status=%d next=%d body=%s", toolResponse.Code, nextCalls, toolResponse.Body.String())
 	}
 
+	historyRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"ordinary current question"}]}`))
+	historyRequest.Header.Set("Content-Type", "application/json")
+	historyResponse := httptest.NewRecorder()
+	router.ServeHTTP(historyResponse, historyRequest)
+	if historyResponse.Code != http.StatusNoContent || nextCalls != 2 {
+		t.Fatalf("history status=%d next=%d body=%s", historyResponse.Code, nextCalls, historyResponse.Body.String())
+	}
+
 	continuationRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"继续"}]}`))
 	continuationRequest.Header.Set("Content-Type", "application/json")
 	continuationResponse := httptest.NewRecorder()
 	router.ServeHTTP(continuationResponse, continuationRequest)
-	if continuationResponse.Code != http.StatusBadRequest || nextCalls != 1 {
+	if continuationResponse.Code != http.StatusNoContent || nextCalls != 3 {
 		t.Fatalf("continuation status=%d next=%d body=%s", continuationResponse.Code, nextCalls, continuationResponse.Body.String())
+	}
+
+	directContinuationRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":[{"role":"user","content":"generate story with explicit phrase"},{"role":"assistant","content":"refusal"},{"role":"user","content":"继续"}]}`))
+	directContinuationRequest.Header.Set("Content-Type", "application/json")
+	directContinuationResponse := httptest.NewRecorder()
+	router.ServeHTTP(directContinuationResponse, directContinuationRequest)
+	if directContinuationResponse.Code != http.StatusBadRequest || nextCalls != 3 {
+		t.Fatalf("direct-continuation status=%d next=%d body=%s", directContinuationResponse.Code, nextCalls, directContinuationResponse.Body.String())
 	}
 
 	list, err := service.List(t.Context(), ListFilter{})
@@ -435,13 +479,13 @@ rules:
 	}
 	for _, item := range list.Items {
 		switch item.RuleID {
-		case "observe-rule":
-			if !item.UpstreamSent {
-				t.Fatalf("tool output observe event was blocked: %#v", item)
-			}
 		case "block-rule":
 			if item.UpstreamSent {
 				t.Fatalf("continuation block event was sent upstream: %#v", item)
+			}
+		case "observe-rule":
+			if !item.UpstreamSent {
+				t.Fatalf("ambiguous continuation observation did not reach upstream: %#v", item)
 			}
 		default:
 			t.Fatalf("unexpected event: %#v", item)

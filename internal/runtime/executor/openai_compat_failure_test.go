@@ -76,6 +76,14 @@ func TestNewOpenAICompatStatusErrTypedFailureParity(t *testing.T) {
 			wantRetry: true,
 		},
 		{
+			name:      "403 insufficient quota code is credential scoped",
+			status:    http.StatusForbidden,
+			body:      `{"error":{"message":"quota is unavailable","code":"insufficient_quota"}}`,
+			wantKind:  failurecontract.QuotaExceeded,
+			wantScope: failurecontract.ScopeCredential,
+			wantRetry: true,
+		},
+		{
 			name:      "429 rate limit",
 			status:    http.StatusTooManyRequests,
 			headers:   http.Header{"Retry-After": {"12"}},
