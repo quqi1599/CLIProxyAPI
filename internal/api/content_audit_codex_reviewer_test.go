@@ -21,7 +21,8 @@ func TestCodexContentAuditReviewerUsesDirectCodexExecution(t *testing.T) {
 			t.Fatalf("request=%#v options=%#v", request, options)
 		}
 		body := string(request.Payload)
-		if !strings.Contains(body, "CURRENT_USER_TEXT") || !strings.Contains(body, "synthetic user text") || !strings.Contains(body, "matched_term") {
+		if !strings.Contains(body, "CURRENT_USER_TEXT") || !strings.Contains(body, "synthetic user text") || !strings.Contains(body, "matched_term") ||
+			!strings.Contains(body, "pornographic") || !strings.Contains(body, "gambling operation") {
 			t.Fatalf("payload=%s", body)
 		}
 		return coreexecutor.Response{Payload: []byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"decision\":\"allow\",\"category\":\"jailbreak\",\"confidence\":0.98,\"reason_codes\":[\"SAFETY_CONTEXT\"]}"}]}]}`)}, nil
