@@ -327,6 +327,40 @@ func TestEnrichAuthSelectionError_PreservesExplicitStatus(t *testing.T) {
 	}
 }
 
+func TestEnrichAuthSelectionError_PreservesCanonicalCompactionFailure(t *testing.T) {
+	retryAfter := 17 * time.Second
+	in := &failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeModel,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		SemanticCode:  "compaction_route_unavailable",
+		RetryAfter:    &retryAfter,
+		Retryable:     true,
+		Cause:         &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusServiceUnavailable},
+		PublicMessage: "compaction_route_unavailable: all compatible remote-compaction routes are temporarily unavailable",
+	}
+	out := enrichAuthSelectionError(in, []string{"codex"}, "gpt-5.6-sol")
+
+	if out != in {
+		t.Fatalf("canonical failure was replaced: got %T %v", out, out)
+	}
+	errMsg := executionErrorMessage(out)
+	if errMsg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want 503", errMsg.StatusCode)
+	}
+	if got := errMsg.Addon.Get("Retry-After"); got != "17" {
+		t.Fatalf("Retry-After = %q, want 17", got)
+	}
+	body := BuildErrorResponseBody(errMsg.StatusCode, errMsg.Error.Error())
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Code != "compaction_route_unavailable" {
+		t.Fatalf("error code = %q, want compaction_route_unavailable", payload.Error.Code)
+	}
+}
+
 func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	in := errors.New("boom")
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")

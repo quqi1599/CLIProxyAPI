@@ -2542,6 +2542,10 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	if err == nil {
 		return nil
 	}
+	var canonical *failurecontract.Failure
+	if errors.As(err, &canonical) && canonical != nil {
+		return err
+	}
 
 	var authErr *coreauth.Error
 	if !errors.As(err, &authErr) || authErr == nil {
