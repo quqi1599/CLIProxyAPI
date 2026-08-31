@@ -8851,16 +8851,18 @@ func errorCodeFromError(err error) string {
 	if err == nil {
 		return ""
 	}
-	var authErr *Error
-	if errors.As(err, &authErr) && authErr != nil {
-		return strings.TrimSpace(authErr.Code)
-	}
 	type errorCoder interface {
 		ErrorCode() string
 	}
 	var ec errorCoder
 	if errors.As(err, &ec) && ec != nil {
-		return strings.TrimSpace(ec.ErrorCode())
+		if code := strings.TrimSpace(ec.ErrorCode()); code != "" {
+			return code
+		}
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return strings.TrimSpace(authErr.Code)
 	}
 	return ""
 }

@@ -31,9 +31,9 @@ type LogFormatter struct{}
 
 // logFieldOrder defines the display order for common log fields.
 var logFieldOrder = []string{
-	"event", "client_request_id", "provider", "model", "requested_model", "upstream_model",
+	"event", "client_request_id", "provider", "model", "requested_model", "requested_model_hash", "requested_model_bytes", "upstream_model",
 	"auth_index", "routing_strategy", "routing_scope", "routing_group", "prefix", "base_url", "token_hash",
-	"selection_reason", "candidate_count", "candidate_ready_count", "candidate_health_downweighted",
+	"selection_reason", "routing_phase", "candidate_count", "candidate_ready_count", "candidate_health_downweighted",
 	"candidate_skipped_disabled", "candidate_skipped_cooldown", "candidate_skipped_breaker", "candidate_skipped_unavailable",
 	"status", "status_code", "success", "error_code", "retryable", "retry_after_ms", "reset_ms", "providers",
 	"normalized_status", "outer_status", "failure_kind", "failure_scope", "scope", "semantic_type", "semantic_code",
@@ -57,7 +57,7 @@ var logFieldOrder = []string{
 	"first_event_success_rate_25", "first_event_success_rate_30", "first_event_success_rate_40", "first_event_success_rate_50",
 	"failure_rate", "hard_failure_rate", "timeout_count", "upstream_5xx_count", "network_failure_count", "used_global_fallback",
 	"max_channels", "max_rounds", "wait_budget_ms",
-	"executor", "channel", "compat_name", "compat_kind", "compat_kind_source", "compat_mapping", "upstream_request_id",
+	"executor", "plugin_id", "plugin_id_hash", "plugin_id_bytes", "channel", "compat_name", "compat_kind", "compat_kind_source", "compat_mapping", "upstream_request_id",
 	"payload_fields", "message_roles", "message_role_sequence", "message_content_kinds", "content_part_types",
 	"input_item_types", "tool_definition_count", "tool_call_count", "tool_choice_type", "thinking_type",
 	"response_format_type", "parallel_tool_calls", "assistant_tool_call_messages", "tool_result_messages",
@@ -69,7 +69,7 @@ var logFieldOrder = []string{
 	"wire_input_bytes", "decoded_input_bytes", "transform_output_bytes", "transform_added_bytes", "transform_removed_bytes",
 	"transform_synthetic_bytes", "transform_duration_ms", "transform_stage_count", "transform_stages",
 	"amplification_ratio", "amplification_exceeded", "instrumented", "finalized",
-	"failure_class", "endpoint_method", "endpoint_path", "endpoint", "client_profile", "payload_bytes", "message_count", "tool_count",
+	"failure_class", "endpoint_method", "endpoint_path", "endpoint", "source_format", "request_stream", "client_profile", "payload_bytes", "payload_sha256", "message_count", "tool_count",
 	"declared_tool_count", "tool_interaction_count", "mcp_tool_count", "builtin_tool_count", "tool_types", "tool_name_hashes",
 	"parallel_tool_calls_forced", "tool_stream_repair_kind", "orphan_tool_delta_dropped_count", "invalid_tool_announcement_dropped_count",
 	"tool_done_fallback_emitted_count",

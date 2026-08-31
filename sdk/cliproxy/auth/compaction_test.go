@@ -321,6 +321,13 @@ func TestRemoteCompactionHealthBlockedCompatibleRouteReturnsTypedUnavailable(t *
 	if !ok || failure.ErrorCode() != "compaction_route_unavailable" || failure.StatusCode() != http.StatusServiceUnavailable {
 		t.Fatalf("ExecuteStream() error = %T %v, want typed compaction_route_unavailable 503", err, err)
 	}
+	if code := errorCodeFromError(err); code != "compaction_route_unavailable" {
+		t.Fatalf("errorCodeFromError() = %q, want outer compaction_route_unavailable instead of wrapped auth code", code)
+	}
+	resultErr := resultErrorFromCause(err)
+	if resultErr == nil || resultErr.Code != "compaction_route_unavailable" || resultErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("resultErrorFromCause() = %+v, want compaction_route_unavailable 503", resultErr)
+	}
 	if failure.RetryAfter == nil || *failure.RetryAfter < 9*time.Second || *failure.RetryAfter > 11*time.Second {
 		t.Fatalf("RetryAfter = %v, want the next safe half-open probe window", failure.RetryAfter)
 	}

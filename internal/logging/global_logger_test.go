@@ -209,6 +209,60 @@ func TestLogFormatterIncludesRoutingAvailabilityAndCanonicalFailureFields(t *tes
 	}
 }
 
+func TestLogFormatterIncludesPreRouteFailureCorrelationFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 8, 30, 23, 30, 0, 0, time.Local)
+	entry.Level = log.WarnLevel
+	entry.Message = "pre-route failure"
+	entry.Data["request_id"] = "cpa-502"
+	entry.Data["event"] = "pre_route_failure"
+	entry.Data["client_request_id"] = "oneapi-502"
+	entry.Data["requested_model"] = "unknown-model"
+	entry.Data["routing_phase"] = "pre_route"
+	entry.Data["failure_class"] = "pre_route_bad_gateway"
+	entry.Data["failure_kind"] = "provider_resolution"
+	entry.Data["failure_scope"] = "request"
+	entry.Data["status_code"] = http.StatusBadGateway
+	entry.Data["error_code"] = "provider_not_resolved"
+	entry.Data["endpoint_method"] = http.MethodPost
+	entry.Data["endpoint_path"] = "/v1/chat/completions"
+	entry.Data["source_format"] = "openai"
+	entry.Data["request_stream"] = false
+	entry.Data["payload_bytes"] = 105
+	entry.Data["payload_sha256"] = strings.Repeat("a", 64)
+	entry.Data["attempt_count"] = 0
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+
+	line := string(formatted)
+	for _, want := range []string{
+		"[cpa-502]",
+		"event=pre_route_failure",
+		"client_request_id=oneapi-502",
+		"requested_model=unknown-model",
+		"routing_phase=pre_route",
+		"failure_class=pre_route_bad_gateway",
+		"failure_kind=provider_resolution",
+		"failure_scope=request",
+		"status_code=502",
+		"error_code=provider_not_resolved",
+		"endpoint_method=POST",
+		"endpoint_path=/v1/chat/completions",
+		"source_format=openai",
+		"request_stream=false",
+		"payload_bytes=105",
+		"payload_sha256=" + strings.Repeat("a", 64),
+		"attempt_count=0",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %q", line, want)
+		}
+	}
+}
+
 func TestLogFormatterIncludesRemoteCompactionAvailabilityFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 8, 24, 2, 49, 27, 0, time.Local)

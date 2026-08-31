@@ -1075,6 +1075,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
 	if errMsg != nil {
+		logProviderResolutionFailure(ctx, errMsg.StatusCode, entryProtocol, originalRequestedModel, false, rawJSON, execOptions)
 		return nil, nil, errMsg
 	}
 	providers = filterProvidersByToolCompatibility(providers, execOptions.complexity)
@@ -1153,6 +1154,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision)
 	if errMsg != nil {
+		logProviderResolutionFailure(ctx, errMsg.StatusCode, handlerType, originalRequestedModel, false, rawJSON, execOptions)
 		return nil, nil, errMsg
 	}
 	providers = filterProvidersByToolCompatibility(providers, execOptions.complexity)
@@ -1209,14 +1211,18 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	host := h.pluginExecutorHost()
 	if host == nil {
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginHostUnavailable, entryProtocol, originalRequestedModel, executorPluginID, false, rawJSON, execOptions)
+		return nil, nil, errMsg
 	}
 	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, false, execOptions)
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	resp, errExecute := host.ExecutePluginExecutor(ctx, executorPluginID, req, opts)
 	if errExecute != nil {
-		return nil, nil, executionErrorMessage(errExecute)
+		errMsg := executionErrorMessage(errExecute)
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginExecutionFailed, entryProtocol, originalRequestedModel, executorPluginID, false, rawJSON, execOptions)
+		return nil, nil, errMsg
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
@@ -1227,14 +1233,18 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	host := h.pluginExecutorHost()
 	if host == nil {
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginHostUnavailable, handlerType, originalRequestedModel, executorPluginID, false, rawJSON, execOptions)
+		return nil, nil, errMsg
 	}
 	req, opts := h.pluginExecutorRequest(ctx, handlerType, handlerType, modelName, originalRequestedModel, rawJSON, alt, false, execOptions)
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	resp, errCount := host.CountPluginExecutor(ctx, executorPluginID, req, opts)
 	if errCount != nil {
-		return nil, nil, executionErrorMessage(errCount)
+		errMsg := executionErrorMessage(errCount)
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginExecutionFailed, handlerType, originalRequestedModel, executorPluginID, false, rawJSON, execOptions)
+		return nil, nil, errMsg
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
@@ -1326,7 +1336,9 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	if host == nil {
 		releaseAdmission()
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor host is unavailable")}
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginHostUnavailable, entryProtocol, originalRequestedModel, executorPluginID, true, rawJSON, execOptions)
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1337,14 +1349,18 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	if errStream != nil {
 		releaseAdmission()
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- executionErrorMessage(errStream)
+		errMsg := executionErrorMessage(errStream)
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginExecutionFailed, entryProtocol, originalRequestedModel, executorPluginID, true, rawJSON, execOptions)
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
 	if streamResult == nil {
 		releaseAdmission()
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
+		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
+		logPluginExecutorFailure(ctx, errMsg.StatusCode, preRouteErrorPluginStreamUnavailable, entryProtocol, originalRequestedModel, executorPluginID, true, rawJSON, execOptions)
+		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1519,6 +1535,7 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
 	if errMsg != nil {
 		releaseAdmission()
+		logProviderResolutionFailure(ctx, errMsg.StatusCode, entryProtocol, originalRequestedModel, true, rawJSON, execOptions)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
