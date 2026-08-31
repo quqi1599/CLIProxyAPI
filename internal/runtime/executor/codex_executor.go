@@ -537,7 +537,8 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *clipr
 			return codexRequestPlan{}, err
 		}
 	}
-	body = repairCodexResponsesToolHistory(body)
+	body, toolHistoryRepairStats := repairCodexResponsesToolHistoryWithStats(body)
+	logCodexToolSearchHistoryRepair(ctx, toolHistoryRepairStats.toolSearchRepairs)
 	if mode != codexRequestPlanCount {
 		body = normalizeCodexToolSchemas(body)
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
@@ -560,6 +561,16 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *clipr
 		transformStage:        transformStage,
 		amplificationOverride: codexReplayAmplificationOverride(replayScope),
 	}, nil
+}
+
+func logCodexToolSearchHistoryRepair(ctx context.Context, repairs int) {
+	if repairs <= 0 {
+		return
+	}
+	helps.LogWithRequestID(ctx).WithFields(log.Fields{
+		"event":         "codex_tool_search_history_repaired",
+		"repairs_count": repairs,
+	}).Info("codex tool search history repaired")
 }
 
 type codexReasoningReplayScope struct {

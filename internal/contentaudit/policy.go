@@ -32,6 +32,7 @@ type Rule struct {
 	Severity           string     `yaml:"severity" json:"severity"`
 	Action             string     `yaml:"action,omitempty" json:"action"`
 	Keywords           []string   `yaml:"keywords" json:"keywords"`
+	MinKeywordMatches  int        `yaml:"min-keyword-matches,omitempty" json:"min_keyword_matches,omitempty"`
 	RequireAny         []string   `yaml:"require-any,omitempty" json:"require_any,omitempty"`
 	ExcludeAny         []string   `yaml:"exclude-any,omitempty" json:"exclude_any,omitempty"`
 	ExcludeAll         [][]string `yaml:"exclude-all,omitempty" json:"exclude_all,omitempty"`
@@ -126,6 +127,9 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		}
 		if rule.Action == "" {
 			return nil, fmt.Errorf("content audit rule %q has invalid action", rule.ID)
+		}
+		if rule.MinKeywordMatches < 0 || rule.MinKeywordMatches > len(rule.Keywords) {
+			return nil, fmt.Errorf("content audit rule %q has invalid min-keyword-matches", rule.ID)
 		}
 
 		for _, rawTerm := range rule.Keywords {
@@ -346,6 +350,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 	if len(normalized) == 0 {
 		return Decision{PolicyVersion: m.policy.Version}
 	}
+	matchCounts := m.countDistinctRuleMatches(normalized, action, continuation)
 
 	nodeIndex := 0
 	best := Decision{PolicyVersion: m.policy.Version}
@@ -378,6 +383,9 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 			if !ruleMatchesContext(normalized, start, position+1, rule, continuation) {
 				continue
 			}
+			if rule.MinKeywordMatches > 1 && matchCounts[term.ruleIndex] < rule.MinKeywordMatches {
+				continue
+			}
 			actionRank := ruleActionRank(rule.Action)
 			severity := severityRank(rule.Severity)
 			if actionRank < bestActionRank ||
@@ -401,6 +409,64 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 		}
 	}
 	return best
+}
+
+// countDistinctRuleMatches precomputes only the multi-keyword thresholds used
+// by dense-content rules. Ordinary rules keep the existing single-pass path.
+func (m *Matcher) countDistinctRuleMatches(text []rune, action string, continuation bool) map[int]int {
+	hasThresholdRule := false
+	for _, rule := range m.policy.Rules {
+		if rule.MinKeywordMatches > 1 && (action == "" || rule.Action == action) {
+			hasThresholdRule = true
+			break
+		}
+	}
+	if !hasThresholdRule {
+		return nil
+	}
+
+	distinct := make(map[int]map[string]struct{})
+	nodeIndex := 0
+	for position, character := range text {
+		for nodeIndex != 0 {
+			if _, exists := m.nodes[nodeIndex].next[character]; exists {
+				break
+			}
+			nodeIndex = m.nodes[nodeIndex].fail
+		}
+		if next, exists := m.nodes[nodeIndex].next[character]; exists {
+			nodeIndex = next
+		}
+		for _, termIndex := range m.nodes[nodeIndex].out {
+			term := m.terms[termIndex]
+			rule := m.policy.Rules[term.ruleIndex]
+			if rule.MinKeywordMatches <= 1 || action != "" && rule.Action != action {
+				continue
+			}
+			start := position - term.runeLen + 1
+			if start < 0 {
+				continue
+			}
+			if !matchOnRuleBoundaries(text, start, position+1, rule) || m.allowlisted(text, start, position+1, term.ruleIndex) {
+				continue
+			}
+			if !ruleMatchesContext(text, start, position+1, rule, continuation) {
+				continue
+			}
+			terms := distinct[term.ruleIndex]
+			if terms == nil {
+				terms = make(map[string]struct{}, rule.MinKeywordMatches)
+				distinct[term.ruleIndex] = terms
+			}
+			terms[term.term] = struct{}{}
+		}
+	}
+
+	counts := make(map[int]int, len(distinct))
+	for ruleIndex, terms := range distinct {
+		counts[ruleIndex] = len(terms)
+	}
+	return counts
 }
 
 func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool) bool {

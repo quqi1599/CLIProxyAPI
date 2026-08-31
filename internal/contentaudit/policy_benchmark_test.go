@@ -107,3 +107,29 @@ func BenchmarkMatcherScoped(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkMatcherDenseKeywordThreshold(b *testing.B) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "benchmark",
+		Rules: []Rule{{
+			ID:                "dense",
+			Category:          "synthetic",
+			Severity:          "high",
+			Action:            RuleActionBlock,
+			Keywords:          []string{"alpha risk", "beta risk", "gamma risk", "delta risk"},
+			MinKeywordMatches: 3,
+		}},
+	})
+	if err != nil {
+		b.Fatalf("CompilePolicy() error = %v", err)
+	}
+	text := strings.Repeat("ordinary request content. ", 200) + "alpha risk beta risk gamma risk"
+	b.ReportAllocs()
+	b.SetBytes(int64(len(text)))
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if decision := matcher.Match(text); !decision.Matched {
+			b.Fatalf("unexpected dense threshold miss: %#v", decision)
+		}
+	}
+}

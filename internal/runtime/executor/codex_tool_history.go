@@ -2,23 +2,57 @@ package executor
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 
 	"github.com/tidwall/gjson"
 )
 
+type codexToolHistoryRepairStats struct {
+	toolSearchRepairs int
+}
+
 func repairCodexResponsesToolHistory(payload []byte) []byte {
+	out, _ := repairCodexResponsesToolHistoryWithStats(payload)
+	return out
+}
+
+func repairCodexResponsesToolHistoryWithStats(payload []byte) ([]byte, codexToolHistoryRepairStats) {
+	var stats codexToolHistoryRepairStats
 	if len(payload) == 0 || !gjson.GetBytes(payload, "input").IsArray() {
-		return payload
+		return payload, stats
 	}
 
 	var root map[string]any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return payload
+		return payload, stats
 	}
 	input, ok := root["input"].([]any)
 	if !ok || len(input) == 0 {
-		return payload
+		return payload, stats
+	}
+
+	clientToolSearchKeep := make(map[int]bool)
+	validClientToolSearchCalls := make(map[string]bool)
+	droppedClientToolSearchCalls := make(map[string]bool)
+	for index, rawItem := range input {
+		item, okItem := rawItem.(map[string]any)
+		if !okItem || strings.TrimSpace(compatStringValue(item["type"])) != "tool_search_call" || strings.TrimSpace(compatStringValue(item["execution"])) != "client" {
+			continue
+		}
+		callID, keep, changed := sanitizeCodexClientToolSearchCallItem(item)
+		clientToolSearchKeep[index] = keep
+		if changed {
+			stats.toolSearchRepairs++
+		}
+		if callID == "" {
+			continue
+		}
+		if keep {
+			validClientToolSearchCalls[callID] = true
+		} else {
+			droppedClientToolSearchCalls[callID] = true
+		}
 	}
 
 	allowOrphanOutputs := strings.TrimSpace(compatStringValue(root["previous_response_id"])) != ""
@@ -47,8 +81,8 @@ func repairCodexResponsesToolHistory(payload []byte) []byte {
 	cleaned := make([]any, 0, len(input))
 	seenCalls := make(map[string]bool)
 	seenOutputs := make(map[string]bool)
-	changed := false
-	for _, rawItem := range input {
+	changed := stats.toolSearchRepairs > 0
+	for index, rawItem := range input {
 		item, okItem := rawItem.(map[string]any)
 		if !okItem {
 			cleaned = append(cleaned, rawItem)
@@ -57,6 +91,19 @@ func repairCodexResponsesToolHistory(payload []byte) []byte {
 
 		itemType := strings.TrimSpace(compatStringValue(item["type"]))
 		switch {
+		case itemType == "tool_search_call" && strings.TrimSpace(compatStringValue(item["execution"])) == "client":
+			if !clientToolSearchKeep[index] {
+				changed = true
+				continue
+			}
+			cleaned = append(cleaned, item)
+		case itemType == "tool_search_output" && strings.TrimSpace(compatStringValue(item["execution"])) == "client":
+			callID := strings.TrimSpace(compatStringValue(item["call_id"]))
+			if callID != "" && droppedClientToolSearchCalls[callID] && !validClientToolSearchCalls[callID] {
+				changed = true
+				continue
+			}
+			cleaned = append(cleaned, item)
 		case itemType == "message":
 			cleanedItem, keep, itemChanged := sanitizeCodexResponsesMessageItem(item)
 			if itemChanged {
@@ -92,14 +139,56 @@ func repairCodexResponsesToolHistory(payload []byte) []byte {
 	}
 
 	if !changed {
-		return payload
+		return payload, stats
 	}
 	root["input"] = cleaned
 	out, err := json.Marshal(root)
 	if err != nil || !gjson.ValidBytes(out) {
-		return payload
+		return payload, codexToolHistoryRepairStats{}
 	}
-	return out
+	return out, stats
+}
+
+func sanitizeCodexClientToolSearchCallItem(item map[string]any) (string, bool, bool) {
+	callID := strings.TrimSpace(compatStringValue(item["call_id"]))
+
+	arguments, okArguments := item["arguments"].(map[string]any)
+	argumentsWereString := false
+	if !okArguments {
+		rawArguments, okString := item["arguments"].(string)
+		if !okString {
+			return callID, false, true
+		}
+		argumentsWereString = true
+		if err := json.Unmarshal([]byte(rawArguments), &arguments); err != nil || arguments == nil {
+			return callID, false, true
+		}
+	}
+
+	query, okQuery := arguments["query"].(string)
+	if !okQuery || strings.TrimSpace(query) == "" {
+		return callID, false, true
+	}
+
+	normalizedArguments := map[string]any{"query": query}
+	limit, hasLimit := arguments["limit"]
+	validLimit := hasLimit && isCodexToolSearchLimit(limit)
+	if validLimit {
+		normalizedArguments["limit"] = limit
+	}
+
+	canonicalArguments := len(arguments) == 1 || (len(arguments) == 2 && validLimit)
+	if !argumentsWereString && canonicalArguments {
+		return callID, true, false
+	}
+
+	item["arguments"] = normalizedArguments
+	return callID, true, true
+}
+
+func isCodexToolSearchLimit(value any) bool {
+	limit, ok := value.(float64)
+	return ok && !math.IsNaN(limit) && !math.IsInf(limit, 0) && limit > 0 && math.Trunc(limit) == limit && limit <= float64(^uint(0)>>1)
 }
 
 func sanitizeCodexResponsesMessageItem(item map[string]any) (map[string]any, bool, bool) {

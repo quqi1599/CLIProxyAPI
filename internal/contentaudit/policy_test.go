@@ -58,6 +58,52 @@ func TestMatcherReturnsHighestSeverityThenLongestTerm(t *testing.T) {
 	}
 }
 
+func TestMatcherRequiresDistinctKeywordMatches(t *testing.T) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:                "dense",
+			Category:          "synthetic",
+			Severity:          "high",
+			Action:            RuleActionBlock,
+			Keywords:          []string{"alpha risk", "beta risk", "gamma risk"},
+			MinKeywordMatches: 3,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompilePolicy() error = %v", err)
+	}
+
+	for _, text := range []string{
+		"alpha risk",
+		"alpha risk alpha risk beta risk",
+	} {
+		if decision := matcher.Match(text); decision.Matched {
+			t.Fatalf("Match(%q) = %#v, want no dense match", text, decision)
+		}
+	}
+	decision := matcher.Match("alpha risk beta risk gamma risk")
+	if !decision.Matched || decision.RuleID != "dense" || decision.Action != RuleActionBlock {
+		t.Fatalf("three-term Match() = %#v, want dense block", decision)
+	}
+}
+
+func TestCompilePolicyRejectsInvalidKeywordMatchThreshold(t *testing.T) {
+	_, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:                "invalid",
+			Category:          "synthetic",
+			Severity:          "high",
+			Keywords:          []string{"alpha risk"},
+			MinKeywordMatches: 2,
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "min-keyword-matches") {
+		t.Fatalf("CompilePolicy() error = %v, want threshold validation", err)
+	}
+}
+
 func TestMatcherPrefersBlockActionAndHonorsContext(t *testing.T) {
 	matcher, err := CompilePolicy(Policy{
 		Version: "test-v1",
