@@ -118,6 +118,7 @@ func BenchmarkMatcherDenseKeywordThreshold(b *testing.B) {
 			Action:            RuleActionBlock,
 			Keywords:          []string{"alpha risk", "beta risk", "gamma risk", "delta risk"},
 			MinKeywordMatches: 3,
+			MaxKeywordSpan:    512,
 		}},
 	})
 	if err != nil {

@@ -162,7 +162,9 @@ Provide `CPA_AUDIT_IDENTITY_SECRET` and `CPA_AUDIT_EVIDENCE_KEY` through the
 environment. Management API authentication controls evidence viewing. Keep the
 policy under a writable persistent directory to edit rule actions, terms,
 context requirements, exceptions, and rollback versions from the Management
-Center without rebuilding the image. WebSocket frames are not inspected when
+Center without rebuilding the image. Rules using `min-keyword-matches` can
+also set `max-keyword-span` so distinct terms must form a local cluster instead
+of accumulating across a long prompt. WebSocket frames are not inspected when
 `allow-unaudited-websocket` is enabled.
 
 ### Usage Statistics Persistence

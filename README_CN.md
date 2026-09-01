@@ -151,6 +151,8 @@ content-audit:
 审计证据由管理 API 身份验证后直接查看。策略文件应放在可写的持久化目录，
 之后可以在管理中心在线修改规则动作、关键词、上下文条件和例外，并回滚历史版本，
 无需重建镜像。启用 `allow-unaudited-websocket` 时 WebSocket 帧继续通行。
+使用 `min-keyword-matches` 的密集规则还可设置 `max-keyword-span`，
+要求多个不同关键词必须在同一局部窗口内，避免跨超长上下文累积误拦。
 
 ### 使用量统计持久化
 

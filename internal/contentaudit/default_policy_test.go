@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -66,6 +67,10 @@ func TestDefaultPolicyManagedCountsAndActions(t *testing.T) {
 	}
 	if decision := matcher.Match("虚构段落包含飞机杯、生殖器、乳头和阴茎等露骨描述"); !decision.Matched || decision.RuleID != "block-sexual-dense-explicit-content" || decision.Action != RuleActionBlock {
 		t.Fatalf("dense explicit fixture = %#v, want local block", decision)
+	}
+	farApartDense := "这份产品目录提到飞机杯。" + strings.Repeat("普通产品说明。", 100) + "另一份文档提到生殖器。" + strings.Repeat("普通产品说明。", 100) + "最后一份文档提到乳头。"
+	if decision := matcher.Match(farApartDense); decision.Matched && decision.Action == RuleActionBlock {
+		t.Fatalf("far-apart dense fixture = %#v, want no local block", decision)
 	}
 	if decision := matcher.Match("医学教材介绍乳房、乳头和生殖器的临床检查"); !decision.Matched || decision.Action != RuleActionObserve {
 		t.Fatalf("medical anatomy fixture = %#v, want observation only", decision)

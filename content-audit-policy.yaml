@@ -4,7 +4,7 @@
 # The source seed is supplemented with CPA high-confidence intent phrases.
 # Exact managed counts are verified by tests so policy tuning stays reviewable.
 # CPA keeps request-level enforcement only; this policy does not ban sessions or API keys.
-version: "llm-access-managed-2026-08-30-v7"
+version: "llm-access-managed-2026-09-01-v8"
 global-allowlist:
   - "接口交互"
   - "光口交换机"
@@ -653,6 +653,7 @@ rules:
     severity: "high"
     action: "block"
     min-keyword-matches: 3
+    max-keyword-span: 512
     keywords:
       - "自 慰"
       - "乱 伦"

@@ -8,6 +8,8 @@ rules:
     severity: "high"
     # Optional: require this many distinct keywords from the same rule.
     min-keyword-matches: 1
+    # Dense rules may also limit the normalized rune distance between keyword start positions.
+    # max-keyword-span: 512
     keywords:
       - "synthetic prohibited action"
       - "敏感测试短语"

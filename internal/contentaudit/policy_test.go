@@ -88,6 +88,32 @@ func TestMatcherRequiresDistinctKeywordMatches(t *testing.T) {
 	}
 }
 
+func TestMatcherRequiresDistinctKeywordMatchesWithinConfiguredSpan(t *testing.T) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:                "dense",
+			Category:          "synthetic",
+			Severity:          "high",
+			Action:            RuleActionBlock,
+			Keywords:          []string{"alpha risk", "beta risk", "gamma risk"},
+			MinKeywordMatches: 3,
+			MaxKeywordSpan:    80,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompilePolicy() error = %v", err)
+	}
+
+	if decision := matcher.Match("alpha risk beta risk gamma risk"); !decision.Matched || decision.RuleID != "dense" {
+		t.Fatalf("nearby Match() = %#v, want dense block", decision)
+	}
+	farApart := "alpha risk " + strings.Repeat("ordinary padding ", 10) + "beta risk " + strings.Repeat("ordinary padding ", 10) + "gamma risk"
+	if decision := matcher.Match(farApart); decision.Matched {
+		t.Fatalf("far-apart Match() = %#v, want no dense match", decision)
+	}
+}
+
 func TestCompilePolicyRejectsInvalidKeywordMatchThreshold(t *testing.T) {
 	_, err := CompilePolicy(Policy{
 		Version: "test-v1",
@@ -101,6 +127,22 @@ func TestCompilePolicyRejectsInvalidKeywordMatchThreshold(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "min-keyword-matches") {
 		t.Fatalf("CompilePolicy() error = %v, want threshold validation", err)
+	}
+}
+
+func TestCompilePolicyRejectsKeywordSpanWithoutThreshold(t *testing.T) {
+	_, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:             "invalid-span",
+			Category:       "synthetic",
+			Severity:       "high",
+			Keywords:       []string{"alpha risk"},
+			MaxKeywordSpan: 80,
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "max-keyword-span") {
+		t.Fatalf("CompilePolicy() error = %v, want span validation", err)
 	}
 }
 
