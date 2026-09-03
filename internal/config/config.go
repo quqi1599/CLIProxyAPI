@@ -84,6 +84,10 @@ type Config struct {
 	// ContentAudit controls the local pre-upstream content safety audit.
 	ContentAudit ContentAuditConfig `yaml:"content-audit" json:"content-audit"`
 
+	// CacheDiagnostics controls low-sensitivity cache observability. It never
+	// changes request routing, payloads, retries, or provider health.
+	CacheDiagnostics CacheDiagnosticsConfig `yaml:"cache-diagnostics" json:"cache-diagnostics"`
+
 	// RedisUsageQueueRetentionSeconds controls how long usage queue items are retained
 	// in memory for Management API consumers.
 	// Default: 60. Max: 3600.
@@ -234,6 +238,55 @@ type ContentAuditModelReviewConfig struct {
 	BlockMinConfidence       float64  `yaml:"block-min-confidence" json:"block-min-confidence"`
 	CircuitFailureThreshold  int      `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
 	CircuitOpenSeconds       int      `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
+}
+
+// CacheDiagnosticsConfig groups provider-specific cache diagnostics.
+type CacheDiagnosticsConfig struct {
+	DeepSeekAnthropic DeepSeekAnthropicCacheDiagnosticsConfig `yaml:"deepseek-anthropic" json:"deepseek-anthropic"`
+}
+
+// DeepSeekAnthropicCacheDiagnosticsConfig controls the sampled HMAC-only
+// prefix diagnostics for the official DeepSeek Anthropic Messages endpoint.
+// The HMAC secret is supplied only through CPA_CACHE_DIAG_HMAC_SECRET.
+type DeepSeekAnthropicCacheDiagnosticsConfig struct {
+	Enabled              bool     `yaml:"enabled" json:"enabled"`
+	SampleRate           *float64 `yaml:"sample-rate,omitempty" json:"sample-rate,omitempty"`
+	CompareWindowSeconds int      `yaml:"compare-window-seconds" json:"compare-window-seconds"`
+	StableMissThreshold  int      `yaml:"stable-miss-threshold" json:"stable-miss-threshold"`
+	MaxEntries           int      `yaml:"max-entries,omitempty" json:"max-entries,omitempty"`
+}
+
+// EffectiveSampleRate returns the default without making an explicit zero
+// indistinguishable from an omitted value.
+func (c DeepSeekAnthropicCacheDiagnosticsConfig) EffectiveSampleRate() float64 {
+	if c.SampleRate == nil {
+		return 0.05
+	}
+	if *c.SampleRate < 0 {
+		return 0
+	}
+	if *c.SampleRate > 1 {
+		return 1
+	}
+	return *c.SampleRate
+}
+
+// NormalizeCacheDiagnosticsConfig applies bounded defaults. Diagnostics remain
+// disabled unless explicitly enabled and independently keyed at runtime.
+func (cfg *Config) NormalizeCacheDiagnosticsConfig() {
+	if cfg == nil {
+		return
+	}
+	c := &cfg.CacheDiagnostics.DeepSeekAnthropic
+	if c.CompareWindowSeconds <= 0 {
+		c.CompareWindowSeconds = 600
+	}
+	if c.StableMissThreshold <= 0 {
+		c.StableMissThreshold = 3
+	}
+	if c.MaxEntries <= 0 {
+		c.MaxEntries = 10000
+	}
 }
 
 // EmptyResponseRetryConfig controls targeted detection of upstream responses
@@ -986,6 +1039,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	cfg.NormalizeCacheDiagnosticsConfig()
 	cfg.NormalizePluginsConfig()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.

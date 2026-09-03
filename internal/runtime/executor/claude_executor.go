@@ -11,15 +11,19 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
@@ -60,10 +64,24 @@ const (
 	claudeUnsupportedContentPlaceholderText      = "Unsupported content removed for upstream compatibility."
 )
 
-// ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
-// If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
+const deepSeekAnthropicCacheDiagnosticQueueSize = 1024
+
+type deepSeekAnthropicCacheDiagnosticLogRecord struct {
+	fields  log.Fields
+	anomaly bool
+}
+
+var (
+	deepSeekAnthropicCacheDiagnosticLogOnce  sync.Once
+	deepSeekAnthropicCacheDiagnosticLogQueue chan deepSeekAnthropicCacheDiagnosticLogRecord
+	deepSeekAnthropicCacheDiagnosticDropped  atomic.Uint64
+)
+
+// ClaudeExecutor handles Anthropic Messages requests. Optional cache diagnostic
+// state is bounded, HMAC-only, and never changes request execution semantics.
 type ClaudeExecutor struct {
-	cfg *config.Config
+	cfg              *config.Config
+	cacheDiagnostics *helps.CachePrefixDiagnostics
 }
 
 type claudeCompatPreflight struct {
@@ -221,7 +239,26 @@ const (
 	largeClaudeCompatStepInteractions              = largeClaudeCompatStepLimitMultiplier * 500
 )
 
-func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
+func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
+	executor := &ClaudeExecutor{cfg: cfg}
+	if cfg == nil {
+		return executor
+	}
+	diagnosticConfig := cfg.CacheDiagnostics.DeepSeekAnthropic
+	executor.cacheDiagnostics = helps.NewCachePrefixDiagnostics(helps.CachePrefixDiagnosticsOptions{
+		Enabled:             diagnosticConfig.Enabled,
+		SampleRate:          diagnosticConfig.EffectiveSampleRate(),
+		CompareWindow:       time.Duration(diagnosticConfig.CompareWindowSeconds) * time.Second,
+		StableMissThreshold: diagnosticConfig.StableMissThreshold,
+		MaxEntries:          diagnosticConfig.MaxEntries,
+		Secret:              []byte(os.Getenv("CPA_CACHE_DIAG_HMAC_SECRET")),
+		KeyID:               os.Getenv("CPA_CACHE_DIAG_HMAC_KEY_ID"),
+	})
+	if diagnosticConfig.Enabled && executor.cacheDiagnostics == nil {
+		log.Warn("DeepSeek Anthropic cache diagnostics requested but disabled because CPA_CACHE_DIAG_HMAC_SECRET is missing")
+	}
+	return executor
+}
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
@@ -292,6 +329,7 @@ type claudeRequestPlan struct {
 	oauthToken               bool
 	oauthToolNamesReverseMap map[string]string
 	toolNameSanitization     *claudeToolNameSanitization
+	cacheDiagnostic          *helps.CachePrefixDiagnosticSession
 }
 
 func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, streamResponse bool) (plan claudeRequestPlan, err error) {
@@ -516,6 +554,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	); err != nil {
 		return plan, err
 	}
+	providerCompatibleBody := body
 
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
@@ -554,7 +593,75 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	); err != nil {
 		return plan, err
 	}
+	plan.cacheDiagnostic = e.beginDeepSeekAnthropicCacheDiagnostic(ctx, auth, opts, plan, originalTranslated, providerCompatibleBody, baseModel, streamResponse)
 	return plan, nil
+}
+
+func (e *ClaudeExecutor) beginDeepSeekAnthropicCacheDiagnostic(ctx context.Context, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options, plan claudeRequestPlan, received, providerCompatible []byte, model string, stream bool) *helps.CachePrefixDiagnosticSession {
+	if e == nil || e.cacheDiagnostics == nil || !isOfficialDeepSeekAnthropicRoute(plan.providerIdentity.Kind, plan.baseURL) || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek-") {
+		return nil
+	}
+	affinityIdentity := executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
+	if affinityIdentity == "" {
+		affinityIdentity = helps.ExtractClaudeCodeSessionID(ctx, received, opts.Headers)
+	}
+	authIdentity := ""
+	if auth != nil {
+		authIdentity = strings.TrimSpace(auth.ID)
+		if authIdentity == "" {
+			authIdentity = strings.TrimSpace(auth.EnsureIndex())
+		}
+	}
+	return e.cacheDiagnostics.Begin(helps.CachePrefixDiagnosticMeta{
+		Model:            model,
+		SourceFormat:     opts.SourceFormat.String(),
+		Stream:           stream,
+		RouteKind:        plan.providerIdentity.Kind,
+		BaseHost:         plan.providerIdentity.BaseHost,
+		Endpoint:         "/anthropic/v1/messages",
+		ConsumerIdentity: helps.APIKeyFromContext(ctx),
+		AuthIdentity:     authIdentity,
+		AffinityIdentity: affinityIdentity,
+	}, received, providerCompatible, plan.bodyForUpstream)
+}
+
+func logDeepSeekAnthropicCacheDiagnostic(ctx context.Context, event helps.CachePrefixDiagnosticEvent) {
+	deepSeekAnthropicCacheDiagnosticLogOnce.Do(func() {
+		deepSeekAnthropicCacheDiagnosticLogQueue = make(chan deepSeekAnthropicCacheDiagnosticLogRecord, deepSeekAnthropicCacheDiagnosticQueueSize)
+		go func() {
+			for record := range deepSeekAnthropicCacheDiagnosticLogQueue {
+				entry := log.WithFields(record.fields)
+				if record.anomaly {
+					entry.Warn(helps.DeepSeekAnthropicCacheDiagnosticEvent)
+					continue
+				}
+				entry.Info(helps.DeepSeekAnthropicCacheDiagnosticEvent)
+			}
+		}()
+	})
+	fields := log.Fields(event.Fields())
+	if requestID := internallogging.GetRequestID(ctx); requestID != "" {
+		fields["request_id"] = requestID
+	}
+	if clientRequestID := internallogging.GetClientRequestID(ctx); clientRequestID != "" {
+		fields["client_request_id"] = clientRequestID
+	}
+	record := deepSeekAnthropicCacheDiagnosticLogRecord{
+		fields:  fields,
+		anomaly: event.Classification == "stable_prefix_anomaly",
+	}
+	select {
+	case deepSeekAnthropicCacheDiagnosticLogQueue <- record:
+	default:
+		dropped := deepSeekAnthropicCacheDiagnosticDropped.Add(1)
+		if dropped == 1 || dropped&(dropped-1) == 0 {
+			log.WithFields(log.Fields{
+				"event":         "deepseek_anthropic_cache_diag_dropped",
+				"reason":        "queue_full",
+				"dropped_total": dropped,
+			}).Warn("DeepSeek Anthropic cache diagnostic event dropped")
+		}
+	}
 }
 
 func rejectDeepSeekFIMForClaudeRoute(model, requestPath string, body []byte) error {
@@ -619,9 +726,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
+			if event, ok := plan.cacheDiagnostic.ObserveStreamLine(line); ok {
+				logDeepSeekAnthropicCacheDiagnostic(ctx, event)
+			}
 		}
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
+		if event, ok := plan.cacheDiagnostic.CompleteNonStream(data); ok {
+			logDeepSeekAnthropicCacheDiagnostic(ctx, event)
+		}
 	}
 	data = restoreClaudeToolNamesFromResponse(data, plan.toolNameSanitization)
 	if plan.oauthToken {
@@ -702,6 +815,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		prepareLine := func(line []byte) []byte {
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
+			}
+			if event, ok := plan.cacheDiagnostic.ObserveStreamLine(line); ok {
+				logDeepSeekAnthropicCacheDiagnostic(ctx, event)
 			}
 			line = normalizeClaudeStringMessageSSELine(line)
 			line = restoreClaudeToolNamesFromStreamLine(line, plan.toolNameSanitization)

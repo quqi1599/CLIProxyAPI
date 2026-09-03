@@ -134,6 +134,18 @@ content-audit:
     circuit-failure-threshold: 5
     circuit-open-seconds: 30
 
+# Low-sensitivity DeepSeek Anthropic Messages cache diagnostics. Disabled by
+# default and never changes request payloads, routing, retries, or provider health.
+# When enabled, supply an independent HMAC secret through:
+#   CPA_CACHE_DIAG_HMAC_SECRET, CPA_CACHE_DIAG_HMAC_KEY_ID
+cache-diagnostics:
+  deepseek-anthropic:
+    enabled: false
+    sample-rate: 0.05
+    compare-window-seconds: 600
+    stable-miss-threshold: 3
+    max-entries: 10000
+
 # How long (in seconds) usage queue items are retained in memory for the Management API.
 # The local Redis RESP usage output is disabled.
 # Default: 60. Max: 3600.
