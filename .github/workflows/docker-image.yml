@@ -96,7 +96,13 @@ jobs:
           for path in "$docker_root" "$GITHUB_WORKSPACE"; do
             used="$(df -P "$path" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
             inodes="$(df -Pi "$path" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
-            (( used <= 85 && inodes <= 85 )) || { echo 'Resource gate failed'; exit 1; }
+            if (( used > 85 || inodes > 85 )); then
+              echo 'Resource gate failed; read-only cache diagnostics follow'
+              docker system df
+              docker buildx du || true
+              du -x -h --max-depth=2 "$RUNNER_WORKSPACE" 2>/dev/null | sort -h | tail -20
+              exit 1
+            fi
           done
           if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
             docker pull "$IMAGE"
