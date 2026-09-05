@@ -99,26 +99,27 @@ func TestExtractJSONRequestUsesLatestUserMessageForEnforcement(t *testing.T) {
 	}
 }
 
-func TestExtractJSONRequestIncludesPreviousUserMessageForContinuation(t *testing.T) {
+func TestExtractJSONRequestSeparatesContinuationReferenceFromCurrentTask(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"answer"},{"role":"user","content":"继续上面的内容"}]}`)
 	extracted := ExtractJSONRequest(body)
 	if !extracted.Continuation {
 		t.Fatal("Continuation = false, want true")
 	}
-	for _, expected := range []string{"older sensitive phrase", "继续上面的内容"} {
-		if !strings.Contains(extracted.EnforcementText, expected) {
-			t.Fatalf("enforcement text %q does not contain %q", extracted.EnforcementText, expected)
-		}
+	if extracted.EnforcementText != "继续上面的内容" || extracted.CurrentUserText != extracted.EnforcementText {
+		t.Fatalf("enforcement text = %q, want only the current task", extracted.EnforcementText)
 	}
-	if len(extracted.EnforcementFields) != 2 {
-		t.Fatalf("enforcement fields = %#v", extracted.EnforcementFields)
+	if !strings.Contains(extracted.ReferenceText, "older sensitive phrase") || !strings.Contains(extracted.ReferenceText, "answer") {
+		t.Fatalf("reference text = %q, want preceding user and assistant sources", extracted.ReferenceText)
+	}
+	if len(extracted.EnforcementFields) != 1 || len(extracted.ReferenceFields) != 2 {
+		t.Fatalf("enforcement/reference fields = %#v / %#v", extracted.EnforcementFields, extracted.ReferenceFields)
 	}
 }
 
 func TestExtractJSONRequestDetectsLongContinuationPrompt(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"older sensitive phrase"},{"role":"assistant","content":"answer"},{"role":"user","content":"请保持前文的剧情设定并继续完成后续章节，同时遵循这里附加的格式规则和角色约束。"}]}`)
 	extracted := ExtractJSONRequest(body)
-	if !extracted.Continuation || !strings.Contains(extracted.EnforcementText, "older sensitive phrase") {
+	if !extracted.Continuation || !strings.Contains(extracted.ReferenceText, "older sensitive phrase") || strings.Contains(extracted.EnforcementText, "older sensitive phrase") {
 		t.Fatalf("extracted = %#v", extracted)
 	}
 }

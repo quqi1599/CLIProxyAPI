@@ -124,6 +124,16 @@ content-audit:
     timeout-milliseconds: 3500
     queue-timeout-milliseconds: 100
     max-concurrent: 16
+    # Shadow never waits for the model. Four service-owned workers consume a
+    # bounded queue; overflow/expired jobs are recorded as skipped observations.
+    shadow-queue-size: 64
+    shadow-queue-bytes: 4194304
+    shadow-max-age-seconds: 30
+    # Normal shadow candidates are sampled; critical candidates bypass sampling.
+    # Durable provider-call quotas apply to both shadow and enforce. UTC+08 day.
+    shadow-sample-rate: 0.2
+    max-calls-per-day: 1000
+    max-calls-per-minute: 5
     cache-seconds: 600
     max-input-bytes: 32768
     # Releasing a local block should require stronger confidence than escalating

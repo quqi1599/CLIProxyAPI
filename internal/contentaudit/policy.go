@@ -3,6 +3,7 @@ package contentaudit
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -53,6 +54,7 @@ type Decision struct {
 	MatchedTerm   string `json:"-"`
 	PolicyVersion string `json:"policy_version,omitempty"`
 	ModelReview   bool   `json:"-"`
+	MatchSource   string `json:"match_source,omitempty"`
 }
 
 type compiledTerm struct {
@@ -167,7 +169,7 @@ func CompilePolicy(policy Policy) (*Matcher, error) {
 		analyzer:       analyzer,
 	}
 	for _, prepared := range preparedTerms {
-		term := analyzer.normalize(prepared.raw)
+		term := analyzer.normalizeVariant(prepared.raw)
 		if term == "" {
 			continue
 		}
@@ -196,7 +198,7 @@ func normalizeTermList(values []string, analyzer *moderationAnalyzer) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))
 	for _, value := range values {
-		normalized := analyzer.normalize(value)
+		normalized := analyzer.normalizeVariant(value)
 		if normalized == "" {
 			continue
 		}
@@ -332,15 +334,40 @@ func (m *Matcher) Match(text string) Decision {
 	return m.match(text, "", false)
 }
 
+// MatchExtracted keeps referenced history out of the local blocking decision.
+// A continuation with risky reference material still enters semantic review.
+func (m *Matcher) MatchExtracted(request ExtractedRequest) Decision {
+	decision := m.MatchScoped(request.EnforcementText, request.Text, false)
+	if decision.Matched && decision.Action == RuleActionBlock {
+		if !request.CurrentTruncated {
+			return decision
+		}
+		// A retained fragment may have lost the task or governing negation.
+		// Missing remote history alone does not weaken a complete current request.
+		decision.Action = RuleActionObserve
+		decision.ModelReview = true
+		decision.MatchSource = "truncated"
+	}
+	if request.Continuation && strings.TrimSpace(request.ReferenceText) != "" {
+		reference := m.Match(request.ReferenceText)
+		if reference.Matched {
+			reference.Action = RuleActionObserve
+			reference.ModelReview = true
+			reference.MatchSource = "reference"
+			if !decision.Matched || !decision.ModelReview || severityRank(reference.Severity) > severityRank(decision.Severity) {
+				return reference
+			}
+		}
+	}
+	return decision
+}
+
 // MatchScoped evaluates both block and observation rules against the current
 // user scope. Explicit continuation prompts may include the previous user turn
 // in enforcementText, but non-user roles and ordinary history stay out of the
 // decision scope.
 func (m *Matcher) MatchScoped(enforcementText, _ string, continuation bool) Decision {
-	if decision := m.match(enforcementText, RuleActionBlock, continuation); decision.Matched {
-		return decision
-	}
-	return m.match(enforcementText, RuleActionObserve, false)
+	return m.match(enforcementText, "", continuation)
 }
 
 func (m *Matcher) match(text, action string, continuation bool) Decision {
@@ -350,18 +377,53 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 	if !m.hasCandidate(moderationCandidateText(text)) {
 		return Decision{PolicyVersion: m.policy.Version}
 	}
-	normalized := []rune(m.analyzer.normalize(text))
+	normalizedText := m.analyzer.normalize(text)
+	decision := m.matchNormalized(normalizedText, action, continuation)
+	if decision.Matched && decision.Action == RuleActionBlock {
+		if outside, isReview := quotedReviewOutside(text); isReview {
+			outsideDecision := m.matchNormalized(m.analyzer.normalize(outside), action, false)
+			if outsideDecision.Matched && outsideDecision.Action == RuleActionBlock {
+				return outsideDecision
+			}
+			decision.Action = RuleActionObserve
+			decision.ModelReview = true
+			decision.MatchSource = "quoted"
+		}
+		return decision
+	}
+	variantText := m.analyzer.normalizeVariant(text)
+	if variantText == normalizedText {
+		return decision
+	}
+	variant := m.matchNormalized(variantText, action, false)
+	if variant.Matched {
+		variant.Action = RuleActionObserve
+		variant.ModelReview = true
+		variant.MatchSource = "variant"
+		if !decision.Matched || severityRank(variant.Severity) > severityRank(decision.Severity) {
+			return variant
+		}
+	}
+	return decision
+}
+
+func (m *Matcher) matchNormalized(normalizedText, action string, continuation bool) Decision {
+	normalized := []rune(normalizedText)
 	if len(normalized) == 0 {
 		return Decision{PolicyVersion: m.policy.Version}
 	}
 	qualifiedThresholdRules := m.qualifyingThresholdRules(normalized, action, continuation)
 
 	nodeIndex := 0
+	clause := 0
 	best := Decision{PolicyVersion: m.policy.Version}
 	bestActionRank := 0
 	bestSeverityRank := 0
 	bestLength := 0
 	for position, r := range normalized {
+		if r == '\n' {
+			clause++
+		}
 		for nodeIndex != 0 {
 			if _, exists := m.nodes[nodeIndex].next[r]; exists {
 				break
@@ -387,7 +449,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 			if !ruleMatchesContext(normalized, start, position+1, rule, continuation) {
 				continue
 			}
-			if rule.MinKeywordMatches > 1 && !qualifiedThresholdRules[term.ruleIndex] {
+			if rule.MinKeywordMatches > 1 && !qualifiedThresholdRules[term.ruleIndex][clause] {
 				continue
 			}
 			actionRank := ruleActionRank(rule.Action)
@@ -406,6 +468,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 				MatchedTerm:   term.term,
 				PolicyVersion: m.policy.Version,
 				ModelReview:   rule.ModelReview,
+				MatchSource:   "current",
 			}
 			bestActionRank = actionRank
 			bestSeverityRank = severity
@@ -416,13 +479,14 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 }
 
 type thresholdMatch struct {
-	start int
-	term  string
+	start  int
+	term   string
+	clause int
 }
 
 // qualifyingThresholdRules precomputes only the multi-keyword thresholds used
 // by dense-content rules. Ordinary rules keep the existing single-pass path.
-func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuation bool) map[int]bool {
+func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuation bool) map[int]map[int]bool {
 	hasThresholdRule := false
 	for _, rule := range m.policy.Rules {
 		if rule.MinKeywordMatches > 1 && (action == "" || rule.Action == action) {
@@ -436,7 +500,11 @@ func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuat
 
 	matches := make(map[int][]thresholdMatch)
 	nodeIndex := 0
+	clause := 0
 	for position, character := range text {
+		if character == '\n' {
+			clause++
+		}
 		for nodeIndex != 0 {
 			if _, exists := m.nodes[nodeIndex].next[character]; exists {
 				break
@@ -463,24 +531,16 @@ func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuat
 				continue
 			}
 			matches[term.ruleIndex] = append(matches[term.ruleIndex], thresholdMatch{
-				start: start,
-				term:  term.term,
+				start:  start,
+				term:   term.term,
+				clause: clause,
 			})
 		}
 	}
 
-	qualified := make(map[int]bool, len(matches))
+	qualified := make(map[int]map[int]bool, len(matches))
 	for ruleIndex, ruleMatches := range matches {
 		rule := m.policy.Rules[ruleIndex]
-		if rule.MaxKeywordSpan <= 0 {
-			terms := make(map[string]struct{}, rule.MinKeywordMatches)
-			for _, match := range ruleMatches {
-				terms[match.term] = struct{}{}
-			}
-			qualified[ruleIndex] = len(terms) >= rule.MinKeywordMatches
-			continue
-		}
-
 		sort.Slice(ruleMatches, func(i, j int) bool {
 			return ruleMatches[i].start < ruleMatches[j].start
 		})
@@ -488,7 +548,7 @@ func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuat
 		left := 0
 		for right, match := range ruleMatches {
 			termCounts[match.term]++
-			for left <= right && match.start-ruleMatches[left].start > rule.MaxKeywordSpan {
+			for left <= right && (ruleMatches[left].clause != match.clause || rule.MaxKeywordSpan > 0 && match.start-ruleMatches[left].start > rule.MaxKeywordSpan) {
 				leftTerm := ruleMatches[left].term
 				termCounts[leftTerm]--
 				if termCounts[leftTerm] == 0 {
@@ -497,8 +557,10 @@ func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuat
 				left++
 			}
 			if len(termCounts) >= rule.MinKeywordMatches {
-				qualified[ruleIndex] = true
-				break
+				if qualified[ruleIndex] == nil {
+					qualified[ruleIndex] = make(map[int]bool)
+				}
+				qualified[ruleIndex][match.clause] = true
 			}
 		}
 	}
@@ -509,11 +571,26 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 	const contextRunes = 192
 	start := max(0, matchStart-contextRunes)
 	end := min(len(text), matchEnd+contextRunes)
+	for index := matchStart - 1; index >= start; index-- {
+		if text[index] == '\n' {
+			start = index + 1
+			break
+		}
+	}
+	for index := matchEnd; index < end; index++ {
+		if text[index] == '\n' {
+			end = index
+			break
+		}
+	}
 	normalized := string(text[start:end])
+	if rule.Action == RuleActionBlock && locallyNegatedMatch(text[start:matchStart]) {
+		return false
+	}
 	overrideExclusions := containsAnyTerm(normalized, rule.OverrideExcludeAny)
 	if !overrideExclusions {
 		for _, excluded := range rule.ExcludeAny {
-			if strings.Contains(normalized, excluded) {
+			if containsContextTerm(normalized, excluded) {
 				return false
 			}
 		}
@@ -534,7 +611,7 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 		return true
 	}
 	for _, required := range rule.RequireAny {
-		if strings.Contains(normalized, required) {
+		if containsContextTerm(normalized, required) {
 			return true
 		}
 	}
@@ -543,11 +620,98 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 
 func containsAnyTerm(text string, terms []string) bool {
 	for _, term := range terms {
-		if strings.Contains(text, term) {
+		if containsContextTerm(text, term) {
 			return true
 		}
 	}
 	return false
+}
+
+// Tokenization may split a Han intent marker differently when it occurs inside
+// a longer seeded term. Ignore tokenizer spaces, never original clause breaks.
+func containsContextTerm(text, term string) bool {
+	if containsHanRune([]rune(term)) {
+		text = strings.ReplaceAll(text, " ", "")
+		term = strings.ReplaceAll(term, " ", "")
+	}
+	return strings.Contains(text, term)
+}
+
+// Negation is scoped to the clause immediately governing this occurrence. It
+// cannot whitelist another occurrence in a later instruction or another field.
+func locallyNegatedMatch(prefix []rune) bool {
+	if len(prefix) > 64 {
+		prefix = prefix[len(prefix)-64:]
+	}
+	text := strings.ReplaceAll(string(prefix), " ", "")
+	english := " " + string(prefix) + " "
+	for _, reset := range []string{"而是", "但是", "然而", "不过", "然后", "接下来", "转而", "\n"} {
+		if index := strings.LastIndex(text, reset); index >= 0 {
+			text = text[index+len(reset):]
+		}
+	}
+	for _, reset := range []string{" but ", " however ", " instead ", " then ", "\n"} {
+		if index := strings.LastIndex(english, reset); index >= 0 {
+			english = " " + english[index+len(reset):]
+		}
+	}
+	for _, marker := range []string{"禁止", "不得", "不允许", "请勿", "不要", "不能", "拒绝", "避免", "严禁"} {
+		index := strings.LastIndex(text, marker)
+		if index < 0 {
+			continue
+		}
+		if marker == "拒绝" && (strings.HasSuffix(text[:index], "不要") || strings.HasSuffix(text[:index], "不得") || strings.HasSuffix(text[:index], "不能") || strings.HasSuffix(text[:index], "禁止")) {
+			continue
+		}
+		if moderationNegatedActionSuffix.MatchString(text[index+len(marker):]) {
+			return true
+		}
+	}
+	for _, marker := range []string{" do not ", " must not ", " refuse to ", " cannot "} {
+		index := strings.LastIndex(english, marker)
+		if index < 0 {
+			continue
+		}
+		if marker == " refuse to " && (strings.HasSuffix(english[:index], "do not") || strings.HasSuffix(english[:index], "must not")) {
+			continue
+		}
+		if moderationNegatedEnglishSuffix.MatchString(strings.TrimSpace(english[index+len(marker):])) {
+			return true
+		}
+	}
+	return false
+}
+
+var moderationNegatedActionSuffix = regexp.MustCompile(`^(?:直接|再次|继续|帮助|协助|用户|客户|任何|提供|生成|制作|编写|写出|完成|描述|描写|一段|露骨|相关|上述|以下|这类|这种|这些|那种|内容|为我|给我|给出|帮我|我们|请|并)*$`)
+var moderationNegatedEnglishSuffix = regexp.MustCompile(`^(?:(?:directly|again|help|assist|users?|any|provide|generate|create|produce|write|complete|describe|this|that|the|to|me|please)\s*)*$`)
+
+var moderationQuotedMaterial = regexp.MustCompile("(?s)```.*?```|`[^`]*`|“[^”]*”|「[^」]*」|\"(?:\\\\.|[^\"\\\\])*\"")
+
+// This recognizes a narrow material-review task, not a research whitelist.
+// Quoted risk remains an observation candidate; explicit requests to perform
+// the quoted action and independent harmful clauses retain their local block.
+func quotedReviewOutside(text string) (string, bool) {
+	if !moderationQuotedMaterial.MatchString(text) {
+		return "", false
+	}
+	outside := moderationQuotedMaterial.ReplaceAllString(text, "\n")
+	normalized := moderationCandidateText(outside)
+	literalOutside := filterModerationText(outside)
+	for _, action := range []string{"照做", "执行", "实施", "帮我做", "帮我写", "生成", "编写", "写出", "输出", "做出来", "照着", "给我", "实现", "完成", "implement", "execute", "perform", "follow", "generat", "write me", "do this", "do that", "carry out", "produce", "build", "show me"} {
+		offset := 0
+		for offset < len(literalOutside) {
+			index := strings.Index(literalOutside[offset:], action)
+			if index < 0 {
+				break
+			}
+			index += offset
+			if !locallyNegatedMatch([]rune(literalOutside[:index])) {
+				return outside, false
+			}
+			offset = index + len(action)
+		}
+	}
+	return outside, containsAny(normalized, []string{"请分析", "请解释", "解释以下", "解释这段", "识别风险", "判断是否", "审核清单", "政策清单", "拒绝策略", "论文引用", "classify", "explain", "analyz", "evaluat", "safetychecklist"})
 }
 
 func (m *Matcher) hasCandidate(normalized string) bool {
@@ -574,8 +738,12 @@ func (m *Matcher) hasCandidate(normalized string) bool {
 
 func matchOnTermBoundaries(text []rune, start, end int) bool {
 	return start >= 0 && end <= len(text) &&
-		(start == 0 || text[start-1] == ' ') &&
-		(end == len(text) || text[end] == ' ')
+		(start == 0 || isModerationTermBoundary(text[start-1])) &&
+		(end == len(text) || isModerationTermBoundary(text[end]))
+}
+
+func isModerationTermBoundary(character rune) bool {
+	return character == ' ' || character == '\n'
 }
 
 func matchOnRuleBoundaries(text []rune, start, end int, rule Rule) bool {
@@ -585,8 +753,8 @@ func matchOnRuleBoundaries(text []rune, start, end int, rule Rule) bool {
 	if start < 0 || end > len(text) || !containsHanRune(text[start:end]) || len(rule.RequireAny) == 0 {
 		return false
 	}
-	leftBoundary := start == 0 || text[start-1] == ' '
-	rightBoundary := end == len(text) || text[end] == ' '
+	leftBoundary := start == 0 || isModerationTermBoundary(text[start-1])
+	rightBoundary := end == len(text) || isModerationTermBoundary(text[end])
 	for _, required := range rule.RequireAny {
 		requiredRunes := []rune(required)
 		if !leftBoundary && len(requiredRunes) <= start && string(text[start-len(requiredRunes):start]) == required {

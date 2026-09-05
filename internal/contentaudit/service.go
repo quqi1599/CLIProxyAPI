@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,36 +46,46 @@ type runtimeState struct {
 
 // Status reports whether enforcement is configured and ready without exposing secrets.
 type Status struct {
-	Enabled                 bool    `json:"enabled"`
-	AuditOnly               bool    `json:"audit_only"`
-	Ready                   bool    `json:"ready"`
-	Error                   string  `json:"error,omitempty"`
-	PolicyVersion           string  `json:"policy_version,omitempty"`
-	KeywordCount            int     `json:"keyword_count"`
-	DatabaseAvailable       bool    `json:"database_available"`
-	RequireSignedIdentity   bool    `json:"require_signed_identity"`
-	AllowUnauditedWebsocket bool    `json:"allow_unaudited_websocket"`
-	BlockRuleCount          int     `json:"block_rule_count"`
-	ObserveRuleCount        int     `json:"observe_rule_count"`
-	DisabledRuleCount       int     `json:"disabled_rule_count"`
-	MaxBodyBytes            int64   `json:"max_body_bytes"`
-	EvidenceDedupeSeconds   int     `json:"evidence_dedupe_seconds"`
-	RawRetentionDays        int     `json:"raw_retention_days"`
-	MetadataRetentionDays   int     `json:"metadata_retention_days"`
-	ModelReviewMode         string  `json:"model_review_mode"`
-	ModelReviewModel        string  `json:"model_review_model,omitempty"`
-	ModelReviewReady        bool    `json:"model_review_ready"`
-	ModelReviewTimeoutMS    int     `json:"model_review_timeout_ms"`
-	ModelReviewAllowMin     float64 `json:"model_review_allow_min_confidence"`
-	ModelReviewBlockMin     float64 `json:"model_review_block_min_confidence"`
+	Enabled                     bool                    `json:"enabled"`
+	AuditOnly                   bool                    `json:"audit_only"`
+	Ready                       bool                    `json:"ready"`
+	Error                       string                  `json:"error,omitempty"`
+	PolicyVersion               string                  `json:"policy_version,omitempty"`
+	KeywordCount                int                     `json:"keyword_count"`
+	DatabaseAvailable           bool                    `json:"database_available"`
+	RequireSignedIdentity       bool                    `json:"require_signed_identity"`
+	AllowUnauditedWebsocket     bool                    `json:"allow_unaudited_websocket"`
+	BlockRuleCount              int                     `json:"block_rule_count"`
+	ObserveRuleCount            int                     `json:"observe_rule_count"`
+	DisabledRuleCount           int                     `json:"disabled_rule_count"`
+	MaxBodyBytes                int64                   `json:"max_body_bytes"`
+	EvidenceDedupeSeconds       int                     `json:"evidence_dedupe_seconds"`
+	RawRetentionDays            int                     `json:"raw_retention_days"`
+	MetadataRetentionDays       int                     `json:"metadata_retention_days"`
+	ModelReviewMode             string                  `json:"model_review_mode"`
+	ModelReviewModel            string                  `json:"model_review_model,omitempty"`
+	ModelReviewReady            bool                    `json:"model_review_ready"`
+	ModelReviewTimeoutMS        int                     `json:"model_review_timeout_ms"`
+	ModelReviewAllowMin         float64                 `json:"model_review_allow_min_confidence"`
+	ModelReviewBlockMin         float64                 `json:"model_review_block_min_confidence"`
+	Shadow                      ShadowReviewStatus      `json:"shadow_review"`
+	ModelReviewBudget           ModelReviewBudgetStatus `json:"model_review_budget"`
+	IncompleteUnmatchedRequests uint64                  `json:"incomplete_unmatched_requests"`
 }
 
 // Service owns the immutable request-time matcher snapshot and encrypted store.
 type Service struct {
-	state     atomic.Pointer[runtimeState]
-	pruneOnce sync.Once
-	policyMu  sync.Mutex
-	reviewer  Reviewer
+	state               atomic.Pointer[runtimeState]
+	pruneOnce           sync.Once
+	policyMu            sync.Mutex
+	reviewer            Reviewer
+	shadow              *shadowReviewQueue
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	background          sync.WaitGroup
+	backgroundWaitOnce  sync.Once
+	backgroundDone      chan struct{}
+	incompleteUnmatched atomic.Uint64
 }
 
 // NewService initializes a service. Invalid enabled configuration is fail-closed at request time.
@@ -83,8 +95,25 @@ func NewService(cfg config.ContentAuditConfig, configFilePath string) *Service {
 
 // NewServiceWithReviewer initializes a service with an optional direct semantic reviewer.
 func NewServiceWithReviewer(cfg config.ContentAuditConfig, configFilePath string, reviewer Reviewer) *Service {
-	service := &Service{reviewer: reviewer}
+	ctx, cancel := context.WithCancel(context.Background())
+	service := &Service{reviewer: reviewer, ctx: ctx, cancel: cancel, backgroundDone: make(chan struct{})}
+	service.shadow = newShadowReviewQueue(service)
 	service.Update(cfg, configFilePath)
+	// Reconcile the previous process's pending observations before accepting HTTP
+	// traffic. This never replays customer requests or changes their final action.
+	if state := service.state.Load(); state != nil && state.store != nil {
+		recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := state.store.InitializeLegacyModelReviewBudget(recoverCtx, state.cfg.ModelReview.MaxCallsPerDay, time.Now()); err != nil {
+			log.Warn("content audit legacy quota reconciliation failed")
+		}
+		count, err := state.store.RecoverInterruptedShadowReviews(recoverCtx, time.Now().Unix())
+		recoverCancel()
+		if err != nil {
+			log.Warn("content audit interrupted shadow reconciliation failed")
+		} else {
+			service.shadow.stats.Recovered = uint64(count)
+		}
+	}
 	return service
 }
 
@@ -95,6 +124,9 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	}
 	s.policyMu.Lock()
 	defer s.policyMu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
 	baseDir := filepath.Dir(configFilePath)
 	if strings.TrimSpace(configFilePath) == "" || baseDir == "." {
 		if cwd, err := os.Getwd(); err == nil {
@@ -103,7 +135,6 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 	}
 	normalizeAuditConfig(&cfg)
 	state := &runtimeState{cfg: cfg}
-	state.modelReview = newModelReviewController(cfg.ModelReview, s.reviewer)
 	state.identitySecret = firstNonEmptySecret(os.Getenv(identitySecretEnv), cfg.IdentitySecret)
 	evidenceKey := firstNonEmptySecret(os.Getenv(evidenceKeyEnv), cfg.EvidenceKey)
 	state.evidenceKeyFingerprint = sha256.Sum256([]byte(evidenceKey))
@@ -125,6 +156,18 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 		}
 	}
 
+	if previous != nil && previous.store == state.store && reflect.DeepEqual(previous.cfg.ModelReview, cfg.ModelReview) {
+		state.modelReview = previous.modelReview
+	} else {
+		state.modelReview = newModelReviewController(cfg.ModelReview, s.reviewer)
+		if state.modelReview != nil && state.store != nil {
+			store := state.store
+			state.modelReview.admit = func(ctx context.Context) (bool, string, error) {
+				reason, err := store.ReserveModelReviewCall(ctx, cfg.ModelReview.MaxCallsPerDay, cfg.ModelReview.MaxCallsPerMinute)
+				return reason == "" && err == nil, reason, err
+			}
+		}
+	}
 	if cfg.Enabled {
 		switch {
 		case state.initErr != nil:
@@ -150,7 +193,10 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 		}
 	}
 	if state.store != nil {
-		s.pruneOnce.Do(func() { go s.pruneLoop() })
+		s.pruneOnce.Do(func() {
+			s.background.Add(1)
+			go func() { defer s.background.Done(); s.pruneLoop() }()
+		})
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := state.store.Prune(ctx, cfg.RawRetentionDays, cfg.MetadataRetentionDays); err != nil {
 			log.WithError(err).Warn("content audit retention cleanup failed")
@@ -229,11 +275,36 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	} else if cfg.TimeoutMilliseconds > 10000 {
 		cfg.TimeoutMilliseconds = 10000
 	}
+	if cfg.Mode == ModelReviewModeEnforce && cfg.TimeoutMilliseconds > 4000 {
+		cfg.TimeoutMilliseconds = 4000
+	}
 	if cfg.QueueTimeoutMilliseconds <= 0 || cfg.QueueTimeoutMilliseconds > 500 {
 		cfg.QueueTimeoutMilliseconds = 100
 	}
 	if cfg.MaxConcurrent <= 0 || cfg.MaxConcurrent > 128 {
 		cfg.MaxConcurrent = 16
+	}
+	if cfg.ShadowQueueSize <= 0 || cfg.ShadowQueueSize > 1024 {
+		cfg.ShadowQueueSize = 64
+	}
+	if cfg.ShadowQueueBytes <= 0 || cfg.ShadowQueueBytes > 64<<20 {
+		cfg.ShadowQueueBytes = 4 << 20
+	}
+	if cfg.ShadowMaxAgeSeconds <= 0 || cfg.ShadowMaxAgeSeconds > 300 {
+		cfg.ShadowMaxAgeSeconds = 30
+	}
+	sampleRate := 0.2
+	if cfg.ShadowSampleRate != nil && !math.IsNaN(*cfg.ShadowSampleRate) && !math.IsInf(*cfg.ShadowSampleRate, 0) && *cfg.ShadowSampleRate >= 0 && *cfg.ShadowSampleRate <= 1 {
+		sampleRate = *cfg.ShadowSampleRate
+	}
+	cfg.ShadowSampleRate = &sampleRate
+	if cfg.MaxCallsPerDay <= 0 || cfg.MaxCallsPerDay > 1000 {
+		cfg.MaxCallsPerDay = 1000
+	}
+	if cfg.MaxCallsPerMinute <= 0 {
+		cfg.MaxCallsPerMinute = 5
+	} else if cfg.MaxCallsPerMinute > 60 {
+		cfg.MaxCallsPerMinute = 60
 	}
 	if cfg.CacheSeconds < 0 {
 		cfg.CacheSeconds = 0
@@ -282,12 +353,17 @@ func resolveAuditPath(baseDir, path string) string {
 func (s *Service) pruneLoop() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		state := s.state.Load()
 		if state == nil || state.store == nil {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 		err := state.store.Prune(ctx, state.cfg.RawRetentionDays, state.cfg.MetadataRetentionDays)
 		cancel()
 		if err != nil {
@@ -303,22 +379,24 @@ func (s *Service) Status() Status {
 		return Status{}
 	}
 	status := Status{
-		Enabled:                 state.cfg.Enabled,
-		AuditOnly:               state.cfg.AuditOnly,
-		Ready:                   state.initErr == nil,
-		DatabaseAvailable:       state.store != nil,
-		RequireSignedIdentity:   state.cfg.RequireSignedIdentity,
-		AllowUnauditedWebsocket: state.cfg.AllowUnauditedWebsocket,
-		MaxBodyBytes:            state.cfg.MaxBodyBytes,
-		EvidenceDedupeSeconds:   state.cfg.EvidenceDedupeSeconds,
-		RawRetentionDays:        state.cfg.RawRetentionDays,
-		MetadataRetentionDays:   state.cfg.MetadataRetentionDays,
-		ModelReviewMode:         state.cfg.ModelReview.Mode,
-		ModelReviewModel:        state.cfg.ModelReview.Model,
-		ModelReviewReady:        state.modelReview != nil,
-		ModelReviewTimeoutMS:    state.cfg.ModelReview.TimeoutMilliseconds,
-		ModelReviewAllowMin:     state.cfg.ModelReview.AllowMinConfidence,
-		ModelReviewBlockMin:     state.cfg.ModelReview.BlockMinConfidence,
+		Enabled:                     state.cfg.Enabled,
+		AuditOnly:                   state.cfg.AuditOnly,
+		Ready:                       state.initErr == nil,
+		DatabaseAvailable:           state.store != nil,
+		RequireSignedIdentity:       state.cfg.RequireSignedIdentity,
+		AllowUnauditedWebsocket:     state.cfg.AllowUnauditedWebsocket,
+		MaxBodyBytes:                state.cfg.MaxBodyBytes,
+		EvidenceDedupeSeconds:       state.cfg.EvidenceDedupeSeconds,
+		RawRetentionDays:            state.cfg.RawRetentionDays,
+		MetadataRetentionDays:       state.cfg.MetadataRetentionDays,
+		ModelReviewMode:             state.cfg.ModelReview.Mode,
+		ModelReviewModel:            state.cfg.ModelReview.Model,
+		ModelReviewReady:            state.modelReview != nil,
+		ModelReviewTimeoutMS:        state.cfg.ModelReview.TimeoutMilliseconds,
+		ModelReviewAllowMin:         state.cfg.ModelReview.AllowMinConfidence,
+		ModelReviewBlockMin:         state.cfg.ModelReview.BlockMinConfidence,
+		Shadow:                      s.shadow.status(),
+		IncompleteUnmatchedRequests: s.incompleteUnmatched.Load(),
 	}
 	if state.matcher != nil {
 		status.PolicyVersion = state.matcher.Version()
@@ -327,6 +405,11 @@ func (s *Service) Status() Status {
 	}
 	if state.initErr != nil {
 		status.Error = state.initErr.Error()
+	}
+	if state.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		status.ModelReviewBudget = state.store.ModelReviewBudgetStatus(ctx, state.cfg.ModelReview.MaxCallsPerDay, state.cfg.ModelReview.MaxCallsPerMinute)
+		cancel()
 	}
 	return status
 }
@@ -378,8 +461,11 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		decision := state.matcher.MatchScoped(extracted.EnforcementText, extracted.Text, extracted.Continuation)
+		decision := state.matcher.MatchExtracted(extracted)
 		if !decision.Matched {
+			if extracted.ContextIncomplete {
+				s.incompleteUnmatched.Add(1)
+			}
 			c.Next()
 			return
 		}
@@ -394,14 +480,40 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			model = identity.Model
 		}
 		modelReview := modelReviewOutcome{}
+		reviewRequest := ModelReviewRequest{
+			Text:              extracted.CurrentUserText,
+			ReferenceText:     extracted.ReferenceText,
+			ContextIncomplete: extracted.ContextIncomplete,
+			MatchedTerm:       decision.MatchedTerm,
+			RuleID:            decision.RuleID,
+			Category:          decision.Category,
+			Severity:          decision.Severity,
+			PolicyVersion:     decision.PolicyVersion,
+			TenantScope:       auditID,
+		}
+		if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
+			reviewRequest.TenantScope = fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
+		}
+		if reviewRequest.Text == "" {
+			reviewRequest.Text = extracted.EnforcementText
+		}
 		if decision.ModelReview && state.modelReview != nil {
-			modelReview = state.modelReview.review(c.Request.Context(), ModelReviewRequest{
-				Text:        extracted.EnforcementText,
-				MatchedTerm: decision.MatchedTerm,
-				RuleID:      decision.RuleID,
-				Category:    decision.Category,
-				Severity:    decision.Severity,
-			})
+			if state.cfg.ModelReview.Mode == ModelReviewModeShadow {
+				modelReview = modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Model: state.cfg.ModelReview.Model, Fallback: "shadow_pending"}
+				if state.modelReview.ruleGate {
+					if _, selected := state.modelReview.rules[decision.RuleID]; !selected {
+						modelReview.Fallback = "rule_not_selected"
+					}
+				}
+				if modelReview.Fallback == "shadow_pending" && !sampleShadowReview(state, reviewRequest) {
+					modelReview.Fallback = "shadow_sampled_out"
+					s.shadow.mu.Lock()
+					s.shadow.stats.Skipped++
+					s.shadow.mu.Unlock()
+				}
+			} else {
+				modelReview = state.modelReview.review(c.Request.Context(), reviewRequest)
+			}
 		}
 		keywordShouldBlock := decision.Action == RuleActionBlock
 		shouldBlock := keywordShouldBlock
@@ -423,41 +535,45 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			finalAction = ModelReviewBlock
 		}
 		event := Event{
-			ID:                    auditID,
-			CreatedAt:             time.Now().Unix(),
-			RequestID:             requestID,
-			UserID:                identity.UserID,
-			TokenID:               identity.TokenID,
-			TokenName:             identity.TokenName,
-			Method:                c.Request.Method,
-			Path:                  c.Request.URL.Path,
-			Protocol:              protocolForPath(c.Request.URL.Path),
-			Model:                 model,
-			Stream:                extracted.Stream,
-			Category:              decision.Category,
-			Severity:              decision.Severity,
-			RuleID:                decision.RuleID,
-			Action:                decision.Action,
-			FinalAction:           finalAction,
-			MatchedTerm:           decision.MatchedTerm,
-			MatchedRoles:          extracted.EnforcementMatchedRoles(decision.MatchedTerm),
-			PolicyVersion:         decision.PolicyVersion,
-			RequestBytes:          requestBytes,
-			IdentityVerified:      identity.Verified,
-			UpstreamSent:          !shouldBlock,
-			EvidenceStatus:        "encrypted",
-			EvidenceKeyID:         state.cfg.EvidenceKeyID,
-			ReviewLabel:           defaultReviewLabel,
-			ModelReviewMode:       state.cfg.ModelReview.Mode,
-			ModelReviewModel:      modelReview.Model,
-			ModelReviewDecision:   modelReview.Decision,
-			ModelReviewCategory:   modelReview.Category,
-			ModelReviewConfidence: modelReview.Confidence,
-			ModelReviewLatencyMS:  modelReview.Latency.Milliseconds(),
-			ModelReviewCacheHit:   modelReview.CacheHit,
-			ModelReviewFallback:   modelReview.Fallback,
-			fingerprintMaterial:   extracted.FingerprintMaterial(),
-			dedupeWindow:          time.Duration(state.cfg.EvidenceDedupeSeconds) * time.Second,
+			ID:                       auditID,
+			CreatedAt:                time.Now().Unix(),
+			RequestID:                requestID,
+			UserID:                   identity.UserID,
+			TokenID:                  identity.TokenID,
+			TokenName:                identity.TokenName,
+			Method:                   c.Request.Method,
+			Path:                     c.Request.URL.Path,
+			Protocol:                 protocolForPath(c.Request.URL.Path),
+			Model:                    model,
+			Stream:                   extracted.Stream,
+			Category:                 decision.Category,
+			Severity:                 decision.Severity,
+			RuleID:                   decision.RuleID,
+			Action:                   decision.Action,
+			FinalAction:              finalAction,
+			MatchedTerm:              decision.MatchedTerm,
+			MatchedRoles:             extracted.DecisionMatchedRoles(decision),
+			MatchSource:              decision.MatchSource,
+			PolicyVersion:            decision.PolicyVersion,
+			RequestBytes:             requestBytes,
+			IdentityVerified:         identity.Verified,
+			UpstreamSent:             !shouldBlock,
+			EvidenceStatus:           "encrypted",
+			EvidenceKeyID:            state.cfg.EvidenceKeyID,
+			ReviewLabel:              defaultReviewLabel,
+			ModelReviewMode:          state.cfg.ModelReview.Mode,
+			ModelReviewModel:         modelReview.Model,
+			ModelReviewResolvedModel: modelReview.ResolvedModel,
+			ModelReviewPromptVersion: state.cfg.ModelReview.PromptVersion,
+			ModelReviewDecision:      modelReview.Decision,
+			ModelReviewCategory:      modelReview.Category,
+			ModelReviewConfidence:    modelReview.Confidence,
+			ModelReviewLatencyMS:     modelReview.Latency.Milliseconds(),
+			ModelReviewCacheHit:      modelReview.CacheHit,
+			ModelReviewFallback:      modelReview.Fallback,
+			ModelReviewDiagnostics:   safeReviewDiagnostics(modelReview.StageLatenciesMS),
+			fingerprintMaterial:      extracted.FingerprintMaterial(),
+			dedupeWindow:             time.Duration(state.cfg.EvidenceDedupeSeconds) * time.Second,
 		}
 		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 3*time.Second)
 		err = state.store.Record(storeCtx, event, extracted.Evidence)
@@ -470,6 +586,20 @@ func (s *Service) Middleware() gin.HandlerFunc {
 				"rule_id":    decision.RuleID,
 			}).WithError(err).Error("failed to persist matched content audit event")
 			c.Header("X-CPA-Audit-Evidence-Status", "storage_failed")
+		}
+		if err == nil && modelReview.Fallback == "shadow_pending" {
+			if reason := s.shadow.submit(shadowReviewJob{eventID: auditID, state: state, request: reviewRequest}); reason != "" {
+				modelReview.Fallback = reason
+				updateCtx, updateCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				errUpdate := state.store.UpdateShadowReview(updateCtx, auditID, decision.PolicyVersion, modelReview)
+				updateCancel()
+				if errUpdate != nil {
+					s.shadow.mu.Lock()
+					s.shadow.stats.PersistenceLost++
+					s.shadow.mu.Unlock()
+					log.Warn("content audit shadow skip persistence failed")
+				}
+			}
 		}
 		if !shouldBlock {
 			c.Next()
@@ -512,7 +642,7 @@ func readAuditRequest(c *gin.Context, maxBodyBytes int64) (ExtractedRequest, int
 	if err != nil {
 		return ExtractedRequest{}, 0, err
 	}
-	return ExtractJSONRequest(body), int64(len(body)), nil
+	return ExtractJSONRequestForPath(body, c.Request.URL.Path), int64(len(body)), nil
 }
 
 func protocolForPath(path string) string {

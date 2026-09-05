@@ -2,9 +2,9 @@
 
 This fork is intended to use a pull-based production deployment flow:
 
-1. Merge validated code into `main`
-2. Create and push a Git tag like `fork/v7.10.43`
-3. GitHub Actions builds release binaries and an amd64 Docker image
+1. Form a trusted candidate containing the current production revision
+2. Push it and require successful `trusted-ci` for that exact full SHA
+3. Dispatch `docker-image` on the candidate branch with that full SHA as `tag`
 4. Production servers pull the published GHCR image
 5. Restart the service without building on the production host
 
@@ -13,7 +13,10 @@ This fork is intended to use a pull-based production deployment flow:
 - `.github/workflows/docker-image.yml`
   - Triggered by pushing `fork/v*` tags
   - Publishes `linux/amd64` images to `ghcr.io/quqi1599/cliproxyapi`
-  - Also supports manual reruns through `workflow_dispatch`
+  - Uses `[self-hosted, ci-vps]`, a host-level build lock and disk/inode gates
+  - Publishes `sha-<12>` tags and reuses an existing revision-verified image
+  - Supports a trusted full SHA or release tag through `workflow_dispatch`
+  - Requires successful `trusted-ci` for the exact checked-out revision
   - Manual reruns can optionally refresh the `latest` image tag
 - `.github/workflows/release.yaml`
   - Triggered by the same `fork/v*` tags
@@ -28,7 +31,8 @@ For a release tag like `fork/v7.10.43`, the Docker workflow publishes:
 - `ghcr.io/quqi1599/cliproxyapi:7.10.43`
 - `ghcr.io/quqi1599/cliproxyapi:7.10`
 - `ghcr.io/quqi1599/cliproxyapi:7`
-- `ghcr.io/quqi1599/cliproxyapi:latest` on tag push
+- `ghcr.io/quqi1599/cliproxyapi:sha-<commit12>` for every publication
+- `ghcr.io/quqi1599/cliproxyapi:latest` only when explicitly requested
 
 These release tags remain available for compatibility. The default
 `docker-compose.yml` keeps its local build and mutable image fallback for

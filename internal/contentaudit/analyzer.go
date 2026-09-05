@@ -81,7 +81,9 @@ func moderationSeedSetHash(seeds []string) string {
 func collectHanKeywordSeeds(keywords []string) []string {
 	seen := make(map[string]struct{})
 	for _, keyword := range keywords {
-		filtered := filterModerationText(keyword)
+		// Managed policies may persist segmented Han keywords with spaces.
+		// Canonicalizing policy entries does not authorize compacting requests.
+		filtered := filterModerationVariantText(keyword)
 		var run strings.Builder
 		flush := func() {
 			seed := run.String()
@@ -109,27 +111,40 @@ func collectHanKeywordSeeds(keywords []string) []string {
 }
 
 func (a *moderationAnalyzer) normalize(value string) string {
+	return a.normalizeFiltered(filterModerationText(value))
+}
+
+func (a *moderationAnalyzer) normalizeVariant(value string) string {
+	return a.normalizeFiltered(filterModerationVariantText(value))
+}
+
+func (a *moderationAnalyzer) normalizeFiltered(filtered string) string {
 	if a == nil || a.segmenter == nil {
 		return ""
 	}
-	filtered := filterModerationText(value)
 	if filtered == "" {
 		return ""
 	}
-	tokens := a.segmenter.Cut(filtered, false)
 	var output strings.Builder
 	output.Grow(len(filtered))
-	for _, token := range tokens {
-		token = normalizeModerationToken(token)
-		if token == "" {
-			continue
+	for index, fragment := range strings.Split(filtered, "\n") {
+		if index > 0 {
+			output.WriteByte('\n')
 		}
-		if output.Len() > 0 {
-			output.WriteByte(' ')
+		first := true
+		for _, token := range a.segmenter.Cut(fragment, false) {
+			token = normalizeModerationToken(token)
+			if token == "" {
+				continue
+			}
+			if !first {
+				output.WriteByte(' ')
+			}
+			output.WriteString(token)
+			first = false
 		}
-		output.WriteString(token)
 	}
-	return output.String()
+	return strings.TrimSpace(output.String())
 }
 
 func normalizeModerationToken(value string) string {
@@ -143,10 +158,39 @@ func normalizeModerationToken(value string) string {
 	return output.String()
 }
 
-// filterModerationText applies NFKC and removes characters commonly used to
-// disguise a phrase. Separators inside a Han run are dropped so "口，交" is
-// analyzed like "口交"; separators elsewhere collapse to one space.
+// filterModerationText preserves structural boundaries for local enforcement.
+// In particular, punctuation, newlines, invisible separators and spaces between
+// Han characters cannot manufacture a word or move intent across clauses.
 func filterModerationText(value string) string {
+	value = strings.ToLower(norm.NFKC.String(value))
+	var output strings.Builder
+	output.Grow(len(value))
+	var previous rune
+	pendingSpace, pendingBoundary := false, false
+	for _, character := range value {
+		if isModerationInvisible(character) || unicode.IsPunct(character) || unicode.IsSymbol(character) || character == '\n' || character == '\r' || unicode.IsControl(character) {
+			pendingBoundary = output.Len() > 0
+			continue
+		}
+		if unicode.IsSpace(character) {
+			pendingSpace = output.Len() > 0
+			continue
+		}
+		if pendingBoundary || pendingSpace && unicode.Is(unicode.Han, previous) && unicode.Is(unicode.Han, character) {
+			output.WriteByte('\n')
+		} else if pendingSpace {
+			output.WriteByte(' ')
+		}
+		pendingSpace, pendingBoundary = false, false
+		output.WriteRune(character)
+		previous = character
+	}
+	return strings.TrimSpace(output.String())
+}
+
+// filterModerationVariantText is a recall-only view. Its matches must never
+// become a local block without an independently supported original-text match.
+func filterModerationVariantText(value string) string {
 	value = strings.ToLower(norm.NFKC.String(value))
 	var output strings.Builder
 	output.Grow(len(value))

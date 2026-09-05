@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -39,47 +40,51 @@ var validReviewLabels = map[string]struct{}{
 
 // Event is the plaintext metadata stored for one matched request.
 type Event struct {
-	ID                    string   `json:"id"`
-	CreatedAt             int64    `json:"created_at"`
-	RequestID             string   `json:"request_id"`
-	UserID                int64    `json:"user_id,omitempty"`
-	TokenID               int64    `json:"token_id,omitempty"`
-	TokenName             string   `json:"token_name,omitempty"`
-	Method                string   `json:"method"`
-	Path                  string   `json:"path"`
-	Protocol              string   `json:"protocol"`
-	Model                 string   `json:"model,omitempty"`
-	Stream                bool     `json:"stream"`
-	Category              string   `json:"category"`
-	Severity              string   `json:"severity"`
-	RuleID                string   `json:"rule_id"`
-	Action                string   `json:"action"`
-	FinalAction           string   `json:"final_action"`
-	MatchedTerm           string   `json:"matched_term,omitempty"`
-	MatchedRoles          []string `json:"matched_roles,omitempty"`
-	ContentFingerprint    string   `json:"content_fingerprint,omitempty"`
-	PolicyVersion         string   `json:"policy_version"`
-	RequestBytes          int64    `json:"request_bytes"`
-	IdentityVerified      bool     `json:"identity_verified"`
-	UpstreamSent          bool     `json:"upstream_sent"`
-	EvidenceStatus        string   `json:"evidence_status"`
-	EvidenceKeyID         string   `json:"evidence_key_id"`
-	EvidenceRefID         string   `json:"evidence_ref_id,omitempty"`
-	DuplicateCount        int64    `json:"duplicate_count"`
-	ModelReviewMode       string   `json:"model_review_mode,omitempty"`
-	ModelReviewModel      string   `json:"model_review_model,omitempty"`
-	ModelReviewDecision   string   `json:"model_review_decision,omitempty"`
-	ModelReviewCategory   string   `json:"model_review_category,omitempty"`
-	ModelReviewConfidence float64  `json:"model_review_confidence,omitempty"`
-	ModelReviewLatencyMS  int64    `json:"model_review_latency_ms,omitempty"`
-	ModelReviewCacheHit   bool     `json:"model_review_cache_hit,omitempty"`
-	ModelReviewFallback   string   `json:"model_review_fallback,omitempty"`
-	ReviewLabel           string   `json:"review_label"`
-	ReviewNote            string   `json:"review_note,omitempty"`
-	ReviewedAt            int64    `json:"reviewed_at,omitempty"`
-	ReviewedBy            string   `json:"reviewed_by,omitempty"`
-	fingerprintMaterial   string
-	dedupeWindow          time.Duration
+	ID                       string           `json:"id"`
+	CreatedAt                int64            `json:"created_at"`
+	RequestID                string           `json:"request_id"`
+	UserID                   int64            `json:"user_id,omitempty"`
+	TokenID                  int64            `json:"token_id,omitempty"`
+	TokenName                string           `json:"token_name,omitempty"`
+	Method                   string           `json:"method"`
+	Path                     string           `json:"path"`
+	Protocol                 string           `json:"protocol"`
+	Model                    string           `json:"model,omitempty"`
+	Stream                   bool             `json:"stream"`
+	Category                 string           `json:"category"`
+	Severity                 string           `json:"severity"`
+	RuleID                   string           `json:"rule_id"`
+	Action                   string           `json:"action"`
+	FinalAction              string           `json:"final_action"`
+	MatchedTerm              string           `json:"matched_term,omitempty"`
+	MatchedRoles             []string         `json:"matched_roles,omitempty"`
+	MatchSource              string           `json:"match_source,omitempty"`
+	ContentFingerprint       string           `json:"content_fingerprint,omitempty"`
+	PolicyVersion            string           `json:"policy_version"`
+	RequestBytes             int64            `json:"request_bytes"`
+	IdentityVerified         bool             `json:"identity_verified"`
+	UpstreamSent             bool             `json:"upstream_sent"`
+	EvidenceStatus           string           `json:"evidence_status"`
+	EvidenceKeyID            string           `json:"evidence_key_id"`
+	EvidenceRefID            string           `json:"evidence_ref_id,omitempty"`
+	DuplicateCount           int64            `json:"duplicate_count"`
+	ModelReviewMode          string           `json:"model_review_mode,omitempty"`
+	ModelReviewModel         string           `json:"model_review_model,omitempty"`
+	ModelReviewResolvedModel string           `json:"model_review_resolved_model,omitempty"`
+	ModelReviewPromptVersion string           `json:"model_review_prompt_version,omitempty"`
+	ModelReviewDecision      string           `json:"model_review_decision,omitempty"`
+	ModelReviewCategory      string           `json:"model_review_category,omitempty"`
+	ModelReviewConfidence    float64          `json:"model_review_confidence,omitempty"`
+	ModelReviewLatencyMS     int64            `json:"model_review_latency_ms,omitempty"`
+	ModelReviewCacheHit      bool             `json:"model_review_cache_hit,omitempty"`
+	ModelReviewFallback      string           `json:"model_review_fallback,omitempty"`
+	ModelReviewDiagnostics   map[string]int64 `json:"model_review_diagnostics,omitempty"`
+	ReviewLabel              string           `json:"review_label"`
+	ReviewNote               string           `json:"review_note,omitempty"`
+	ReviewedAt               int64            `json:"reviewed_at,omitempty"`
+	ReviewedBy               string           `json:"reviewed_by,omitempty"`
+	fingerprintMaterial      string
+	dedupeWindow             time.Duration
 }
 
 // AccessLog records sensitive evidence reveals and operator annotations.
@@ -163,7 +168,14 @@ func NewStore(path, evidenceKey, keyID string) (*Store, error) {
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create content audit database directory: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve content audit database path: %w", err)
+	}
+	// SQLite pragmas are connection-local. Apply the busy handler to every pooled
+	// connection so background result writes do not fail immediately under load.
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath), RawQuery: "_pragma=busy_timeout%3d5000"}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open content audit database: %w", err)
 	}
@@ -214,6 +226,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			final_action TEXT NOT NULL DEFAULT '',
 			matched_term TEXT NOT NULL DEFAULT '',
 			matched_roles TEXT NOT NULL DEFAULT '[]',
+			match_source TEXT NOT NULL DEFAULT '',
 			content_fingerprint TEXT NOT NULL DEFAULT '',
 			policy_version TEXT NOT NULL DEFAULT '',
 			request_bytes INTEGER NOT NULL DEFAULT 0,
@@ -225,12 +238,15 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			model_review_mode TEXT NOT NULL DEFAULT '',
 			model_review_model TEXT NOT NULL DEFAULT '',
+			model_review_resolved_model TEXT NOT NULL DEFAULT '',
+			model_review_prompt_version TEXT NOT NULL DEFAULT '',
 			model_review_decision TEXT NOT NULL DEFAULT '',
 			model_review_category TEXT NOT NULL DEFAULT '',
 			model_review_confidence REAL NOT NULL DEFAULT 0,
 			model_review_latency_ms INTEGER NOT NULL DEFAULT 0,
 			model_review_cache_hit INTEGER NOT NULL DEFAULT 0,
 			model_review_fallback TEXT NOT NULL DEFAULT '',
+			model_review_diagnostics TEXT NOT NULL DEFAULT '{}',
 			evidence_nonce BLOB,
 			evidence_ciphertext BLOB,
 			review_label TEXT NOT NULL DEFAULT 'unreviewed',
@@ -256,6 +272,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS audit_model_review_budget (
+			period_key TEXT PRIMARY KEY,
+			calls INTEGER NOT NULL,
+			legacy_closed INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS audit_policy_versions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at INTEGER NOT NULL,
@@ -278,17 +300,21 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		{name: "action", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "final_action", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "matched_roles", definition: "TEXT NOT NULL DEFAULT '[]'"},
+		{name: "match_source", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "content_fingerprint", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "evidence_ref_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "duplicate_count", definition: "INTEGER NOT NULL DEFAULT 1"},
 		{name: "model_review_mode", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "model_review_model", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_resolved_model", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_prompt_version", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "model_review_decision", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "model_review_category", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "model_review_confidence", definition: "REAL NOT NULL DEFAULT 0"},
 		{name: "model_review_latency_ms", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "model_review_cache_hit", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "model_review_fallback", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_review_diagnostics", definition: "TEXT NOT NULL DEFAULT '{}'"},
 	}
 	for _, column := range columns {
 		if err := ensureSQLiteColumn(ctx, s.db, "audit_events", column.name, column.definition); err != nil {
@@ -611,24 +637,28 @@ func insertAuditEvent(ctx context.Context, execer auditEventExecer, event Event,
 	if err != nil {
 		return fmt.Errorf("marshal content audit matched roles: %w", err)
 	}
+	diagnosticsJSON, err := json.Marshal(safeReviewDiagnostics(event.ModelReviewDiagnostics))
+	if err != nil {
+		return fmt.Errorf("marshal content audit review diagnostics: %w", err)
+	}
 	_, err = execer.ExecContext(ctx, `INSERT INTO audit_events (
 		id, created_at, request_id, user_id, token_id, token_name, method, path, protocol,
-		model, stream, category, severity, rule_id, action, final_action, matched_term, matched_roles,
+		model, stream, category, severity, rule_id, action, final_action, matched_term, matched_roles, match_source,
 		content_fingerprint, policy_version,
 		request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
-		evidence_ref_id, duplicate_count, model_review_mode, model_review_model,
+		evidence_ref_id, duplicate_count, model_review_mode, model_review_model, model_review_resolved_model, model_review_prompt_version,
 		model_review_decision, model_review_category, model_review_confidence,
-		model_review_latency_ms, model_review_cache_hit, model_review_fallback,
+		model_review_latency_ms, model_review_cache_hit, model_review_fallback, model_review_diagnostics,
 		evidence_nonce, evidence_ciphertext, review_label
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID, event.CreatedAt, event.RequestID, event.UserID, event.TokenID, event.TokenName,
 		event.Method, event.Path, event.Protocol, event.Model, boolInt(event.Stream), event.Category,
-		event.Severity, event.RuleID, event.Action, event.FinalAction, event.MatchedTerm, string(rolesJSON),
+		event.Severity, event.RuleID, event.Action, event.FinalAction, event.MatchedTerm, string(rolesJSON), event.MatchSource,
 		event.ContentFingerprint, event.PolicyVersion, event.RequestBytes, boolInt(event.IdentityVerified),
 		boolInt(event.UpstreamSent), event.EvidenceStatus, event.EvidenceKeyID, event.EvidenceRefID,
-		event.DuplicateCount, event.ModelReviewMode, event.ModelReviewModel,
+		event.DuplicateCount, event.ModelReviewMode, event.ModelReviewModel, event.ModelReviewResolvedModel, event.ModelReviewPromptVersion,
 		event.ModelReviewDecision, event.ModelReviewCategory, event.ModelReviewConfidence,
-		event.ModelReviewLatencyMS, boolInt(event.ModelReviewCacheHit), event.ModelReviewFallback,
+		event.ModelReviewLatencyMS, boolInt(event.ModelReviewCacheHit), event.ModelReviewFallback, string(diagnosticsJSON),
 		nonce, ciphertext, event.ReviewLabel,
 	)
 	return err
@@ -648,17 +678,17 @@ type eventScanner interface {
 func scanEvent(scanner eventScanner) (Event, error) {
 	var event Event
 	var stream, identityVerified, upstreamSent, modelReviewCacheHit int
-	var matchedRoles string
+	var matchedRoles, diagnostics string
 	err := scanner.Scan(
 		&event.ID, &event.CreatedAt, &event.RequestID, &event.UserID, &event.TokenID,
 		&event.TokenName, &event.Method, &event.Path, &event.Protocol, &event.Model, &stream,
 		&event.Category, &event.Severity, &event.RuleID, &event.Action, &event.FinalAction, &event.MatchedTerm,
-		&matchedRoles, &event.ContentFingerprint, &event.PolicyVersion, &event.RequestBytes,
+		&matchedRoles, &event.MatchSource, &event.ContentFingerprint, &event.PolicyVersion, &event.RequestBytes,
 		&identityVerified, &upstreamSent, &event.EvidenceStatus, &event.EvidenceKeyID,
 		&event.EvidenceRefID, &event.DuplicateCount,
-		&event.ModelReviewMode, &event.ModelReviewModel, &event.ModelReviewDecision,
+		&event.ModelReviewMode, &event.ModelReviewModel, &event.ModelReviewResolvedModel, &event.ModelReviewPromptVersion, &event.ModelReviewDecision,
 		&event.ModelReviewCategory, &event.ModelReviewConfidence, &event.ModelReviewLatencyMS,
-		&modelReviewCacheHit, &event.ModelReviewFallback,
+		&modelReviewCacheHit, &event.ModelReviewFallback, &diagnostics,
 		&event.ReviewLabel, &event.ReviewNote, &event.ReviewedAt, &event.ReviewedBy,
 	)
 	event.Stream = stream != 0
@@ -666,6 +696,9 @@ func scanEvent(scanner eventScanner) (Event, error) {
 	event.UpstreamSent = upstreamSent != 0
 	event.ModelReviewCacheHit = modelReviewCacheHit != 0
 	if err == nil {
+		if errDiagnostics := json.Unmarshal([]byte(diagnostics), &event.ModelReviewDiagnostics); errDiagnostics != nil {
+			event.ModelReviewDiagnostics = nil
+		}
 		if errRoles := json.Unmarshal([]byte(matchedRoles), &event.MatchedRoles); errRoles != nil {
 			event.MatchedRoles = []string{"unknown"}
 		}
@@ -675,11 +708,11 @@ func scanEvent(scanner eventScanner) (Event, error) {
 
 const eventSelectColumns = `id, created_at, request_id, user_id, token_id, token_name,
 	method, path, protocol, model, stream, category, severity, rule_id, action, final_action, matched_term,
-	matched_roles, content_fingerprint, policy_version,
+	matched_roles, match_source, content_fingerprint, policy_version,
 	request_bytes, identity_verified, upstream_sent, evidence_status, evidence_key_id,
-	evidence_ref_id, duplicate_count, model_review_mode, model_review_model,
+	evidence_ref_id, duplicate_count, model_review_mode, model_review_model, model_review_resolved_model, model_review_prompt_version,
 	model_review_decision, model_review_category, model_review_confidence,
-	model_review_latency_ms, model_review_cache_hit, model_review_fallback,
+	model_review_latency_ms, model_review_cache_hit, model_review_fallback, model_review_diagnostics,
 	review_label, review_note, reviewed_at, reviewed_by`
 
 // List returns metadata only; evidence is never included in list responses.

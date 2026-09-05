@@ -1083,6 +1083,14 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	if cliproxyexecutor.ContentAuditReviewTraceFromContext(ctx) != nil {
+		// One reserved review must produce at most one HTTP dispatch. In particular,
+		// 307/308 must not replay the review body to an unaccounted destination.
+		// The underlying client is cached and shared with normal business requests.
+		auditClient := *httpClient
+		auditClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		httpClient = &auditClient
+	}
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		return httpResp, newCodexHTTPDoStatusErr(ctx, errDo, false)

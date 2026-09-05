@@ -231,6 +231,12 @@ type ContentAuditModelReviewConfig struct {
 	TimeoutMilliseconds      int      `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`
 	QueueTimeoutMilliseconds int      `yaml:"queue-timeout-milliseconds" json:"queue-timeout-milliseconds"`
 	MaxConcurrent            int      `yaml:"max-concurrent" json:"max-concurrent"`
+	ShadowQueueSize          int      `yaml:"shadow-queue-size" json:"shadow-queue-size"`
+	ShadowQueueBytes         int64    `yaml:"shadow-queue-bytes" json:"shadow-queue-bytes"`
+	ShadowMaxAgeSeconds      int      `yaml:"shadow-max-age-seconds" json:"shadow-max-age-seconds"`
+	ShadowSampleRate         *float64 `yaml:"shadow-sample-rate,omitempty" json:"shadow-sample-rate,omitempty"`
+	MaxCallsPerDay           int      `yaml:"max-calls-per-day" json:"max-calls-per-day"`
+	MaxCallsPerMinute        int      `yaml:"max-calls-per-minute" json:"max-calls-per-minute"`
 	CacheSeconds             int      `yaml:"cache-seconds" json:"cache-seconds"`
 	MaxInputBytes            int      `yaml:"max-input-bytes" json:"max-input-bytes"`
 	MinConfidence            float64  `yaml:"min-confidence" json:"min-confidence"`

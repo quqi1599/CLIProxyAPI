@@ -23,16 +23,18 @@ import (
 func TestNormalizeModelReviewConfigAllowsBoundedExtendedTimeout(t *testing.T) {
 	tests := []struct {
 		name     string
+		mode     string
 		input    int
 		expected int
 	}{
-		{name: "default", input: 0, expected: 3500},
-		{name: "extended", input: 8000, expected: 8000},
-		{name: "bounded", input: 12000, expected: 10000},
+		{name: "default", mode: ModelReviewModeEnforce, input: 0, expected: 3500},
+		{name: "realtime total cap", mode: ModelReviewModeEnforce, input: 8000, expected: 4000},
+		{name: "shadow extended", mode: ModelReviewModeShadow, input: 8000, expected: 8000},
+		{name: "shadow bounded", mode: ModelReviewModeShadow, input: 12000, expected: 10000},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cfg := config.ContentAuditModelReviewConfig{Mode: ModelReviewModeEnforce, TimeoutMilliseconds: test.input}
+			cfg := config.ContentAuditModelReviewConfig{Mode: test.mode, TimeoutMilliseconds: test.input}
 			normalizeModelReviewConfig(&cfg)
 			if cfg.TimeoutMilliseconds != test.expected {
 				t.Fatalf("timeout = %d, want %d", cfg.TimeoutMilliseconds, test.expected)
@@ -152,6 +154,7 @@ func TestMiddlewareAllowsNonMatchWithoutDatabaseWrite(t *testing.T) {
 
 func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	fullSample := 1.0
 	tests := []struct {
 		name            string
 		mode            string
@@ -188,6 +191,7 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 					Mode:               test.mode,
 					Model:              "synthetic-reviewer",
 					MinConfidence:      0.9,
+					ShadowSampleRate:   &fullSample,
 					AllowMinConfidence: test.allowMin,
 					BlockMinConfidence: test.blockMin,
 				},
@@ -196,6 +200,7 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 			}))
 			state := service.state.Load()
 			defer func() { _ = state.store.Close() }()
+			defer func() { _ = service.Shutdown(context.Background()) }()
 			nextCalls := 0
 			router := gin.New()
 			router.Use(service.Middleware())
@@ -215,6 +220,9 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 				t.Fatalf("List()=%#v err=%v", list, err)
 			}
 			event := list.Items[0]
+			if test.mode == ModelReviewModeShadow {
+				event = waitForShadowResult(t, service, event.ID)
+			}
 			if event.ModelReviewDecision != test.modelDecision || event.ModelReviewModel != "synthetic-reviewer" || event.FinalAction != test.wantFinalAction {
 				t.Fatalf("event=%#v", event)
 			}
@@ -469,7 +477,8 @@ rules:
 	directContinuationRequest.Header.Set("Content-Type", "application/json")
 	directContinuationResponse := httptest.NewRecorder()
 	router.ServeHTTP(directContinuationResponse, directContinuationRequest)
-	if directContinuationResponse.Code != http.StatusBadRequest || nextCalls != 3 {
+	// Referenced history is now an observation candidate, never a local block.
+	if directContinuationResponse.Code != http.StatusNoContent || nextCalls != 4 {
 		t.Fatalf("direct-continuation status=%d next=%d body=%s", directContinuationResponse.Code, nextCalls, directContinuationResponse.Body.String())
 	}
 
@@ -480,8 +489,8 @@ rules:
 	for _, item := range list.Items {
 		switch item.RuleID {
 		case "block-rule":
-			if item.UpstreamSent {
-				t.Fatalf("continuation block event was sent upstream: %#v", item)
+			if !item.UpstreamSent || item.FinalAction != ModelReviewAllow || item.MatchSource != "reference" {
+				t.Fatalf("reference candidate unexpectedly blocked: %#v", item)
 			}
 		case "observe-rule":
 			if !item.UpstreamSent {

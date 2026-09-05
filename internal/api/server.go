@@ -1636,6 +1636,13 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	s.ready.Store(false)
+	defer func() {
+		if s.contentAudit != nil {
+			if err := s.contentAudit.Shutdown(ctx); err != nil {
+				log.Warn("content audit background shutdown exceeded its budget")
+			}
+		}
+	}()
 	log.Debug("Stopping API server...")
 
 	if s.keepAliveEnabled {

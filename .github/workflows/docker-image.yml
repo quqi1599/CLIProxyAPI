@@ -2,207 +2,125 @@ name: docker-image
 
 on:
   push:
-    tags:
-      - fork/v*
+    tags: ["fork/v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: '要构建并发布的 Git tag（例如: fork/v7.10.43）'
+        description: "Trusted release tag or full commit SHA with successful trusted-ci"
         required: true
       publish_latest:
-        description: '手动补跑时是否同步刷新 latest 标签'
-        required: false
+        description: "Also update the compatibility latest tag"
         type: boolean
         default: false
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+permissions:
+  contents: read
+
+concurrency:
+  group: cliproxy-image-publication
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-vps]
+    timeout-minutes: 60
     permissions:
       contents: read
+      actions: read
       packages: write
-
     steps:
-      - name: Prepare
+      - name: Validate trusted reference
+        env:
+          RELEASE_REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          platform=linux/amd64
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-          echo "IMAGE_NAME_LC=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          [[ "$RELEASE_REF" =~ ^fork/v[0-9]+\.[0-9]+\.[0-9]+$ || "$RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Resolve immutable candidate
+        id: candidate
+        env:
+          RELEASE_REF: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${commit:0:12}"
+          version="${RELEASE_REF#fork/}"
+          if [[ "$RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]; then version="sha-${commit:0:12}"; fi
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Registry
-        uses: docker/login-action@v3
+      - name: Require successful tests for this exact candidate
+        uses: actions/github-script@v7
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
         with:
-          registry: ${{ env.REGISTRY }}
+          script: |
+            const {data} = await github.rest.actions.listWorkflowRuns({
+              ...context.repo, workflow_id: 'trusted-ci.yml',
+              head_sha: process.env.CANDIDATE_SHA, status: 'success', per_page: 100
+            });
+            const trusted = data.workflow_runs.some(run =>
+              run.head_sha === process.env.CANDIDATE_SHA &&
+              ['push', 'workflow_dispatch'].includes(run.event) &&
+              run.head_repository?.full_name === context.repo.owner + '/' + context.repo.repo);
+            if (!trusted) core.setFailed('No successful trusted-ci for this exact SHA');
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate release metadata
-        id: version
+      - name: Resource gate, build and publish immutable amd64 image
+        env:
+          IMAGE: ${{ steps.candidate.outputs.image }}
+          COMMIT: ${{ steps.candidate.outputs.sha }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest || false }}
+          RELEASE_REF: ${{ inputs.tag || github.ref_name }}
+          DOCKER_BUILDKIT: "1"
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RELEASE_TAG="${{ github.event.inputs.tag }}"
+          set -euo pipefail
+          command -v flock
+          docker info --format '{{.Architecture}}'
+          exec 9>/tmp/ci-heavy-docker-build.lock
+          flock -w 1800 9
+          docker_root="$(docker info --format '{{.DockerRootDir}}')"
+          df -h "$docker_root" "$GITHUB_WORKSPACE"
+          df -i "$docker_root" "$GITHUB_WORKSPACE"
+          for path in "$docker_root" "$GITHUB_WORKSPACE"; do
+            used="$(df -P "$path" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+            inodes="$(df -Pi "$path" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+            (( used <= 85 && inodes <= 85 )) || { echo 'Resource gate failed'; exit 1; }
+          done
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            docker pull "$IMAGE"
+            test "$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$COMMIT"
           else
-            RELEASE_TAG="${GITHUB_REF_NAME}"
+            docker build --platform linux/amd64 \
+              --build-arg VERSION="$VERSION" --build-arg COMMIT="$COMMIT" \
+              --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+              --tag "$IMAGE" .
+            docker push "$IMAGE"
           fi
-
-          if [[ ! "$RELEASE_TAG" =~ ^fork/v ]]; then
-            echo "expected fork/v* tag, got: $RELEASE_TAG" >&2
-            exit 1
+          test "$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$COMMIT"
+          test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = amd64
+          if [[ "$RELEASE_REF" == fork/v* ]]; then
+            semver="${VERSION#v}"
+            for alias in "${RELEASE_REF//\//-}" "$VERSION" "$semver" "${semver%.*}" "${semver%%.*}"; do
+              docker tag "$IMAGE" "${IMAGE%:*}:$alias"
+              docker push "${IMAGE%:*}:$alias"
+            done
           fi
-
-          VERSION="${RELEASE_TAG#fork/}"
-          VERSION_SEMVER="${VERSION#v}"
-          DOCKER_TAG="${RELEASE_TAG//\//-}"
-          COMMIT="$(git rev-parse HEAD)"
-          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          REPOSITORY_URL="https://github.com/${{ github.repository }}"
-
-          {
-            echo "release_tag=$RELEASE_TAG"
-            echo "version=$VERSION"
-            echo "version_semver=$VERSION_SEMVER"
-            echo "docker_tag=$DOCKER_TAG"
-            echo "commit=$COMMIT"
-            echo "build_date=$BUILD_DATE"
-            echo "repository_url=$REPOSITORY_URL"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.docker_tag }}
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version_semver }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version_semver }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.version_semver }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' || github.event.inputs.publish_latest == 'true' }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,scope=build-${{ env.PLATFORM_PAIR }},mode=max
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            COMMIT=${{ steps.version.outputs.commit }}
-            BUILD_DATE=${{ steps.version.outputs.build_date }}
-            REPOSITORY_URL=${{ steps.version.outputs.repository_url }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ env.PLATFORM_PAIR }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  manifest:
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
-
-      - name: Prepare
-        run: |
-          echo "IMAGE_NAME_LC=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-
-      - name: Generate release metadata
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RELEASE_TAG="${{ github.event.inputs.tag }}"
-          else
-            RELEASE_TAG="${GITHUB_REF_NAME}"
+          if [[ "$PUBLISH_LATEST" = true ]]; then
+            docker tag "$IMAGE" "${IMAGE%:*}:latest"
+            docker push "${IMAGE%:*}:latest"
           fi
-
-          if [[ ! "$RELEASE_TAG" =~ ^fork/v ]]; then
-            echo "expected fork/v* tag, got: $RELEASE_TAG" >&2
-            exit 1
-          fi
-
-          VERSION="${RELEASE_TAG#fork/}"
-          VERSION_SEMVER="${VERSION#v}"
-          DOCKER_TAG="${RELEASE_TAG//\//-}"
-
-          {
-            echo "release_tag=$RELEASE_TAG"
-            echo "version=$VERSION"
-            echo "version_semver=$VERSION_SEMVER"
-            echo "docker_tag=$DOCKER_TAG"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.docker_tag }}
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version_semver }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version_semver }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.version_semver }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' || github.event.inputs.publish_latest == 'true' }}
-
-      - name: Create manifest list
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}@sha256:%s ' *)
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.docker_tag }}
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' >> "$GITHUB_STEP_SUMMARY"
+          echo "Revision: $COMMIT" >> "$GITHUB_STEP_SUMMARY"

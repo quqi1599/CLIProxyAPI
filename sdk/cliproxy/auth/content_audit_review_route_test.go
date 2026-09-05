@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -16,9 +17,10 @@ import (
 )
 
 type contentAuditReviewRouteExecutor struct {
-	mu      sync.Mutex
-	authIDs []string
-	models  []string
+	mu       sync.Mutex
+	authIDs  []string
+	models   []string
+	response func(*http.Request) (*http.Response, error)
 }
 
 func (e *contentAuditReviewRouteExecutor) Identifier() string { return "codex" }
@@ -58,6 +60,9 @@ func (e *contentAuditReviewRouteExecutor) HttpRequest(_ context.Context, auth *A
 	e.authIDs = append(e.authIDs, auth.ID)
 	e.models = append(e.models, payload.Model)
 	e.mu.Unlock()
+	if e.response != nil {
+		return e.response(request)
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
@@ -274,6 +279,8 @@ func TestContentAuditReviewRouteRejectsInvalidInternalRequests(t *testing.T) {
 	}{
 		{name: "different model", request: cliproxyexecutor.Request{Model: "gpt-5.4"}},
 		{name: "stream", request: cliproxyexecutor.Request{Model: contentAuditReviewModel}, opts: cliproxyexecutor.Options{Stream: true}},
+		{name: "array payload", request: cliproxyexecutor.Request{Model: contentAuditReviewModel, Payload: []byte(`[]`)}},
+		{name: "invalid payload", request: cliproxyexecutor.Request{Model: contentAuditReviewModel, Payload: []byte(`{`)}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -283,6 +290,106 @@ func TestContentAuditReviewRouteRejectsInvalidInternalRequests(t *testing.T) {
 				t.Fatalf("error = %#v, want invalid_internal_request", errExecute)
 			}
 		})
+	}
+}
+
+type auditReviewErrorReader struct{ err error }
+
+func (r auditReviewErrorReader) Read([]byte) (int, error) { return 0, r.err }
+func (r auditReviewErrorReader) Close() error             { return nil }
+
+func newContentAuditReviewFixtureManager(t *testing.T, baseURL string, response func(*http.Request) (*http.Response, error)) *Manager {
+	t.Helper()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(&contentAuditReviewRouteExecutor{response: response})
+	auth := &Auth{ID: "review-diagnostics-" + t.Name(), Provider: "codex", Attributes: map[string]string{"base_url": baseURL, contentAuditReviewAuthAttribute: "true"}}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	if _, err := manager.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+func TestContentAuditReviewRouteClassifiesSanitizedFailures(t *testing.T) {
+	tests := []struct {
+		name, code string
+		response   func(*http.Request) (*http.Response, error)
+	}{
+		{"transport", "review_transport_error", func(*http.Request) (*http.Response, error) { return nil, errors.New("sensitive-transport-url") }},
+		{"empty response", "review_response_empty", func(*http.Request) (*http.Response, error) { return nil, nil }},
+		{"empty body", "review_response_empty", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(" "))}, nil
+		}},
+		{"rate limit", "review_upstream_http_429", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 429, Body: auditReviewErrorReader{err: errors.New("sensitive-body-must-not-read")}}, nil
+		}},
+		{"redirect rejected", "review_upstream_http_3xx", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Body: auditReviewErrorReader{err: errors.New("sensitive-redirect-body-must-not-read")}}, nil
+		}},
+		{"schema rejected", "review_upstream_http_400", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader("sensitive-provider-error"))}, nil
+		}},
+		{"server failure", "review_upstream_http_5xx", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader("sensitive-provider-error"))}, nil
+		}},
+		{"read failure", "review_response_read_error", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: auditReviewErrorReader{err: errors.New("sensitive-read-error")}}, nil
+		}},
+		{"bounded body", "review_response_too_large", func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", (2<<20)+1)))}, nil
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newContentAuditReviewFixtureManager(t, "https://review.invalid/v1", test.response)
+			_, err := manager.ExecuteContentAuditReview(t.Context(), cliproxyexecutor.Request{Model: contentAuditReviewModel, Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
+			var classified interface {
+				AuditReviewFailureCode() string
+				AuditReviewStageLatenciesMS() map[string]int64
+			}
+			if !errors.As(err, &classified) || classified.AuditReviewFailureCode() != test.code {
+				t.Fatalf("error=%v want=%s", err, test.code)
+			}
+			if strings.Contains(err.Error(), "sensitive-") {
+				t.Fatal("failure leaked provider data")
+			}
+			if _, ok := classified.AuditReviewStageLatenciesMS()["auth_select"]; !ok {
+				t.Fatal("missing auth stage")
+			}
+			if _, ok := classified.AuditReviewStageLatenciesMS()["transport"]; !ok {
+				t.Fatal("missing transport stage")
+			}
+		})
+	}
+}
+
+func TestContentAuditReviewRouteRecordsHTTPPhasesWithoutChangingDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"completed","output":[]}`)
+	}))
+	defer server.Close()
+	manager := newContentAuditReviewFixtureManager(t, server.URL+"/v1", func(request *http.Request) (*http.Response, error) {
+		// The fixture reader consumed the request once to inspect model isolation.
+		request.Body, _ = request.GetBody()
+		if _, hasDeadline := request.Context().Deadline(); hasDeadline {
+			t.Error("internal route invented a deadline")
+		}
+		return server.Client().Do(request)
+	})
+	ctx, trace := cliproxyexecutor.WithContentAuditReviewTrace(t.Context())
+	_, err := manager.ExecuteContentAuditReview(ctx, cliproxyexecutor.Request{Model: contentAuditReviewModel, Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{"auth_select", "connect", "request_write", "ttfb", "transport", "read"} {
+		if elapsed, ok := trace.Snapshot()[stage]; !ok || elapsed < 0 {
+			t.Fatalf("phase %s missing or invalid: %v", stage, trace.Snapshot())
+		}
 	}
 }
 
