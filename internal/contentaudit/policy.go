@@ -420,6 +420,7 @@ func (m *Matcher) matchNormalized(normalizedText, action string, continuation bo
 	bestActionRank := 0
 	bestSeverityRank := 0
 	bestLength := 0
+	bestIntentReview := false
 	for position, r := range normalized {
 		if r == '\n' {
 			clause++
@@ -454,9 +455,13 @@ func (m *Matcher) matchNormalized(normalizedText, action string, continuation bo
 			}
 			actionRank := ruleActionRank(rule.Action)
 			severity := severityRank(rule.Severity)
+			// At an otherwise exact tie, prefer a qualified intent-review rule
+			// over its broad seed. Never weaken an action or severity priority.
+			intentReview := rule.Action == RuleActionObserve && rule.ModelReview && len(rule.RequireAny) > 0
+			preferIntent := term.runeLen == bestLength && rule.Category == best.Category && intentReview && !bestIntentReview
 			if actionRank < bestActionRank ||
 				actionRank == bestActionRank && severity < bestSeverityRank ||
-				actionRank == bestActionRank && severity == bestSeverityRank && term.runeLen <= bestLength {
+				actionRank == bestActionRank && severity == bestSeverityRank && (term.runeLen < bestLength || term.runeLen == bestLength && !preferIntent) {
 				continue
 			}
 			best = Decision{
@@ -473,6 +478,7 @@ func (m *Matcher) matchNormalized(normalizedText, action string, continuation bo
 			bestActionRank = actionRank
 			bestSeverityRank = severity
 			bestLength = term.runeLen
+			bestIntentReview = intentReview
 		}
 	}
 	return best
