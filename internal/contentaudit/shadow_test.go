@@ -76,7 +76,10 @@ func shadowRequest(router *gin.Engine, text string, ctx context.Context) *httpte
 
 func TestShadowReturnsBeforeModelAndSurvivesRequestCancellation(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
+	budget := make(chan time.Duration, 1)
 	service, router := newShadowTestService(t, modelReviewerFunc(func(ctx context.Context, _ ModelReviewRequest) (ModelReviewResult, error) {
+		deadline, _ := ctx.Deadline()
+		budget <- time.Until(deadline)
 		close(entered)
 		select {
 		case <-release:
@@ -84,13 +87,16 @@ func TestShadowReturnsBeforeModelAndSurvivesRequestCancellation(t *testing.T) {
 			return ModelReviewResult{}, ctx.Err()
 		}
 		return ModelReviewResult{Decision: ModelReviewBlock, Confidence: .99, Category: "jailbreak", ResolvedModel: "synthetic-resolved", StageLatenciesMS: map[string]int64{"parse": 2}}, nil
-	}), config.ContentAuditModelReviewConfig{})
+	}), config.ContentAuditModelReviewConfig{TimeoutMilliseconds: 20000})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	returned := make(chan *httptest.ResponseRecorder, 1)
 	go func() { returned <- shadowRequest(router, "review fixture", ctx) }()
 	select {
 	case <-entered:
+		if remaining := <-budget; remaining < 15*time.Second || remaining > 20*time.Second {
+			t.Fatalf("shadow review budget = %s, want close to 20s", remaining)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("review did not start")
 	}
@@ -110,6 +116,10 @@ func TestShadowReturnsBeforeModelAndSurvivesRequestCancellation(t *testing.T) {
 	if list.Items[0].ModelReviewFallback != "shadow_pending" {
 		t.Fatal("expected pending result while model is blocked")
 	}
+	// Background review may outlive both the request and the 4s realtime cap.
+	timer := time.NewTimer(4100 * time.Millisecond)
+	defer timer.Stop()
+	<-timer.C
 	close(release)
 	event := waitForShadowResult(t, service, list.Items[0].ID)
 	if event.ModelReviewDecision != ModelReviewBlock || event.FinalAction != ModelReviewAllow || !event.UpstreamSent {

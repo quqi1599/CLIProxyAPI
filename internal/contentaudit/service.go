@@ -272,8 +272,8 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	}
 	if cfg.TimeoutMilliseconds <= 0 {
 		cfg.TimeoutMilliseconds = 3500
-	} else if cfg.TimeoutMilliseconds > 10000 {
-		cfg.TimeoutMilliseconds = 10000
+	} else if cfg.TimeoutMilliseconds > 30000 {
+		cfg.TimeoutMilliseconds = 30000
 	}
 	if cfg.Mode == ModelReviewModeEnforce && cfg.TimeoutMilliseconds > 4000 {
 		cfg.TimeoutMilliseconds = 4000

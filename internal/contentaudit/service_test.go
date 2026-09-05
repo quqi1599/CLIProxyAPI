@@ -29,8 +29,11 @@ func TestNormalizeModelReviewConfigAllowsBoundedExtendedTimeout(t *testing.T) {
 	}{
 		{name: "default", mode: ModelReviewModeEnforce, input: 0, expected: 3500},
 		{name: "realtime total cap", mode: ModelReviewModeEnforce, input: 8000, expected: 4000},
+		{name: "shadow budget cannot extend realtime", mode: ModelReviewModeEnforce, input: 20000, expected: 4000},
+		{name: "oversized realtime budget", mode: ModelReviewModeEnforce, input: 50000, expected: 4000},
 		{name: "shadow extended", mode: ModelReviewModeShadow, input: 8000, expected: 8000},
-		{name: "shadow bounded", mode: ModelReviewModeShadow, input: 12000, expected: 10000},
+		{name: "shadow slow provider", mode: ModelReviewModeShadow, input: 20000, expected: 20000},
+		{name: "shadow bounded", mode: ModelReviewModeShadow, input: 50000, expected: 30000},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

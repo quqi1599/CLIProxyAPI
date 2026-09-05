@@ -121,7 +121,7 @@ content-audit:
     # to review every policy rule marked model-review: true; an explicit [] disables calls.
     # rules: ["review-ambiguous-rule"]
     prompt-version: "cpa-audit-review-v1"
-    timeout-milliseconds: 3500
+    timeout-milliseconds: 3500 # Total review budget; enforce caps at 4000ms, async shadow at 30000ms.
     queue-timeout-milliseconds: 100
     max-concurrent: 16
     # Shadow never waits for the model. Four service-owned workers consume a
