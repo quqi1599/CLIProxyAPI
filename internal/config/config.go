@@ -228,6 +228,7 @@ type ContentAuditModelReviewConfig struct {
 	Model                    string   `yaml:"model" json:"model"`
 	Rules                    []string `yaml:"rules,omitempty" json:"rules,omitempty"`
 	PromptVersion            string   `yaml:"prompt-version" json:"prompt-version"`
+	StructuredOutput         bool     `yaml:"structured-output" json:"structured-output"`
 	TimeoutMilliseconds      int      `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`
 	QueueTimeoutMilliseconds int      `yaml:"queue-timeout-milliseconds" json:"queue-timeout-milliseconds"`
 	MaxConcurrent            int      `yaml:"max-concurrent" json:"max-concurrent"`

@@ -18,6 +18,29 @@ func (f modelReviewerFunc) Review(ctx context.Context, request ModelReviewReques
 	return f(ctx, request)
 }
 
+func TestModelReviewControllerOwnsStructuredOutputSetting(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{{"disabled", false}, {"enabled", true}} {
+		t.Run(test.name, func(t *testing.T) {
+			controller := newModelReviewController(config.ContentAuditModelReviewConfig{
+				Mode: ModelReviewModeShadow, StructuredOutput: test.enabled,
+				TimeoutMilliseconds: 2000, QueueTimeoutMilliseconds: 50, MaxConcurrent: 1, MaxInputBytes: 4096,
+			}, modelReviewerFunc(func(_ context.Context, request ModelReviewRequest) (ModelReviewResult, error) {
+				if request.StructuredOutput != test.enabled {
+					return ModelReviewResult{}, errors.New("request overrode the configured output contract")
+				}
+				return ModelReviewResult{Decision: ModelReviewAllow, Confidence: .99}, nil
+			}))
+			outcome := controller.review(t.Context(), ModelReviewRequest{Text: "synthetic task", StructuredOutput: !test.enabled})
+			if outcome.Fallback != "" || outcome.Decision != ModelReviewAllow {
+				t.Fatalf("review outcome = %#v", outcome)
+			}
+		})
+	}
+}
+
 func TestModelReviewControllerCachesIdenticalContent(t *testing.T) {
 	var calls atomic.Int32
 	controller := newModelReviewController(config.ContentAuditModelReviewConfig{

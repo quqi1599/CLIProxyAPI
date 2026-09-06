@@ -23,6 +23,19 @@ const (
 	maxAuditReviewOutputBytes   = 16 << 10
 )
 
+// Provider-side structure supplements, but never replaces, local validation.
+const contentAuditReviewOutputSchema = `{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "category", "confidence", "reason_codes"],
+  "properties": {
+    "decision": {"type": "string", "enum": ["allow", "block", "uncertain"]},
+    "category": {"type": "string", "enum": ["jailbreak", "csam", "weapons", "extremism", "drugs", "criminal", "fraud", "cyber", "piracy", "gambling", "sexual", "self_harm", "violence", "none", "unknown"]},
+    "confidence": {"type": "number"},
+    "reason_codes": {"type": "array", "items": {"type": "string"}}
+  }
+}`
+
 type contentAuditReviewExecutor interface {
 	ExecuteContentAuditReview(context.Context, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error)
 }
@@ -52,9 +65,9 @@ func (r *codexContentAuditReviewer) Review(ctx context.Context, request contenta
 	if request.Model != auth.ContentAuditReviewModel {
 		return fail("review_request_invalid", nil)
 	}
-	// Keep the provider's existing Responses wire contract. Server-side JSON schema
-	// support must be proved per route; local validation is mandatory either way.
-	payload, err := json.Marshal(map[string]any{
+	// Keep the existing Responses contract unless schema support is explicitly
+	// enabled after verifying the configured route. Local validation is mandatory.
+	wirePayload := map[string]any{
 		"model": request.Model,
 		"input": []map[string]any{
 			{"role": "system", "content": []map[string]string{{"type": "input_text", "text": contentAuditReviewerInstructions}}},
@@ -63,7 +76,16 @@ func (r *codexContentAuditReviewer) Review(ctx context.Context, request contenta
 		"reasoning":         map[string]string{"effort": "low"},
 		"max_output_tokens": 300,
 		"stream":            false,
-	})
+	}
+	if request.StructuredOutput {
+		wirePayload["text"] = map[string]any{
+			"format": map[string]any{
+				"type": "json_schema", "name": "content_audit_review", "strict": true,
+				"schema": json.RawMessage(contentAuditReviewOutputSchema),
+			},
+		}
+	}
+	payload, err := json.Marshal(wirePayload)
 	if err != nil {
 		return fail("review_request_invalid", err)
 	}

@@ -19,6 +19,57 @@ func (f contentAuditReviewExecutorFunc) ExecuteContentAuditReview(ctx context.Co
 	return f(ctx, request, options)
 }
 
+func TestCodexContentAuditReviewerStructuredOutputIsOptIn(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			calls := 0
+			reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, request coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+				calls++
+				var payload map[string]any
+				if err := json.Unmarshal(request.Payload, &payload); err != nil {
+					t.Fatal(err)
+				}
+				text, present := payload["text"].(map[string]any)
+				if present != enabled {
+					t.Fatalf("structured output present=%t, want %t", present, enabled)
+				}
+				if enabled {
+					format, _ := text["format"].(map[string]any)
+					schema, _ := format["schema"].(map[string]any)
+					properties, _ := schema["properties"].(map[string]any)
+					required, _ := schema["required"].([]any)
+					if format["type"] != "json_schema" || format["strict"] != true || schema["additionalProperties"] != false || len(properties) != 4 || len(required) != 4 {
+						t.Fatalf("unexpected output schema: %#v", format)
+					}
+					for _, field := range []string{"decision", "category", "confidence", "reason_codes"} {
+						if _, ok := properties[field]; !ok {
+							t.Fatalf("missing schema field %s", field)
+						}
+					}
+				}
+				return coreexecutor.Response{Payload: auditReviewResponseFixture(`{"decision":"block","category":"sexual","confidence":0.99,"reason_codes":["DIRECT_INTENT"]}`)}, nil
+			})}
+			result, err := reviewer.Review(t.Context(), contentaudit.ModelReviewRequest{Model: "codex-auto-review", StructuredOutput: enabled})
+			if err != nil || result.Decision != contentaudit.ModelReviewBlock || calls != 1 {
+				t.Fatalf("result=%#v err=%v calls=%d", result, err, calls)
+			}
+		})
+	}
+}
+
+func TestCodexContentAuditReviewerStructuredOutputStillRejectsInvalidVerdict(t *testing.T) {
+	calls := 0
+	reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(context.Context, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+		calls++
+		return coreexecutor.Response{Payload: auditReviewResponseFixture(`{"decision":"block","category":"none","confidence":1,"reason_codes":["INVALID_CATEGORY"]}`)}, nil
+	})}
+	_, err := reviewer.Review(t.Context(), contentaudit.ModelReviewRequest{Model: "codex-auto-review", StructuredOutput: true})
+	assertAuditReviewFailureCode(t, err, "review_response_schema_invalid")
+	if calls != 1 {
+		t.Fatalf("unexpected retry count: %d", calls)
+	}
+}
+
 func TestCodexContentAuditReviewerUsesDirectCodexExecution(t *testing.T) {
 	reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
 		if request.Model != "codex-auto-review" || options.Stream {

@@ -66,6 +66,7 @@ type Status struct {
 	ModelReviewModel            string                  `json:"model_review_model,omitempty"`
 	ModelReviewReady            bool                    `json:"model_review_ready"`
 	ModelReviewTimeoutMS        int                     `json:"model_review_timeout_ms"`
+	ModelReviewStructuredOutput bool                    `json:"model_review_structured_output"`
 	ModelReviewAllowMin         float64                 `json:"model_review_allow_min_confidence"`
 	ModelReviewBlockMin         float64                 `json:"model_review_block_min_confidence"`
 	Shadow                      ShadowReviewStatus      `json:"shadow_review"`
@@ -393,6 +394,7 @@ func (s *Service) Status() Status {
 		ModelReviewModel:            state.cfg.ModelReview.Model,
 		ModelReviewReady:            state.modelReview != nil,
 		ModelReviewTimeoutMS:        state.cfg.ModelReview.TimeoutMilliseconds,
+		ModelReviewStructuredOutput: state.cfg.ModelReview.StructuredOutput,
 		ModelReviewAllowMin:         state.cfg.ModelReview.AllowMinConfidence,
 		ModelReviewBlockMin:         state.cfg.ModelReview.BlockMinConfidence,
 		Shadow:                      s.shadow.status(),

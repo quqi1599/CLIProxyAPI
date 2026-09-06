@@ -41,6 +41,7 @@ var errModelReviewBudgetStorage = errors.New("content audit model review budget 
 type ModelReviewRequest struct {
 	Model             string
 	PromptVersion     string
+	StructuredOutput  bool   `json:"-"`
 	PolicyVersion     string `json:"-"`
 	TenantScope       string `json:"-"`
 	Text              string
@@ -166,6 +167,7 @@ func (c *modelReviewController) review(ctx context.Context, request ModelReviewR
 	defer cancel()
 	request.Model = c.cfg.Model
 	request.PromptVersion = c.cfg.PromptVersion
+	request.StructuredOutput = c.cfg.StructuredOutput
 	// Fingerprint the complete task before compaction; identical excerpts are not
 	// interchangeable when their original context or decision versions differ.
 	cacheKey := c.fingerprint(request)
