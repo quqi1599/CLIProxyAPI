@@ -27,6 +27,8 @@ const (
 	ModelReviewBlock     = "block"
 	ModelReviewAllow     = "allow"
 	ModelReviewUncertain = "uncertain"
+
+	minCachedBlockConfidence = 0.95
 )
 
 var errModelReviewSaturated = errors.New("content audit model review capacity is saturated")
@@ -103,19 +105,20 @@ type modelReviewController struct {
 	reviewer Reviewer
 	// admit is initialized before publishing the controller and reserves durable
 	// quota only for a unique external attempt after cache and capacity gates.
-	admit     func(context.Context) (bool, string, error)
-	rules     map[string]struct{}
-	ruleGate  bool
-	semaphore chan struct{}
-	cacheKey  [32]byte
-	cacheMu   sync.Mutex
-	cache     map[string]modelReviewCacheEntry
-	flightsMu sync.Mutex
-	flights   map[string]*modelReviewFlight
-	circuitMu sync.Mutex
-	failures  int
-	openUntil time.Time
-	halfOpen  bool
+	admit            func(context.Context) (bool, string, error)
+	rules            map[string]struct{}
+	cachedBlockRules map[string]struct{}
+	ruleGate         bool
+	semaphore        chan struct{}
+	cacheKey         [32]byte
+	cacheMu          sync.Mutex
+	cache            map[string]modelReviewCacheEntry
+	flightsMu        sync.Mutex
+	flights          map[string]*modelReviewFlight
+	circuitMu        sync.Mutex
+	failures         int
+	openUntil        time.Time
+	halfOpen         bool
 }
 
 func newModelReviewController(cfg config.ContentAuditModelReviewConfig, reviewer Reviewer) *modelReviewController {
@@ -135,18 +138,53 @@ func newModelReviewController(cfg config.ContentAuditModelReviewConfig, reviewer
 		cfg.TimeoutMilliseconds = 4000
 	}
 	controller := &modelReviewController{
-		cfg:       cfg,
-		reviewer:  reviewer,
-		rules:     makeRuleSelection(cfg.Rules),
-		ruleGate:  cfg.Rules != nil,
-		semaphore: make(chan struct{}, cfg.MaxConcurrent),
-		cache:     make(map[string]modelReviewCacheEntry),
-		flights:   make(map[string]*modelReviewFlight),
+		cfg:              cfg,
+		reviewer:         reviewer,
+		rules:            makeRuleSelection(cfg.Rules),
+		cachedBlockRules: makeRuleSelection(cfg.CachedBlockRules),
+		ruleGate:         cfg.Rules != nil,
+		semaphore:        make(chan struct{}, cfg.MaxConcurrent),
+		cache:            make(map[string]modelReviewCacheEntry),
+		flights:          make(map[string]*modelReviewFlight),
 	}
 	if _, err := rand.Read(controller.cacheKey[:]); err != nil {
 		controller.cacheKey = sha256.Sum256([]byte(time.Now().UTC().String()))
 	}
 	return controller
+}
+
+func (c *modelReviewController) cachedBlockEligible(request ModelReviewRequest) bool {
+	if c == nil || c.cfg.Mode != ModelReviewModeShadow || c.cfg.CacheSeconds <= 0 || request.ContextIncomplete {
+		return false
+	}
+	if _, selected := c.cachedBlockRules[strings.TrimSpace(request.RuleID)]; !selected {
+		return false
+	}
+	if c.ruleGate {
+		if _, selected := c.rules[strings.TrimSpace(request.RuleID)]; !selected {
+			return false
+		}
+	}
+	return true
+}
+
+// cachedBlock never starts or joins provider work. The caller must supply a
+// verified non-test tenant scope; the complete task and policy remain in the key.
+func (c *modelReviewController) cachedBlock(request ModelReviewRequest) (modelReviewOutcome, bool) {
+	if !c.cachedBlockEligible(request) {
+		return modelReviewOutcome{}, false
+	}
+	started := time.Now()
+	request.Model = c.cfg.Model
+	request.PromptVersion = c.cfg.PromptVersion
+	request.StructuredOutput = c.cfg.StructuredOutput
+	result, found := c.cached(c.fingerprint(request))
+	if !found || result.Decision != ModelReviewBlock || result.Category == "" || result.Category == "none" || result.Category == "unknown" ||
+		!(result.Confidence >= math.Max(minCachedBlockConfidence, c.cfg.BlockMinConfidence) && result.Confidence <= 1) {
+		return modelReviewOutcome{}, false
+	}
+	result.StageLatenciesMS = nil
+	return finishModelReview(request.Model, started, result, nil, true), true
 }
 
 func (c *modelReviewController) review(ctx context.Context, request ModelReviewRequest) modelReviewOutcome {

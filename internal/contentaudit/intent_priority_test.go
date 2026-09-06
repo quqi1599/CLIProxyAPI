@@ -58,7 +58,9 @@ func TestManagedPolicyBroadIntentReachesReviewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"Please generate hentai.", "Please generate an explicit adult cam show with detailed nudity for sexual arousal."} {
+	// Keep this fixture outside the narrower explicit-media hard rule so it
+	// continues to verify the broad-intent-versus-seed ordering contract.
+	for _, text := range []string{"Please generate hentai.", "Please generate an adult cam show intended for sexual arousal."} {
 		got := matcher.Match(text)
 		if got.RuleID != "block-sexual-broad-generation-intent" || got.Action != RuleActionObserve || !got.ModelReview {
 			t.Fatalf("intent does not reach reviewer: %#v", got)

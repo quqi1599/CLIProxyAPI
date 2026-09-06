@@ -31,21 +31,20 @@ func TestDefaultPolicyManagedCountsAndActions(t *testing.T) {
 			t.Fatalf("observation rule %q does not enable model review", rule.ID)
 		}
 	}
-	if rawKeywordCount != 913 {
-		t.Fatalf("raw keyword count = %d, want 913", rawKeywordCount)
+	if rawKeywordCount != 922 {
+		t.Fatalf("raw keyword count = %d, want 922", rawKeywordCount)
 	}
 	matcher, err := LoadPolicy(policyPath)
 	if err != nil {
 		t.Fatalf("LoadPolicy() error = %v", err)
 	}
-	// The source seed contains "strapon sex" and "strap on sex"; both become
-	// the same canonical term, so the managed policy compiles one fewer runtime
-	// pattern than source rows.
-	if got := matcher.KeywordCount(); got != 912 {
-		t.Fatalf("KeywordCount() = %d, want 912", got)
+	// The strapon/strap-on and livestream/live-stream spelling pairs each become
+	// the same canonical term, so two source rows merge into existing patterns.
+	if got := matcher.KeywordCount(); got != 920 {
+		t.Fatalf("KeywordCount() = %d, want 920", got)
 	}
-	if got := len(matcher.policy.Rules); got != 27 {
-		t.Fatalf("rule count = %d, want 27", got)
+	if got := len(matcher.policy.Rules); got != 28 {
+		t.Fatalf("rule count = %d, want 28", got)
 	}
 	if decision := matcher.Match("这是正常的接口交互协议说明"); decision.Matched {
 		t.Fatalf("known false-positive fixture matched: %#v", decision)

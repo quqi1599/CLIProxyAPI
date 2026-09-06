@@ -138,6 +138,11 @@ content-audit:
     max-calls-per-day: 1000
     max-calls-per-minute: 5
     cache-seconds: 600
+    # Optional exact-repeat enforcement for selected shadow rules. Never waits for
+    # a model, never shares results across users/tokens, and never blocks on a miss.
+    # Requires complete context and confidence >= max(0.95, block-min-confidence).
+    # Eligible observation misses bypass sampling, but retain queue/quota limits.
+    cached-block-rules: []
     max-input-bytes: 32768
     # Releasing a local block should require stronger confidence than escalating
     # an observe rule. min-confidence remains the backward-compatible default.

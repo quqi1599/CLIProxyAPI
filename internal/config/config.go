@@ -224,9 +224,13 @@ type ContentAuditConfig struct {
 // ContentAuditModelReviewConfig controls the bounded semantic review of keyword matches.
 // The reviewer is an optional second-stage signal; keyword matching remains available when it is off.
 type ContentAuditModelReviewConfig struct {
-	Mode                     string   `yaml:"mode" json:"mode"`
-	Model                    string   `yaml:"model" json:"model"`
-	Rules                    []string `yaml:"rules,omitempty" json:"rules,omitempty"`
+	Mode  string   `yaml:"mode" json:"mode"`
+	Model string   `yaml:"model" json:"model"`
+	Rules []string `yaml:"rules,omitempty" json:"rules,omitempty"`
+	// CachedBlockRules opts selected shadow rules into exact-context cached blocks.
+	// Only verified non-test identities qualify; cache misses never wait or block.
+	// Eligible observation misses bypass sampling, but not queue or quota limits.
+	CachedBlockRules         []string `yaml:"cached-block-rules,omitempty" json:"cached-block-rules,omitempty"`
 	PromptVersion            string   `yaml:"prompt-version" json:"prompt-version"`
 	StructuredOutput         bool     `yaml:"structured-output" json:"structured-output"`
 	TimeoutMilliseconds      int      `yaml:"timeout-milliseconds" json:"timeout-milliseconds"`

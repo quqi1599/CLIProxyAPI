@@ -69,6 +69,8 @@ type Status struct {
 	ModelReviewStructuredOutput bool                    `json:"model_review_structured_output"`
 	ModelReviewAllowMin         float64                 `json:"model_review_allow_min_confidence"`
 	ModelReviewBlockMin         float64                 `json:"model_review_block_min_confidence"`
+	ModelReviewCachedBlockRules []string                `json:"model_review_cached_block_rules,omitempty"`
+	ModelReviewCachedBlockMin   float64                 `json:"model_review_cached_block_min_confidence"`
 	Shadow                      ShadowReviewStatus      `json:"shadow_review"`
 	ModelReviewBudget           ModelReviewBudgetStatus `json:"model_review_budget"`
 	IncompleteUnmatchedRequests uint64                  `json:"incomplete_unmatched_requests"`
@@ -397,6 +399,8 @@ func (s *Service) Status() Status {
 		ModelReviewStructuredOutput: state.cfg.ModelReview.StructuredOutput,
 		ModelReviewAllowMin:         state.cfg.ModelReview.AllowMinConfidence,
 		ModelReviewBlockMin:         state.cfg.ModelReview.BlockMinConfidence,
+		ModelReviewCachedBlockRules: append([]string(nil), state.cfg.ModelReview.CachedBlockRules...),
+		ModelReviewCachedBlockMin:   math.Max(minCachedBlockConfidence, state.cfg.ModelReview.BlockMinConfidence),
 		Shadow:                      s.shadow.status(),
 		IncompleteUnmatchedRequests: s.incompleteUnmatched.Load(),
 	}
@@ -482,6 +486,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			model = identity.Model
 		}
 		modelReview := modelReviewOutcome{}
+		cachedBlock := false
 		reviewRequest := ModelReviewRequest{
 			Text:              extracted.CurrentUserText,
 			ReferenceText:     extracted.ReferenceText,
@@ -501,24 +506,31 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		}
 		if decision.ModelReview && state.modelReview != nil {
 			if state.cfg.ModelReview.Mode == ModelReviewModeShadow {
-				modelReview = modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Model: state.cfg.ModelReview.Model, Fallback: "shadow_pending"}
-				if state.modelReview.ruleGate {
-					if _, selected := state.modelReview.rules[decision.RuleID]; !selected {
-						modelReview.Fallback = "rule_not_selected"
-					}
+				priorityReview := false
+				if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
+					priorityReview = decision.Action == RuleActionObserve && state.modelReview.cachedBlockEligible(reviewRequest)
+					modelReview, cachedBlock = state.modelReview.cachedBlock(reviewRequest)
 				}
-				if modelReview.Fallback == "shadow_pending" && !sampleShadowReview(state, reviewRequest) {
-					modelReview.Fallback = "shadow_sampled_out"
-					s.shadow.mu.Lock()
-					s.shadow.stats.Skipped++
-					s.shadow.mu.Unlock()
+				if !cachedBlock {
+					modelReview = modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Model: state.cfg.ModelReview.Model, Fallback: "shadow_pending"}
+					if state.modelReview.ruleGate {
+						if _, selected := state.modelReview.rules[decision.RuleID]; !selected {
+							modelReview.Fallback = "rule_not_selected"
+						}
+					}
+					if modelReview.Fallback == "shadow_pending" && !priorityReview && !sampleShadowReview(state, reviewRequest) {
+						modelReview.Fallback = "shadow_sampled_out"
+						s.shadow.mu.Lock()
+						s.shadow.stats.Skipped++
+						s.shadow.mu.Unlock()
+					}
 				}
 			} else {
 				modelReview = state.modelReview.review(c.Request.Context(), reviewRequest)
 			}
 		}
 		keywordShouldBlock := decision.Action == RuleActionBlock
-		shouldBlock := keywordShouldBlock
+		shouldBlock := keywordShouldBlock || cachedBlock
 		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed {
 			switch modelReview.Decision {
 			case ModelReviewBlock:
@@ -535,6 +547,10 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		finalAction := ModelReviewAllow
 		if shouldBlock {
 			finalAction = ModelReviewBlock
+		}
+		reviewMode := state.cfg.ModelReview.Mode
+		if cachedBlock {
+			reviewMode = ModelReviewModeEnforce
 		}
 		event := Event{
 			ID:                       auditID,
@@ -563,7 +579,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			EvidenceStatus:           "encrypted",
 			EvidenceKeyID:            state.cfg.EvidenceKeyID,
 			ReviewLabel:              defaultReviewLabel,
-			ModelReviewMode:          state.cfg.ModelReview.Mode,
+			ModelReviewMode:          reviewMode,
 			ModelReviewModel:         modelReview.Model,
 			ModelReviewResolvedModel: modelReview.ResolvedModel,
 			ModelReviewPromptVersion: state.cfg.ModelReview.PromptVersion,
