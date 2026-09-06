@@ -70,6 +70,17 @@ func TestCodexContentAuditReviewerStructuredOutputStillRejectsInvalidVerdict(t *
 	}
 }
 
+func TestReviewEnvelopePreservesTaskFirstWireContract(t *testing.T) {
+	envelope := reviewEnvelope(contentaudit.ModelReviewRequest{
+		Text: "synthetic current", ReferenceText: "synthetic reference", ContextIncomplete: false,
+		Category: "sexual", MatchedTerm: "fixture", PromptVersion: "test-v1", RuleID: "rule", Severity: "high",
+	})
+	want := `{"current_user_text":"synthetic current","reference_text":"synthetic reference","context_incomplete":false,"metadata":{"category_hint":"sexual","matched_term":"fixture","prompt_version":"test-v1","rule_id":"rule","severity_hint":"high"}}`
+	if envelope != want {
+		t.Fatalf("review envelope wire layout changed: got %s, want %s", envelope, want)
+	}
+}
+
 func TestCodexContentAuditReviewerUsesDirectCodexExecution(t *testing.T) {
 	reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, request coreexecutor.Request, options coreexecutor.Options) (coreexecutor.Response, error) {
 		if request.Model != "codex-auto-review" || options.Stream {

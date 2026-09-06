@@ -147,17 +147,24 @@ func reportedContentAuditReviewModel(payload []byte) string {
 func reviewEnvelope(request contentaudit.ModelReviewRequest) string {
 	// JSON string encoding prevents customer text from manufacturing envelope fields.
 	// Tenant identity, request headers, and credentials never enter this envelope.
-	envelope, _ := json.Marshal(map[string]any{
-		"metadata": map[string]string{
+	// Preserve the task-first wire layout verified for the reviewer gateway.
+	// A map would sort context metadata before the task and change that contract.
+	envelope, _ := json.Marshal(struct {
+		CurrentUserText   string            `json:"current_user_text"`
+		ReferenceText     string            `json:"reference_text"`
+		ContextIncomplete bool              `json:"context_incomplete"`
+		Metadata          map[string]string `json:"metadata"`
+	}{
+		CurrentUserText:   request.Text,
+		ReferenceText:     request.ReferenceText,
+		ContextIncomplete: request.ContextIncomplete,
+		Metadata: map[string]string{
 			"category_hint":  request.Category,
 			"matched_term":   request.MatchedTerm,
 			"rule_id":        request.RuleID,
 			"severity_hint":  request.Severity,
 			"prompt_version": request.PromptVersion,
 		},
-		"current_user_text":  request.Text,
-		"reference_text":     request.ReferenceText,
-		"context_incomplete": request.ContextIncomplete,
 	})
 	return string(envelope)
 }
