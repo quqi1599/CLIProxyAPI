@@ -70,6 +70,35 @@ func TestCodexContentAuditReviewerStructuredOutputStillRejectsInvalidVerdict(t *
 	}
 }
 
+func TestCodexContentAuditReviewerPoliticalTopicContract(t *testing.T) {
+	for _, structured := range []bool{false, true} {
+		reviewer := &codexContentAuditReviewer{executor: contentAuditReviewExecutorFunc(func(_ context.Context, request coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+			var payload struct {
+				Input []struct {
+					Content []struct{ Text string }
+				}
+			}
+			if err := json.Unmarshal(request.Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			instructions := payload.Input[0].Content[0].Text
+			for _, required := range []string{"Service topic restriction", "current or former Chinese national political leaders", "praise, criticism, neutral biographies", "coincidental personal names"} {
+				if !strings.Contains(instructions, required) {
+					t.Fatalf("missing political topic instruction: %s", required)
+				}
+			}
+			if structured && !strings.Contains(string(request.Payload), `"political"`) {
+				t.Fatal("structured schema omits political category")
+			}
+			return coreexecutor.Response{Payload: auditReviewResponseFixture(`{"decision":"block","category":"political","confidence":0.99,"reason_codes":["RESTRICTED_POLITICAL_TOPIC"]}`)}, nil
+		})}
+		result, err := reviewer.Review(t.Context(), contentaudit.ModelReviewRequest{Model: "codex-auto-review", StructuredOutput: structured, Text: "synthetic political topic"})
+		if err != nil || result.Decision != contentaudit.ModelReviewBlock || result.Category != "political" {
+			t.Fatalf("political result=%#v err=%v", result, err)
+		}
+	}
+}
+
 func TestReviewEnvelopePreservesTaskFirstWireContract(t *testing.T) {
 	envelope := reviewEnvelope(contentaudit.ModelReviewRequest{
 		Text: "synthetic current", ReferenceText: "synthetic reference", ContextIncomplete: false,

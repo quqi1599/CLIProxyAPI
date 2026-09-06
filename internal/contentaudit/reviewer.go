@@ -473,7 +473,7 @@ func normalizeModelReviewResult(result ModelReviewResult) ModelReviewResult {
 	}
 	result.Category = strings.ToLower(strings.TrimSpace(result.Category))
 	switch result.Category {
-	case "", "jailbreak", "csam", "weapons", "extremism", "drugs", "criminal", "fraud", "cyber", "piracy", "gambling", "sexual", "self_harm", "violence", "none", "unknown":
+	case "", "jailbreak", "csam", "weapons", "extremism", "drugs", "criminal", "fraud", "cyber", "piracy", "gambling", "sexual", "self_harm", "violence", "political", "none", "unknown":
 	default:
 		result.Decision = ""
 	}
