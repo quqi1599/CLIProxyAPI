@@ -146,25 +146,18 @@ func reportedContentAuditReviewModel(payload []byte) string {
 
 func reviewEnvelope(request contentaudit.ModelReviewRequest) string {
 	// JSON string encoding prevents customer text from manufacturing envelope fields.
-	// Tenant identity, request headers, and credentials never enter this envelope.
+	// Local rule hints stay in audit records and cache keys, not in the provider
+	// prompt: classifier behavior must not depend on local rule identifiers.
+	// Tenant identity, request headers, and credentials are also never exported.
 	// Preserve the task-first wire layout verified for the reviewer gateway.
-	// A map would sort context metadata before the task and change that contract.
 	envelope, _ := json.Marshal(struct {
-		CurrentUserText   string            `json:"current_user_text"`
-		ReferenceText     string            `json:"reference_text"`
-		ContextIncomplete bool              `json:"context_incomplete"`
-		Metadata          map[string]string `json:"metadata"`
+		CurrentUserText   string `json:"current_user_text"`
+		ReferenceText     string `json:"reference_text"`
+		ContextIncomplete bool   `json:"context_incomplete"`
 	}{
 		CurrentUserText:   request.Text,
 		ReferenceText:     request.ReferenceText,
 		ContextIncomplete: request.ContextIncomplete,
-		Metadata: map[string]string{
-			"category_hint":  request.Category,
-			"matched_term":   request.MatchedTerm,
-			"rule_id":        request.RuleID,
-			"severity_hint":  request.Severity,
-			"prompt_version": request.PromptVersion,
-		},
 	})
 	return string(envelope)
 }

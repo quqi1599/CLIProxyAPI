@@ -75,9 +75,24 @@ func TestReviewEnvelopePreservesTaskFirstWireContract(t *testing.T) {
 		Text: "synthetic current", ReferenceText: "synthetic reference", ContextIncomplete: false,
 		Category: "sexual", MatchedTerm: "fixture", PromptVersion: "test-v1", RuleID: "rule", Severity: "high",
 	})
-	want := `{"current_user_text":"synthetic current","reference_text":"synthetic reference","context_incomplete":false,"metadata":{"category_hint":"sexual","matched_term":"fixture","prompt_version":"test-v1","rule_id":"rule","severity_hint":"high"}}`
+	want := `{"current_user_text":"synthetic current","reference_text":"synthetic reference","context_incomplete":false}`
 	if envelope != want {
 		t.Fatalf("review envelope wire layout changed: got %s, want %s", envelope, want)
+	}
+}
+
+func TestReviewEnvelopeDoesNotDependOnLocalRuleHints(t *testing.T) {
+	request := contentaudit.ModelReviewRequest{Text: "synthetic current", ReferenceText: "synthetic reference"}
+	want := reviewEnvelope(request)
+	for _, ruleID := range []string{"seed-sexual", "block-sexual-broad-generation-intent", "unrelated-local-rule"} {
+		request.RuleID = ruleID
+		request.Category = "sexual"
+		request.Severity = "high"
+		request.MatchedTerm = "local-match-fixture"
+		request.PromptVersion = "local-prompt-version"
+		if got := reviewEnvelope(request); got != want {
+			t.Fatalf("local rule hints changed provider envelope: %s", got)
+		}
 	}
 }
 
@@ -87,7 +102,7 @@ func TestCodexContentAuditReviewerUsesDirectCodexExecution(t *testing.T) {
 			t.Fatalf("request=%#v options=%#v", request, options)
 		}
 		body := string(request.Payload)
-		if !strings.Contains(body, "current_user_text") || !strings.Contains(body, "synthetic user text") || !strings.Contains(body, "matched_term") ||
+		if !strings.Contains(body, "current_user_text") || !strings.Contains(body, "synthetic user text") || strings.Contains(body, "matched_term") ||
 			!strings.Contains(body, "pornographic") || !strings.Contains(body, "gambling operation") {
 			t.Fatalf("payload=%s", body)
 		}
