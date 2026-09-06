@@ -617,7 +617,8 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 		return true
 	}
 	for _, required := range rule.RequireAny {
-		if containsContextTerm(normalized, required) {
+		if containsContextTerm(normalized, required) &&
+			(rule.Action != RuleActionBlock || containsUnnegatedContextTerm(normalized, required)) {
 			return true
 		}
 	}
@@ -641,6 +642,31 @@ func containsContextTerm(text, term string) bool {
 		term = strings.ReplaceAll(term, " ", "")
 	}
 	return strings.Contains(text, term)
+}
+
+// A prohibited capability may follow a negated request with intervening words.
+// A hard rule also needs an affirmative intent marker; a later, independently
+// affirmative occurrence still qualifies. Observation rules retain both forms.
+func containsUnnegatedContextTerm(text, term string) bool {
+	if containsHanRune([]rune(term)) {
+		text = strings.ReplaceAll(text, " ", "")
+		term = strings.ReplaceAll(term, " ", "")
+	}
+	if term == "" {
+		return false
+	}
+	for offset := 0; offset < len(text); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		if !locallyNegatedMatch([]rune(text[:index])) {
+			return true
+		}
+		offset = index + len(term)
+	}
+	return false
 }
 
 // Negation is scoped to the clause immediately governing this occurrence. It
@@ -689,7 +715,7 @@ func locallyNegatedMatch(prefix []rune) bool {
 }
 
 var moderationNegatedActionSuffix = regexp.MustCompile(`^(?:直接|再次|继续|帮助|协助|用户|客户|任何|提供|生成|制作|编写|写出|完成|描述|描写|一段|露骨|相关|上述|以下|这类|这种|这些|那种|内容|为我|给我|给出|帮我|我们|请|并)*$`)
-var moderationNegatedEnglishSuffix = regexp.MustCompile(`^(?:(?:directly|again|help|assist|users?|any|provide|generate|create|produce|write|complete|describe|this|that|the|to|me|please)\s*)*$`)
+var moderationNegatedEnglishSuffix = regexp.MustCompile(`^(?:(?:directly|again|help|assist|users?|any|provide|generate|create|produce|write|complete|describe|this|that|the|an?|to|me|please)\s*)*$`)
 
 var moderationQuotedMaterial = regexp.MustCompile("(?s)```.*?```|`[^`]*`|“[^”]*”|「[^」]*」|\"(?:\\\\.|[^\"\\\\])*\"")
 
