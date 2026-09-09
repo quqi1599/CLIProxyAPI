@@ -631,14 +631,18 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 
 // ExtractOpenAIStyleThinkingConfig extracts OpenAI-compatible thinking controls.
 //
-// DeepSeek V4 accepts the official OpenAI-compatible toggle under
-// thinking.type, while reasoning_effort controls the effort level. A disabled
-// toggle wins over effort fields because it is an explicit off switch.
+// Providers use thinking.type or the boolean enable_thinking toggle, while
+// reasoning_effort controls the effort level. An explicit disabled toggle wins
+// over effort fields. Missing, null, and malformed booleans are not off switches.
 func ExtractOpenAIStyleThinkingConfig(body []byte) (ThinkingConfig, bool) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return ThinkingConfig{}, false
 	}
 	root := gjson.ParseBytes(body)
+	enableThinking := root.Get("enable_thinking")
+	if enableThinking.Type == gjson.False {
+		return ThinkingConfig{Mode: ModeNone, Budget: 0}, true
+	}
 
 	thinkingType := strings.ToLower(strings.TrimSpace(root.Get("thinking.type").String()))
 	switch thinkingType {
@@ -694,6 +698,9 @@ func ExtractOpenAIStyleThinkingConfig(body []byte) (ThinkingConfig, bool) {
 		return ThinkingConfig{Mode: ModeAuto, Budget: -1}, true
 	}
 
+	if enableThinking.Type == gjson.True {
+		return ThinkingConfig{Mode: ModeAuto, Budget: -1}, true
+	}
 	return ThinkingConfig{}, false
 }
 
