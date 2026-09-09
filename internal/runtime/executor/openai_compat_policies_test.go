@@ -187,6 +187,7 @@ func TestOpenAICompatDeepSeekChatAliasesRespectEndpointAndCanonicalFields(t *tes
 		endpoint                compat.EndpointKind
 		input                   []byte
 		wantThinkingType        string
+		wantResponsesEffort     string
 		wantMaxTokens           int64
 		wantEnableThinking      bool
 		wantMaxCompletionTokens bool
@@ -209,11 +210,12 @@ func TestOpenAICompatDeepSeekChatAliasesRespectEndpointAndCanonicalFields(t *tes
 			wantChatAliasDowngrade: true,
 		},
 		{
-			name:                    "responses leaves chat aliases untouched",
+			name:                    "responses maps disabled intent without changing token aliases",
 			endpoint:                "responses",
 			input:                   []byte(`{"model":"deepseek-v4-flash","input":"hi","enable_thinking":false,"max_completion_tokens":4096}`),
-			wantEnableThinking:      true,
+			wantResponsesEffort:     "none",
 			wantMaxCompletionTokens: true,
+			wantChatAliasDowngrade:  true,
 		},
 		{
 			name:                    "invalid aliases are not guessed",
@@ -240,6 +242,9 @@ func TestOpenAICompatDeepSeekChatAliasesRespectEndpointAndCanonicalFields(t *tes
 			}
 			if got := gjson.GetBytes(actual, "thinking.type").String(); got != test.wantThinkingType {
 				t.Fatalf("thinking.type = %q, want %q; body=%s", got, test.wantThinkingType, actual)
+			}
+			if got := gjson.GetBytes(actual, "reasoning.effort").String(); got != test.wantResponsesEffort {
+				t.Fatalf("reasoning.effort = %q, want %q; body=%s", got, test.wantResponsesEffort, actual)
 			}
 			if got := gjson.GetBytes(actual, "max_tokens").Int(); got != test.wantMaxTokens {
 				t.Fatalf("max_tokens = %d, want %d; body=%s", got, test.wantMaxTokens, actual)

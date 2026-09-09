@@ -253,6 +253,7 @@ func scrubOpenAICompatCapabilityFields(payload []byte, profile openAICompatProfi
 	if len(payload) == 0 {
 		return payload
 	}
+	payload = helps.NormalizeOpenAICompatDisabledThinking(payload, config.NormalizeOpenAICompatibilityKind(profile.Kind))
 	deletePaths := make([]string, 0, 6)
 	if !profile.SupportsStore {
 		deletePaths = append(deletePaths, "store")
@@ -304,7 +305,7 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 	}
 	payload = scrubOpenAICompatLegacyProviderQuirks(payload, profile, model)
 	if endpoint == "responses" && config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" {
-		return payload
+		return helps.NormalizeDeepSeekResponsesThinking(payload)
 	}
 	return scrubOpenAICompatPayloadAfterProviderQuirks(payload, profile, model, baseURL)
 }
@@ -1000,6 +1001,7 @@ func requiresDoubaoSeed20Compatibility(model string) bool {
 }
 
 func scrubDoubaoUnsupportedOpenAIFields(payload []byte, model string) []byte {
+	seedThinking := helps.DoubaoSeedThinkingType(payload, model)
 	unsupportedPaths := []string{
 		"user",
 		"response_format",
@@ -1023,6 +1025,9 @@ func scrubDoubaoUnsupportedOpenAIFields(payload []byte, model string) []byte {
 		}
 	}
 	payload = mutateOpenAICompatJSON(payload, unsupportedPaths, nil)
+	if seedThinking != "" {
+		payload, _ = sjson.SetBytes(payload, "thinking.type", seedThinking)
+	}
 	payload = deleteMessageReasoningContent(payload)
 	return payload
 }

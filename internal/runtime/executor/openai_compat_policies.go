@@ -661,6 +661,7 @@ func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.
 	}
 	output = scrubDeepSeekThinkingBudgetForCompat(output, state.model, state.baseURL, "deepseek")
 	if state.endpoint == "responses" {
+		output = helps.NormalizeDeepSeekResponsesThinking(output)
 		return compat.TransformResult{
 			Payload:    output,
 			Downgrades: openAICompatDeepSeekPolicyDowngrades(input, output),

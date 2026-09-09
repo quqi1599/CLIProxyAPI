@@ -342,6 +342,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
 	}
 
+	// Keep provider-native controls through the Responses-to-Chat bridge. The
+	// provider policy, not the translator, decides which controls it supports.
+	for _, field := range []string{"thinking", "enable_thinking", "thinking_budget", "reasoning_effort"} {
+		if value := root.Get(field); value.Exists() {
+			out, _ = sjson.SetRawBytes(out, field, []byte(value.Raw))
+		}
+	}
 	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
 		if effort != "" {
