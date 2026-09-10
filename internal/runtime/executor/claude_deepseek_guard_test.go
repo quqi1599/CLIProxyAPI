@@ -71,6 +71,7 @@ func TestPrepareClaudeRequestDeepSeekDowngradesIncompleteDefaultHistory(t *testi
 	}}
 	payload := []byte(`{
 		"model":"deepseek-v4-pro",
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[
 			{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
 			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
@@ -99,6 +100,7 @@ func TestPrepareClaudeRequestDeepSeekRejectsIncompleteExplicitHistory(t *testing
 		"model":"deepseek-v4-pro",
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"high"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 	_, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
@@ -125,12 +127,13 @@ func TestPrepareClaudeRequestDeepSeekWorkBuddyDowngradesIncompleteExplicitHistor
 		"model":"deepseek-v4-pro",
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"high"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 	plan, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{
 		Model: "deepseek-v4-pro", Payload: payload,
 	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai"),
+		SourceFormat: sdktranslator.FromString("claude"),
 		Metadata: map[string]any{
 			cliproxyexecutor.ClientProfileMetadataKey: "workbuddy",
 		},
@@ -158,6 +161,7 @@ func TestPrepareClaudeRequestDeepSeekClaudeCodeDowngradesIncompleteExplicitHisto
 		"model":"deepseek-v4-flash",
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"high"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 	plan, err := executor.prepareClaudeRequest(context.Background(), auth, cliproxyexecutor.Request{

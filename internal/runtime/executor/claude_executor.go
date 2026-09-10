@@ -381,7 +381,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	}
 	providerConfigStarted := time.Now()
 	providerConfigInput := body
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "model", helps.OfficialDeepSeekModel(baseModel, plan.baseURL))
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier())
 	if err != nil {
 		return plan, err
@@ -667,7 +667,7 @@ func logDeepSeekAnthropicCacheDiagnostic(ctx context.Context, event helps.CacheP
 func rejectDeepSeekFIMForClaudeRoute(model, requestPath string, body []byte) error {
 	modelName := normalizedOpenAICompatPolicyModelName(model)
 	path := strings.TrimSuffix(strings.TrimSpace(requestPath), "/")
-	if !strings.HasPrefix(modelName, "deepseek-v4-pro") ||
+	if !thinking.IsDeepSeekV4Model(modelName) ||
 		(path != "/completions" && !strings.HasSuffix(path, "/v1/completions")) ||
 		!gjson.GetBytes(body, "prompt").Exists() {
 		return nil
@@ -1904,6 +1904,7 @@ func downgradeClaudeToolSearchForCompatKindWithStats(compatKind, baseURL string,
 		return body, 0
 	}
 	modelID := strings.TrimSpace(compatStringValue(root["model"]))
+	nativeDeepSeekVision := compatKind == "deepseek" && helps.DeepSeekFlashVisionEnabled(modelID, baseURL)
 
 	changed := false
 	messagePlaceholders := 0
@@ -1964,7 +1965,7 @@ func downgradeClaudeToolSearchForCompatKindWithStats(compatKind, baseURL string,
 				cleanedMessages = append(cleanedMessages, message)
 				continue
 			}
-			cleanedContent, contentChanged := downgradeClaudeToolSearchContentForCompat(compatKind, modelID, content)
+			cleanedContent, contentChanged := downgradeClaudeToolSearchContentForCompat(compatKind, modelID, content, nativeDeepSeekVision)
 			if contentChanged {
 				changed = true
 				if len(cleanedContent) == 0 {
@@ -2070,7 +2071,7 @@ func supportsDeepSeekClaudeWebSearchContent(compatKind, partType string, part ma
 	}
 }
 
-func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, content []any) ([]any, bool) {
+func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, content []any, nativeDeepSeekVision ...bool) ([]any, bool) {
 	cleaned := make([]any, 0, len(content))
 	changed := false
 	for _, rawPart := range content {
@@ -2084,7 +2085,7 @@ func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, conte
 		case supportsDeepSeekClaudeWebSearchContent(compatKind, partType, part):
 			cleaned = append(cleaned, part)
 			continue
-		case isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType):
+		case isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType, nativeDeepSeekVision...):
 			changed = true
 			if text := claudeUnsupportedContentText(part); text != "" {
 				cleaned = append(cleaned, map[string]any{"type": "text", "text": text})
@@ -2111,7 +2112,7 @@ func downgradeClaudeToolSearchContentForCompat(compatKind, modelID string, conte
 		case partType == "tool_result":
 			updated := part
 			updatedChanged := false
-			if next, nextChanged := downgradeClaudeToolResultContentForCompat(compatKind, modelID, updated); nextChanged {
+			if next, nextChanged := downgradeClaudeToolResultContentForCompat(compatKind, modelID, updated, nativeDeepSeekVision...); nextChanged {
 				updated = next
 				updatedChanged = true
 			}
@@ -2144,7 +2145,10 @@ func hasUnsupportedClaudeImageForCompat(compatKind, modelID string, content []an
 	return false
 }
 
-func isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType string) bool {
+func isUnsupportedClaudeContentPartForCompat(compatKind, modelID, partType string, nativeDeepSeekVision ...bool) bool {
+	if partType == "image" && compatKind == "deepseek" && len(nativeDeepSeekVision) > 0 && nativeDeepSeekVision[0] {
+		return false
+	}
 	if !requiresClaudeContentBlockDowngradeForCompat(compatKind) {
 		return false
 	}
@@ -2213,7 +2217,7 @@ func isClaudeServerToolResultPart(partType string) bool {
 	return partType != "" && partType != "tool_result" && strings.HasSuffix(partType, "_tool_result")
 }
 
-func downgradeClaudeToolResultContentForCompat(compatKind, modelID string, part map[string]any) (map[string]any, bool) {
+func downgradeClaudeToolResultContentForCompat(compatKind, modelID string, part map[string]any, nativeDeepSeekVision ...bool) (map[string]any, bool) {
 	if !requiresClaudeContentBlockDowngradeForCompat(compatKind) {
 		return part, false
 	}
@@ -2233,7 +2237,7 @@ func downgradeClaudeToolResultContentForCompat(compatKind, modelID string, part 
 				continue
 			}
 			nestedType := strings.TrimSpace(compatStringValue(nested["type"]))
-			if !isUnsupportedClaudeContentPartForCompat(compatKind, modelID, nestedType) {
+			if !isUnsupportedClaudeContentPartForCompat(compatKind, modelID, nestedType, nativeDeepSeekVision...) {
 				cleaned = append(cleaned, rawNested)
 				continue
 			}
@@ -2763,12 +2767,17 @@ func claudeCompatToolResultPileLimits(meta compatRepairLogMeta) (payloadBytes in
 }
 
 func isDeepSeekV4LongContextModel(model string) bool {
-	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	return strings.HasPrefix(baseModel, "deepseek-v4-pro") || strings.HasPrefix(baseModel, "deepseek-v4-flash")
+	return thinking.IsDeepSeekV4Model(model)
 }
 
 func rejectDeepSeekAnthropicUnsupportedImageInput(ctx context.Context, body []byte, compatKind, baseURL, model string, clientProfiles ...string) error {
 	if !isOfficialDeepSeekAnthropicRoute(compatKind, baseURL) {
+		return nil
+	}
+	if helps.DeepSeekFlashVisionEnabled(model, baseURL) {
+		if err := helps.ValidateDeepSeekFlashImages(body, "claude"); err != nil {
+			return statusErr{code: http.StatusBadRequest, errorCode: "invalid_image_input", msg: err.Error()}
+		}
 		return nil
 	}
 	imageParts := countClaudeImageParts(body)
@@ -3658,6 +3667,10 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 	}
 	if errGuard := rejectDeepSeekAnthropicUnsupportedImageInput(req.Context(), body, compatKind, requestURLString(req), gjson.GetBytes(body, "model").String()); errGuard != nil {
 		return nil, errGuard
+	}
+	model := gjson.GetBytes(body, "model").String()
+	if upstreamModel := helps.OfficialDeepSeekModel(model, requestURLString(req)); upstreamModel != model {
+		body, _ = sjson.SetBytes(body, "model", upstreamModel)
 	}
 	body, capabilityManaged, errCapability := applyClaudeCompatProviderCapabilities(req.Context(), body, compatKind, requestURLString(req), compat.MatchContext{
 		Model:        gjson.GetBytes(body, "model").String(),

@@ -2248,7 +2248,7 @@ func requiresDeepSeekThinkingBudgetCompatibility(model string, baseURL string, c
 		return false
 	}
 	modelName := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(modelName, "deepseek-v4") || strings.Contains(modelName, "deepseek-reasoner")
+	return thinking.IsDeepSeekV4Model(modelName) || strings.Contains(modelName, "deepseek-reasoner")
 }
 
 func deleteDeepSeekThinkingBudgetPaths(payload []byte) []byte {
@@ -2764,17 +2764,20 @@ func scrubDeepSeekThinkingToolChoice(payload []byte, model string, baseURL strin
 	if !requiresDeepSeekThinkingBudgetCompatibility(model, baseURL, compatKind) {
 		return payload
 	}
-	if !deepSeekOpenAIThinkingEnabled(payload) {
+	if deepSeekThinkingHistoryIntent(payload, "openai") == deepSeekThinkingIntentDisabled {
 		return payload
 	}
-	if !gjson.GetBytes(payload, "tool_choice").Exists() {
+	choice := gjson.GetBytes(payload, "tool_choice")
+	if choice.String() != "required" && !(choice.IsObject() && choice.Get("type").String() == "function") {
 		return payload
 	}
-	out, err := sjson.DeleteBytes(payload, "tool_choice")
+	// Preserve the required tool selection. Official Chat rejects forced tools in
+	// thinking mode, including its default-on mode, so disable thinking explicitly.
+	out, err := disableDeepSeekThinkingForIncompleteHistory(payload, "openai")
 	if err != nil {
 		return payload
 	}
-	return out
+	return deleteDeepSeekThinkingBudgetPaths(out)
 }
 
 func repairOpenAICompatToolCallHistory(payload []byte) []byte {
@@ -3013,8 +3016,7 @@ func openAICompatMessageHasContent(message map[string]any) bool {
 }
 
 func requiresDeepSeekToolSchemaCompatibility(model string) bool {
-	modelName := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(modelName, "deepseek-v4")
+	return thinking.IsDeepSeekV4Model(model)
 }
 
 func scrubDeepSeekToolPayload(payload []byte, baseURL string) []byte {

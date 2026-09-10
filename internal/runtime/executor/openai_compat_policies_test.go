@@ -647,7 +647,7 @@ func TestOpenAICompatPostConfigRevalidatesMigratedProviders(t *testing.T) {
 			profile:        openAICompatProfileForKind("deepseek"),
 			model:          "deepseek-v4-pro",
 			baseURL:        "https://api.deepseek.com/v1",
-			wantDowngrades: []string{openAICompatDeepSeekThinkingDowngrade, openAICompatDeepSeekToolChoiceDowngrade},
+			wantDowngrades: []string{openAICompatDeepSeekThinkingDowngrade},
 		},
 		{
 			name:           "doubao",

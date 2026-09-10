@@ -378,8 +378,8 @@ func TestRoutePlanNormalizedReasoningEffort_OfficialDeepSeekUsesOfficialSemantic
 	}
 
 	got := routePlanNormalizedReasoningEffort(auth, "openai-compatibility", "deepseek-v4-pro[1m]", "claude_code", "deepseek-v4-pro", "low")
-	if got != "high" {
-		t.Fatalf("routePlanNormalizedReasoningEffort() = %q, want high", got)
+	if got != "low" {
+		t.Fatalf("routePlanNormalizedReasoningEffort() = %q, want low", got)
 	}
 }
 

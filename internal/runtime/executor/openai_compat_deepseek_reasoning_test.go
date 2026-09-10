@@ -102,7 +102,8 @@ func TestOpenAICompatExecutorDeepSeekDowngradesIncompleteDefaultHistoryBeforeUps
 		Model: "deepseek-v4-pro",
 		Payload: []byte(`{
 			"model":"deepseek-v4-pro",
-			"messages":[
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+		"messages":[
 				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"},
 				{"role":"user","content":"continue"}
@@ -137,7 +138,8 @@ func TestOpenAICompatExecutorDeepSeekRejectsIncompleteExplicitHistoryBeforeUpstr
 		Payload: []byte(`{
 			"model":"deepseek-v4-pro",
 			"reasoning_effort":"high",
-			"messages":[
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+		"messages":[
 				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"}
 			]
@@ -176,7 +178,8 @@ func TestOpenAICompatExecutorDeepSeekWorkBuddyDowngradesIncompleteExplicitHistor
 		Payload: []byte(`{
 			"model":"deepseek-v4-pro",
 			"reasoning_effort":"high",
-			"messages":[
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+		"messages":[
 				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"}
 			]
@@ -220,7 +223,8 @@ func TestOpenAICompatExecutorDeepSeekClaudeCodeDowngradesIncompleteExplicitHisto
 		Payload: []byte(`{
 			"model":"deepseek-v4-flash",
 			"reasoning_effort":"high",
-			"messages":[
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+		"messages":[
 				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"}
 			]
@@ -267,7 +271,8 @@ func TestOpenAICompatExecutorDeepSeekRechecksIncompleteHistoryAfterPayloadConfig
 		Model: "deepseek-v4-pro",
 		Payload: []byte(`{
 			"model":"deepseek-v4-pro",
-			"messages":[
+			"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+		"messages":[
 				{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 				{"role":"tool","tool_call_id":"call_1","content":"ok"}
 			]
@@ -415,8 +420,7 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"input":[{"role":"developer","content":"Be concise."},{"role":"user","content":"Inspect the repository."}],
 		"tools":[
 			{"type":"function","name":"lookup","description":"Look up data","parameters":{"type":"object","properties":{"q":{"type":"string"}}},"strict":true},
-			{"type":"custom","name":"apply_patch","description":"Apply a patch"},
-			{"type":"web_search"}
+			{"type":"custom","name":"apply_patch","description":"Apply a patch"}
 		],
 		"tool_choice":"auto",
 		"reasoning":{"effort":"low"},
@@ -445,7 +449,6 @@ func TestOpenAICompatExecutorDeepSeekFlashUsesNativeResponses(t *testing.T) {
 		"tools.0.name":     "lookup",
 		"tools.1.type":     "custom",
 		"tools.1.name":     "apply_patch",
-		"tools.2.type":     "web_search",
 		"tool_choice":      "auto",
 		"reasoning.effort": "low",
 		"text.format.type": "json_schema",
@@ -511,7 +514,7 @@ func TestOpenAICompatExecutorDeepSeekResponsesRejectsUnsupportedToolsBeforeUpstr
 			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
 				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
 			}
-			for _, marker := range []string{"deepseek_responses_unsupported_tools", "工具命名空间(namespace)", "自定义工具(custom:shell)", "网页搜索(web_search)", "CPA 不会静默删除"} {
+			for _, marker := range []string{"deepseek_responses_unsupported_tools", "工具命名空间(namespace)", "自定义工具(custom:shell)", "当前 DeepSeek 通道无法执行"} {
 				if !strings.Contains(err.Error(), marker) {
 					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
 				}
@@ -520,7 +523,7 @@ func TestOpenAICompatExecutorDeepSeekResponsesRejectsUnsupportedToolsBeforeUpstr
 	}
 }
 
-func TestOpenAICompatExecutorHTTPDeepSeekResponsesAllowsWebSearch(t *testing.T) {
+func TestOpenAICompatExecutorHTTPDeepSeekProResponsesAllowsWebSearch(t *testing.T) {
 	upstreamCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
@@ -538,7 +541,7 @@ func TestOpenAICompatExecutorHTTPDeepSeekResponsesAllowsWebSearch(t *testing.T) 
 		},
 	}
 	req := httptest.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{
-		"model":"deepseek-v4-flash",
+		"model":"deepseek-v4-pro",
 		"input":"Search the web.",
 		"tools":[{"type":"web_search"}]
 	}`))

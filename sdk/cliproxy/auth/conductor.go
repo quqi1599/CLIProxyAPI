@@ -1163,8 +1163,7 @@ func routePlanCompatMapping(requestedModel, resolvedModel, compatKind string) st
 }
 
 func isDeepSeekV4RouteModel(model string) bool {
-	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	return strings.HasPrefix(modelName, "deepseek-v4-pro") || strings.HasPrefix(modelName, "deepseek-v4-flash")
+	return thinking.IsDeepSeekV4Model(model)
 }
 
 func routePlanCompatBaseHost(auth *Auth) string {
@@ -10264,11 +10263,7 @@ func isDeepSeekCompatibilityFallbackError(err error) bool {
 }
 
 func isDeepSeekCompatibilityFallbackModel(model string) bool {
-	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	if slash := strings.LastIndex(modelName, "/"); slash >= 0 {
-		modelName = modelName[slash+1:]
-	}
-	return strings.HasPrefix(modelName, "deepseek-v4")
+	return thinking.IsDeepSeekV4Model(model)
 }
 
 func shouldFallbackRequestScopedRouteErrorForRequest(routeModel string, opts cliproxyexecutor.Options, err error) bool {

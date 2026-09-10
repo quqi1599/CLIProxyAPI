@@ -197,14 +197,12 @@ func openAICompatModelSupportsNativeResponses(profile openAICompatProfile, model
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
 		return true
 	}
-	modelName := normalizedOpenAICompatPolicyModelName(model)
-	return strings.HasPrefix(modelName, "deepseek-v4-flash") ||
-		strings.HasPrefix(modelName, "deepseek-v4-pro")
+	return thinking.IsDeepSeekV4Model(model)
 }
 
 func openAICompatIsDeepSeekFIMRequest(opts cliproxyexecutor.Options, profile openAICompatProfile, model string) bool {
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" ||
-		!strings.HasPrefix(normalizedOpenAICompatPolicyModelName(model), "deepseek-v4-pro") {
+		!thinking.IsDeepSeekV4Model(model) {
 		return false
 	}
 	path := strings.TrimSuffix(strings.TrimSpace(helps.PayloadRequestPath(opts)), "/")
@@ -370,10 +368,13 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if errReject := rejectLargeOpenAICompatToolHistory(req.Context(), body, profile, model, path); errReject != nil {
 		return errReject
 	}
-	if errReject := rejectDeepSeekUnsupportedImageInput(req.Context(), body, profile, model, path); errReject != nil {
+	if errReject := rejectDeepSeekUnsupportedImageInput(req.Context(), body, profile, model, path, baseURL); errReject != nil {
 		return errReject
 	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
+	if upstreamModel := helps.OfficialDeepSeekModel(model, baseURL); upstreamModel != model {
+		updated, _ = sjson.SetBytes(updated, "model", upstreamModel)
+	}
 	inlinedImages := false
 	if inlined, changed := inlineMiniMaxM3RemoteImageURLs(req.Context(), updated, profile, model); changed {
 		updated = inlined
@@ -437,8 +438,7 @@ func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOut
 		strings.HasPrefix(baseModel, "kimi-k3") ||
 		strings.HasPrefix(baseModel, "glm-5.2") ||
 		strings.HasPrefix(baseModel, "glm-5.3") ||
-		strings.HasPrefix(baseModel, "deepseek-v4-pro") ||
-		strings.HasPrefix(baseModel, "deepseek-v4-flash") {
+		thinking.IsDeepSeekV4Model(baseModel) {
 		return largeOpenAICompatLongContextToolHistoryPayloadBytes,
 			largeOpenAICompatLongContextToolOutputMessages
 	}
@@ -480,8 +480,18 @@ func deepSeekChatJSONSchemaUserMessage() string {
 	return "request_feature_unsupported: deepseek_chat_json_schema. DeepSeek 官方 Chat Completions 仅支持 response_format.type=text 或 json_object，不支持 json_schema。如果必须保证 JSON Schema，请改用 deepseek-v4-pro 或 deepseek-v4-flash 的 /v1/responses；否则请将 Chat 请求改为 response_format={\"type\":\"json_object\"}，并在提示词中明确要求输出 JSON。CPA 不会静默降级 json_schema。"
 }
 
-func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string) error {
+func rejectDeepSeekUnsupportedImageInput(ctx context.Context, body []byte, profile openAICompatProfile, model, path string, baseURLs ...string) error {
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
+		return nil
+	}
+	if len(baseURLs) > 0 && helps.DeepSeekFlashVisionEnabled(model, baseURLs[0]) {
+		format := "openai"
+		if gjson.GetBytes(body, "input").Exists() {
+			format = "responses"
+		}
+		if err := helps.ValidateDeepSeekFlashImages(body, format); err != nil {
+			return statusErr{code: http.StatusBadRequest, errorCode: "invalid_image_input", msg: err.Error()}
+		}
 		return nil
 	}
 	imageParts, fileParts := countOpenAICompatUnsupportedAttachmentParts(body)
@@ -549,7 +559,7 @@ func qwenLargeInlineBase64ImageUserMessage() string {
 }
 
 func deepSeekOfficialImageInputUserMessage() string {
-	return "DeepSeek 官方当前不支持图片输入。请移除当前请求和历史消息里的 image_url / input_image，仅保留文本内容后重试；如果必须传图，请切换到支持图像输入的模型或路由。原样重复提交不会提高成功率。"
+	return "当前 DeepSeek 模型或通道不支持图片输入。请切换到 DeepSeek 官方 deepseek-v4.1-flash 或其他支持图片的模型；也可以移除当前请求和历史消息里的图片后重试。"
 }
 
 func deepSeekOfficialFileInputUserMessage() string {
@@ -565,7 +575,7 @@ func rejectDeepSeekUnsupportedResponsesToolsForKind(ctx context.Context, body []
 		!strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") {
 		return nil
 	}
-	toolCount, unsupportedCount, unsupportedTypes := deepSeekUnsupportedResponsesToolTypes(body, endpoint)
+	toolCount, unsupportedCount, unsupportedTypes := deepSeekUnsupportedResponsesToolTypes(body, endpoint, model)
 	if unsupportedCount == 0 {
 		return nil
 	}
@@ -589,7 +599,7 @@ func rejectDeepSeekUnsupportedResponsesToolsForKind(ctx context.Context, body []
 	}
 }
 
-func deepSeekUnsupportedResponsesToolTypes(body []byte, endpoint string) (toolCount, unsupportedCount int, unsupportedTypes []string) {
+func deepSeekUnsupportedResponsesToolTypes(body []byte, endpoint string, models ...string) (toolCount, unsupportedCount int, unsupportedTypes []string) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return 0, 0, nil
 	}
@@ -598,7 +608,7 @@ func deepSeekUnsupportedResponsesToolTypes(body []byte, endpoint string) (toolCo
 		toolCount++
 		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
 		toolName := strings.ToLower(strings.TrimSpace(tool.Get("name").String()))
-		if deepSeekResponsesToolSupported(toolType, toolName, endpoint) {
+		if deepSeekResponsesToolSupported(toolType, toolName, endpoint, models...) {
 			continue
 		}
 		unsupportedCount++
@@ -614,11 +624,14 @@ func deepSeekUnsupportedResponsesToolTypes(body []byte, endpoint string) (toolCo
 	return toolCount, unsupportedCount, unsupportedTypes
 }
 
-func deepSeekResponsesToolSupported(toolType, toolName, endpoint string) bool {
+func deepSeekResponsesToolSupported(toolType, toolName, endpoint string, models ...string) bool {
 	switch toolType {
 	case "function":
 		return true
 	case "web_search", "web_search_2025_08_26":
+		if strings.Contains(strings.ToLower(endpoint), "responses") && len(models) > 0 && thinking.IsDeepSeekFlashModel(models[0]) {
+			return false
+		}
 		return true
 	case "custom":
 		return strings.Contains(strings.ToLower(endpoint), "responses") && toolName == "apply_patch"
@@ -633,6 +646,8 @@ func deepSeekResponsesToolSupported(toolType, toolName, endpoint string) bool {
 
 func deepSeekUnsupportedToolLabel(toolType, toolName string) string {
 	switch toolType {
+	case "web_search", "web_search_2025_08_26":
+		return "网页搜索(web_search)"
 	case "namespace":
 		return "工具命名空间(namespace)"
 	case "file_search":
@@ -674,7 +689,7 @@ func deepSeekResponsesToolsUserMessage(unsupportedTypes []string) string {
 	if len(unsupportedTypes) > 0 {
 		typeSummary = strings.Join(unsupportedTypes, ", ")
 	}
-	return fmt.Sprintf("request_feature_unsupported: deepseek_responses_unsupported_tools. DeepSeek V4 Pro 当前可用的 Responses 工具是：函数工具(function)、网页搜索(web_search)和补丁应用(apply_patch)。当前请求还包含不支持的：%s。CPA 不会静默删除或改写这些工具。请移除这些工具，或在 Codex 中切换到原生 GPT 模型/渠道后重试。", typeSummary)
+	return fmt.Sprintf("request_feature_unsupported: deepseek_responses_unsupported_tools. 当前 DeepSeek 通道无法执行这些工具：%s。请切换到支持对应功能的 OpenAI 原生 GPT 模型后重试，或关闭对应工具后新建对话。", typeSummary)
 }
 
 func rejectDeepSeekUnsupportedResponsesState(ctx context.Context, body []byte, compatKind, model, path, endpoint, sourceFormat string) error {
@@ -1017,6 +1032,13 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		if err != nil {
 			return plan, err
 		}
+		if plan.endpoint == "/chat/completions" && profile.Kind == "deepseek" {
+			beforeChoice := body
+			body = scrubDeepSeekThinkingToolChoice(body, baseModel, baseURL, profile.Kind)
+			if !bytes.Equal(beforeChoice, body) {
+				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatDeepSeekToolChoiceDowngrade)
+			}
+		}
 	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
@@ -1058,7 +1080,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 
 	providerConfigStarted := time.Now()
 	providerConfigInput := body
-	body = e.overrideModel(body, baseModel)
+	body = e.overrideModel(body, helps.OfficialDeepSeekModel(baseModel, baseURL))
 	if plan.endpoint == "/completions" {
 		body = mutateOpenAICompatJSON(body, []string{"thinking", "reasoning", "reasoning_effort"}, nil)
 	}
@@ -1183,7 +1205,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	if err = rejectDeepSeekUnsupportedResponsesState(ctx, plan.requestSource, profile.Kind, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
 		return plan, err
 	}
-	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath); err != nil {
+	if err = rejectDeepSeekUnsupportedImageInput(ctx, body, profile, baseModel, plan.requestPath, baseURL); err != nil {
 		return plan, err
 	}
 	plan.logBody = body

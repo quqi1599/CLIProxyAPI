@@ -70,7 +70,7 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider, clientProfil
 	if report.PlaceholderCount > 0 {
 		appliedPolicies = append(appliedPolicies, thinkingHistoryPlaceholderPolicy)
 	}
-	if report.CheckedToolCallTurns > 0 {
+	if report.CheckedToolCallTurns > 0 || report.CheckedAssistantTurns > 0 {
 		appliedPolicies = append(appliedPolicies, thinkingHistoryValidationPolicy)
 	}
 	downgrades := make([]string, 0, 1)
@@ -139,9 +139,9 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 		var err error
 		switch strings.ToLower(strings.TrimSpace(provider)) {
 		case "openai":
-			report, err = compathistory.Validate(body, compathistory.FormatOpenAI, true)
+			report, err = compathistory.ValidateDeepSeek(body, compathistory.FormatOpenAI)
 		case "claude":
-			report, err = compathistory.Validate(body, compathistory.FormatClaude, true)
+			report, err = compathistory.ValidateDeepSeek(body, compathistory.FormatClaude)
 		default:
 			return body, false, false, report, nil
 		}
@@ -349,7 +349,7 @@ func claudeHistoryNeedsThinkingNormalization(body []byte) bool {
 
 func requiresReturnedThinkingHistory(model string) bool {
 	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	return strings.HasPrefix(modelName, "deepseek-v4") || strings.Contains(modelName, "deepseek-reasoner")
+	return thinking.IsDeepSeekV4Model(modelName) || strings.Contains(modelName, "deepseek-reasoner")
 }
 
 func deepSeekThinkingHistoryRequiredForRequest(body []byte, provider string) bool {

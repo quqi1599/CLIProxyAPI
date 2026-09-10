@@ -536,7 +536,7 @@ func TestBuildErrorResponseBody_ExplainsDeepSeekResponsesToolsInCustomerLanguage
 	if payload.Error.Message != userFacingDeepSeekResponsesNonFunctionToolsMessage(errText) {
 		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingDeepSeekResponsesNonFunctionToolsMessage(errText))
 	}
-	for _, marker := range []string{"Codex", "工具分组", "自定义工具", "已支持函数调用、联网搜索和补丁应用", "原生 GPT 模型"} {
+	for _, marker := range []string{"客户端", "工具分组", "自定义工具", "模型列表", "原生 GPT 模型"} {
 		if !strings.Contains(payload.Error.Message, marker) {
 			t.Fatalf("message = %q, want marker %q", payload.Error.Message, marker)
 		}

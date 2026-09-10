@@ -32,7 +32,7 @@ const (
 
 	openAICompatDeepSeekThinkingDowngrade   = "openai_compat.deepseek.thinking_controls_normalized"
 	openAICompatDeepSeekChatAliasDowngrade  = "openai_compat.deepseek.chat_aliases_normalized"
-	openAICompatDeepSeekToolChoiceDowngrade = "openai_compat.deepseek.tool_choice_removed"
+	openAICompatDeepSeekToolChoiceDowngrade = "openai_compat.deepseek.forced_tool_choice_thinking_disabled"
 	openAICompatDeepSeekStrictDowngrade     = "openai_compat.deepseek.strict_schema_removed"
 	openAICompatDoubaoFieldsDowngrade       = "openai_compat.doubao.unsupported_fields_removed"
 	openAICompatDoubaoSeed20Downgrade       = "openai_compat.doubao.seed20_payload_normalized"
@@ -766,7 +766,10 @@ func openAICompatDeepSeekPolicyDowngrades(input, output []byte) []string {
 			break
 		}
 	}
-	if gjson.GetBytes(input, "tool_choice").Exists() && !gjson.GetBytes(output, "tool_choice").Exists() {
+	if deepSeekThinkingHistoryIntent(input, "openai") != deepSeekThinkingIntentDisabled &&
+		gjson.GetBytes(output, "thinking.type").String() == "disabled" &&
+		!openAICompatJSONValueChanged(input, output, "tool_choice") &&
+		gjson.GetBytes(input, "tool_choice").Exists() {
 		downgrades = append(downgrades, openAICompatDeepSeekToolChoiceDowngrade)
 	}
 	if deepSeekHasStrictField(input) && !deepSeekHasStrictField(output) {

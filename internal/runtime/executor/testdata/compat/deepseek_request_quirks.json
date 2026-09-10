@@ -52,12 +52,9 @@
             "content": "hi"
           }
         ],
-        "thinking_budget": 100,
         "thinking": {
-          "type": "enabled",
-          "budget_tokens": 32768
+          "type": "disabled"
         },
-        "reasoning_effort": "max",
         "tools": [
           {
             "type": "function",
@@ -73,11 +70,17 @@
               }
             }
           }
-        ]
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "lookup"
+          }
+        }
       },
       "downgrades": [
         "openai_compat.deepseek.thinking_controls_normalized",
-        "openai_compat.deepseek.tool_choice_removed",
+        "openai_compat.deepseek.forced_tool_choice_thinking_disabled",
         "openai_compat.deepseek.strict_schema_removed"
       ]
     },

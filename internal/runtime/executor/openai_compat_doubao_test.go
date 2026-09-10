@@ -394,8 +394,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := entry.Data["max_content_parts"]; got != 2 {
 		t.Fatalf("max_content_parts = %#v, want 2", got)
 	}
-	if _, exists := entry.Data["tool_choice_type"]; exists {
-		t.Fatalf("tool_choice_type should be removed for DeepSeek thinking mode, got %#v", entry.Data["tool_choice_type"])
+	if got := entry.Data["tool_choice_type"]; got != "auto" {
+		t.Fatalf("tool_choice_type = %#v, want preserved auto", got)
 	}
 	if got := entry.Data["thinking_type"]; got != "enabled" {
 		t.Fatalf("thinking_type = %#v, want enabled", got)
@@ -403,8 +403,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := entry.Data["reasoning_effort"]; got != "max" {
 		t.Fatalf("reasoning_effort = %#v, want max", got)
 	}
-	if !logFieldContains(entry.Data["removed_fields"], "tool_choice") {
-		t.Fatalf("removed_fields should contain tool_choice, got %#v", entry.Data["removed_fields"])
+	if logFieldContains(entry.Data["removed_fields"], "tool_choice") {
+		t.Fatalf("preserved tool_choice reported as removed: %#v", entry.Data["removed_fields"])
 	}
 	if got := entry.Data["response_format_type"]; got != "json_object" {
 		t.Fatalf("response_format_type = %#v, want json_object", got)
@@ -435,7 +435,7 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := failureEntry.Data["upstream_request_id"]; got != "deepseek-log-1" {
 		t.Fatalf("failure upstream_request_id = %#v, want deepseek-log-1", got)
 	}
-	if got := failureEntry.Data["payload_fields"]; got != "messages,model,parallel_tool_calls,reasoning_effort,response_format,thinking,tools" {
+	if got := failureEntry.Data["payload_fields"]; got != "messages,model,parallel_tool_calls,reasoning_effort,response_format,thinking,tool_choice,tools" {
 		t.Fatalf("failure payload_fields = %#v", got)
 	}
 	if got := failureEntry.Data["message_roles"]; got != "assistant:1,system:1,tool:1,user:1" {
@@ -456,8 +456,8 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if got := failureEntry.Data["parallel_tool_calls"]; got != "false" {
 		t.Fatalf("failure parallel_tool_calls = %#v, want false", got)
 	}
-	if got := failureEntry.Data["removed_fields"]; got != "tool_choice" {
-		t.Fatalf("failure removed_fields = %#v, want tool_choice", got)
+	if logFieldContains(failureEntry.Data["removed_fields"], "tool_choice") {
+		t.Fatalf("failure reports preserved tool_choice as removed: %#v", failureEntry.Data["removed_fields"])
 	}
 	if got := failureEntry.Data["modified_fields"]; got != "messages,tools" {
 		t.Fatalf("failure modified_fields = %#v, want messages,tools", got)
@@ -541,7 +541,7 @@ func TestOpenAICompatExecutorDeepSeekRejectsImageInputBeforeUpstream(t *testing.
 	if got := status.ErrorCode(); got != "request_feature_unsupported" {
 		t.Fatalf("ErrorCode() = %q, want request_feature_unsupported", got)
 	}
-	if !strings.Contains(err.Error(), "DeepSeek 官方当前不支持图片输入") {
+	if !strings.Contains(err.Error(), "当前 DeepSeek 模型或通道不支持图片输入") {
 		t.Fatalf("error = %q, want direct Chinese image-input guidance", err.Error())
 	}
 	if !strings.Contains(err.Error(), "deepseek_official_image_input") {

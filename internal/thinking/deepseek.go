@@ -17,42 +17,46 @@ type ReasoningEffortNormalization struct {
 // vocabulary accepted by DeepSeek official compatibility endpoints.
 func NormalizeDeepSeekOfficialReasoningEffort(level string) string {
 	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "low", "medium":
+	case "minimal", "low":
+		return "low"
+	case "medium", "high", "xhigh":
 		return "high"
-	case "high":
-		return "high"
-	case "xhigh", "max":
+	case "max", "ultra":
 		return "max"
 	default:
 		return strings.ToLower(strings.TrimSpace(level))
 	}
 }
 
-// NormalizeDeepSeekOfficialReasoningEffortForModel preserves the native low
-// effort level supported by DeepSeek V4 Flash while retaining the compatibility
-// mapping required by other official DeepSeek models.
+// NormalizeDeepSeekOfficialReasoningEffortForModel follows the official effort
+// vocabulary shared by current Flash and Pro endpoints.
 func NormalizeDeepSeekOfficialReasoningEffortForModel(model string, level string) string {
-	normalized := strings.ToLower(strings.TrimSpace(level))
+	return NormalizeDeepSeekOfficialReasoningEffort(level)
+}
+
+func deepSeekBaseModel(model string) string {
 	baseModel, _ := StripPublicModelHint(model)
 	baseModel = strings.ToLower(strings.TrimSpace(ParseSuffix(baseModel).ModelName))
 	if slash := strings.LastIndex(baseModel, "/"); slash >= 0 {
 		baseModel = baseModel[slash+1:]
 	}
-	if strings.HasPrefix(baseModel, "deepseek-v4-flash") {
-		switch normalized {
-		case "low":
-			return "low"
-		case "medium":
-			return "high"
-		case "high":
-			return "high"
-		case "xhigh", "max":
-			return "max"
-		default:
-			return normalized
-		}
+	return baseModel
+}
+
+// IsDeepSeekFlashModel recognizes the current Flash name and compatibility aliases.
+// Old Flash names are served by V4.1 Flash on the official API since 2026-09-10.
+func IsDeepSeekFlashModel(model string) bool {
+	switch deepSeekBaseModel(model) {
+	case "deepseek-flash", "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp":
+		return true
+	default:
+		return false
 	}
-	return NormalizeDeepSeekOfficialReasoningEffort(normalized)
+}
+
+// IsDeepSeekV4Model includes the unversioned official Flash alias.
+func IsDeepSeekV4Model(model string) bool {
+	return IsDeepSeekFlashModel(model) || strings.HasPrefix(deepSeekBaseModel(model), "deepseek-v4")
 }
 
 // StripPublicModelHint removes a trailing public hint suffix such as "[1m]".
@@ -76,9 +80,7 @@ func StripPublicModelHint(model string) (baseModel string, hint string) {
 // IsDeepSeekReasoningIntentModel reports whether the requested public model should
 // be treated as a DeepSeek strongest-reasoning intent alias.
 func IsDeepSeekReasoningIntentModel(model string) bool {
-	baseModel, _ := StripPublicModelHint(model)
-	baseModel = strings.ToLower(strings.TrimSpace(ParseSuffix(baseModel).ModelName))
-	return strings.HasPrefix(baseModel, "deepseek-v4-pro") || strings.HasPrefix(baseModel, "deepseek-v4-flash")
+	return IsDeepSeekV4Model(model)
 }
 
 // ShouldNormalizeStrongestReasoningIntent reports whether the request should be

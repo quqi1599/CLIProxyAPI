@@ -27,7 +27,7 @@ func userFacingDeepSeekChatJSONSchemaMessage() string {
 }
 
 func userFacingDeepSeekOfficialImageInputMessage() string {
-	return "当前选择的 DeepSeek 模型不支持本次 Codex 请求中的图片输入（包括对话历史里的图片）。这是模型能力兼容限制，不是账号或余额问题。请在 Codex 的模型选择器中切换到支持图片的原生 GPT 模型后重试；如果继续使用 DeepSeek，请移除当前和历史消息中的图片，仅保留文字。原样重试不会成功。"
+	return "当前选择的模型或通道无法接收图片。请在客户端打开“模型设置”，切换到支持图片的 DeepSeek V4.1 Flash 官方通道或 OpenAI 原生 GPT 模型后重试；如果只需文字，请新建对话并重新发送文字内容。这不是账号余额问题。"
 }
 
 func userFacingDeepSeekOfficialFileInputMessage() string {
@@ -68,7 +68,7 @@ func userFacingClaudeCodeDeepSeekContentFormatMessage() string {
 
 func userFacingDeepSeekResponsesNonFunctionToolsMessage(errText string) string {
 	toolNames := deepSeekUnsupportedToolChineseNames(errText)
-	return "DeepSeek V4 Pro 已支持函数调用、联网搜索和补丁应用，但当前 Codex 请求还使用了 DeepSeek 不支持的工具：" + strings.Join(toolNames, "、") + "。这是工具协议的兼容性限制，不是账号、余额或网络问题。请移除这些工具，或在 Codex 的模型选择器中切换到原生 GPT 模型后重试。"
+	return "当前 DeepSeek 通道无法执行本次请求中的工具：" + strings.Join(toolNames, "、") + "。请在客户端的模型列表中切换到支持这些功能的 OpenAI 原生 GPT 模型后重试；如果不需要这些功能，可关闭对应工具后新建对话。这不是账号余额问题。"
 }
 
 func userFacingDeepSeekResponsesStateMessage() string {

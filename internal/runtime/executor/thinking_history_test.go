@@ -122,6 +122,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 
 func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesPartialHistoryWithoutExplicitThinking(t *testing.T) {
 	body := []byte(`{
+		"tools":[{"type":"function","function":{"name":"list_directory","parameters":{"type":"object"}}},{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
 		"messages":[
 			{"role":"assistant","reasoning_content":"first plan","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
 			{"role":"tool","tool_call_id":"call_1","content":"result"},
@@ -146,6 +147,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesPartialHistoryWithoutEx
 
 func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutExplicitThinking(t *testing.T) {
 	body := []byte(`{
+		"tools":[{"type":"function","function":{"name":"list_directory","parameters":{"type":"object"}}}],
 		"messages":[
 			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},
 			{"role":"tool","tool_call_id":"call_1","content":"result"}
@@ -167,6 +169,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutEx
 func TestNormalizeOpenAIThinkingHistoryDeepSeekRejectsMissingReasoningWhenThinkingEnabled(t *testing.T) {
 	body := []byte(`{
 		"thinking":{"type":"enabled","budget_tokens":1024},
+		"tools":[{"type":"function","function":{"name":"list_directory","parameters":{"type":"object"}}}],
 		"messages":[
 			{"role":"assistant","content":"previous answer"},
 			{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]}
@@ -195,6 +198,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekWorkBuddyDowngradesExplicitThinki
 	body := []byte(`{
 		"thinking":{"type":"enabled"},
 		"reasoning_effort":"high",
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
 		"messages":[
 			{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
 			{"role":"tool","tool_call_id":"call_1","content":"ok"}
@@ -225,6 +229,7 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekWorkBuddyDowngradesExplicitThinki
 func TestNormalizeOpenAIThinkingHistoryDeepSeekClaudeCodeDowngradesExplicitThinking(t *testing.T) {
 	body := []byte(`{
 		"reasoning_effort":"high",
+		"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
 		"messages":[{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]
 	}`)
 
@@ -250,7 +255,8 @@ func TestNormalizeOpenAIThinkingHistoryDeepSeekClaudeCodeDowngradesExplicitThink
 }
 
 func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesMissingHistoryWithoutExplicitThinking(t *testing.T) {
-	body := []byte(`{"messages":[
+	body := []byte(`{"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+		"messages":[
 		{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
 		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
 	]}`)
@@ -271,6 +277,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekRejectsExplicitThinkingWithProtoc
 	body := []byte(`{
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"high"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 
@@ -297,6 +304,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekWorkBuddyDowngradesExplicitThinki
 	body := []byte(`{
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"max"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 
@@ -325,6 +333,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekClaudeCodeDowngradesExplicitThink
 	body := []byte(`{
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"high"},
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"messages":[{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]}]
 	}`)
 
@@ -698,6 +707,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekSkipsWithoutThinkingRequest(t *te
 
 func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesPartialToolThinkingByDefault(t *testing.T) {
 	body := []byte(`{
+		"tools":[{"name":"list_directory","input_schema":{"type":"object"}},{"name":"read_file","input_schema":{"type":"object"}}],
 		"messages":[
 			{"role":"assistant","content":[{"type":"thinking","thinking":"first plan"},{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
 			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result"}]},
@@ -719,6 +729,7 @@ func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesPartialToolThinkingByDe
 
 func TestNormalizeClaudeThinkingHistoryDeepSeekDowngradesMissingToolThinkingByDefault(t *testing.T) {
 	body := []byte(`{
+		"tools":[{"name":"list_directory","input_schema":{"type":"object"}}],
 		"messages":[
 			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"list_directory","input":{}}]},
 			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result"}]}

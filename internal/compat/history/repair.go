@@ -33,13 +33,14 @@ const (
 
 // Report contains payload-free accounting for one history repair.
 type Report struct {
-	InputBytes           int
-	OutputBytes          int
-	SyntheticBytes       int
-	PatchedCount         int
-	PlaceholderCount     int
-	DowngradeReason      string
-	CheckedToolCallTurns int
+	InputBytes            int
+	OutputBytes           int
+	SyntheticBytes        int
+	PatchedCount          int
+	PlaceholderCount      int
+	DowngradeReason       string
+	CheckedToolCallTurns  int
+	CheckedAssistantTurns int
 }
 
 // Result contains the repaired payload and its bounded accounting metadata.

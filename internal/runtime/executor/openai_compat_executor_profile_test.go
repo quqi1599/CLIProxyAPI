@@ -2221,12 +2221,12 @@ func TestOpenAICompatPayloadDeepSeekNormalizesThinkingBudget(t *testing.T) {
 	if got := gjson.GetBytes(out, "thinking.budget_tokens").Int(); got != 32768 {
 		t.Fatalf("thinking.budget_tokens = %d, want 32768: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
-		t.Fatalf("reasoning_effort = %q, want max: %s", got, string(out))
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high: %s", got, string(out))
 	}
 }
 
-func TestOpenAICompatPayloadDeepSeekThinkingModeStripsToolChoice(t *testing.T) {
+func TestOpenAICompatPayloadDeepSeekThinkingModeKeepsForcedToolChoice(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek-v4-pro",
 		"messages":[{"role":"user","content":"hi"}],
@@ -2238,8 +2238,8 @@ func TestOpenAICompatPayloadDeepSeekThinkingModeStripsToolChoice(t *testing.T) {
 
 	out := scrubOpenAICompatPayloadForModel(payload, genericOpenAICompatProfile(), "deepseek-v4-pro", "https://api.deepseek.com/v1")
 
-	if gjson.GetBytes(out, "tool_choice").Exists() {
-		t.Fatalf("tool_choice should be removed for DeepSeek thinking mode: %s", string(out))
+	if gjson.GetBytes(out, "tool_choice.function.name").String() != "lookup" || gjson.GetBytes(out, "thinking.type").String() != "disabled" {
+		t.Fatalf("forced tool must be preserved with thinking disabled: %s", string(out))
 	}
 }
 

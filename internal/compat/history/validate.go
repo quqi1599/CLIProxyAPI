@@ -42,8 +42,19 @@ func (e *MissingReasoningError) Error() string {
 // Validate checks only assistant turns that contain tool calls. It never adds,
 // copies, or replaces reasoning content.
 func Validate(body []byte, format Format, requireToolCallReasoning bool) (Report, error) {
+	return validateReasoning(body, format, requireToolCallReasoning, false)
+}
+
+// ValidateDeepSeek checks every assistant turn when tools are declared, including
+// final answers without tool calls. Without tools, DeepSeek ignores past reasoning.
+func ValidateDeepSeek(body []byte, format Format) (Report, error) {
+	tools := gjson.GetBytes(body, "tools")
+	return validateReasoning(body, format, tools.IsArray() && len(tools.Array()) > 0, true)
+}
+
+func validateReasoning(body []byte, format Format, required, allAssistantTurns bool) (Report, error) {
 	report := Report{InputBytes: len(body), OutputBytes: len(body)}
-	if !requireToolCallReasoning || len(body) == 0 || !gjson.ValidBytes(body) {
+	if !required || len(body) == 0 || !gjson.ValidBytes(body) {
 		return report, nil
 	}
 	messages := gjson.GetBytes(body, "messages")
@@ -59,18 +70,26 @@ func Validate(body []byte, format Format, requireToolCallReasoning bool) (Report
 		switch format {
 		case FormatOpenAI:
 			toolCalls := message.Get("tool_calls")
-			if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+			hasCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
+			if !allAssistantTurns && !hasCalls {
 				continue
 			}
-			report.CheckedToolCallTurns++
+			if hasCalls {
+				report.CheckedToolCallTurns++
+			}
+			report.CheckedAssistantTurns++
 			if !isRealReasoningValue(message.Get("reasoning_content"), OpenAIUnavailableValue) {
 				missing = append(missing, index)
 			}
 		case FormatClaude:
-			if !hasClaudeToolUse(message) {
+			hasCalls := hasClaudeToolUse(message)
+			if !allAssistantTurns && !hasCalls {
 				continue
 			}
-			report.CheckedToolCallTurns++
+			if hasCalls {
+				report.CheckedToolCallTurns++
+			}
+			report.CheckedAssistantTurns++
 			if !hasRealClaudeThinking(message) {
 				missing = append(missing, index)
 			}

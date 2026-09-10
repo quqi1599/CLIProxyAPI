@@ -194,7 +194,7 @@ func TestClaudeExecutorDeepSeekResponsesRejectsApplyPatchBeforeUpstream(t *testi
 			if status.StatusCode() != http.StatusBadRequest || status.ErrorCode() != "request_feature_unsupported" {
 				t.Fatalf("status/code = %d/%q, want 400/request_feature_unsupported", status.StatusCode(), status.ErrorCode())
 			}
-			for _, marker := range []string{"deepseek_responses_unsupported_tools", "自定义工具(custom:apply_patch)", "CPA 不会静默删除"} {
+			for _, marker := range []string{"deepseek_responses_unsupported_tools", "自定义工具(custom:apply_patch)", "当前 DeepSeek 通道无法执行"} {
 				if !strings.Contains(err.Error(), marker) {
 					t.Fatalf("error = %q, want marker %q", err.Error(), marker)
 				}

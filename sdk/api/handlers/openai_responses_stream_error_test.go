@@ -85,7 +85,7 @@ func TestBuildOpenAIResponsesStreamErrorChunkPreservesDeepSeekCustomerGuidance(t
 		t.Fatalf("unmarshal: %v", err)
 	}
 	message, _ := payload["message"].(string)
-	for _, marker := range []string{"Codex", "工具分组", "文件搜索", "联网搜索", "原生 GPT 模型"} {
+	for _, marker := range []string{"客户端", "工具分组", "文件搜索", "原生 GPT 模型"} {
 		if !strings.Contains(message, marker) {
 			t.Fatalf("message = %q, want marker %q", message, marker)
 		}
