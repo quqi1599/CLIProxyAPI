@@ -102,13 +102,14 @@ type selectorRouteSelection struct {
 }
 
 type selectionAvailabilitySummary struct {
-	total              int
-	ready              int
-	skippedDisabled    int
-	skippedCooldown    int
-	skippedBreaker     int
-	skippedUnavailable int
-	healthDownweighted int
+	total                int
+	ready                int
+	skippedDisabled      int
+	skippedCooldown      int
+	skippedBreaker       int
+	skippedUnavailable   int
+	skippedCompatibility int
+	healthDownweighted   int
 }
 
 type requestAttemptTrace struct {
@@ -605,6 +606,16 @@ func (t *requestAttemptTrace) recordSelectionAvailability(summary selectionAvail
 	t.mu.Unlock()
 }
 
+func (t *requestAttemptTrace) recordSelectionCompatibilityPrefiltered(count int) {
+	if t == nil || count <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.selectionAvailability.total += count
+	t.selectionAvailability.skippedCompatibility += count
+	t.mu.Unlock()
+}
+
 func (t *requestAttemptTrace) selectionLogFields() log.Fields {
 	if t == nil {
 		return nil
@@ -631,6 +642,9 @@ func (t *requestAttemptTrace) selectionLogFields() log.Fields {
 	}
 	if summary.skippedUnavailable > 0 {
 		fields["candidate_skipped_unavailable"] = summary.skippedUnavailable
+	}
+	if summary.skippedCompatibility > 0 {
+		fields["candidate_skipped_compatibility"] = summary.skippedCompatibility
 	}
 	if summary.healthDownweighted > 0 {
 		fields["candidate_health_downweighted"] = summary.healthDownweighted
@@ -3128,6 +3142,7 @@ func (m *Manager) preparedExecutionModelsForRequest(auth *Auth, routeModel strin
 	models := m.filterExecutionModels(auth, routeModel, candidates, pooled)
 	models = filterImageInputUnsupportedExecutionModels(req, opts, models)
 	models = filterMiniMaxM3RequiredExecutionModels(routeModel, req, opts, models)
+	models = filterClaudeSonnet46MiMoExecutionModels(auth, routeModel, req, opts, models)
 	return models, pooled
 }
 
@@ -5597,6 +5612,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = classifyClaudeSonnet46MiMoHistory(routeModel, req, opts)
 	compactionIntent := compactionIntentFromRequest(req, opts)
 	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
 	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
@@ -5929,6 +5945,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = classifyClaudeSonnet46MiMoHistory(routeModel, req, opts)
 	compactionIntent := compactionIntentFromRequest(req, opts)
 	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntent)
 	gptRoute := isGPTRetryRoute(providers, routeModel) && !remoteCompaction
@@ -11120,7 +11137,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
@@ -11225,6 +11246,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	if claudeSonnet46MiMoHistoryIncompatible(model, cliproxyexecutor.Request{Model: model}, opts) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 
@@ -11383,7 +11407,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
@@ -11447,6 +11475,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
+	if claudeSonnet46MiMoHistoryIncompatible(model, cliproxyexecutor.Request{Model: model}, opts) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	if pinnedAuthIDFromMetadata(opts.Metadata) == "" && shouldPreferDeepSeekProtocolAffinity(model, opts) {

@@ -49,6 +49,8 @@ func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 	entry.Data["candidate_skipped_cooldown"] = 1
 	entry.Data["candidate_skipped_breaker"] = 1
 	entry.Data["candidate_skipped_unavailable"] = 1
+	entry.Data["candidate_skipped_compatibility"] = 2
+	entry.Data["excluded_candidate_count"] = 2
 	entry.Data["request_path"] = "/v1/chat/completions"
 	entry.Data["round_no"] = 2
 	entry.Data["gpt_round_count"] = 3
@@ -83,6 +85,8 @@ func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 		"candidate_skipped_cooldown=1",
 		"candidate_skipped_breaker=1",
 		"candidate_skipped_unavailable=1",
+		"candidate_skipped_compatibility=2",
+		"excluded_candidate_count=2",
 		"request_path=/v1/chat/completions",
 		"round_no=2",
 		"gpt_round_count=3",
