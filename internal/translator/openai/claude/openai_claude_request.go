@@ -346,25 +346,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 }
 
 func normalizeObjectSchemaProperties(schema any) any {
-	switch value := schema.(type) {
-	case map[string]any:
-		if schemaType, ok := value["type"].(string); ok && schemaType == "object" {
-			if _, ok := value["properties"]; !ok {
-				value["properties"] = map[string]any{}
-			}
-		}
-		for key, child := range value {
-			value[key] = normalizeObjectSchemaProperties(child)
-		}
-		return value
-	case []any:
-		for i, child := range value {
-			value[i] = normalizeObjectSchemaProperties(child)
-		}
-		return value
-	default:
-		return schema
-	}
+	return util.NormalizeToolSchema(schema, false)
 }
 
 func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result) bool {

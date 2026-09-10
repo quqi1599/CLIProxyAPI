@@ -452,7 +452,11 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
 func translateCodexRequestPair(ctx context.Context, from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte, error) {
-	return helps.TranslateRequestPairGuarded(ctx, "legacy.translate.codex", from, to, model, originalPayload, payload, stream, internalpayload.AmplificationOverride{})
+	original, body, err := helps.TranslateRequestPairGuarded(ctx, "legacy.translate.codex", from, to, model, originalPayload, payload, stream, internalpayload.AmplificationOverride{})
+	if err != nil {
+		return original, body, err
+	}
+	return helps.NormalizeCodexRequestSchemas(original), helps.NormalizeCodexRequestSchemas(body), nil
 }
 
 type codexRequestPlanMode uint8

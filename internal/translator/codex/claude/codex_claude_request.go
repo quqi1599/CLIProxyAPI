@@ -553,19 +553,5 @@ func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string
 
 // normalizeToolParameters ensures object schemas contain at least an empty properties map.
 func normalizeToolParameters(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || raw == "null" || !gjson.Valid(raw) {
-		return `{"type":"object","properties":{}}`
-	}
-	result := gjson.Parse(raw)
-	schema := []byte(raw)
-	schemaType := result.Get("type").String()
-	if schemaType == "" {
-		schema, _ = sjson.SetBytes(schema, "type", "object")
-		schemaType = "object"
-	}
-	if schemaType == "object" && !result.Get("properties").Exists() {
-		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
-	}
-	return string(schema)
+	return string(util.NormalizeCodexToolParameters([]byte(raw)))
 }
