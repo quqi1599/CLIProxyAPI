@@ -27,6 +27,7 @@ const (
 	thinkingHistoryBudgetDowngradeReason  = compathistory.BudgetDowngradeReason
 	thinkingHistoryUnrepairableReason     = compathistory.UnrepairableReason
 	thinkingHistoryClientDowngradeReason  = "thinking_history_downgraded"
+	thinkingHistoryFlashDowngradeReason   = "thinking_history_flash_downgraded"
 	thinkingHistorySyntheticBudgetPolicy  = "thinking_history.synthetic_budget"
 	thinkingHistoryPlaceholderPolicy      = "thinking_history.placeholder"
 	thinkingHistoryValidationPolicy       = "thinking_history.real_reasoning_validation"
@@ -75,7 +76,7 @@ func enforceThinkingHistoryTransform(ctx context.Context, provider, clientProfil
 	}
 	downgrades := make([]string, 0, 1)
 	switch report.DowngradeReason {
-	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason, thinkingHistoryClientDowngradeReason:
+	case thinkingHistoryBudgetDowngradeReason, thinkingHistoryUnrepairableReason, thinkingHistoryClientDowngradeReason, thinkingHistoryFlashDowngradeReason:
 		downgrades = append(downgrades, report.DowngradeReason)
 	}
 	override := internalpayload.AmplificationOverride{}
@@ -150,7 +151,8 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 		}
 		clientProfile = strings.ToLower(strings.TrimSpace(clientProfile))
 		clientDowngrade := clientProfile == "workbuddy" || clientProfile == "claude_code"
-		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault || clientDowngrade {
+		flashDowngrade := thinking.IsDeepSeekFlashModel(model)
+		if deepSeekThinkingHistoryIntent(body, provider) == deepSeekThinkingIntentDefault || clientDowngrade || flashDowngrade {
 			out, errDisable := disableDeepSeekThinkingForIncompleteHistory(body, provider)
 			if errDisable != nil {
 				if clientDowngrade {
@@ -161,6 +163,8 @@ func normalizeThinkingHistoryForModelWithReportForClient(body []byte, provider s
 			report.OutputBytes = len(out)
 			if clientDowngrade {
 				report.DowngradeReason = thinkingHistoryClientDowngradeReason
+			} else if flashDowngrade {
+				report.DowngradeReason = thinkingHistoryFlashDowngradeReason
 			} else {
 				report.DowngradeReason = thinkingHistoryUnrepairableReason
 			}

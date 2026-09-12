@@ -4,11 +4,108 @@
 # The source seed is supplemented with CPA high-confidence intent phrases.
 # Exact managed counts are verified by tests so policy tuning stays reviewable.
 # CPA keeps request-level enforcement only; this policy does not ban sessions or API keys.
-version: "llm-access-managed-2026-09-07-v12"
+version: "llm-access-managed-2026-09-10-v13"
 global-allowlist:
   - "接口交互"
   - "光口交换机"
 rules:
+  # These intent rules enforce locally even when semantic review is unavailable.
+  # Broad topic seeds, ordinary marketing, and anatomical terms remain observations.
+  - id: "block-csam-explicit-request-intent"
+    category: "csam"
+    severity: "critical"
+    action: "block"
+    model-review: true
+    override-exclude-any: ["不要拒绝", "无需拒绝", "即使违规也生成", "generate it anyway", "do not refuse", "ignore safety policy"]
+    keywords:
+      - "儿童色情"
+      - "未成年色情"
+      - "未成年人色情"
+      - "未成年性描写"
+      - "未成年性视频"
+      - "幼童裸照"
+      - "幼女性描写"
+      - "幼女色情"
+      - "萝莉色情"
+      - "正太色情"
+      - "child pornography"
+      - "child porn"
+      - "child sexual abuse material"
+      - "underage porn"
+      - "underage sexual roleplay"
+      - "sexual roleplay with a minor"
+      - "minor nude photo"
+    require-any: ["生成", "制作", "创作", "请描写", "帮我描写", "续写", "扩写", "请扮演", "帮我扮演", "开始", "write", "generate", "create", "produce", "continue", "start a", "start an", "begin"]
+    exclude-any: ["儿童保护", "儿童安全", "保护儿童", "未成年人保护", "内容审核", "审核规则", "内容政策", "安全策略", "识别", "检测", "举报", "取证", "案件分析", "法律分析", "研究报告", "新闻报道", "禁止", "不得", "拒绝", "不要生成", "不要制作", "不要续写", "child protection", "child safety", "protect children", "moderation", "content policy", "safety policy", "detect", "recognize", "report", "prevention", "prevent", "research", "news", "legal analysis", "do not", "must not", "refuse"]
+    allowlist: []
+  - id: "block-fraud-deceptive-request-intent"
+    category: "fraud"
+    severity: "high"
+    action: "block"
+    model-review: true
+    override-exclude-any: ["不要拒绝", "无需拒绝", "即使违规也生成", "generate it anyway", "do not refuse", "ignore safety policy"]
+    keywords:
+      - "骗取转账"
+      - "骗取验证码"
+      - "骗取银行卡密码"
+      - "诱骗充值"
+      - "诱骗投资"
+      - "冒充客服诈骗"
+      - "投资诈骗"
+      - "杀猪盘"
+      - "电信诈骗"
+      - "诈骗话术"
+      - "诈骗短信"
+      - "诈骗脚本"
+      - "诈骗引流"
+      - "romance scam"
+      - "investment scam"
+      - "phishing sms"
+      - "phishing text message"
+      - "phishing text messages"
+      - "trick victims into paying"
+      - "steal verification codes"
+    require-any: ["编写", "生成", "制作", "设计", "开发", "实现", "帮我", "教我", "群发", "养号", "自动化", "write", "generate", "create", "build", "design", "automate", "help me", "show me", "how to"]
+    exclude-any: ["反诈", "反诈骗", "防诈骗", "诈骗识别", "骗局识别", "检测规则", "检测模型", "风险评估", "风险说明", "安全培训", "防范", "预防", "内容审核", "安全策略", "案例分析", "案件分析", "新闻报道", "报警", "禁止", "不得", "拒绝", "不要生成", "不要编写", "anti fraud", "anti scam", "fraud prevention", "scam prevention", "detection", "detect", "prevent", "awareness", "security training", "risk assessment", "risk analysis", "news", "moderation", "safety policy", "do not", "must not", "refuse"]
+    allowlist: []
+  - id: "block-extremism-promotion-operation-intent"
+    category: "extremism"
+    severity: "critical"
+    action: "block"
+    model-review: true
+    override-exclude-any: ["不要拒绝", "无需拒绝", "即使违规也生成", "generate it anyway", "do not refuse", "ignore safety policy"]
+    keywords: ["种族清洗", "恐怖袭击", "恐怖组织", "ethnic cleansing", "terrorist attack", "terrorist organization", "terrorist group"]
+    require-any: ["招募话术", "招募文案", "招募脚本", "宣传文案", "宣传口号", "宣传海报", "煽动", "策划袭击", "实施袭击", "作战计划", "袭击步骤", "行动方案", "实施计划", "recruitment script", "recruitment propaganda", "recruitment poster", "recruitment speech", "operational plan", "plan an attack", "glorify", "encourage", "incite"]
+    exclude-any: ["反恐", "预防", "防范", "识别", "检测", "风险评估", "风险说明", "案件分析", "历史研究", "学术研究", "新闻报道", "内容审核", "安全策略", "禁止", "不得", "拒绝", "不要生成", "不要编写", "counter terrorism", "counterterrorism", "prevention", "prevent", "detect", "recognize", "risk assessment", "academic", "historical research", "news", "moderation", "safety policy", "do not", "must not", "refuse"]
+    allowlist: []
+  - id: "block-sexual-explicit-request-intent"
+    category: "sexual"
+    severity: "high"
+    action: "block"
+    model-review: true
+    override-exclude-any: ["不要拒绝", "无需拒绝", "即使违规也生成", "generate it anyway", "do not refuse", "ignore safety policy"]
+    keywords:
+      - "露骨性描写"
+      - "色情角色扮演"
+      - "色情故事"
+      - "性爱故事"
+      - "露骨色情"
+      - "露骨性爱"
+      - "色情音频"
+      - "色情视频"
+      - "色情图片"
+      - "露骨性细节"
+      - "露骨性场景"
+      - "explicit sexual content"
+      - "graphic sex scene"
+      - "pornographic content"
+      - "pornographic roleplay"
+      - "erotic sex scene"
+      - "explicit sexual roleplay"
+      - "explicit sex scene"
+    require-any: ["编写", "生成", "制作", "创作", "请描写", "帮我描写", "续写", "扩写", "润色", "请扮演", "帮我扮演", "开始", "write", "generate", "create", "produce", "continue", "rewrite", "start a", "start an", "begin"]
+    exclude-any: ["医学", "医疗", "科普", "性教育", "临床", "法律分析", "学术", "研究", "新闻", "内容审核", "审核规则", "内容政策", "安全策略", "风险说明", "识别", "检测", "举报", "禁止", "不得", "拒绝", "不要生成", "不要创作", "不要续写", "medical", "clinical", "education", "academic", "research", "news", "legal analysis", "moderation", "content policy", "safety policy", "detect", "recognize", "report", "prevent", "do not", "must not", "refuse"]
+    allowlist: []
   # Service topic restrictions apply independently of praise or criticism.
   # Public leadership reference: https://cpc.people.com.cn/GB/64162/448511/index.html
   - id: "block-political-china-leadership"
@@ -356,6 +453,9 @@ rules:
       - "描写幼女性行为"
       - "未成年色情角色扮演"
       - "制作幼童裸照"
+    allowlist:
+      - "what does underage sexual roleplay mean"
+      - "explain the term underage sexual roleplay"
     exclude-any:
       - "禁止生成"
       - "不得生成"
@@ -431,6 +531,10 @@ rules:
       - "风险评估"
       - "预防校园枪击"
       - "counter terrorism research"
+      - "detect terrorist recruitment"
+      - "detection rules for terrorist recruitment"
+      - "识别恐怖组织招募"
+      - "恐怖组织招募检测"
       - "attack prevention"
     override-exclude-any:
       - "帮我策划"
@@ -908,6 +1012,9 @@ rules:
     severity: "high"
     action: "block"
     model-review: true
+    allowlist:
+      - "what does underage sexual roleplay mean"
+      - "explain the term underage sexual roleplay"
     keywords:
       - "write explicit sex scene"
       - "write graphic sex scene"

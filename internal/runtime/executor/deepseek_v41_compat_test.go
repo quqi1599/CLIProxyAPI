@@ -107,9 +107,17 @@ func TestDeepSeekV41ThinkingHistoryChecksNonToolAssistantTurns(t *testing.T) {
 				t.Fatalf("thinking still enabled: %s", out)
 			}
 		}
-		if _, _, _, _, err := normalizeThinkingHistoryForModelWithReportForClient(body, "openai", model, ""); err == nil {
-			t.Fatal("explicit thinking for an unknown client should be rejected")
+		out, _, downgraded, report, err := normalizeThinkingHistoryForModelWithReportForClient(body, "openai", model, "")
+		if err != nil || !downgraded || report.DowngradeReason != thinkingHistoryFlashDowngradeReason {
+			t.Fatalf("flash explicit thinking should downgrade safely: downgraded=%v report=%+v err=%v", downgraded, report, err)
 		}
+		if gjson.GetBytes(out, "thinking.type").String() != "disabled" {
+			t.Fatalf("flash thinking was not disabled: %s", out)
+		}
+	}
+	proBody := []byte(`{"thinking":{"type":"enabled"},"reasoning_effort":"high","tools":[{"type":"function","function":{"name":"lookup"}}],"messages":[{"role":"assistant","content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
+	if _, _, _, _, err := normalizeThinkingHistoryForModelWithReportForClient(proBody, "openai", "deepseek-v4-pro", ""); err == nil {
+		t.Fatal("explicit thinking for DeepSeek Pro should remain rejected")
 	}
 	noTools := []byte(`{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":"hello"},{"role":"user","content":"continue"}]}`)
 	out, changed, downgraded, _, err := normalizeThinkingHistoryForModelWithReportForClient(noTools, "openai", "deepseek-flash", "workbuddy")
