@@ -252,7 +252,25 @@ func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, 
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return conn.WriteMessage(msgType, payload)
+	const chunkSize = 32 * 1024
+	if len(payload) <= chunkSize {
+		return conn.WriteMessage(msgType, payload)
+	}
+	w, err := conn.NextWriter(msgType)
+	if err != nil {
+		return err
+	}
+	for start := 0; start < len(payload); start += chunkSize {
+		end := start + chunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if _, err = w.Write(payload[start:end]); err != nil {
+			_ = w.Close()
+			return err
+		}
+	}
+	return w.Close()
 }
 
 func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
@@ -262,9 +280,8 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 	s.resetUpstreamDisconnectError(conn)
 	conn.SetReadLimit(providerWebsocketReadLimit)
 	conn.SetPingHandler(func(appData string) error {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		// Reply pongs from the same write lock to avoid concurrent writes.
+		// WriteControl is safe to call concurrently with data writes. Do not take
+		// writeMu here: a large payload may otherwise starve keepalive pongs.
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
 	defaultCloseHandler := conn.CloseHandler()
@@ -1469,6 +1486,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	misc.EnsureHeader(headers, ginHeaders, "X-Codex-Turn-State", "")
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {

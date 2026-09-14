@@ -37,7 +37,7 @@ func TestBuildRemoteCompactionErrorBody(t *testing.T) {
 func TestBuildOpenAIResponsesStreamErrorChunkPreservesCompactionCode(t *testing.T) {
 	t.Parallel()
 	body := BuildOpenAIResponsesStreamErrorChunk(http.StatusBadGateway, "invalid_compaction_stream: missing response.completed", 3)
-	if got := gjson.GetBytes(body, "code").String(); got != "invalid_compaction_stream" {
+	if got := gjson.GetBytes(body, "error.code").String(); got != "invalid_compaction_stream" {
 		t.Fatalf("code = %q; body=%s", got, body)
 	}
 	if got := gjson.GetBytes(body, "sequence_number").Int(); got != 3 {

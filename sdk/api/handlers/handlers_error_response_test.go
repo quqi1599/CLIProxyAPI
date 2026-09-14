@@ -743,11 +743,11 @@ func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesMiniMaxInputNewSensitive
 	if payload.SequenceNumber != 7 {
 		t.Fatalf("sequence_number = %d, want 7", payload.SequenceNumber)
 	}
-	if payload.Message != UserFacingContentSafetyMessage("input") {
-		t.Fatalf("message = %q, want %q", payload.Message, UserFacingContentSafetyMessage("input"))
+	if payload.Error["message"] != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error["message"], UserFacingContentSafetyMessage("input"))
 	}
-	if payload.Code != contentPolicyViolationErrorCode {
-		t.Fatalf("code = %q, want %q", payload.Code, contentPolicyViolationErrorCode)
+	if payload.Error["code"] != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error["code"], contentPolicyViolationErrorCode)
 	}
 }
 
@@ -764,11 +764,11 @@ func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesRequestFeatureUnsupporte
 	if payload.SequenceNumber != 9 {
 		t.Fatalf("sequence_number = %d, want 9", payload.SequenceNumber)
 	}
-	if payload.Message != UserFacingRequestFeatureUnsupportedMessage() {
-		t.Fatalf("message = %q, want %q", payload.Message, UserFacingRequestFeatureUnsupportedMessage())
+	if payload.Error["message"] != UserFacingRequestFeatureUnsupportedMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error["message"], UserFacingRequestFeatureUnsupportedMessage())
 	}
-	if payload.Code != requestFeatureUnsupportedErrorCode {
-		t.Fatalf("code = %q, want %q", payload.Code, requestFeatureUnsupportedErrorCode)
+	if payload.Error["code"] != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error["code"], requestFeatureUnsupportedErrorCode)
 	}
 }
 
@@ -785,11 +785,11 @@ func TestBuildOpenAIResponsesStreamErrorChunk_NormalizesContentSafety1301(t *tes
 	if payload.SequenceNumber != 11 {
 		t.Fatalf("sequence_number = %d, want 11", payload.SequenceNumber)
 	}
-	if payload.Message != UserFacingContentSafetyMessage("input") {
-		t.Fatalf("message = %q, want %q", payload.Message, UserFacingContentSafetyMessage("input"))
+	if payload.Error["message"] != UserFacingContentSafetyMessage("input") {
+		t.Fatalf("message = %q, want %q", payload.Error["message"], UserFacingContentSafetyMessage("input"))
 	}
-	if payload.Code != contentPolicyViolationErrorCode {
-		t.Fatalf("code = %q, want %q", payload.Code, contentPolicyViolationErrorCode)
+	if payload.Error["code"] != contentPolicyViolationErrorCode {
+		t.Fatalf("code = %q, want %q", payload.Error["code"], contentPolicyViolationErrorCode)
 	}
 }
 

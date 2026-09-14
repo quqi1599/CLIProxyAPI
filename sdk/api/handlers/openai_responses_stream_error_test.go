@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func errorField(payload map[string]any, key string) any {
+	if detail, ok := payload["error"].(map[string]any); ok {
+		return detail[key]
+	}
+	return nil
+}
+
 func TestBuildOpenAIResponsesStreamErrorChunk(t *testing.T) {
 	chunk := BuildOpenAIResponsesStreamErrorChunk(http.StatusInternalServerError, "unexpected EOF", 0)
 	var payload map[string]any
@@ -16,11 +23,11 @@ func TestBuildOpenAIResponsesStreamErrorChunk(t *testing.T) {
 	if payload["type"] != "error" {
 		t.Fatalf("type = %v, want %q", payload["type"], "error")
 	}
-	if payload["code"] != "upstream_error" {
-		t.Fatalf("code = %v, want %q", payload["code"], "upstream_error")
+	if errorField(payload, "code") != "upstream_error" {
+		t.Fatalf("code = %v, want %q", errorField(payload, "code"), "upstream_error")
 	}
-	if payload["message"] != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
-		t.Fatalf("message = %v", payload["message"])
+	if errorField(payload, "message") != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
+		t.Fatalf("message = %v", errorField(payload, "message"))
 	}
 	if payload["sequence_number"] != float64(0) {
 		t.Fatalf("sequence_number = %v, want %v", payload["sequence_number"], 0)
@@ -40,11 +47,11 @@ func TestBuildOpenAIResponsesStreamErrorChunkExtractsHTTPErrorBody(t *testing.T)
 	if payload["type"] != "error" {
 		t.Fatalf("type = %v, want %q", payload["type"], "error")
 	}
-	if payload["code"] != "upstream_error" {
-		t.Fatalf("code = %v, want %q", payload["code"], "upstream_error")
+	if errorField(payload, "code") != "upstream_error" {
+		t.Fatalf("code = %v, want %q", errorField(payload, "code"), "upstream_error")
 	}
-	if payload["message"] != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
-		t.Fatalf("message = %v", payload["message"])
+	if errorField(payload, "message") != "上游模型通道临时异常或超时。系统已尝试可用通道后仍失败，请稍后重试或切换模型；这通常不是提示词格式问题。" {
+		t.Fatalf("message = %v", errorField(payload, "message"))
 	}
 }
 
@@ -62,11 +69,11 @@ func TestBuildOpenAIResponsesStreamErrorChunkNormalizesContextWindowJSON(t *test
 	if payload["type"] != "error" {
 		t.Fatalf("type = %v, want %q", payload["type"], "error")
 	}
-	if payload["code"] != contextWindowExceededErrorCode {
-		t.Fatalf("code = %v, want %q", payload["code"], contextWindowExceededErrorCode)
+	if errorField(payload, "code") != contextWindowExceededErrorCode {
+		t.Fatalf("code = %v, want %q", errorField(payload, "code"), contextWindowExceededErrorCode)
 	}
-	if payload["message"] != UserFacingContextWindowMessage() {
-		t.Fatalf("message = %v, want %q", payload["message"], UserFacingContextWindowMessage())
+	if errorField(payload, "message") != UserFacingContextWindowMessage() {
+		t.Fatalf("message = %v, want %q", errorField(payload, "message"), UserFacingContextWindowMessage())
 	}
 	if payload["sequence_number"] != float64(7) {
 		t.Fatalf("sequence_number = %v, want %v", payload["sequence_number"], 7)
@@ -84,7 +91,7 @@ func TestBuildOpenAIResponsesStreamErrorChunkPreservesDeepSeekCustomerGuidance(t
 	if err := json.Unmarshal(chunk, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	message, _ := payload["message"].(string)
+	message, _ := errorField(payload, "message").(string)
 	for _, marker := range []string{"客户端", "工具分组", "文件搜索", "原生 GPT 模型"} {
 		if !strings.Contains(message, marker) {
 			t.Fatalf("message = %q, want marker %q", message, marker)
@@ -95,7 +102,7 @@ func TestBuildOpenAIResponsesStreamErrorChunkPreservesDeepSeekCustomerGuidance(t
 			t.Fatalf("message = %q, contains internal term %q", message, internalTerm)
 		}
 	}
-	if payload["code"] != requestFeatureUnsupportedErrorCode {
-		t.Fatalf("code = %v, want %q", payload["code"], requestFeatureUnsupportedErrorCode)
+	if errorField(payload, "code") != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("code = %v, want %q", errorField(payload, "code"), requestFeatureUnsupportedErrorCode)
 	}
 }

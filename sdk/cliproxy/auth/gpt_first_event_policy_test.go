@@ -166,11 +166,11 @@ func TestGPTFirstEventObserverClassifiesCollectiveOutage(t *testing.T) {
 	if snapshot.PolicyState != gptFirstEventPolicyStateOutage {
 		t.Fatalf("policy state = %q, want outage", snapshot.PolicyState)
 	}
-	if snapshot.EnforcedTimeoutMs != (25 * time.Second).Milliseconds() {
-		t.Fatalf("outage timeout = %dms, want 25000ms", snapshot.EnforcedTimeoutMs)
+	if snapshot.EnforcedTimeoutMs != (40 * time.Second).Milliseconds() {
+		t.Fatalf("outage timeout = %dms, want 40000ms", snapshot.EnforcedTimeoutMs)
 	}
-	if snapshot.MaxChannels != 3 || snapshot.MaxRounds != 1 {
-		t.Fatalf("outage retry limits = %d channels x %d rounds, want 3 x 1", snapshot.MaxChannels, snapshot.MaxRounds)
+	if snapshot.MaxChannels != 4 || snapshot.MaxRounds != 2 {
+		t.Fatalf("outage retry limits = %d channels x %d rounds, want 4 x 2", snapshot.MaxChannels, snapshot.MaxRounds)
 	}
 	if snapshot.WaitBudgetMs != gptFirstEventPolicyOutageWaitBudget.Milliseconds() {
 		t.Fatalf("outage wait budget = %dms, want %dms", snapshot.WaitBudgetMs, gptFirstEventPolicyOutageWaitBudget.Milliseconds())
@@ -289,8 +289,8 @@ func TestGPTFirstEventObserverKeepsOutageWithSustainedHardFailureEvidence(t *tes
 	}
 
 	snapshot := observer.snapshot(model, now.Add(6*time.Minute))
-	if snapshot.PolicyState != gptFirstEventPolicyStateOutage || snapshot.MaxRounds != 1 || snapshot.Transitioned {
-		t.Fatalf("sustained hard-failure policy = %q rounds=%d transitioned=%v, want outage/1/false", snapshot.PolicyState, snapshot.MaxRounds, snapshot.Transitioned)
+	if snapshot.PolicyState != gptFirstEventPolicyStateOutage || snapshot.MaxRounds != 2 || snapshot.Transitioned {
+		t.Fatalf("sustained hard-failure policy = %q rounds=%d transitioned=%v, want outage/2/false", snapshot.PolicyState, snapshot.MaxRounds, snapshot.Transitioned)
 	}
 }
 
@@ -692,12 +692,15 @@ func TestGPTFirstEventPolicyLimitsRetryRounds(t *testing.T) {
 		gptFirstEventPolicy: GPTFirstEventPolicySnapshot{
 			PolicyState: gptFirstEventPolicyStateOutage,
 			MaxChannels: 3,
-			MaxRounds:   1,
+			MaxRounds:   2,
 		},
 	}
 
-	if _, retry := shouldRetryGPTRound(errTimeout, 0, []string{"codex"}, "gpt-5.6-sol", trace); retry {
-		t.Fatal("outage policy must stop after the first round")
+	if _, retry := shouldRetryGPTRound(errTimeout, 0, []string{"codex"}, "gpt-5.6-sol", trace); !retry {
+		t.Fatal("outage policy must allow one bounded retry round")
+	}
+	if _, retry := shouldRetryGPTRound(errTimeout, 1, []string{"codex"}, "gpt-5.6-sol", trace); retry {
+		t.Fatal("outage policy must stop after the bounded second round")
 	}
 }
 

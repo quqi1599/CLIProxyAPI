@@ -157,6 +157,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
 	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"prompt_cache_key":"cache-1","turn_id":"turn-1","window_id":"cache-1:0"}`)
+	ginCtx.Request.Header.Set("X-Codex-Turn-State", `{"state":"active"}`)
 	ginCtx.Request.Header.Set("X-Client-Request-Id", "client-request-1")
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
@@ -224,6 +225,9 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	}
 	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	}
+	if got := httpReq.Header.Get("X-Codex-Turn-State"); got != `{"state":"active"}` {
+		t.Fatalf("X-Codex-Turn-State = %q, want original state", got)
 	}
 }
 

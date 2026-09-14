@@ -356,6 +356,17 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesStructure
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_NormalizesNamespacedToolChoice(t *testing.T) {
+	raw := []byte(`{"input":[{"role":"user","content":"Run command."}],"tool_choice":{"type":"custom","custom":{"name":"run_command"},"namespace":"shell"}}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", raw, false)
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.function.name").String(); got != "shell__run_command" {
+		t.Fatalf("tool_choice.function.name = %q, want shell__run_command; output=%s", got, out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesInputImageDetail(t *testing.T) {
 	raw := []byte(`{
 		"input": [

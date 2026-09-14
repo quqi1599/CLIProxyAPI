@@ -18,17 +18,26 @@ const (
 	gptRetryPressureStateNormal    = "normal"
 	gptRetryPressureStateCongested = "congested"
 
-	gptRetryPressureWindow             = 2 * time.Minute
-	gptRetryPressureRecoveryHold       = time.Minute
-	gptRetryPressureQueueWait          = 5 * time.Second
-	gptRetryPressureRecheckInterval    = 250 * time.Millisecond
-	gptRetryPressureRetryAfter         = time.Second
+	gptRetryPressureWindow       = 2 * time.Minute
+	gptRetryPressureRecoveryHold = time.Minute
+	// Keep a retry request queued long enough to ride out a short upstream
+	// saturation burst. The caller context remains the hard upper bound.
+	gptRetryPressureQueueWait       = 20 * time.Second
+	gptRetryPressureRecheckInterval = 250 * time.Millisecond
+	// Do not immediately create another request when the bounded retry queue is
+	// full; clients that honor Retry-After should back off with the queue.
+	gptRetryPressureRetryAfter         = 5 * time.Second
 	gptRetryPressureRouteMinSamples    = 4
 	gptRetryPressureRouteFailureRate   = 0.50
 	gptRetryPressureRouteFailureStreak = 2
 	gptRetryPressureMinDegradedRoutes  = 3
-	gptRetryPressureMaxWaitersPerModel = 64
+	gptRetryPressureMaxWaitersPerModel = 128
 	gptRetryPressureMaxSamplesPerRoute = 256
+	// A route can have more than one request waiting for its first event. Limit
+	// retry pressure per eligible route, but do not turn route count into a
+	// single global slot for the whole model.
+	gptRetryPressurePermitsPerRoute = 2
+	gptRetryPressureMaxPermits      = gptImmediateFailoverMaxChannels
 )
 
 type gptRetryPressureSample struct {
@@ -78,6 +87,17 @@ type gptRouteAvailabilitySnapshot struct {
 	blockedRoutes    map[string]string
 	breakerRoutes    map[string]int
 	earliestRecovery time.Time
+}
+
+func gptRetryPressurePermitLimit(eligibleRoutes int) int {
+	if eligibleRoutes <= 0 {
+		return 0
+	}
+	limit := eligibleRoutes * gptRetryPressurePermitsPerRoute
+	if limit > gptRetryPressureMaxPermits {
+		return gptRetryPressureMaxPermits
+	}
+	return limit
 }
 
 func newGPTRetryPressureController() *gptRetryPressureController {
@@ -249,7 +269,7 @@ func (c *gptRetryPressureController) evaluateLocked(model string, availability g
 		EligibleRoutes:  eligibleCount,
 		BlockedRoutes:   blockedCount,
 		DegradedRoutes:  degradedCount,
-		PermitLimit:     eligibleCount,
+		PermitLimit:     gptRetryPressurePermitLimit(eligibleCount),
 		InFlightRetries: state.inFlight,
 		WaitingRetries:  state.waiters,
 	}
@@ -288,9 +308,26 @@ func (c *gptRetryPressureController) acquire(ctx context.Context, model string, 
 			c.mu.Unlock()
 			return nil, snapshot, newGPTRetryPressureLimitedError()
 		}
-		if snapshot.PermitLimit > 0 && state.inFlight < snapshot.PermitLimit {
+		// Leave an entirely blocked route pool to the zero-eligible probe path.
+		// Returning a pressure error here would bypass that path and turn a
+		// recoverable breaker cooldown into an avoidable 503.
+		if snapshot.EligibleRoutes == 0 {
+			snapshot.Wait = time.Since(startedAt)
+			c.mu.Unlock()
+			return func() {}, snapshot, nil
+		}
+		// Once a waiter exists, let queued retries take the next permit before
+		// newly arriving requests. This avoids a busy model starving older
+		// requests while still keeping the queue bounded.
+		if snapshot.PermitLimit > 0 && state.inFlight < snapshot.PermitLimit &&
+			(state.waiters == 0 || waiterRegistered) {
+			if waiterRegistered {
+				state.waiters--
+				waiterRegistered = false
+			}
 			state.inFlight++
 			snapshot.InFlightRetries = state.inFlight
+			snapshot.WaitingRetries = state.waiters
 			snapshot.Acquired = true
 			snapshot.Wait = time.Since(startedAt)
 			if transition.Transitioned {
@@ -357,6 +394,7 @@ func (c *gptRetryPressureController) unregisterWaiter(model string) {
 	state := c.models[canonicalModelKey(model)]
 	if state != nil && state.waiters > 0 {
 		state.waiters--
+		notifyGPTRetryPressureWaitersLocked(state)
 	}
 	c.mu.Unlock()
 }

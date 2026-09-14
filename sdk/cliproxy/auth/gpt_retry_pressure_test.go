@@ -64,6 +64,24 @@ func TestGPTRetryPressureRequiresThreeIndependentDegradedRoutes(t *testing.T) {
 	}
 }
 
+func TestGPTRetryPressurePermitLimitIsBounded(t *testing.T) {
+	for eligible, want := range map[int]int{0: 0, 1: 2, 2: 4, 3: 6, 4: 8, 5: 8} {
+		if got := gptRetryPressurePermitLimit(eligible); got != want {
+			t.Fatalf("eligible routes=%d permit limit=%d, want %d", eligible, got, want)
+		}
+	}
+}
+
+func TestGPTRetryPressureLimitedErrorUsesClientBackoff(t *testing.T) {
+	failure, ok := failurecontract.As(newGPTRetryPressureLimitedError())
+	if !ok || failure == nil || failure.RetryAfter == nil {
+		t.Fatalf("pressure failure must carry a retry-after hint: %+v", failure)
+	}
+	if got := *failure.RetryAfter; got != gptRetryPressureRetryAfter {
+		t.Fatalf("retry-after = %v, want %v", got, gptRetryPressureRetryAfter)
+	}
+}
+
 func TestGPTRetryPressureRoutePoolExhaustionAndRecoveryHysteresis(t *testing.T) {
 	controller := newGPTRetryPressureController()
 	now := time.Now()
@@ -105,8 +123,15 @@ func TestGPTRetryPressurePermitLimitTracksEligibleRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first retry permit failed: %v", err)
 	}
-	if !first.Acquired || first.PermitLimit != 1 || first.InFlightRetries != 1 {
-		t.Fatalf("one eligible route must allow one retry, got %+v", first)
+	if !first.Acquired || first.PermitLimit != 2 || first.InFlightRetries != 1 {
+		t.Fatalf("one eligible route must allow two bounded retries, got %+v", first)
+	}
+	releaseSecond, second, err := controller.acquire(context.Background(), "gpt-5.6-luna", availabilityFn)
+	if err != nil {
+		t.Fatalf("second retry permit failed: %v", err)
+	}
+	if !second.Acquired || second.InFlightRetries != 2 {
+		t.Fatalf("second retry should use the route burst capacity, got %+v", second)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -121,9 +146,10 @@ func TestGPTRetryPressurePermitLimitTracksEligibleRoutes(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 	if errAcquire := <-result; !errors.Is(errAcquire, context.Canceled) {
-		t.Fatalf("second concurrent retry must wait for the only permit, got %v", errAcquire)
+		t.Fatalf("retry beyond the bounded route capacity must wait, got %v", errAcquire)
 	}
 	releaseFirst()
+	releaseSecond()
 
 	controller.mu.Lock()
 	state := controller.models[canonicalModelKey("gpt-5.6-luna")]
@@ -132,6 +158,76 @@ func TestGPTRetryPressurePermitLimitTracksEligibleRoutes(t *testing.T) {
 	if inFlight != 0 || waiters != 0 {
 		t.Fatalf("cancelled waiter or release leaked capacity: in_flight=%d waiters=%d", inFlight, waiters)
 	}
+}
+
+func TestGPTRetryPressureQueuedRetryPrecedesNewArrival(t *testing.T) {
+	controller := newGPTRetryPressureController()
+	availability := testGPTRouteAvailability(
+		[]string{"route-a"},
+		[]string{"route-a"},
+		nil,
+	)
+	availabilityFn := func(time.Time) gptRouteAvailabilitySnapshot { return availability }
+
+	releaseFirst, _, err := controller.acquire(context.Background(), "gpt-5.6-luna", availabilityFn)
+	if err != nil {
+		t.Fatalf("first retry permit failed: %v", err)
+	}
+	releaseSecond, _, err := controller.acquire(context.Background(), "gpt-5.6-luna", availabilityFn)
+	if err != nil {
+		t.Fatalf("second retry permit failed: %v", err)
+	}
+
+	queued := make(chan func(), 1)
+	go func() {
+		release, _, errAcquire := controller.acquire(context.Background(), "gpt-5.6-luna", availabilityFn)
+		if errAcquire == nil {
+			queued <- release
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		controller.mu.Lock()
+		waiters := controller.models[canonicalModelKey("gpt-5.6-luna")].waiters
+		controller.mu.Unlock()
+		if waiters == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retry waiter was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	releaseFirst()
+	late := make(chan func(), 1)
+	go func() {
+		release, _, errAcquire := controller.acquire(context.Background(), "gpt-5.6-luna", availabilityFn)
+		if errAcquire == nil {
+			late <- release
+		}
+	}()
+
+	var queuedRelease func()
+	select {
+	case queuedRelease = <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("queued retry did not receive the released permit")
+	}
+	select {
+	case <-late:
+		t.Fatal("new retry arrival bypassed an existing waiter")
+	case <-time.After(20 * time.Millisecond):
+	}
+	queuedRelease()
+
+	select {
+	case lateRelease := <-late:
+		lateRelease()
+	case <-time.After(time.Second):
+		t.Fatal("new retry did not receive the next released permit")
+	}
+	releaseSecond()
 }
 
 func TestGPTRetryPressureRejectsMissingRouteWithoutQueueing(t *testing.T) {
@@ -151,7 +247,24 @@ func TestGPTRetryPressureRejectsMissingRouteWithoutQueueing(t *testing.T) {
 	}
 }
 
-func TestGPTRetryPressureAllowsTwoSolRetriesAndWakesWaiter(t *testing.T) {
+func TestGPTRetryPressureLeavesBlockedPoolToZeroEligibleProbe(t *testing.T) {
+	controller := newGPTRetryPressureController()
+	startedAt := time.Now()
+	release, snapshot, err := controller.acquire(context.Background(), "gpt-5.6-sol", func(time.Time) gptRouteAvailabilitySnapshot {
+		return testGPTRouteAvailability([]string{"route-a"}, nil, []string{"route-a"})
+	})
+	if release != nil {
+		release()
+	}
+	if err != nil || snapshot.Rejected || snapshot.Acquired {
+		t.Fatalf("blocked pool must bypass pressure rejection: snapshot=%+v err=%v", snapshot, err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= gptRetryPressureRecheckInterval {
+		t.Fatalf("blocked pool must not consume pressure queue, elapsed=%s", elapsed)
+	}
+}
+
+func TestGPTRetryPressureAllowsBoundedSolRetriesAndWakesWaiter(t *testing.T) {
 	controller := newGPTRetryPressureController()
 	now := time.Now()
 	for _, route := range []string{"route-a", "route-b", "route-c"} {
@@ -165,16 +278,16 @@ func TestGPTRetryPressureAllowsTwoSolRetriesAndWakesWaiter(t *testing.T) {
 	)
 	availabilityFn := func(time.Time) gptRouteAvailabilitySnapshot { return availability }
 
-	releaseFirst, first, err := controller.acquire(context.Background(), "gpt-5.6-sol", availabilityFn)
-	if err != nil {
-		t.Fatalf("first permit failed: %v", err)
-	}
-	releaseSecond, second, err := controller.acquire(context.Background(), "gpt-5.6-sol", availabilityFn)
-	if err != nil {
-		t.Fatalf("second permit failed: %v", err)
-	}
-	if first.PermitLimit != 2 || second.InFlightRetries != 2 {
-		t.Fatalf("two eligible routes must allow two retries: first=%+v second=%+v", first, second)
+	releases := make([]func(), 0, 4)
+	for i := 0; i < 4; i++ {
+		release, snapshot, errAcquire := controller.acquire(context.Background(), "gpt-5.6-sol", availabilityFn)
+		if errAcquire != nil {
+			t.Fatalf("permit %d failed: %v", i+1, errAcquire)
+		}
+		if snapshot.PermitLimit != 4 || snapshot.InFlightRetries != i+1 {
+			t.Fatalf("two eligible routes must allow four bounded retries: permit=%d snapshot=%+v", i+1, snapshot)
+		}
+		releases = append(releases, release)
 	}
 
 	woken := make(chan error, 1)
@@ -189,7 +302,7 @@ func TestGPTRetryPressureAllowsTwoSolRetriesAndWakesWaiter(t *testing.T) {
 		woken <- errAcquire
 	}()
 	time.Sleep(20 * time.Millisecond)
-	releaseFirst()
+	releases[0]()
 	select {
 	case errAcquire := <-woken:
 		if errAcquire != nil {
@@ -198,7 +311,9 @@ func TestGPTRetryPressureAllowsTwoSolRetriesAndWakesWaiter(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("waiting retry was not woken by permit release")
 	}
-	releaseSecond()
+	for _, release := range releases[1:] {
+		release()
+	}
 }
 
 func TestGPTRetryPressureModelIsolationAndFirstAttemptBypass(t *testing.T) {
@@ -222,8 +337,8 @@ func TestGPTRetryPressureModelIsolationAndFirstAttemptBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normal-state retry permit failed: %v", err)
 	}
-	if snapshot.State != gptRetryPressureStateNormal || !snapshot.Acquired || snapshot.PermitLimit != 3 {
-		t.Fatalf("normal-state retries must still acquire a model permit: %+v", snapshot)
+	if snapshot.State != gptRetryPressureStateNormal || !snapshot.Acquired || snapshot.PermitLimit != 6 {
+		t.Fatalf("normal-state retries must acquire bounded per-route capacity: %+v", snapshot)
 	}
 	release()
 	traceWithNormalPressure := &requestAttemptTrace{}

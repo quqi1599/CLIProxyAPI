@@ -358,10 +358,43 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert tool_choice if present
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-		if strings.TrimSpace(toolChoice.Get("type").String()) != "function" || responsesToolName(toolChoice) != "" {
-			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(toolChoice.Raw))
+		if converted := convertResponsesToolChoiceToChatCompletions(toolChoice); len(converted) > 0 {
+			out, _ = sjson.SetRawBytes(out, "tool_choice", converted)
 		}
 	}
 
 	return out
+}
+
+// convertResponsesToolChoiceToChatCompletions normalizes named Responses tool
+// choices to the Chat Completions function shape expected by compatible
+// upstreams. Scalar choices such as auto/none/required are already shared.
+func convertResponsesToolChoiceToChatCompletions(toolChoice gjson.Result) []byte {
+	if !toolChoice.IsObject() {
+		return []byte(toolChoice.Raw)
+	}
+	choiceType := strings.TrimSpace(toolChoice.Get("type").String())
+	if choiceType != "function" && choiceType != "custom" {
+		return []byte(toolChoice.Raw)
+	}
+	name := responsesToolName(toolChoice)
+	if name == "" {
+		name = strings.TrimSpace(toolChoice.Get("custom.name").String())
+	}
+	if name == "" {
+		return nil
+	}
+	namespace := strings.TrimSpace(toolChoice.Get("namespace").String())
+	if namespace == "" {
+		namespace = strings.TrimSpace(toolChoice.Get("function.namespace").String())
+	}
+	if namespace == "" {
+		namespace = strings.TrimSpace(toolChoice.Get("custom.namespace").String())
+	}
+	if namespace != "" {
+		name = qualifyResponsesNamespaceToolName(namespace, name)
+	}
+	converted := []byte(`{"type":"function","function":{"name":""}}`)
+	converted, _ = sjson.SetBytes(converted, "function.name", name)
+	return converted
 }

@@ -35,20 +35,23 @@ const (
 	gptFirstEventPolicyOutageSuccessRate    = 0.10
 	gptFirstEventPolicyOutageFailureRate    = 0.90
 	gptFirstEventPolicyWaitBudget           = 300 * time.Second
-	gptFirstEventPolicyOutageWaitBudget     = 75 * time.Second
-	gptFirstEventPolicyPersistenceTTL       = 24 * time.Hour
-	gptFirstEventPolicyCheckpointInterval   = time.Hour
-	gptFirstEventPolicyPersistTimeout       = 2 * time.Second
-	gptFirstEventPolicyDailyRetention       = 31
-	gptFirstEventPolicyGlobalModel          = "*"
-	gptFirstEventPolicyStateNormal          = "normal"
-	gptFirstEventPolicyStateSlow30          = "slow_30s"
-	gptFirstEventPolicyStateSlow40          = "slow_40s"
-	gptFirstEventPolicyStateSlow50          = "slow_50s"
-	gptFirstEventPolicyStateOutage          = "outage"
-	gptFirstEventOutcomeDeliverable         = "deliverable"
-	gptFirstEventOutcomeTimeout             = "timeout"
-	gptFirstEventOutcomeFailure             = "upstream_failure"
+	// Even during a hard upstream incident, keep a bounded second chance. The
+	// retry-pressure controller limits concurrent retries while this budget
+	// allows a slow but recoverable upstream response to reach the client.
+	gptFirstEventPolicyOutageWaitBudget   = 150 * time.Second
+	gptFirstEventPolicyPersistenceTTL     = 24 * time.Hour
+	gptFirstEventPolicyCheckpointInterval = time.Hour
+	gptFirstEventPolicyPersistTimeout     = 2 * time.Second
+	gptFirstEventPolicyDailyRetention     = 31
+	gptFirstEventPolicyGlobalModel        = "*"
+	gptFirstEventPolicyStateNormal        = "normal"
+	gptFirstEventPolicyStateSlow30        = "slow_30s"
+	gptFirstEventPolicyStateSlow40        = "slow_40s"
+	gptFirstEventPolicyStateSlow50        = "slow_50s"
+	gptFirstEventPolicyStateOutage        = "outage"
+	gptFirstEventOutcomeDeliverable       = "deliverable"
+	gptFirstEventOutcomeTimeout           = "timeout"
+	gptFirstEventOutcomeFailure           = "upstream_failure"
 )
 
 type gptFirstEventSample struct {
@@ -463,8 +466,8 @@ func (o *gptFirstEventObserver) restorePolicyStates(records []GPTFirstEventPolic
 		decisionReason := strings.TrimSpace(record.DecisionReason)
 		// Persisted outage is a hard-failure snapshot, not a safe startup mode:
 		// without the prior observation window it would otherwise pin a model to
-		// 25 seconds and one round indefinitely. Resume conservatively at slow30
-		// and require fresh samples to classify a new outage.
+		// outage-mode limits indefinitely. Resume conservatively at slow30 and
+		// require fresh samples to classify a new outage.
 		if state == gptFirstEventPolicyStateOutage {
 			previous = gptFirstEventPolicyStateOutage
 			state = gptFirstEventPolicyStateSlow30
@@ -867,7 +870,7 @@ func gptFirstEventPolicyLimits(state string) (timeout time.Duration, maxChannels
 	case gptFirstEventPolicyStateSlow50:
 		return 50 * time.Second, 3, 2, gptFirstEventPolicyWaitBudget
 	case gptFirstEventPolicyStateOutage:
-		return 25 * time.Second, 3, 1, gptFirstEventPolicyOutageWaitBudget
+		return 40 * time.Second, 4, 2, gptFirstEventPolicyOutageWaitBudget
 	default:
 		return 25 * time.Second, gptImmediateFailoverMaxChannels, gptImmediateFailoverMaxRounds, gptFirstEventPolicyWaitBudget
 	}

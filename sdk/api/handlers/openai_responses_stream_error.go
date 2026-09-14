@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,10 +9,15 @@ import (
 )
 
 type openAIResponsesStreamErrorChunk struct {
-	Type           string `json:"type"`
-	Code           string `json:"code"`
-	Message        string `json:"message"`
-	SequenceNumber int    `json:"sequence_number"`
+	Type           string         `json:"type"`
+	Error          map[string]any `json:"error"`
+	SequenceNumber int            `json:"sequence_number"`
+}
+
+func unmarshalJSONWithNumber(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v)
 }
 
 func openAIResponsesStreamErrorCode(status int) string {
@@ -90,9 +96,16 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
 		var payload map[string]any
-		if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
-			if v, ok := payload["sequence_number"].(float64); ok && sequenceNumber == 0 {
-				sequenceNumber = int(v)
+		if err := unmarshalJSONWithNumber([]byte(trimmed), &payload); err == nil {
+			if v, ok := payload["sequence_number"]; ok && sequenceNumber == 0 {
+				switch n := v.(type) {
+				case json.Number:
+					if seq, err := n.Int64(); err == nil {
+						sequenceNumber = int(seq)
+					}
+				case float64:
+					sequenceNumber = int(n)
+				}
 			}
 			if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) == "error" {
 				if !isNormalizedError {
@@ -132,11 +145,22 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	if strings.TrimSpace(code) == "" {
 		code = "unknown_error"
 	}
+	detail := map[string]any{"type": "server_error", "code": code, "message": message, "param": nil}
+	if status < http.StatusInternalServerError {
+		detail["type"] = "invalid_request_error"
+	}
+	if !isNormalizedError && trimmed != "" && json.Valid([]byte(trimmed)) {
+		var payload map[string]any
+		if err := unmarshalJSONWithNumber([]byte(trimmed), &payload); err == nil {
+			if nested, ok := payload["error"].(map[string]any); ok {
+				detail = nested
+			}
+		}
+	}
 
 	data, err := json.Marshal(openAIResponsesStreamErrorChunk{
 		Type:           "error",
-		Code:           code,
-		Message:        message,
+		Error:          detail,
 		SequenceNumber: sequenceNumber,
 	})
 	if err == nil {
@@ -146,12 +170,11 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	// Extremely defensive fallback.
 	data, _ = json.Marshal(openAIResponsesStreamErrorChunk{
 		Type:           "error",
-		Code:           "internal_server_error",
-		Message:        message,
+		Error:          map[string]any{"type": "server_error", "code": "internal_server_error", "message": message, "param": nil},
 		SequenceNumber: sequenceNumber,
 	})
 	if len(data) > 0 {
 		return data
 	}
-	return []byte(`{"type":"error","code":"internal_server_error","message":"internal error","sequence_number":0}`)
+	return []byte(`{"type":"error","error":{"type":"server_error","code":"internal_server_error","message":"internal error","param":null},"sequence_number":0}`)
 }
