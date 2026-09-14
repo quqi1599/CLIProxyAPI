@@ -26,7 +26,7 @@ func sampleShadowReview(state *runtimeState, request ModelReviewRequest) bool {
 	}
 	mac := hmac.New(sha256.New, state.evidenceKeyFingerprint[:])
 	var size [8]byte
-	for _, value := range []string{"shadow-sample-v1", request.TenantScope, request.PolicyVersion, request.RuleID, request.Text, request.ReferenceText} {
+	for _, value := range []string{"shadow-sample-v1", request.TenantScope, request.PolicyVersion, request.RuleID, request.Profile, request.Text, request.ReferenceText, request.MaterialText} {
 		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
 		_, _ = mac.Write(size[:])
 		_, _ = mac.Write([]byte(value))
@@ -94,7 +94,7 @@ func (q *shadowReviewQueue) submit(job shadowReviewJob) string {
 		return "shadow_shutdown"
 	}
 	cfg := job.state.cfg.ModelReview
-	job.bytes = int64(len(job.request.Text) + len(job.request.ReferenceText))
+	job.bytes = int64(len(job.request.Text) + len(job.request.ReferenceText) + len(job.request.MaterialText))
 	if job.bytes > cfg.ShadowQueueBytes {
 		q.stats.Skipped++
 		return "shadow_oversize"
@@ -106,6 +106,7 @@ func (q *shadowReviewQueue) submit(job shadowReviewJob) string {
 	// Clone only admitted text so slices cannot retain an entire request body.
 	job.request.Text = strings.Clone(job.request.Text)
 	job.request.ReferenceText = strings.Clone(job.request.ReferenceText)
+	job.request.MaterialText = strings.Clone(job.request.MaterialText)
 	job.queued = time.Now()
 	if !q.started {
 		q.started = true

@@ -715,11 +715,11 @@ func TestManagerEmptyResponseRetryReturnsTypedFailureWhenAllChannelsAreEmpty(t *
 	if finalErr == nil {
 		t.Fatal("missing final stream error")
 	}
-	if got := statusCodeFromError(finalErr); got != http.StatusBadGateway {
-		t.Fatalf("final status = %d, want %d; error=%v", got, http.StatusBadGateway, finalErr)
+	if got := statusCodeFromError(finalErr); got != http.StatusServiceUnavailable {
+		t.Fatalf("final status = %d, want %d; error=%v", got, http.StatusServiceUnavailable, finalErr)
 	}
-	if got := errorCodeFromError(finalErr); got != emptyUpstreamResponseErrorCode {
-		t.Fatalf("final code = %q, want %q; error=%v", got, emptyUpstreamResponseErrorCode, finalErr)
+	if got := errorCodeFromError(finalErr); got != gptChannelsUnavailableErrorCode {
+		t.Fatalf("final code = %q, want %q; error=%v", got, gptChannelsUnavailableErrorCode, finalErr)
 	}
 
 	var summary *log.Entry

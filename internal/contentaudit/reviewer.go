@@ -48,6 +48,8 @@ type ModelReviewRequest struct {
 	TenantScope       string `json:"-"`
 	Text              string
 	ReferenceText     string
+	MaterialText      string
+	Profile           string
 	ContextIncomplete bool
 	MatchedTerm       string
 	RuleID            string
@@ -507,7 +509,7 @@ func normalizeModelReviewResult(result ModelReviewResult) ModelReviewResult {
 func (c *modelReviewController) fingerprint(request ModelReviewRequest) string {
 	mac := hmac.New(sha256.New, c.cacheKey[:])
 	var size [8]byte
-	for _, value := range []string{request.TenantScope, request.PolicyVersion, request.PromptVersion, request.Model, request.RuleID, request.Category, request.Severity, request.MatchedTerm, request.Text, request.ReferenceText} {
+	for _, value := range []string{request.TenantScope, request.PolicyVersion, request.PromptVersion, request.Model, request.RuleID, request.Category, request.Severity, request.MatchedTerm, request.Profile, request.Text, request.ReferenceText, request.MaterialText} {
 		// Length prefixes prevent delimiter injection from merging distinct fields.
 		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
 		_, _ = mac.Write(size[:])
@@ -578,7 +580,7 @@ func cloneModelReviewStages(stages map[string]int64) map[string]int64 {
 }
 
 func compactModelReviewRequest(request ModelReviewRequest, maxBytes int) ModelReviewRequest {
-	if maxBytes <= 0 || len(request.Text)+len(request.ReferenceText) <= maxBytes {
+	if maxBytes <= 0 || len(request.Text)+len(request.ReferenceText)+len(request.MaterialText) <= maxBytes {
 		return request
 	}
 	request.ContextIncomplete = true
@@ -592,6 +594,12 @@ func compactModelReviewRequest(request ModelReviewRequest, maxBytes int) ModelRe
 		request.ReferenceText = compactReviewText(request.ReferenceText, request.MatchedTerm, referenceBudget)
 	} else {
 		request.ReferenceText = ""
+	}
+	materialBudget := maxBytes - len(request.Text) - len(request.ReferenceText)
+	if materialBudget > 0 {
+		request.MaterialText = compactReviewText(request.MaterialText, request.MatchedTerm, materialBudget)
+	} else {
+		request.MaterialText = ""
 	}
 	return request
 }

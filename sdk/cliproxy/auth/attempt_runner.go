@@ -118,6 +118,9 @@ attempts:
 			return managerAttemptOutcome[T]{result: result, returnErr: returnErr, finalErr: finalErr}
 		}
 	}
+	if !remoteCompaction {
+		lastErr = normalizeExhaustedGPTChannelError(lastErr, providers, req.Model)
+	}
 	return managerAttemptOutcome[T]{returnErr: lastErr, finalErr: lastErr}
 }
 
@@ -358,6 +361,7 @@ func (m *Manager) runCountAttempts(ctx context.Context, providers []string, req 
 }
 
 func (m *Manager) runStreamAttempts(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(req, opts))
 	runner := managerAttemptRunner[*cliproxyexecutor.StreamResult]{
 		manager:                      m,
 		runOnce:                      m.executeStreamMixedOnce,
@@ -373,7 +377,11 @@ func (m *Manager) runStreamAttempts(ctx context.Context, providers []string, req
 			if !errors.As(lastErr, &bootstrapErr) || bootstrapErr == nil {
 				return nil, nil, nil, false
 			}
-			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil, bootstrapErr.cause, true
+			cause := bootstrapErr.cause
+			if !remoteCompaction {
+				cause = normalizeExhaustedGPTChannelError(cause, providers, req.Model)
+			}
+			return streamErrorResult(bootstrapErr.Headers(), cause), nil, cause, true
 		},
 	}
 	return runManagerAttemptOperation(ctx, m, providers, req, opts, runner)

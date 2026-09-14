@@ -2533,3 +2533,110 @@ func requiredContains(payload []byte, path string, want string) bool {
 	}
 	return false
 }
+
+func TestOpenAICompatNativeResponsesProfiles(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		kind       string
+		model      string
+		wantNative bool
+	}{
+		{name: "deepseek v4", kind: "deepseek", model: "deepseek-v4-flash", wantNative: true},
+		{name: "doubao", kind: "doubao", model: "doubao-seed-2.1-turbo", wantNative: true},
+		{name: "qwen", kind: "qwen", model: "qwen3.8-max", wantNative: true},
+		{name: "kimi", kind: "kimi", model: "kimi-k3", wantNative: true},
+		{name: "xiaomi", kind: "xiaomi", model: "mimo-v2.5", wantNative: true},
+		{name: "minimax remains chat", kind: "minimax", model: "MiniMax-M3", wantNative: false},
+		{name: "qwen legacy model remains chat", kind: "qwen", model: "qwen2.5-72b-instruct", wantNative: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := openAICompatProfileForKind(test.kind)
+			format, endpoint := openAICompatTargetFormatAndEndpoint(
+				sdktranslator.FromString("openai-response"),
+				cliproxyexecutor.Options{},
+				profile,
+				test.model,
+			)
+			gotNative := format.String() == "openai-response" && endpoint == "/responses"
+			if gotNative != test.wantNative {
+				t.Fatalf("native Responses = %v (%s, %s), want %v", gotNative, format, endpoint, test.wantNative)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatNativeResponsesPreserveWirePayload(t *testing.T) {
+	for _, test := range []struct {
+		kind  string
+		model string
+	}{
+		{kind: "qwen", model: "qwen3.8-max"},
+		{kind: "kimi", model: "kimi-k3"},
+		{kind: "xiaomi", model: "mimo-v2.5"},
+	} {
+		t.Run(test.kind, func(t *testing.T) {
+			payload := []byte(`{"model":"` + test.model + `","input":"hello","reasoning":{"effort":"low"},"stream":true}`)
+			plan, err := (&OpenAICompatExecutor{}).prepareOpenAICompatRequest(
+				context.Background(),
+				&cliproxyauth.Auth{Attributes: map[string]string{"compat_kind": test.kind}},
+				cliproxyexecutor.Request{Model: test.model, Payload: payload},
+				cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true},
+				"https://provider.example/v1",
+				test.model,
+				openAICompatProfileForKind(test.kind),
+				true,
+			)
+			if err != nil {
+				t.Fatalf("prepare request: %v", err)
+			}
+			if plan.endpoint != "/responses" || plan.upstreamFormat.String() != "openai-response" {
+				t.Fatalf("plan = endpoint %q, format %q; want native Responses", plan.endpoint, plan.upstreamFormat)
+			}
+			if got := gjson.GetBytes(plan.body, "input").String(); got != "hello" {
+				t.Fatalf("input = %q, want preserved Responses input", got)
+			}
+			if got := gjson.GetBytes(plan.body, "reasoning.effort").String(); got != "low" {
+				t.Fatalf("reasoning.effort = %q, want preserved native control: %s", got, plan.body)
+			}
+		})
+	}
+}
+
+func TestOpenAICompatNativeResponsesExecutePassthrough(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-qwen","object":"response","status":"completed","model":"qwen3.8-max","output":[]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("qwen-provider", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{Name: "qwen-provider", Kind: "qwen"}},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/compatible-mode/v1",
+		"api_key":  "test", "compat_name": "qwen-provider", "compat_kind": "qwen",
+	}}
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "qwen3.8-max",
+		Payload: []byte(`{"model":"qwen3.8-max","input":"hello","reasoning":{"effort":"low"}}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/compatible-mode/v1/responses" {
+		t.Fatalf("path = %q, want native Responses endpoint", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "input").String(); got != "hello" {
+		t.Fatalf("upstream input = %q, want hello: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("upstream reasoning.effort = %q, want low: %s", got, gotBody)
+	}
+	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
+		t.Fatalf("downstream object = %q, want response: %s", got, resp.Payload)
+	}
+}

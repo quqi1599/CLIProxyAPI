@@ -112,6 +112,9 @@ content-audit:
   evidence-dedupe-seconds: 600
   raw-retention-days: 30
   metadata-retention-days: 180
+  # Optional server-side allowlist of verified NewAPI token IDs for the education
+  # document profile. Do not accept a client-provided profile header.
+  # education-document-token-ids: [12345]
   # Optional second-stage semantic review for rules with model-review: true.
   # Keep shadow until precision and availability are verified; enforce may change the final action.
   model-review:

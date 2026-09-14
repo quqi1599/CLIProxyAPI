@@ -637,6 +637,57 @@ func TestManagerGPTChannelFailoverUsesBoundedRounds(t *testing.T) {
 	}
 }
 
+func TestManagerGPTExhaustedGatewayFailureUsesStableGatewayEnvelope(t *testing.T) {
+	const model = "gpt-5.5"
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable} {
+		for _, operation := range gptChannelFailoverOperations() {
+			t.Run(fmt.Sprintf("status-%d/%s", status, operation.name), func(t *testing.T) {
+				provider := fmt.Sprintf("gpt-terminal-%d-%s", status, operation.name)
+				failure := retryableGPTChannelFailure(status)
+				executor := &authFallbackExecutor{
+					id: provider,
+					executeErrors: map[string]error{
+						"terminal-primary-" + operation.name: failure,
+						"terminal-backup-" + operation.name:  failure,
+					},
+					countErrors: map[string]error{
+						"terminal-primary-" + operation.name: failure,
+						"terminal-backup-" + operation.name:  failure,
+					},
+					streamFirstErrors: map[string]error{
+						"terminal-primary-" + operation.name: failure,
+						"terminal-backup-" + operation.name:  failure,
+					},
+				}
+				manager := NewManager(nil, nil, nil)
+				manager.SetRetryConfig(10, 30*time.Second, 10)
+				manager.RegisterExecutor(executor)
+				primaryID := "terminal-primary-" + operation.name
+				backupID := "terminal-backup-" + operation.name
+				registerGPTChannelFailoverAuths(t, manager, provider, model, []*Auth{
+					openAICompatChannelBreakerAuth(primaryID, provider, "https://terminal-primary.example/v1", 10),
+					openAICompatChannelBreakerAuth(backupID, provider, "https://terminal-backup.example/v1", 10),
+				})
+
+				errExecute := operation.invoke(context.Background(), manager, provider, cliproxyexecutor.Request{Model: model})
+				if errExecute == nil {
+					t.Fatal("operation unexpectedly succeeded")
+				}
+				classified := failurecontract.Classify(errExecute)
+				if classified == nil {
+					t.Fatalf("operation error has no canonical failure: %v", errExecute)
+				}
+				if classified.HTTPStatus != http.StatusServiceUnavailable || classified.OuterStatus != status {
+					t.Fatalf("final statuses = %d/%d, want 503/%d", classified.HTTPStatus, classified.OuterStatus, status)
+				}
+				if classified.SemanticCode != gptChannelsUnavailableErrorCode || classified.PublicMessage != "all GPT channels are temporarily unavailable" {
+					t.Fatalf("final gateway envelope = %+v", classified)
+				}
+			})
+		}
+	}
+}
+
 func TestManagerGPTRetryPressureCapsExecutionAtTwoRounds(t *testing.T) {
 	const (
 		model    = "gpt-5.5"

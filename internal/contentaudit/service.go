@@ -467,7 +467,9 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		decision := state.matcher.MatchExtracted(extracted)
+		profile := profileForIdentity(state.cfg, identity)
+		extracted = extracted.withDocumentProfile(profile)
+		decision := state.matcher.MatchExtractedForProfile(extracted, profile)
 		if !decision.Matched {
 			if extracted.ContextIncomplete {
 				s.incompleteUnmatched.Add(1)
@@ -490,6 +492,8 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		reviewRequest := ModelReviewRequest{
 			Text:              extracted.CurrentUserText,
 			ReferenceText:     extracted.ReferenceText,
+			MaterialText:      extracted.MaterialText,
+			Profile:           profile,
 			ContextIncomplete: extracted.ContextIncomplete,
 			MatchedTerm:       decision.MatchedTerm,
 			RuleID:            decision.RuleID,

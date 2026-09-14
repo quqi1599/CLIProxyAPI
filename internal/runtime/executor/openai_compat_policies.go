@@ -87,6 +87,22 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 	}
 	preQuirkStarted := time.Now()
 	preQuirkInput := payload
+	if openAICompatNativeResponsesProfile(profile, match.Endpoint) {
+		output := scrubOpenAICompatPayload(payload, profile)
+		if err := helps.EnforceSemanticTransformStage(
+			ctx,
+			openAICompatProviderPreQuirkStage,
+			preQuirkInput,
+			output,
+			preQuirkStarted,
+			[]string{openAICompatProviderPreQuirkPolicy},
+			openAICompatCompatibilityDowngrades(preQuirkInput, output),
+			internalpayload.AmplificationOverride{},
+		); err != nil {
+			return nil, err
+		}
+		return output, nil
+	}
 	payload = scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(payload, profile, model, baseURL)
 	if err := helps.EnforceSemanticTransformStage(
 		ctx,
@@ -252,6 +268,9 @@ func applyOpenAICompatPostConfigRevalidatePolicy(ctx context.Context, input []by
 	state, ok := ctx.Value(openAICompatPostConfigContextKey{}).(openAICompatPostConfigContext)
 	if !ok {
 		return compat.TransformResult{}, fmt.Errorf("openai compat post-config context is missing")
+	}
+	if openAICompatNativeResponsesProfile(state.profile, state.endpoint) {
+		return compat.TransformResult{Payload: scrubOpenAICompatPayload(input, state.profile)}, nil
 	}
 	output := scrubOpenAICompatPostConfigPayload(input, state.profile, state.model, state.baseURL, state.endpoint)
 	return compat.TransformResult{

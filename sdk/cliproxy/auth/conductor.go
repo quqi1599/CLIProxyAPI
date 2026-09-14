@@ -935,7 +935,7 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 		fields["gpt_round_count"] = summary.GPTRoundCount
 	}
 	if summary.EmptyResponses > 0 {
-		finalEmptyResponse := strings.EqualFold(errorCodeFromError(finalErr), emptyUpstreamResponseErrorCode)
+		finalEmptyResponse := isRetryableEmptyUpstreamResponseError(finalErr)
 		fields["empty_response_count"] = summary.EmptyResponses
 		fields["empty_response_retry_count"] = summary.EmptyRetries
 		fields["empty_response_upstream_count"] = summary.EmptyUpstreams
@@ -7304,6 +7304,8 @@ type gptChannelFailoverError struct {
 	cause error
 }
 
+const gptChannelsUnavailableErrorCode = "gpt_channels_unavailable"
+
 func (e *gptChannelFailoverError) Error() string {
 	if e == nil || e.cause == nil {
 		return "GPT channel unavailable"
@@ -7354,6 +7356,57 @@ func shouldFailoverGPTChannel(err error, providers []string, model string) bool 
 		return true
 	default:
 		return false
+	}
+}
+
+// normalizeExhaustedGPTChannelError hides the last upstream gateway failure
+// after every eligible GPT channel has been attempted. Individual 502/503/504
+// responses remain failover signals during routing; only the terminal error is
+// converted to a stable gateway envelope for downstream clients.
+func normalizeExhaustedGPTChannelError(err error, providers []string, model string) error {
+	if err == nil || !isGPTRetryRoute(providers, model) {
+		return err
+	}
+	status := statusCodeFromError(err)
+	failure, typed := failurecontract.As(err)
+	if typed && failure != nil && failure.OuterStatus > 0 {
+		status = failure.OuterStatus
+	}
+	if status != http.StatusBadGateway && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
+		return err
+	}
+	if typed && failure != nil {
+		if failure.OutputCommitted || failure.Scope == failurecontract.ScopeRequest {
+			return err
+		}
+	}
+
+	outerStatus := status
+	phase := failurecontract.StreamPhaseUnknown
+	var retryAfter *time.Duration
+	if typed && failure != nil {
+		if failure.OuterStatus > 0 {
+			outerStatus = failure.OuterStatus
+		}
+		phase = failure.StreamPhase
+		if failure.RetryAfter != nil {
+			delay := *failure.RetryAfter
+			retryAfter = &delay
+		}
+	}
+	return &failurecontract.Failure{
+		Kind:          failurecontract.ProviderUnavailable,
+		Scope:         failurecontract.ScopeProvider,
+		HTTPStatus:    http.StatusServiceUnavailable,
+		OuterStatus:   outerStatus,
+		ProviderCode:  gptChannelsUnavailableErrorCode,
+		SemanticCode:  gptChannelsUnavailableErrorCode,
+		SemanticType:  "server_error",
+		StreamPhase:   phase,
+		RetryAfter:    retryAfter,
+		Retryable:     true,
+		Cause:         err,
+		PublicMessage: "all GPT channels are temporarily unavailable",
 	}
 }
 
@@ -10253,14 +10306,17 @@ func isRetryableEmptyUpstreamResponseError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(errorCodeFromError(err)), emptyUpstreamResponseErrorCode) {
-		return false
+	if strings.EqualFold(strings.TrimSpace(errorCodeFromError(err)), emptyUpstreamResponseErrorCode) {
+		status := statusCodeFromError(err)
+		if status == 0 {
+			return true
+		}
+		return status == http.StatusRequestTimeout || isTransientUpstreamStatus(status)
 	}
-	status := statusCodeFromError(err)
-	if status == 0 {
-		return true
+	if failure, ok := failurecontract.As(err); ok && failure != nil && failure.Cause != nil {
+		return isRetryableEmptyUpstreamResponseError(failure.Cause)
 	}
-	return status == http.StatusRequestTimeout || isTransientUpstreamStatus(status)
+	return false
 }
 
 func isDeepSeekCompatibilityFallbackError(err error) bool {

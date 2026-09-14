@@ -489,8 +489,8 @@ func TestHandlerStreamExecutorErrorSkipsResponseInterceptors(t *testing.T) {
 	if !ok || msg == nil {
 		t.Fatal("stream error channel did not return error message")
 	}
-	if msg.StatusCode != http.StatusBadGateway {
-		t.Fatalf("stream error status = %d, want %d", msg.StatusCode, http.StatusBadGateway)
+	if msg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("stream error status = %d, want %d", msg.StatusCode, http.StatusServiceUnavailable)
 	}
 	if responseCalls != 0 || streamCalls != 0 {
 		t.Fatalf("interceptor calls = response:%d stream:%d, want 0", responseCalls, streamCalls)
@@ -541,8 +541,8 @@ func TestHandlerStreamChunkErrorBeforePayloadSkipsResponseInterceptors(t *testin
 	if !ok || msg == nil {
 		t.Fatal("stream error channel did not return error message")
 	}
-	if msg.StatusCode != http.StatusBadGateway {
-		t.Fatalf("stream error status = %d, want %d", msg.StatusCode, http.StatusBadGateway)
+	if msg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("stream error status = %d, want %d", msg.StatusCode, http.StatusServiceUnavailable)
 	}
 	for msg := range errChan {
 		if msg != nil {

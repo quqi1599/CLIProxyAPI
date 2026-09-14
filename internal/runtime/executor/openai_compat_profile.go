@@ -64,7 +64,8 @@ func genericOpenAICompatProfile() openAICompatProfile {
 var openAICompatProfiles = map[string]openAICompatProfile{
 	"kimi": {
 		Kind:                     "kimi",
-		SupportsResponses:        false,
+		SupportsResponses:        true,
+		SupportsNativeResponses:  true,
 		SupportsStreamUsage:      true,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
@@ -84,7 +85,8 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 	},
 	"xiaomi": {
 		Kind:                     "xiaomi",
-		SupportsResponses:        false,
+		SupportsResponses:        true,
+		SupportsNativeResponses:  true,
 		SupportsStreamUsage:      false,
 		SupportsParallelToolCall: false,
 		SupportsReasoning:        false,
@@ -102,6 +104,16 @@ var openAICompatProfiles = map[string]openAICompatProfile{
 		SupportsReasoning:        false,
 		SupportsMetadata:         false,
 		SupportsStore:            false,
+	},
+	"qwen": {
+		Kind:                     "qwen",
+		SupportsResponses:        true,
+		SupportsNativeResponses:  true,
+		SupportsStreamUsage:      true,
+		SupportsParallelToolCall: false,
+		SupportsReasoning:        true,
+		SupportsMetadata:         false,
+		SupportsStore:            true,
 	},
 	"doubao": {
 		Kind:                     "doubao",
@@ -395,6 +407,35 @@ func openAICompatCapabilityProfileForModel(profile openAICompatProfile, model st
 	profile.SupportsNativeThinking = true
 	profile.PreserveReasoningContent = true
 	return profile
+}
+
+func openAICompatProfileForEndpoint(profile openAICompatProfile, endpoint string) openAICompatProfile {
+	if endpoint != "/responses" || !profile.SupportsNativeResponses {
+		return profile
+	}
+
+	// These providers expose the OpenAI Responses wire format natively. Their
+	// Responses requests carry reasoning controls in the canonical OpenAI shape,
+	// even though their legacy Chat compatibility profiles intentionally remove
+	// those fields.
+	switch config.NormalizeOpenAICompatibilityKind(profile.Kind) {
+	case "kimi", "qwen", "xiaomi":
+		profile.SupportsReasoning = true
+		profile.PreserveReasoningContent = true
+	}
+	return profile
+}
+
+func openAICompatNativeResponsesProfile(profile openAICompatProfile, endpoint compat.EndpointKind) bool {
+	if endpoint != compat.EndpointKind("responses") || !profile.SupportsNativeResponses {
+		return false
+	}
+	switch config.NormalizeOpenAICompatibilityKind(profile.Kind) {
+	case "kimi", "qwen", "xiaomi":
+		return true
+	default:
+		return false
+	}
 }
 
 func scrubOpenAICompatPayloadAfterProviderQuirks(payload []byte, profile openAICompatProfile, model string, baseURL string) []byte {

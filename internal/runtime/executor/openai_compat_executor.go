@@ -194,10 +194,27 @@ func openAICompatTargetFormatAndEndpoint(from sdktranslator.Format, opts cliprox
 }
 
 func openAICompatModelSupportsNativeResponses(profile openAICompatProfile, model string) bool {
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "deepseek" {
+	modelName := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	switch config.NormalizeOpenAICompatibilityKind(profile.Kind) {
+	case "deepseek":
+		return thinking.IsDeepSeekV4Model(modelName)
+	case "qwen":
+		// The current Qwen Responses contract covers the Qwen 3.5–3.8 and
+		// Qwen 3 Max families. Older or provider-specific aliases must keep
+		// using the Chat Completions compatibility path.
+		return strings.HasPrefix(modelName, "qwen3.5-") ||
+			strings.HasPrefix(modelName, "qwen3.6-") ||
+			strings.HasPrefix(modelName, "qwen3.7-") ||
+			strings.HasPrefix(modelName, "qwen3.8-") ||
+			strings.HasPrefix(modelName, "qwen3-max")
+	case "kimi":
+		return modelName == "kimi-k3" || strings.HasPrefix(modelName, "kimi-k3-") ||
+			modelName == "kimi-k2.8" || strings.HasPrefix(modelName, "kimi-k2.8-")
+	case "xiaomi":
+		return isXiaomiMimoV25Model(modelName)
+	default:
 		return true
 	}
-	return thinking.IsDeepSeekV4Model(model)
 }
 
 func openAICompatIsDeepSeekFIMRequest(opts cliproxyexecutor.Options, profile openAICompatProfile, model string) bool {
@@ -987,6 +1004,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	from := opts.SourceFormat
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
 	plan.upstreamFormat, plan.endpoint = openAICompatTargetFormatAndEndpoint(from, opts, profile, baseModel)
+	profile = openAICompatProfileForEndpoint(profile, plan.endpoint)
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1027,7 +1045,10 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatZhipuGLM53ThinkingDowngrade)
 			}
 		}
-		body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
+		nativeResponses := openAICompatNativeResponsesProfile(profile, compat.EndpointKind(strings.Trim(plan.endpoint, "/")))
+		if !nativeResponses {
+			body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
+		}
 		body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey)
 		if err != nil {
 			return plan, err

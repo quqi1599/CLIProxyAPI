@@ -19,6 +19,7 @@ type ExtractedRequest struct {
 	CurrentUserText   string
 	CurrentTruncated  bool
 	ReferenceText     string
+	MaterialText      string
 	ReferenceFields   []string
 	ContextIncomplete bool
 	Model             string
@@ -281,6 +282,9 @@ func (r ExtractedRequest) EnforcementMatchedRoles(term string) []string {
 
 // DecisionMatchedRoles reports the source actually evaluated for this decision.
 func (r ExtractedRequest) DecisionMatchedRoles(decision Decision) []string {
+	if decision.MatchSource == "material" {
+		return []string{"user"}
+	}
 	if decision.MatchSource != "reference" {
 		return r.EnforcementMatchedRoles(decision.MatchedTerm)
 	}
