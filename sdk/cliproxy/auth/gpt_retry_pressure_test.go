@@ -230,6 +230,35 @@ func TestGPTRetryPressureQueuedRetryPrecedesNewArrival(t *testing.T) {
 	releaseSecond()
 }
 
+func TestGPTRetryPressureFailoverOpensWhenEligibleRouteIsSaturated(t *testing.T) {
+	controller := newGPTRetryPressureController()
+	availability := testGPTRouteAvailability([]string{"route-a"}, []string{"route-a"}, nil)
+	availabilityFn := func(time.Time) gptRouteAvailabilitySnapshot { return availability }
+
+	releaseFirst, _, err := controller.acquire(context.Background(), "gpt-5.6-sol", availabilityFn)
+	if err != nil {
+		t.Fatalf("first retry permit failed: %v", err)
+	}
+	releaseSecond, _, err := controller.acquire(context.Background(), "gpt-5.6-sol", availabilityFn)
+	if err != nil {
+		t.Fatalf("second retry permit failed: %v", err)
+	}
+	startedAt := time.Now()
+	releaseFailover, snapshot, err := controller.acquireFailover(context.Background(), "gpt-5.6-sol", availabilityFn)
+	if err == nil || releaseFailover == nil {
+		t.Fatalf("saturated failover must return a fail-open signal: snapshot=%+v err=%v", snapshot, err)
+	}
+	if snapshot.EligibleRoutes != 1 || !snapshot.Rejected || snapshot.Reason != "eligible_route_fail_open" {
+		t.Fatalf("unexpected fail-open snapshot: %+v", snapshot)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= gptRetryPressureRecheckInterval {
+		t.Fatalf("eligible failover must not queue behind first-event waits, elapsed=%s", elapsed)
+	}
+	releaseFailover()
+	releaseFirst()
+	releaseSecond()
+}
+
 func TestGPTRetryPressureRejectsMissingRouteWithoutQueueing(t *testing.T) {
 	controller := newGPTRetryPressureController()
 	startedAt := time.Now()

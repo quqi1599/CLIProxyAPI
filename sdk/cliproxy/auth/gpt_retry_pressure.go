@@ -276,6 +276,18 @@ func (c *gptRetryPressureController) evaluateLocked(model string, availability g
 }
 
 func (c *gptRetryPressureController) acquire(ctx context.Context, model string, availability func(time.Time) gptRouteAvailabilitySnapshot) (func(), gptRetryPressureSnapshot, error) {
+	return c.acquireWithPolicy(ctx, model, availability, false)
+}
+
+// acquireFailover admits a retry attempt without queueing when at least one
+// eligible route remains. A retry is already the recovery path after an
+// upstream failure, so delaying it behind another in-flight first-event wait
+// only turns a recoverable route failure into a customer-visible 503.
+func (c *gptRetryPressureController) acquireFailover(ctx context.Context, model string, availability func(time.Time) gptRouteAvailabilitySnapshot) (func(), gptRetryPressureSnapshot, error) {
+	return c.acquireWithPolicy(ctx, model, availability, true)
+}
+
+func (c *gptRetryPressureController) acquireWithPolicy(ctx context.Context, model string, availability func(time.Time) gptRouteAvailabilitySnapshot, failOpenWhenEligible bool) (func(), gptRetryPressureSnapshot, error) {
 	if c == nil || availability == nil {
 		return func() {}, gptRetryPressureSnapshot{State: gptRetryPressureStateNormal}, nil
 	}
@@ -315,6 +327,15 @@ func (c *gptRetryPressureController) acquire(ctx context.Context, model string, 
 			snapshot.Wait = time.Since(startedAt)
 			c.mu.Unlock()
 			return func() {}, snapshot, nil
+		}
+		if failOpenWhenEligible && snapshot.PermitLimit > 0 && state.inFlight >= snapshot.PermitLimit {
+			// Preserve the pressure signal for observability, but let the picker
+			// immediately try another eligible route instead of returning 503.
+			snapshot.Rejected = true
+			snapshot.Reason = "eligible_route_fail_open"
+			snapshot.Wait = time.Since(startedAt)
+			c.mu.Unlock()
+			return func() {}, snapshot, newGPTRetryPressureLimitedError()
 		}
 		// Once a waiter exists, let queued retries take the next permit before
 		// newly arriving requests. This avoids a busy model starving older
@@ -473,27 +494,40 @@ func shouldAcquireGPTRetryPermit(trace *requestAttemptTrace) bool {
 }
 
 func (m *Manager) acquireGPTRetryPermit(ctx context.Context, providers []string, model string) (func(), gptRetryPressureSnapshot, error) {
+	return m.acquireGPTRetryPermitWithPolicy(ctx, providers, model, false)
+}
+
+func (m *Manager) acquireGPTRetryPermitForFailover(ctx context.Context, providers []string, model string) (func(), gptRetryPressureSnapshot, error) {
+	return m.acquireGPTRetryPermitWithPolicy(ctx, providers, model, true)
+}
+
+func (m *Manager) acquireGPTRetryPermitWithPolicy(ctx context.Context, providers []string, model string, failOpenWhenEligible bool) (func(), gptRetryPressureSnapshot, error) {
 	if m == nil || m.gptRetryPressure == nil {
 		return func() {}, gptRetryPressureSnapshot{State: gptRetryPressureStateNormal}, nil
 	}
-	release, snapshot, err := m.gptRetryPressure.acquire(ctx, model, func(now time.Time) gptRouteAvailabilitySnapshot {
+	acquire := m.gptRetryPressure.acquire
+	if failOpenWhenEligible {
+		acquire = m.gptRetryPressure.acquireFailover
+	}
+	release, snapshot, err := acquire(ctx, model, func(now time.Time) gptRouteAvailabilitySnapshot {
 		return m.gptRouteAvailabilitySnapshot(providers, model, now)
 	})
 	fields := log.Fields{
-		"event":                 "gpt_retry_pressure",
-		"model":                 canonicalModelKey(model),
-		"retry_pressure_state":  snapshot.State,
-		"retry_pressure_reason": snapshot.Reason,
-		"candidate_route_count": snapshot.CandidateRoutes,
-		"eligible_route_count":  snapshot.EligibleRoutes,
-		"blocked_route_count":   snapshot.BlockedRoutes,
-		"degraded_route_count":  snapshot.DegradedRoutes,
-		"retry_permit_limit":    snapshot.PermitLimit,
-		"retry_in_flight":       snapshot.InFlightRetries,
-		"retry_waiters":         snapshot.WaitingRetries,
-		"retry_permit_wait_ms":  snapshot.Wait.Milliseconds(),
-		"retry_permit_acquired": snapshot.Acquired,
-		"retry_permit_rejected": snapshot.Rejected,
+		"event":                  "gpt_retry_pressure",
+		"model":                  canonicalModelKey(model),
+		"retry_pressure_state":   snapshot.State,
+		"retry_pressure_reason":  snapshot.Reason,
+		"candidate_route_count":  snapshot.CandidateRoutes,
+		"eligible_route_count":   snapshot.EligibleRoutes,
+		"blocked_route_count":    snapshot.BlockedRoutes,
+		"degraded_route_count":   snapshot.DegradedRoutes,
+		"retry_permit_limit":     snapshot.PermitLimit,
+		"retry_in_flight":        snapshot.InFlightRetries,
+		"retry_waiters":          snapshot.WaitingRetries,
+		"retry_permit_wait_ms":   snapshot.Wait.Milliseconds(),
+		"retry_permit_acquired":  snapshot.Acquired,
+		"retry_permit_rejected":  snapshot.Rejected,
+		"retry_permit_fail_open": failOpenWhenEligible && snapshot.Reason == "eligible_route_fail_open",
 	}
 	addRequestAttemptLogFields(ctx, fields)
 	entry := logEntryWithRequestID(ctx).WithFields(fields)

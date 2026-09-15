@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -311,6 +312,30 @@ func TestSessionAffinitySoft_BadBoundChannelDoesNotSelectPeerCredential(t *testi
 	}
 	if picked.ID != backup.ID {
 		t.Fatalf("picked auth = %q, want different-channel backup %q", picked.ID, backup.ID)
+	}
+}
+
+func TestSessionAffinitySoft_FailedBoundChannelEscapesAcrossAffinityGroup(t *testing.T) {
+	spread := &SpreadSelector{load: newSpreadLoadTracker()}
+	selector := newSoftAffinityTestSelector(spread)
+	defer selector.Stop()
+
+	bound := softAffinityTestAuth("failed-bound-channel", "https://failed-bound.example.com/v1")
+	peer := softAffinityTestAuth("failed-bound-peer", "https://failed-bound.example.com/v1")
+	backup := softAffinityTestAuth("failed-bound-backup", "https://healthy-backup.example.com/v1")
+	bound.Attributes["provider_key"] = "failed-bound-channel"
+	peer.Attributes["provider_key"] = "failed-bound-channel"
+	opts := softAffinityTestOptions("failed-bound-channel-escape")
+	selector.cache.SetBinding(softAffinityTestCacheKey(opts), bound.ID, routingChannelBaseKey(bound))
+
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.markFailedChannel(routingChannelBaseKey(bound), errors.New("upstream 503"))
+	picked, errPick := selector.Pick(ctx, softAffinityTestProvider, softAffinityTestModel, opts, []*Auth{bound, peer, backup})
+	if errPick != nil {
+		t.Fatalf("pick after failed bound channel: %v", errPick)
+	}
+	if picked.ID != backup.ID {
+		t.Fatalf("picked auth = %q, want cross-channel backup %q", picked.ID, backup.ID)
 	}
 }
 

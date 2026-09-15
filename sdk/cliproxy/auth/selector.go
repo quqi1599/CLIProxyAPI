@@ -1888,6 +1888,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if cachedChannelKey == "" {
 			return nil, false, nil
 		}
+		// A failed GPT channel must never remain sticky for the rest of the
+		// request. Escape the entire affinity group so the fallback selector can
+		// borrow a healthy channel instead of rotating credentials on the same
+		// broken upstream.
+		if trace := requestAttemptTraceFromContext(ctx); gptRoute && trace.failedGPTChannel(cachedChannelKey) {
+			recordSelectorReason(ctx, "session_affinity_failed_channel_escape")
+			return nil, false, nil
+		}
 		channelAuths := inRoutingChannel(available, cachedChannelKey)
 		if len(channelAuths) == 0 {
 			return nil, false, nil

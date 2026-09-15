@@ -5642,10 +5642,12 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 	}()
 	for {
 		if operation == "execute" && gptRoute && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
-			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
+			release, pressure, errPermit := m.acquireGPTRetryPermitForFailover(ctx, providers, routeModel)
 			trace.recordGPTRetryPressure(pressure, errPermit)
 			if errPermit != nil {
-				return cliproxyexecutor.Response{}, errPermit
+				if pressure.EligibleRoutes <= 0 || errors.Is(errPermit, context.Canceled) || errors.Is(errPermit, context.DeadlineExceeded) {
+					return cliproxyexecutor.Response{}, errPermit
+				}
 			}
 			retryPermitRelease = release
 		}
@@ -5773,6 +5775,10 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 			}
 			startedAt := time.Now()
+			if retryPermitRelease != nil {
+				retryPermitRelease()
+				retryPermitRelease = nil
+			}
 			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -5976,10 +5982,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}()
 	for {
 		if gptRoute && retryPermitRelease == nil && shouldAcquireGPTRetryPermit(trace) {
-			release, pressure, errPermit := m.acquireGPTRetryPermit(ctx, providers, routeModel)
+			release, pressure, errPermit := m.acquireGPTRetryPermitForFailover(ctx, providers, routeModel)
 			trace.recordGPTRetryPressure(pressure, errPermit)
 			if errPermit != nil {
-				return nil, errPermit
+				if pressure.EligibleRoutes <= 0 || errors.Is(errPermit, context.Canceled) || errors.Is(errPermit, context.DeadlineExceeded) {
+					return nil, errPermit
+				}
 			}
 			retryPermitRelease = release
 		}
@@ -6091,6 +6099,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 		attempted[auth.ID] = struct{}{}
+		if retryPermitRelease != nil {
+			retryPermitRelease()
+			retryPermitRelease = nil
+		}
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, providers, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
