@@ -562,6 +562,8 @@ func TestBuildErrorResponseBody_ExplainsDeepSeekCompatibilityFamilies(t *testing
 	}{
 		{name: "file input", input: `{"error":{"message":"request_feature_unsupported: deepseek_official_file_input. unsupported","code":"request_feature_unsupported"}}`, marker: "文件输入"},
 		{name: "responses state", input: `{"error":{"message":"request_feature_unsupported: deepseek_responses_state. unsupported","code":"request_feature_unsupported"}}`, marker: "不保存服务端会话状态"},
+		{name: "responses route", input: `{"error":{"message":"request_feature_unsupported: deepseek_responses_route_unsupported. unsupported","code":"request_feature_unsupported"}}`, marker: "不支持带工具的这类请求"},
+		{name: "responses namespace", input: `{"error":{"message":"request_feature_unsupported: deepseek_responses_namespace_invalid. unsupported","code":"request_feature_unsupported"}}`, marker: "工具分组或历史记录格式"},
 		{name: "fim route", input: `{"error":{"message":"request_feature_unsupported: deepseek_fim_requires_openai_compat. unsupported","code":"request_feature_unsupported"}}`, marker: "不能走 Anthropic API"},
 		{name: "fim thinking", input: `{"error":{"message":"request_feature_unsupported: deepseek_fim_non_thinking_only. unsupported","code":"request_feature_unsupported"}}`, marker: "仅支持非思考模式"},
 	}

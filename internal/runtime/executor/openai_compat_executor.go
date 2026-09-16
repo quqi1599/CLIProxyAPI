@@ -952,10 +952,18 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	if errorCode := firstNonEmptyJSONValue(body, "error.code", "code", "error.type", "type", "error.err_code"); errorCode != "" {
 		fields["upstream_error_code"] = errorCode
 	}
+	if diagnostic.CompatKind == "deepseek" {
+		reason, field := helps.DeepSeekErrorDiagnostic(body)
+		fields["upstream_error_reason"] = reason
+		if field != "" {
+			fields["upstream_error_field"] = field
+		}
+	}
 	helps.LogWithRequestID(ctx).WithFields(fields).Warn("openai compat compatibility diagnostic")
 }
 
 type openAICompatRequestPlan struct {
+	namespaceNames   helps.DeepSeekNamespaceMap
 	upstreamFormat   sdktranslator.Format
 	responseFormat   sdktranslator.Format
 	endpoint         string
@@ -1005,6 +1013,14 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
 	plan.upstreamFormat, plan.endpoint = openAICompatTargetFormatAndEndpoint(from, opts, profile, baseModel)
 	profile = openAICompatProfileForEndpoint(profile, plan.endpoint)
+	if thinking.IsDeepSeekV4Model(baseModel) && helps.DeepSeekCodingResponsesUnsupported(baseURL, plan.endpoint) {
+		helps.LogWithRequestID(ctx).WithFields(log.Fields{
+			"event": "deepseek_responses_route_guard", "model": baseModel,
+			"endpoint": plan.endpoint, "reason": "coding_endpoint_unsupported",
+		}).Warn("DeepSeek Coding route does not support Responses")
+		return plan, statusErr{code: http.StatusBadRequest, errorCode: "request_feature_unsupported",
+			msg: "request_feature_unsupported: deepseek_responses_route_unsupported. 当前 DeepSeek 通道无法接收本次工具任务，系统会尝试其他兼容通道。如仍失败，请切换到 OpenAI 原生 GPT 模型后继续。"}
+	}
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1022,6 +1038,27 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		payloadSource = downgradeClaudeToolSearchForCompat(baseURL, payloadSource)
 	}
 	plan.requestSource = payloadSource
+	if profile.Kind == "deepseek" && helps.DeepSeekIsResponsesEndpoint(plan.endpoint) && from == sdktranslator.FormatOpenAIResponse {
+		started := time.Now()
+		input := payloadSource
+		payloadSource, plan.namespaceNames, err = helps.FlattenDeepSeekNamespaces(payloadSource)
+		if err != nil {
+			if guardErr := rejectDeepSeekUnsupportedResponsesTools(ctx, input, profile, baseModel, helps.PayloadRequestPath(opts), plan.endpoint, from.String()); guardErr != nil {
+				return plan, guardErr
+			}
+			return plan, statusErr{code: http.StatusBadRequest, errorCode: "request_feature_unsupported", msg: "request_feature_unsupported: deepseek_responses_namespace_invalid. 当前工具分组或历史记录无法完整转换，请新建任务或切换到 OpenAI 原生 GPT 模型。"}
+		}
+		// Keep the same name mapping in defaults and the actual wire request.
+		originalTranslatedSource, _, errOriginal := helps.FlattenDeepSeekNamespaces(originalPayloadSource)
+		if errOriginal != nil {
+			return plan, statusErr{code: http.StatusBadRequest, errorCode: "request_feature_unsupported", msg: "request_feature_unsupported: deepseek_responses_namespace_invalid. 原始工具记录无法完整转换，请新建任务或切换到 OpenAI 原生 GPT 模型。"}
+		}
+		originalPayloadSource = originalTranslatedSource
+		plan.requestSource = payloadSource
+		if err = helps.EnforceSemanticTransformStage(ctx, "deepseek.responses_namespace", input, payloadSource, started, []string{"deepseek.namespace_roundtrip"}, nil, internalpayload.AmplificationOverride{}); err != nil {
+			return plan, err
+		}
+	}
 	if plan.endpoint == "/completions" {
 		if err = validateDeepSeekFIMRequest(payloadSource); err != nil {
 			return plan, err
@@ -1222,6 +1259,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	if err = rejectDeepSeekUnsupportedResponsesTools(ctx, plan.requestSource, profile, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
 		return plan, err
+	}
+	if helps.DeepSeekIsResponsesEndpoint(plan.endpoint) {
+		// Recheck after operator payload overrides; they must not add unsupported tools.
+		if err = rejectDeepSeekUnsupportedResponsesTools(ctx, body, profile, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
+			return plan, err
+		}
 	}
 	if err = rejectDeepSeekUnsupportedResponsesState(ctx, plan.requestSource, profile.Kind, baseModel, plan.requestPath, plan.endpoint, from.String()); err != nil {
 		return plan, err
@@ -1570,7 +1613,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, body, &param)
+	out := sdktranslator.TranslateNonStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, plan.namespaceNames.Restore(body), &param)
 	responseHeaders := decodedResponseHeaders(httpResp.Header)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: responseHeaders}
 	return resp, nil
@@ -1836,7 +1879,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 
 				// OpenAI-compatible streams must use SSE data lines.
-				chunks := sdktranslator.TranslateStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, internalpayload.CloneBytes(trimmedLine), &param)
+				chunks := sdktranslator.TranslateStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, plan.namespaceNames.Restore(internalpayload.CloneBytes(trimmedLine)), &param)
 				for i := range chunks {
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:

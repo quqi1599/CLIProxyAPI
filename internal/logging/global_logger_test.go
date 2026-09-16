@@ -27,6 +27,25 @@ func TestLogFormatterPrintsVersionField(t *testing.T) {
 	}
 }
 
+func TestLogFormatterDeepSeekCompatibilityDetails(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Data = log.Fields{
+		"event": "compatibility_diagnostic", "unsupported_tool_count": 2,
+		"unsupported_tool_types": []string{"web_search", "namespace"},
+		"upstream_endpoint":      "/responses", "upstream_error_reason": "tool_history_pairing",
+		"upstream_error_field": "messages[3].tool_calls[0]",
+	}
+	formatted, err := (&LogFormatter{}).Format(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range entry.Data {
+		if !strings.Contains(string(formatted), key+"=") {
+			t.Fatalf("missing %s: %s", key, formatted)
+		}
+	}
+}
+
 func TestLogFormatterIncludesOperationalTroubleshootingFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 6, 23, 22, 58, 0, 0, time.Local)

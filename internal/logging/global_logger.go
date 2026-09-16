@@ -62,7 +62,7 @@ var logFieldOrder = []string{
 	"payload_fields", "message_roles", "message_role_sequence", "message_content_kinds", "content_part_types",
 	"input_item_types", "tool_definition_count", "tool_call_count", "tool_choice_type", "thinking_type",
 	"response_format_type", "parallel_tool_calls", "assistant_tool_call_messages", "tool_result_messages",
-	"reasoning_messages", "max_content_parts",
+	"reasoning_messages", "max_content_parts", "unsupported_tool_count", "unsupported_tool_types", "upstream_endpoint",
 	"repairs", "merged_tool_result_messages", "deduped_tool_results",
 	"reordered_tool_results", "removed_tool_uses", "removed_tool_results", "repair_type", "repairs_count",
 	"removed_fields", "modified_fields", "added_fields",
@@ -87,7 +87,7 @@ var logFieldOrder = []string{
 	"downstream_flush_ms", "downstream_flush_calls", "chunks_count", "bytes_out",
 	"stream_output_tokens", "stream_output_tokens_observed", "output_tokens", "tokens_per_second",
 	"client_gone", "cancel_origin", "finish_reason",
-	"error_type", "upstream_status", "upstream_error_code", "route_plan",
+	"error_type", "upstream_status", "upstream_error_code", "upstream_error_reason", "upstream_error_field", "route_plan",
 }
 
 // Format renders a single log entry with custom formatting.

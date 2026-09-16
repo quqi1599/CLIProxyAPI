@@ -4183,6 +4183,18 @@ func TestManager_Execute_DeepSeekCompatibilityBadRequestFallsBackAcrossRoutes(t 
 			name:    "fim requires openai compatibility",
 			message: "request_feature_unsupported: deepseek_fim_requires_openai_compat. DeepSeek FIM does not support Anthropic Messages routes",
 		},
+		{
+			name:    "responses route unsupported on coding endpoint",
+			message: "request_feature_unsupported: deepseek_responses_route_unsupported. 当前 DeepSeek 通道无法接收本次工具任务",
+		},
+		{
+			name:    "responses unsupported tools",
+			message: "request_feature_unsupported: deepseek_responses_unsupported_tools. 当前 DeepSeek 通道无法执行这些工具",
+		},
+		{
+			name:    "responses namespace flatten invalid",
+			message: "request_feature_unsupported: deepseek_responses_namespace_invalid. 当前工具分组或历史记录无法完整转换",
+		},
 	}
 
 	for _, tt := range tests {

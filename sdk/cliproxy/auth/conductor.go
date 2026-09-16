@@ -10342,6 +10342,11 @@ func isDeepSeekCompatibilityFallbackError(err error) bool {
 	if strings.Contains(message, "deepseek_fim_requires_openai_compat") {
 		return true
 	}
+	if strings.Contains(message, "deepseek_responses_route_unsupported") ||
+		strings.Contains(message, "deepseek_responses_unsupported_tools") ||
+		strings.Contains(message, "deepseek_responses_namespace_invalid") {
+		return true
+	}
 	return strings.Contains(message, "invalid schema for function") &&
 		strings.Contains(message, "null is not of type") &&
 		strings.Contains(message, "array")

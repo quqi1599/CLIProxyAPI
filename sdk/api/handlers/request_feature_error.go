@@ -71,6 +71,14 @@ func userFacingDeepSeekResponsesNonFunctionToolsMessage(errText string) string {
 	return "当前 DeepSeek 通道无法执行本次请求中的工具：" + strings.Join(toolNames, "、") + "。请在客户端的模型列表中切换到支持这些功能的 OpenAI 原生 GPT 模型后重试；如果不需要这些功能，可关闭对应工具后新建对话。这不是账号余额问题。"
 }
 
+func userFacingDeepSeekResponsesRouteMessage() string {
+	return "当前所选 DeepSeek 通道不支持带工具的这类请求，系统会尝试其他可用通道。如果仍失败，请在客户端的模型列表中切换到 OpenAI 原生 GPT 模型，或关闭工具后新建对话。这不是账号、余额或网络问题。"
+}
+
+func userFacingDeepSeekResponsesNamespaceMessage() string {
+	return "当前对话中的工具分组或历史记录格式与 DeepSeek 不兼容，无法安全继续。请点击“新建对话”后重试；如果仍失败，请切换到 OpenAI 原生 GPT 模型。这不是账号、余额或网络问题。"
+}
+
 func userFacingDeepSeekResponsesStateMessage() string {
 	return "DeepSeek Responses API 当前不保存服务端会话状态，因此不能使用上一次响应 ID、服务端会话或存储响应。请让客户端重传必要的对话内容；如果 Codex 必须依赖这些状态能力，请切换到原生 GPT 模型。"
 }
@@ -225,6 +233,10 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 			message = userFacingDeepSeekOfficialFileInputMessage()
 		case hasDeepSeekResponsesNonFunctionToolsSignal(candidate):
 			message = userFacingDeepSeekResponsesNonFunctionToolsMessage(errText)
+		case hasDeepSeekResponsesRouteSignal(candidate):
+			message = userFacingDeepSeekResponsesRouteMessage()
+		case hasDeepSeekResponsesNamespaceSignal(candidate):
+			message = userFacingDeepSeekResponsesNamespaceMessage()
 		case hasDeepSeekResponsesStateSignal(candidate):
 			message = userFacingDeepSeekResponsesStateMessage()
 		case hasDeepSeekFIMSignal(candidate):
@@ -378,6 +390,14 @@ func hasDeepSeekResponsesNonFunctionToolsSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "deepseek_responses_non_function_tools") ||
 		strings.Contains(lower, "deepseek_responses_unsupported_tools")
+}
+
+func hasDeepSeekResponsesRouteSignal(text string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(text)), "deepseek_responses_route_unsupported")
+}
+
+func hasDeepSeekResponsesNamespaceSignal(text string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(text)), "deepseek_responses_namespace_invalid")
 }
 
 func hasDeepSeekResponsesStateSignal(text string) bool {
