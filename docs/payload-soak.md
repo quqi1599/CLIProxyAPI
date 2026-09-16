@@ -1,4 +1,12 @@
-# Payload Soak Release Gate
+# Extended Payload Soak Profile
+
+This is an extended validation profile, not a mandatory delay for every
+deployment. Select it under the [risk-based release policy](release-ghcr-workflow.md#risk-based-release-validation)
+when sustained-load or duration-dependent resource risks require it. Isolated
+provider compatibility fixes can use focused regression tests and production
+probes instead. When this profile is selected, its 12-hour minimum, exact-SHA
+checks, and recovery criteria remain mandatory; a shorter smoke test is not a
+successful extended soak.
 
 `cmd/payload-soak` drives the required mixed payload profile against an isolated staging CLIProxyAPI instance. It sends 90% small, 9% medium, and 1% large requests containing generated message history, tool output, reasoning, and inline-image data. Medium and large requests set `reasoning_effort=high`, and the release gate requires the `thinking_history.synthetic_budget` policy counter to increase after preflight. This prevents a run from passing without exercising the July 21 thinking-history normalization path. No customer payload is used or written to disk.
 
@@ -77,9 +85,9 @@ Every scenario reports its expected outcome, attempts, successes, failures, last
 
 The command exits nonzero on early SIGINT/SIGTERM, when any normal workload request exceeds its two-minute client deadline, when an unexpected request is non-2xx, when a bounded response exceeds 16 MiB, or when `/livez` or `/readyz` fails its five-second probe deadline. Scenario-specific non-2xx responses pass only when they match the table above. A valid run must complete the configured duration and successfully exercise every small, medium, and large profile. Every 30 seconds it also samples the authenticated `/healthz/details?gc=1` endpoint so heap readings represent a fresh post-GC snapshot; a missing sample, process start/revision change, or details failure fails the gate. After chaos/load stops, it closes idle workload connections, then probes for up to two minutes and requires admission to drain plus goroutines, live heap, and every platform-available RSS/file-descriptor/socket metric to return to its preflight baseline with bounded headroom. The JSON report includes first/last/max resources, per-resource trends after a short warm-up, and exact recovery limits without exposing either key. Workload `average_latency_ms` and `maximum_latency_ms` are end-to-end values measured after the response body is read and closed; separate `*_headers_latency_ms` fields retain time-to-headers.
 
-For a local smoke test only, invoke the command directly with `-release-gate=false` and a shorter `-duration`. Chaos and Responses WebSocket checks remain enabled by default; they may be disabled explicitly only in non-release mode. This path is not release evidence.
+For a bounded smoke test, invoke the command directly with `-release-gate=false` and a shorter `-duration`. Chaos and Responses WebSocket checks remain enabled by default; they may be disabled explicitly only in non-release mode. Report the actual duration and scenarios as limited smoke-test evidence, not as a passed extended soak.
 
-The release passes only when:
+The extended soak passes only when:
 
 - there are no OOMs or restarts;
 - post-GC heap has no sustained positive slope after warm-up;

@@ -80,9 +80,43 @@ curl -fsS http://127.0.0.1:8317/livez
 
 The preflight rejects mutable tags, pulls the exact candidate, requires a full
 40-character `org.opencontainers.image.revision` label, and verifies that a
-`sha-<12>` tag matches that revision. Before opening traffic, run the 12-hour
-release gate with the same full revision; it continuously verifies
-`/healthz/details.build.commit` and fails on a restart or revision change.
+`sha-<12>` tag matches that revision. A 12-hour soak is not a universal
+prerequisite for every deployment. Select the validation scope below before
+cutover; successful CI or an image pull alone is not deployment evidence.
+
+### Risk-based release validation
+
+Every application release requires successful `trusted-ci` for the exact
+candidate SHA, its immutable GHCR image, a saved previous image/Compose rollback
+point, and a scoped update of the intended service without production builds.
+After cutover, verify the running revision, `/livez`, `/readyz`, `/healthz`,
+authentication, a relevant functional request, and startup/error logs. Keep
+provider failures distinct from application regressions. Roll back when the
+candidate fails readiness or introduces a confirmed regression.
+
+Choose additional checks based on the changed behavior, not elapsed time alone:
+
+- Documentation-only changes: review the diff; no image rebuild or production
+  restart is needed when application code and configuration are unchanged.
+- Isolated provider compatibility, routing guards, or error-message changes:
+  run affected integration tests. For request translation and fallback, cover
+  tool/history round trips, stream and non-stream behavior, rejected shapes,
+  and replay boundaries; use race checks when shared state is involved. Follow
+  with bounded production probes and a short observation window. A long soak
+  is not required solely because the release touches a provider executor.
+- Shared concurrency, memory ownership, stream lifecycle, connection/cache
+  management, or broad payload-pipeline changes: assess sustained-load risk.
+  Run an isolated load/recovery test and use the extended 12-hour profile when
+  a leak, resource-growth, long-lived connection, or other duration-dependent
+  risk remains. Duration must address the suspected failure mode; waiting
+  without exercising that mode is not useful validation.
+
+Record the selected checks, their results, any remaining uncertainty, and the
+rollback reference in the release record. An extended profile may be deferred
+only with an explicit, recorded release decision; never report a skipped or
+shortened soak as passed. The [extended payload soak](payload-soak.md) retains
+its strict 12-hour minimum when selected and verifies the exact revision
+throughout the run.
 
 The production defaults are an 8 GiB memory hard limit, a 6 GiB
 `GOMEMLIMIT`, 4 CPUs with `GOMAXPROCS=4`, 1024 PIDs, no container swap, and a
