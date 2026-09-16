@@ -52,5 +52,28 @@ func credentialRetryLimitReached(ctx context.Context, attempted, configured int,
 		}
 		return attempted >= contextLimitFallbackMaxAttempts
 	}
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil && trace.totalAttemptBudgetExhausted() {
+		return true
+	}
 	return configured > 0 && attempted > configured
+}
+
+func (t *requestAttemptTrace) configureTotalAttemptBudget(retries, credentials int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Preserve the explicitly unbounded credential mode. With a configured
+	// credential limit, outer rounds and inner failover share one total budget.
+	t.enforceTotalAttempts = credentials > 0
+	// Retain room for short transport recovery even with one fallback credential.
+	t.maxAttempts = max(4, retries+1, credentials+1)
+	t.maxFallbacks = t.maxAttempts - 1
+}
+
+func (t *requestAttemptTrace) totalAttemptBudgetExhausted() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.enforceTotalAttempts && t.maxAttempts > 0 && t.attempts >= t.maxAttempts
 }

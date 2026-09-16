@@ -119,6 +119,7 @@ type requestAttemptTrace struct {
 	attempts                     int
 	fallbacks                    int
 	maxAttempts                  int
+	enforceTotalAttempts         bool
 	maxFallbacks                 int
 	translatorRuns               int
 	finalProvider                string

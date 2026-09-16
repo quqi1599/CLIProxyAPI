@@ -181,8 +181,8 @@ func TestManager_Execute_LogsRequestExecutionSummary(t *testing.T) {
 	if got := entry.Data["max_attempts"]; got != 4 {
 		t.Fatalf("max_attempts = %#v, want 4", got)
 	}
-	if got := entry.Data["max_fallbacks"]; got != 1 {
-		t.Fatalf("max_fallbacks = %#v, want 1", got)
+	if got := entry.Data["max_fallbacks"]; got != 3 {
+		t.Fatalf("max_fallbacks = %#v, want 3", got)
 	}
 	if got := entry.Data["translator_run_count"]; got != 2 {
 		t.Fatalf("translator_run_count = %#v, want 2", got)

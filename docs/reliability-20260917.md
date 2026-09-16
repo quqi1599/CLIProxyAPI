@@ -8,6 +8,11 @@ in production on September 16–17, 2026.
   sharing the same upstream and model pool. Distinct model pools remain eligible.
   The request-wide context fallback budget is four attempts, including the first.
   Ordinary invalid requests and content-policy failures keep their existing rules.
+- When credential retries are bounded, non-GPT outer rounds and inner credential
+  fallback share a total budget of `max(4, request-retry+1, max-retry-credentials+1)`.
+  The four-attempt floor preserves short transport recovery. This preserves a configured first-round fallback pool and prevents outer rounds
+  from multiplying a nominal 11-attempt budget into 24 or more executions.
+  Explicitly unbounded credential mode retains its existing behavior.
 - GPT spread selection defers routes with recent first-event failures when a
   healthy alternative exists. Existing two-minute observations expire naturally;
   an entirely degraded pool remains eligible for recovery. After 180 seconds of

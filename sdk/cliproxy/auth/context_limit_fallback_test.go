@@ -83,3 +83,34 @@ func TestContextLimitFallbackHasHardAttemptBound(t *testing.T) {
 		t.Fatal("context fallback exceeded its request-wide attempt limit")
 	}
 }
+
+func TestTotalAttemptBudgetSpansOuterRounds(t *testing.T) {
+	ctx, trace := ensureRequestAttemptTrace(context.Background())
+	trace.configureTotalAttemptBudget(10, 5)
+	m := NewManager(nil, nil, nil)
+	// Each round can otherwise reset its local set and try six credentials.
+	calls := 0
+	runner := managerAttemptRunner[cliproxyexecutor.Response]{manager: m,
+		runOnce: func(ctx context.Context, _ []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, configured int) (cliproxyexecutor.Response, error) {
+			for local := 0; !credentialRetryLimitReached(ctx, local, configured, req.Model, opts, nil); local++ {
+				trace.nextAttempt("")
+				calls++
+			}
+			return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Retryable: true, Message: "upstream unavailable"}
+		}}
+	// Exercise two fresh round-local credential sets against the same trace.
+	for i := 0; i < 2; i++ {
+		_, _ = runner.runOnce(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "MiniMax-M3"}, cliproxyexecutor.Options{}, 5)
+	}
+	if calls != 11 || !trace.totalAttemptBudgetExhausted() {
+		t.Fatalf("calls=%d, want 11", calls)
+	}
+	trace.configureTotalAttemptBudget(0, 5)
+	if trace.summary().MaxAttempts != 6 {
+		t.Fatal("configured fallback pool was removed")
+	}
+	trace.configureTotalAttemptBudget(0, 0)
+	if trace.totalAttemptBudgetExhausted() {
+		t.Fatal("unbounded credential mode changed")
+	}
+}

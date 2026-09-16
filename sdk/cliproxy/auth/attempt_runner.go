@@ -50,6 +50,9 @@ attempts:
 			return managerAttemptOutcome[T]{result: result, success: true}
 		}
 		lastErr = errRun
+		if trace != nil && trace.totalAttemptBudgetExhausted() {
+			break attempts
+		}
 		if remoteCompaction {
 			break attempts
 		}
@@ -238,7 +241,7 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 			trace.configureBudget(gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds, gptImmediateFailoverMaxChannels*gptImmediateFailoverMaxRounds-1)
 		}
 	} else {
-		trace.configureBudget(requestRetry+1, maxRetryCredentials)
+		trace.configureTotalAttemptBudget(requestRetry, maxRetryCredentials)
 	}
 	outcome = runner.run(ctx, providers, req, opts, maxRetryCredentials, maxWait)
 	outcome.returnErr = normalizeTerminalManagerError(ctx, outcome.returnErr)
