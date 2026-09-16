@@ -245,10 +245,10 @@ func TestGPTRetryPressureFailoverOpensWhenEligibleRouteIsSaturated(t *testing.T)
 	}
 	startedAt := time.Now()
 	releaseFailover, snapshot, err := controller.acquireFailover(context.Background(), "gpt-5.6-sol", availabilityFn)
-	if err == nil || releaseFailover == nil {
+	if err != nil || releaseFailover == nil {
 		t.Fatalf("saturated failover must return a fail-open signal: snapshot=%+v err=%v", snapshot, err)
 	}
-	if snapshot.EligibleRoutes != 1 || !snapshot.Rejected || snapshot.Reason != "eligible_route_fail_open" {
+	if snapshot.EligibleRoutes != 1 || snapshot.Rejected || !snapshot.FailOpen || !snapshot.Acquired || snapshot.InFlightRetries != 3 || snapshot.Queued || snapshot.Reason != "eligible_route_fail_open" {
 		t.Fatalf("unexpected fail-open snapshot: %+v", snapshot)
 	}
 	if elapsed := time.Since(startedAt); elapsed >= gptRetryPressureRecheckInterval {

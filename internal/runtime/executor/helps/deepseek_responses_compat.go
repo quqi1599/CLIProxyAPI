@@ -5,10 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -16,13 +16,7 @@ import (
 // DeepSeekCodingResponsesUnsupported identifies the Coding endpoint observed to
 // reject Responses. Standard Ark inference endpoints are deliberately excluded.
 func DeepSeekCodingResponsesUnsupported(baseURL, endpoint string) bool {
-	u, err := url.Parse(baseURL)
-	if err != nil || !strings.HasSuffix(strings.ToLower(u.Hostname()), ".volces.com") {
-		return false
-	}
-	p := strings.TrimRight(u.Path, "/")
-	return (p == "/api/coding" || p == "/api/coding/v1") &&
-		DeepSeekIsResponsesEndpoint(endpoint)
+	return compat.DeepSeekCodingResponsesUnsupported(baseURL, endpoint)
 }
 
 // DeepSeekIsResponsesEndpoint reports whether endpoint is a Responses API path
@@ -185,6 +179,12 @@ func DeepSeekErrorDiagnostic(body []byte) (reason, field string) {
 	lower := strings.ToLower(message)
 	field = deepSeekErrorField.FindString(message)
 	switch {
+	case strings.EqualFold(gjson.GetBytes(body, "error.code").String(), "SensitiveContentDetected"):
+		reason = "content_policy"
+	case strings.Contains(lower, "tool_choice") && strings.Contains(lower, "thinking"):
+		reason = "tool_choice_thinking_conflict"
+	case strings.Contains(lower, "tool_choice"):
+		reason = "tool_choice_parameter"
 	case strings.Contains(lower, "reasoning_content") || strings.Contains(lower, "thinking"):
 		reason = "thinking_history_or_parameter"
 	case strings.Contains(lower, "tool_call_id") || strings.Contains(lower, "tool_result") || strings.Contains(lower, "tool_calls"):

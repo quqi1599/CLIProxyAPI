@@ -110,11 +110,20 @@ func TestDeepSeekErrorDiagnosticNeverEchoesContent(t *testing.T) {
 		{"messages[3].tool_calls[0] missing tool_call_id private customer text", "tool_history_pairing", "messages[3].tool_calls[0]"},
 		{"messages[12].reasoning_content is missing", "thinking_history_or_parameter", "messages[12].reasoning_content"},
 		{"Invalid schema for function customer-private-name", "tool_or_output_schema", ""},
+		{"thinking mode does not support this tool_choice", "tool_choice_thinking_conflict", ""},
+		{"Invalid tool_choice private-function", "tool_choice_parameter", ""},
 		{"private customer text secret-key", "unclassified", ""},
 	} {
 		reason, field := DeepSeekErrorDiagnostic([]byte(fmt.Sprintf(`{"error":{"message":%q}}`, tc.message)))
 		if reason != tc.reason || field != tc.field {
 			t.Fatalf("reason=%q field=%q", reason, field)
 		}
+	}
+}
+
+func TestDeepSeekErrorDiagnosticSeparatesContentPolicy(t *testing.T) {
+	reason, field := DeepSeekErrorDiagnostic([]byte(`{"error":{"code":"SensitiveContentDetected","message":"private content"}}`))
+	if reason != "content_policy" || field != "" {
+		t.Fatalf("reason=%s field=%s", reason, field)
 	}
 }

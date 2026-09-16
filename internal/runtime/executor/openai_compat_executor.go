@@ -952,7 +952,7 @@ func logOpenAICompatCompatibilityDiagnostic(ctx context.Context, diagnostic open
 	if errorCode := firstNonEmptyJSONValue(body, "error.code", "code", "error.type", "type", "error.err_code"); errorCode != "" {
 		fields["upstream_error_code"] = errorCode
 	}
-	if diagnostic.CompatKind == "deepseek" {
+	if diagnostic.CompatKind == "deepseek" || (diagnostic.CompatKind == "doubao" && thinking.IsDeepSeekV4Model(diagnostic.Model)) {
 		reason, field := helps.DeepSeekErrorDiagnostic(body)
 		fields["upstream_error_reason"] = reason
 		if field != "" {
@@ -1090,11 +1090,17 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		if err != nil {
 			return plan, err
 		}
-		if plan.endpoint == "/chat/completions" && profile.Kind == "deepseek" {
+		if (plan.endpoint == "/chat/completions" || helps.DeepSeekIsResponsesEndpoint(plan.endpoint)) && profile.Kind == "deepseek" {
 			beforeChoice := body
 			body = scrubDeepSeekThinkingToolChoice(body, baseModel, baseURL, profile.Kind)
-			if !bytes.Equal(beforeChoice, body) {
+			choiceDowngraded := !bytes.Equal(beforeChoice, body)
+			if helps.DeepSeekIsResponsesEndpoint(plan.endpoint) {
+				body = helps.NormalizeDeepSeekResponsesThinking(body)
+			}
+			if choiceDowngraded {
 				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatDeepSeekToolChoiceDowngrade)
+			} else if !bytes.Equal(beforeChoice, body) {
+				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatDeepSeekThinkingDowngrade)
 			}
 		}
 	}

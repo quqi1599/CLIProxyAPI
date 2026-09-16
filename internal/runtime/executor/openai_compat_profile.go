@@ -312,11 +312,9 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 	}
 	payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	payload = scrubOpenAICompatToolChoice(payload, profile)
-	if endpoint != "responses" {
-		payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
-	}
+	payload = scrubDeepSeekThinkingToolChoice(payload, model, baseURL, profile.Kind)
 	payload = scrubOpenAICompatLegacyProviderQuirks(payload, profile, model)
-	if endpoint == "responses" && config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" {
+	if (endpoint == "responses" || endpoint == "compact") && config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" {
 		return helps.NormalizeDeepSeekResponsesThinking(payload)
 	}
 	return scrubOpenAICompatPayloadAfterProviderQuirks(payload, profile, model, baseURL)

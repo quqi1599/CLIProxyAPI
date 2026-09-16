@@ -79,6 +79,8 @@ type gptRetryPressureSnapshot struct {
 	Wait            time.Duration
 	Acquired        bool
 	Rejected        bool
+	Queued          bool
+	FailOpen        bool
 }
 
 type gptRouteAvailabilitySnapshot struct {
@@ -298,6 +300,7 @@ func (c *gptRetryPressureController) acquireWithPolicy(ctx context.Context, mode
 	startedAt := time.Now()
 	deadline := startedAt.Add(gptRetryPressureQueueWait)
 	waiterRegistered := false
+	queued := false
 	var transition gptRetryPressureSnapshot
 	defer func() {
 		if waiterRegistered {
@@ -310,6 +313,7 @@ func (c *gptRetryPressureController) acquireWithPolicy(ctx context.Context, mode
 		currentAvailability := availability(now)
 		c.mu.Lock()
 		snapshot := c.evaluateLocked(model, currentAvailability, now)
+		snapshot.Queued = queued
 		state := c.modelStateLocked(model)
 		if snapshot.Transitioned {
 			transition = snapshot
@@ -331,17 +335,14 @@ func (c *gptRetryPressureController) acquireWithPolicy(ctx context.Context, mode
 		if failOpenWhenEligible && snapshot.PermitLimit > 0 && state.inFlight >= snapshot.PermitLimit {
 			// Preserve the pressure signal for observability, but let the picker
 			// immediately try another eligible route instead of returning 503.
-			snapshot.Rejected = true
+			snapshot.FailOpen = true
 			snapshot.Reason = "eligible_route_fail_open"
-			snapshot.Wait = time.Since(startedAt)
-			c.mu.Unlock()
-			return func() {}, snapshot, newGPTRetryPressureLimitedError()
 		}
 		// Once a waiter exists, let queued retries take the next permit before
 		// newly arriving requests. This avoids a busy model starving older
 		// requests while still keeping the queue bounded.
-		if snapshot.PermitLimit > 0 && state.inFlight < snapshot.PermitLimit &&
-			(state.waiters == 0 || waiterRegistered) {
+		if snapshot.PermitLimit > 0 && (failOpenWhenEligible || (state.inFlight < snapshot.PermitLimit &&
+			(state.waiters == 0 || waiterRegistered))) {
 			if waiterRegistered {
 				state.waiters--
 				waiterRegistered = false
@@ -369,6 +370,8 @@ func (c *gptRetryPressureController) acquireWithPolicy(ctx context.Context, mode
 				return nil, snapshot, newGPTRetryPressureLimitedError()
 			}
 			state.waiters++
+			queued = true
+			snapshot.Queued = true
 			waiterRegistered = true
 			snapshot.WaitingRetries = state.waiters
 		}
@@ -527,7 +530,8 @@ func (m *Manager) acquireGPTRetryPermitWithPolicy(ctx context.Context, providers
 		"retry_permit_wait_ms":   snapshot.Wait.Milliseconds(),
 		"retry_permit_acquired":  snapshot.Acquired,
 		"retry_permit_rejected":  snapshot.Rejected,
-		"retry_permit_fail_open": failOpenWhenEligible && snapshot.Reason == "eligible_route_fail_open",
+		"retry_permit_fail_open": snapshot.FailOpen,
+		"retry_permit_queued":    snapshot.Queued,
 	}
 	addRequestAttemptLogFields(ctx, fields)
 	entry := logEntryWithRequestID(ctx).WithFields(fields)

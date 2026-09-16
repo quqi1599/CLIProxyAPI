@@ -110,6 +110,7 @@ type selectionAvailabilitySummary struct {
 	skippedUnavailable   int
 	skippedCompatibility int
 	healthDownweighted   int
+	healthDeferred       int
 }
 
 type requestAttemptTrace struct {
@@ -434,7 +435,7 @@ func (t *requestAttemptTrace) recordGPTRetryPressure(snapshot gptRetryPressureSn
 	t.gptRetryPressurePermitLimit = snapshot.PermitLimit
 	t.gptRetryPressureEligible = snapshot.EligibleRoutes
 	t.gptRetryPressureDegraded = snapshot.DegradedRoutes
-	if err != nil || snapshot.Rejected || snapshot.State == gptRetryPressureStateCongested || snapshot.Wait >= time.Millisecond {
+	if snapshot.Rejected || snapshot.Queued {
 		t.gptRetryPressureThrottled = true
 	}
 	t.mu.Unlock()
@@ -645,6 +646,9 @@ func (t *requestAttemptTrace) selectionLogFields() log.Fields {
 	}
 	if summary.skippedCompatibility > 0 {
 		fields["candidate_skipped_compatibility"] = summary.skippedCompatibility
+	}
+	if summary.healthDeferred > 0 {
+		fields["candidate_health_deferred"] = summary.healthDeferred
 	}
 	if summary.healthDownweighted > 0 {
 		fields["candidate_health_downweighted"] = summary.healthDownweighted
@@ -903,6 +907,7 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 
 	fields := log.Fields{
 		"event":                "request_execution_summary",
+		"summary_phase":        "terminal",
 		"final_success":        logFinalSuccess,
 		"attempt_count":        summary.AttemptCount,
 		"fallback_count":       summary.FallbackCount,
@@ -950,6 +955,7 @@ func logRequestExecutionSummary(ctx context.Context, trace *requestAttemptTrace,
 		fields["first_event_timeout_count"] = summary.GPTFirstEventTimeouts
 	}
 	if summary.GPTFirstEventPolicy.PolicyState != "" {
+		fields["retry_admission_wait_budget_ms"] = gptRetryAdmissionWaitBudget.Milliseconds()
 		fields["first_event_policy_state"] = summary.GPTFirstEventPolicy.PolicyState
 		fields["first_event_policy_reason"] = summary.GPTFirstEventPolicy.DecisionReason
 		fields["first_event_policy_source"] = summary.GPTFirstEventPolicy.DecisionSource
@@ -3279,6 +3285,9 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			}
 			return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 		}
+		if gptRoute {
+			availableAll, availabilitySummary.healthDeferred = m.preferHealthyGPTRoutes(availableAll, routeModel, now)
+		}
 		if len(availableAll) > 1 {
 			sort.Slice(availableAll, func(i, j int) bool { return availableAll[i].ID < availableAll[j].ID })
 		}
@@ -4423,6 +4432,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 		}
 		var failed bool
 		var clientGone bool
+		var terminalErr error
 		defer func() {
 			if deliveryAudit != nil && deliveryAudit.tracker != nil {
 				deliveryAudit.tracker.Finish()
@@ -4446,13 +4456,22 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				streamDuration = 0
 			}
 			finishReason := runtime.stats.summaryFields.finishReason
-			if finishReason == "" {
-				finishReason = "done"
-				if failed {
-					finishReason = "error"
-				} else if clientGone {
-					finishReason = "client_gone"
+			finalStatus := http.StatusOK
+			finalErrorCode := ""
+			if failed {
+				internalpayload.MarkTransformReportFailed(ctx)
+				finishReason = "error"
+				finalStatus = statusCodeFromError(terminalErr)
+				if finalStatus < http.StatusBadRequest {
+					finalStatus = http.StatusBadGateway
 				}
+				finalErrorCode = errorCodeFromError(terminalErr)
+			} else if clientGone {
+				finishReason = "client_gone"
+				finalStatus = 499
+				finalErrorCode = "request_canceled"
+			} else if finishReason == "" {
+				finishReason = "done"
 			}
 			record := internalusage.StreamSummaryRecord{
 				TimeToFirstChunkMs:         firstPayloadDelay.Milliseconds(),
@@ -4466,6 +4485,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				StreamOutputTokensObserved: runtime.stats.summaryFields.outputTokensObserved,
 				ClientGone:                 clientGone && !failed,
 				FinishReason:               finishReason,
+				FinalStatus:                finalStatus,
+				FinalErrorCode:             finalErrorCode,
 			}
 			if completeStreamSummaryUpstream(ctx, meta, runtime.attempt, record) {
 				return
@@ -4480,6 +4501,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, meta streamE
 				if !cliproxyexecutor.IsRemoteCompactionIntent(meta.compactionIntent) && isGPTRetryRoute([]string{meta.provider}, meta.requestedModel) {
 					chunk.Err = normalizeOpaqueGPTAttemptFailure(chunk.Err, failurecontract.StreamPhaseAfterOutput, true)
 				}
+				terminalErr = chunk.Err
 				rerr := resultErrorFromCause(chunk.Err)
 				m.markExecutionResult(ctx, auth, selectorModel, Result{AuthID: auth.ID, Provider: meta.provider, Model: meta.upstreamModel, Success: false, Duration: time.Since(startedAt), TTFT: firstPayloadDelay, Error: rerr, Cause: chunk.Err}, meta.compactionIntent)
 				resultRecorded = true
@@ -4577,6 +4599,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
 		if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+			if trace.gptRetryAdmissionExhausted() {
+				trace.markGPTFirstEventBudgetExhausted()
+				return nil, newGPTFirstEventWaitBudgetError()
+			}
 			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
 				trace.markGPTFirstEventBudgetExhausted()
 				return nil, newGPTFirstEventWaitBudgetError()
@@ -5651,8 +5677,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 			}
 			retryPermitRelease = release
 		}
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
-			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
+		if !homeMode && credentialRetryLimitReached(ctx, len(attempted), maxRetryCredentials, routeModel, opts, lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -5775,11 +5800,11 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				trace.recordExecution(provider, resultModel, providerExecutorName(executor))
 			}
 			startedAt := time.Now()
+			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
 			if retryPermitRelease != nil {
 				retryPermitRelease()
 				retryPermitRelease = nil
 			}
-			resp, errExec := execute(executor, execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					m.markSelectorLoadDone(execCtx, auth.ID, routeModel)
@@ -5920,6 +5945,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				m.markRetryChannelTried(ctx, tried, auth, authErr)
 			}
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, authErr)
+			if routeFallback && isRequestScopedContextLimitError(authErr) {
+				m.markContextLimitRouteTried(ctx, tried, auth, routeModel)
+			}
 			transientNetworkFallback := isTransientRoutingError(authErr)
 			emptyUpstreamFallback := isRetryableEmptyUpstreamResponseError(authErr)
 			if isRequestInvalidError(authErr) {
@@ -5992,13 +6020,16 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			retryPermitRelease = release
 		}
 		if gptRoute {
+			if trace.gptRetryAdmissionExhausted() {
+				trace.markGPTFirstEventBudgetExhausted()
+				return nil, newGPTFirstEventWaitBudgetError()
+			}
 			if remaining, tracked := trace.gptFirstEventRemainingBudget(); tracked && remaining <= 0 {
 				trace.markGPTFirstEventBudgetExhausted()
 				return nil, newGPTFirstEventWaitBudgetError()
 			}
 		}
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) > maxRetryCredentials &&
-			!shouldBypassCredentialRetryLimitForRequest(routeModel, opts, lastErr) {
+		if !homeMode && credentialRetryLimitReached(ctx, len(attempted), maxRetryCredentials, routeModel, opts, lastErr) {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -6099,12 +6130,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 		attempted[auth.ID] = struct{}{}
+		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, providers, execReq, opts, routeModel, models, pooled)
 		if retryPermitRelease != nil {
 			retryPermitRelease()
 			retryPermitRelease = nil
 		}
-		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, providers, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, newCallerRequestFailure(errCtx)
@@ -6148,6 +6179,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			routeFallback := shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
 			if routeFallback && isDeepSeekCompatibilityFallbackError(errStream) {
 				m.markCompatibilityFallbackRouteTried(tried, auth)
+			}
+			if routeFallback && isRequestScopedContextLimitError(errStream) {
+				m.markContextLimitRouteTried(ctx, tried, auth, routeModel)
 			}
 			transientNetworkFallback := isTransientRoutingError(errStream)
 			emptyUpstreamFallback := isRetryableEmptyUpstreamResponseError(errStream)
@@ -11211,6 +11245,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
+	candidates, deepSeekExcluded := prefilterDeepSeekResponsesAuths(candidates, model, opts)
+	compatibilityExcluded += deepSeekExcluded
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
@@ -11318,6 +11354,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
+	if shouldPrefilterDeepSeekResponses(model, opts) {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
@@ -11481,6 +11520,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
+	candidates, deepSeekExcluded := prefilterDeepSeekResponsesAuths(candidates, model, opts)
+	compatibilityExcluded += deepSeekExcluded
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
@@ -11547,6 +11588,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
+	if shouldPrefilterDeepSeekResponses(model, opts) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	if cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}

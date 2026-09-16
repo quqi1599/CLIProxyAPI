@@ -8,6 +8,7 @@ import (
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -190,6 +191,14 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 	defer manager.releaseZeroEligibleProbe(ctx, req.Model)
 	outcome := managerAttemptOutcome[T]{}
 	defer func() {
+		if !outcome.success {
+			internalpayload.MarkTransformReportFailed(ctx)
+		}
+		// A stream is only admitted here. Its final result is published after
+		// upstream completion and downstream delivery, not after the first chunk.
+		if _, streaming := any(outcome.result).(*cliproxyexecutor.StreamResult); streaming && outcome.success {
+			return
+		}
 		coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
 			RequestID:    trace.requestIDValue(),
 			FinalSuccess: outcome.success,

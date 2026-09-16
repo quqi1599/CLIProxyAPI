@@ -426,6 +426,18 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	}
 	forcedToolChoiceInput := body
 	body = disableThinkingIfToolChoiceForced(body)
+	if plan.providerIdentity.Kind == "deepseek" && requiresReturnedThinkingHistory(baseModel) {
+		choice := gjson.GetBytes(body, "tool_choice.type").String()
+		if choice == "any" || choice == "tool" {
+			// DeepSeek defaults thinking on. Removing the field, as for Claude,
+			// would re-enable it, even when the client explicitly disabled it.
+			body, err = disableDeepSeekThinkingForIncompleteHistory(body, "claude")
+			if err != nil {
+				return plan, err
+			}
+			body = deleteDeepSeekThinkingBudgetPaths(body)
+		}
+	}
 	providerCompatibilityDowngrades := make([]string, 0, 1)
 	if !bytes.Equal(forcedToolChoiceInput, body) {
 		providerCompatibilityDowngrades = append(providerCompatibilityDowngrades, claudeForcedToolChoiceThinkingDowngrade)

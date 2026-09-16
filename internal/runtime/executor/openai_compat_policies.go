@@ -679,7 +679,8 @@ func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.
 		output = normalizeDeepSeekChatAliases(output)
 	}
 	output = scrubDeepSeekThinkingBudgetForCompat(output, state.model, state.baseURL, "deepseek")
-	if state.endpoint == "responses" {
+	if state.endpoint == "responses" || state.endpoint == "compact" {
+		output = scrubDeepSeekThinkingToolChoice(output, state.model, state.baseURL, "deepseek")
 		output = helps.NormalizeDeepSeekResponsesThinking(output)
 		return compat.TransformResult{
 			Payload:    output,
@@ -786,7 +787,7 @@ func openAICompatDeepSeekPolicyDowngrades(input, output []byte) []string {
 		}
 	}
 	if deepSeekThinkingHistoryIntent(input, "openai") != deepSeekThinkingIntentDisabled &&
-		gjson.GetBytes(output, "thinking.type").String() == "disabled" &&
+		deepSeekThinkingHistoryIntent(output, "openai") == deepSeekThinkingIntentDisabled &&
 		!openAICompatJSONValueChanged(input, output, "tool_choice") &&
 		gjson.GetBytes(input, "tool_choice").Exists() {
 		downgrades = append(downgrades, openAICompatDeepSeekToolChoiceDowngrade)

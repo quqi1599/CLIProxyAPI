@@ -98,7 +98,7 @@ func userFacingDeepSeekFIMMessage(text string) string {
 }
 
 func deepSeekUnsupportedToolChineseNames(errText string) []string {
-	markers := []string{"当前请求还包含不支持的：", "工具类型："}
+	markers := []string{"当前请求还包含不支持的：", "工具类型：", "当前 DeepSeek 通道无法执行这些工具："}
 	seen := make(map[string]struct{})
 	toolNames := make([]string, 0, 4)
 	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
@@ -136,6 +136,8 @@ func deepSeekUnsupportedToolChineseNames(errText string) []string {
 func deepSeekToolChineseName(toolType string) string {
 	normalized := strings.ToLower(strings.TrimSpace(toolType))
 	switch {
+	case strings.Contains(normalized, "web_search"):
+		return "联网搜索"
 	case strings.Contains(normalized, "namespace"):
 		return "工具分组"
 	case strings.Contains(normalized, "file_search"):
@@ -145,7 +147,7 @@ func deepSeekToolChineseName(toolType string) string {
 	case strings.Contains(normalized, "computer"):
 		return "电脑操作"
 	case strings.Contains(normalized, "mcp"):
-		return "MCP 外部工具"
+		return "外部扩展工具"
 	case strings.Contains(normalized, "custom"):
 		return "自定义工具"
 	}

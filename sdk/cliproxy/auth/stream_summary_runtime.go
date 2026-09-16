@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
@@ -153,6 +154,22 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 	if !ok {
 		return
 	}
+	status := record.FinalStatus
+	if status == 0 {
+		status = http.StatusOK
+		if record.ClientGone {
+			status = 499
+		} else if record.FinishReason == "error" {
+			status = http.StatusBadGateway
+		}
+	}
+	success := status < http.StatusBadRequest
+	outcome := "completed"
+	if record.ClientGone {
+		outcome = "cancelled"
+	} else if !success {
+		outcome = "failed"
+	}
 
 	fields := log.Fields{
 		"event":                         "stream_execution_summary",
@@ -181,6 +198,12 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 		"tokens_per_second":             streamTokensPerSecond(record.StreamOutputTokens, time.Duration(record.StreamDurationMs)*time.Millisecond),
 		"client_gone":                   record.ClientGone,
 		"finish_reason":                 record.FinishReason,
+		"final_success":                 success,
+		"final_status":                  status,
+		"final_error_code":              record.FinalErrorCode,
+		"terminal_outcome":              outcome,
+		"summary_phase":                 "terminal",
+		"http_status":                   internallogging.GetResponseStatus(ctx),
 	}
 	addToolShapeLogFields(fields, meta.toolShape)
 	addToolStreamRepairLogFields(fields, internallogging.GetToolStreamRepairStats(ctx))
@@ -189,6 +212,18 @@ func logAndPersistStreamSummary(ctx context.Context, meta streamExecutionLogMeta
 
 	if dbPlugin := internalusage.GetDatabasePlugin(); dbPlugin != nil {
 		dbPlugin.HandleStreamSummary(ctx, record)
+	}
+	coreusage.PublishRequestFinal(ctx, coreusage.RequestFinal{
+		RequestID: record.RequestID, FinalSuccess: success,
+		AttemptCount: record.AttemptNo, CompletedAt: time.Now(),
+	})
+	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
+		trace.recordFinalStatus(status)
+		var finalErr error
+		if !success {
+			finalErr = &Error{HTTPStatus: status, Code: record.FinalErrorCode, Message: "stream did not complete"}
+		}
+		logRequestExecutionSummary(ctx, trace, success, finalErr, true)
 	}
 }
 

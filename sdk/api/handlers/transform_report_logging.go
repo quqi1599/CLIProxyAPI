@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"hash/fnv"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
@@ -12,10 +14,6 @@ import (
 func addTransformReportLogObserver(ctx context.Context) bool {
 	requestID := logging.GetRequestID(ctx)
 	return internalpayload.AddTransformReportObserver(ctx, func(report internalpayload.TransformReport) {
-		stages, errMarshal := json.Marshal(report.Stages)
-		if errMarshal != nil {
-			stages = []byte("[]")
-		}
 		fields := log.Fields{
 			"event":                     "payload_transform_summary",
 			"wire_input_bytes":          report.WireInputBytes,
@@ -27,11 +25,15 @@ func addTransformReportLogObserver(ctx context.Context) bool {
 			"transform_patched_count":   report.PatchedCount,
 			"transform_duration_ms":     report.Duration.Milliseconds(),
 			"transform_stage_count":     len(report.Stages),
-			"transform_stages":          string(stages),
 			"amplification_ratio":       report.FinalAmplification.Ratio,
 			"amplification_exceeded":    report.FinalAmplification.Exceeded,
 			"instrumented":              report.Instrumented,
 			"finalized":                 report.Finalized,
+		}
+		if includeTransformStageDetails(ctx, report) {
+			if stages, errMarshal := json.Marshal(report.Stages); errMarshal == nil {
+				fields["transform_stages"] = string(stages)
+			}
 		}
 		entry := log.WithFields(fields)
 		if requestID != "" {
@@ -39,4 +41,20 @@ func addTransformReportLogObserver(ctx context.Context) bool {
 		}
 		entry.Info("payload transform summary")
 	})
+}
+
+func includeTransformStageDetails(ctx context.Context, report internalpayload.TransformReport) bool {
+	if report.Failed || log.IsLevelEnabled(log.DebugLevel) || logging.GetResponseStatus(ctx) >= 400 ||
+		!report.Finalized || report.FinalAmplification.Exceeded || report.Duration >= 100*time.Millisecond {
+		return true
+	}
+	for _, stage := range report.Stages {
+		if stage.Amplification.Exceeded {
+			return true
+		}
+	}
+	// A stable one-percent sample avoids a shared counter on the request path.
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(logging.GetRequestID(ctx)))
+	return hash.Sum32()%100 == 0
 }

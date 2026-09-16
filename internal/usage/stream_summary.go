@@ -25,6 +25,8 @@ type StreamSummaryRecord struct {
 	StreamOutputTokensObserved bool
 	ClientGone                 bool
 	FinishReason               string
+	FinalStatus                int
+	FinalErrorCode             string
 	RecordedAt                 time.Time
 }
 

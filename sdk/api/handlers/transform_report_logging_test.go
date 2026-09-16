@@ -5,12 +5,41 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
+
+func TestTransformStageSamplingRetainsFailuresAndAnomalies(t *testing.T) {
+	oldLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() { log.SetLevel(oldLevel) })
+	report := internalpayload.TransformReport{Finalized: true}
+	sampled := 0
+	for i := 0; i < 10000; i++ {
+		ctx := logging.WithRequestID(context.Background(), fmt.Sprintf("sample-%d", i))
+		if includeTransformStageDetails(ctx, report) {
+			sampled++
+		}
+	}
+	if sampled < 50 || sampled > 150 {
+		t.Fatalf("sample count=%d, expected about 1%%", sampled)
+	}
+	ctx := logging.WithRequestID(context.Background(), "ordinary")
+	for _, modified := range []internalpayload.TransformReport{
+		{Finalized: true, Failed: true},
+		{Finalized: true, Duration: 100 * time.Millisecond},
+		{Finalized: true, FinalAmplification: internalpayload.AmplificationObservation{Exceeded: true}},
+		{Finalized: false},
+	} {
+		if !includeTransformStageDetails(ctx, modified) {
+			t.Fatal("lost failure/slow/anomaly stage details")
+		}
+	}
+}
 
 func TestTransformReportLogObserverEmitsMetadataOnly(t *testing.T) {
 	const secret = "secret-prompt-must-not-appear"
@@ -23,6 +52,7 @@ func TestTransformReportLogObserverEmitsMetadataOnly(t *testing.T) {
 
 	ctx := logging.WithRequestID(context.Background(), "req-transform-1")
 	ctx = internalpayload.WithTransformReportBytes(ctx, 80, int64(len(secret)))
+	internalpayload.MarkTransformReportFailed(ctx)
 	if !addTransformReportLogObserver(ctx) {
 		t.Fatal("observer was not registered")
 	}

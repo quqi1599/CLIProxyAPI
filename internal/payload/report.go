@@ -36,6 +36,7 @@ type TransformStageReport struct {
 // TransformReport summarizes payload transformation cost without retaining
 // prompt, reasoning, tool output, image, credential, or other body content.
 type TransformReport struct {
+	Failed         bool  `json:"failed,omitempty"`
 	Instrumented   bool  `json:"instrumented"`
 	Finalized      bool  `json:"finalized"`
 	WireInputBytes int64 `json:"wire_input_bytes"`
@@ -49,6 +50,16 @@ type TransformReport struct {
 	Duration           time.Duration            `json:"duration"`
 	Stages             []TransformStageReport   `json:"stages,omitempty"`
 	FinalAmplification AmplificationObservation `json:"final_amplification"`
+}
+
+// MarkTransformReportFailed preserves stage diagnostics when execution fails
+// before an HTTP status is available to the downstream handler.
+func MarkTransformReportFailed(ctx context.Context) {
+	if accumulator := transformReportAccumulatorFromContext(ctx); accumulator != nil {
+		accumulator.mu.Lock()
+		accumulator.report.Failed = true
+		accumulator.mu.Unlock()
+	}
 }
 
 type transformReportContextKey struct{}
