@@ -120,8 +120,22 @@ func shouldCountCodexChannelBreakerFailure(result Result) bool {
 		if failure.Kind == failurecontract.RateLimited {
 			return false
 		}
-		return !failure.OutputCommitted && failure.Retryable &&
-			(failure.Scope == failurecontract.ScopeModel || failure.Scope == failurecontract.ScopeProvider)
+		if failure.Scope != failurecontract.ScopeModel && failure.Scope != failurecontract.ScopeProvider {
+			return false
+		}
+		if failure.OutputCommitted {
+			// Replay safety and channel health are independent. A broken stream
+			// cannot be replayed, but must still lower its route's success rate
+			// and count toward the breaker for subsequent requests.
+			switch failure.Kind {
+			case failurecontract.ProviderUnavailable, failurecontract.TransportError,
+				failurecontract.UpstreamProtocolError, failurecontract.ModelUnavailable:
+				return true
+			default:
+				return false
+			}
+		}
+		return failure.Retryable
 	}
 	return shouldCountChannelBreakerFailure(result)
 }

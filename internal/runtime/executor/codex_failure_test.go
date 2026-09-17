@@ -45,6 +45,27 @@ func TestCanonicalCodexFailureMetadataOnlyIsNotGhostServerError(t *testing.T) {
 	}
 }
 
+func TestCanonicalCodexFastAPIErrorPreservesRequestBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		scope  failurecontract.Scope
+	}{
+		{"http_400", http.StatusBadRequest, `{"error":{"type":"fastapi_error","message":"bad request"}}`, failurecontract.ScopeRequest},
+		{"invalid_input", http.StatusOK, `{"error":{"type":"fastapi_error","code":"invalid_parameter"}}`, failurecontract.ScopeRequest},
+		{"context", http.StatusOK, `{"error":{"type":"fastapi_error","code":"context_length_exceeded"}}`, failurecontract.ScopeRequest},
+		{"credentials", http.StatusOK, `{"error":{"type":"fastapi_error","code":"invalid_api_key"}}`, failurecontract.ScopeCredential},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failure, _ := canonicalCodexFailure(codexFailureInput{outerStatus: tc.status, body: []byte(tc.body)})
+			if failure.Scope != tc.scope || failure.Retryable {
+				t.Fatalf("FastAPI wrapper overrode deterministic error: %+v", failure)
+			}
+		})
+	}
+}
+
 func TestCanonicalCodexFailureDeterministicOuter400NeverRetries(t *testing.T) {
 	tests := []struct {
 		name  string

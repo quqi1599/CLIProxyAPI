@@ -317,7 +317,7 @@ func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46Paylo
 	hook := logtest.NewGlobal()
 	hook.Reset()
 
-	body := buildClaudeCompatToolHistoryBody(200, strings.Repeat("x", 120*1024))
+	body := buildClaudeCompatToolHistoryBody(200, strings.Repeat("x", 340*1024))
 	preflight := newClaudeCompatPreflight(body)
 	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
 		requestedModel: "claude-sonnet-4-6",
@@ -349,6 +349,54 @@ func TestRejectLargeClaudeCompatToolHistory_UsesBodyDerivedStatsForSonnet46Paylo
 	}
 	if got := entry.Data["tool_interaction_count"]; got != 400 {
 		t.Fatalf("tool_interaction_count = %#v, want 400", got)
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_MiniMaxM3PayloadBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, model, kind string
+		bytes             int
+		wantReject        bool
+	}{
+		{"m3_old_limit", "MiniMax-M3", "minimax", 20 * 1024 * 1024, false},
+		{"m3_incident_size", "MiniMax-M3", "minimax", 26141621, false},
+		{"m3_previous_limit", "MiniMax-M3", "minimax", 32 * 1024 * 1024, false},
+		{"m3_shared_limit", "MiniMax-M3", "minimax", 60 * 1024 * 1024, false},
+		{"m3_below_limit", "MiniMax-M3", "minimax", 64*1024*1024 - 1, false},
+		{"m3_at_limit", "MiniMax-M3", "minimax", 64 * 1024 * 1024, true},
+		{"m27_unchanged", "MiniMax-M2.7", "minimax", 12 * 1024 * 1024, true},
+		{"step_unchanged", "step-3.7-flash", "step", 20 * 1024 * 1024, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := buildClaudeCompatToolHistoryBody(1, "")
+			body = buildClaudeCompatToolHistoryBody(1, strings.Repeat("x", tc.bytes-len(body)))
+			preflight := newClaudeCompatPreflight(body)
+			meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
+				requestedModel: "claude-sonnet-4-6",
+				upstreamModel:  tc.model,
+				compatKind:     tc.kind,
+			}, preflight)
+			reason, rejected := largeClaudeCompatToolHistoryRejectReason(body, meta, preflight)
+			if rejected != tc.wantReject || (rejected && reason != "payload_bytes") {
+				t.Fatalf("rejected=%t reason=%q, want rejected=%t", rejected, reason, tc.wantReject)
+			}
+		})
+	}
+}
+
+func TestRejectLargeClaudeCompatToolHistory_AllowsLargeMiniMaxM3AgentSession(t *testing.T) {
+	body := buildClaudeCompatToolHistoryBody(366, strings.Repeat("x", 71*1024))
+	preflight := newClaudeCompatPreflight(body)
+	meta := applyClaudeCompatPreflightStats(compatRepairLogMeta{
+		requestedModel: "claude-sonnet-4-6",
+		upstreamModel:  "MiniMax-M3",
+		compatKind:     "minimax",
+	}, preflight)
+	if len(body) < 20*1024*1024 || len(body) >= 32*1024*1024 || preflight.interactionCount() != 732 {
+		t.Fatalf("unexpected fixture: bytes=%d interactions=%d", len(body), preflight.interactionCount())
+	}
+	if err := rejectLargeClaudeCompatToolHistory(context.Background(), body, meta, preflight); err != nil {
+		t.Fatalf("large MiniMax M3 session rejected: %v", err)
 	}
 }
 

@@ -779,8 +779,8 @@ func TestCommittedProviderFailureIsNeverReplayed(t *testing.T) {
 		t.Fatalf("committed provider failure retry = %t wait = %v, want false/0", retry, wait)
 	}
 	result := Result{Success: false, Error: resultErrorFromCause(failure), Cause: failure}
-	if shouldCountCodexChannelBreakerFailure(result) {
-		t.Fatal("committed provider failure was counted by the channel breaker")
+	if !shouldCountCodexChannelBreakerFailure(result) {
+		t.Fatal("committed provider failure was excluded from channel health")
 	}
 }
 

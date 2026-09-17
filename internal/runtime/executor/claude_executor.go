@@ -224,7 +224,7 @@ const (
 	largeClaudeCompatStepLimitMultiplier           = 5
 	largeClaudeCompatSonnet46PayloadBytes          = largeClaudeCompatToolHistoryLimitMultiplier * 512 * 1024
 	largeClaudeCompatSonnet46MiniMaxPayloadBytes   = 12 * 1024 * 1024
-	largeClaudeCompatSonnet46MiniMaxM3PayloadBytes = 20 * 1024 * 1024
+	largeClaudeCompatSonnet46MiniMaxM3PayloadBytes = 64 * 1024 * 1024
 	largeClaudeCompatToolHistoryPayloadBytes       = largeClaudeCompatToolHistoryLimitMultiplier * 4 * 1024 * 1024
 	largeClaudeCompatToolResultPilePayloadBytes    = largeClaudeCompatToolHistoryLimitMultiplier * 1 * 1024 * 1024
 	largeClaudeCompatToolHistoryMessages           = largeClaudeCompatToolHistoryLimitMultiplier * 800
@@ -2741,7 +2741,7 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 			sonnet46PayloadLimit = largeClaudeCompatSonnet46MiniMaxM3PayloadBytes
 		}
 	} else if strings.EqualFold(strings.TrimSpace(meta.compatKind), "step") {
-		sonnet46PayloadLimit = largeClaudeCompatSonnet46MiniMaxM3PayloadBytes
+		sonnet46PayloadLimit = largeClaudeCompatStepPayloadBytes
 	}
 	if payloadBytes >= sonnet46PayloadLimit && interactions > 0 {
 		return "payload_bytes", true
@@ -2754,7 +2754,7 @@ func largeClaudeCompatToolHistoryRejectReason(body []byte, meta compatRepairLogM
 			return "step_tool_history", true
 		}
 	}
-	if payloadBytes >= largeClaudeCompatToolHistoryPayloadBytes {
+	if payloadBytes >= max(largeClaudeCompatToolHistoryPayloadBytes, sonnet46PayloadLimit) {
 		return "payload_bytes", true
 	}
 	if messageCount >= largeClaudeCompatToolHistoryMessages && interactions >= largeClaudeCompatToolHistoryInteractions {

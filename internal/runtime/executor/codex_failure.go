@@ -530,7 +530,9 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		failure.Kind = failurecontract.RateLimited
 		failure.Scope = failurecontract.ScopeModel
 		failure.Retryable = true
-	case codexProviderFailureIdentifier(code, typeID):
+	case codexProviderFailureIdentifier(code, typeID) || outerStatus == http.StatusOK && identifierIs("fastapi_error"):
+		// Some relays signal generation failures as fastapi_error inside a
+		// successful HTTP stream. Keep ordinary HTTP 4xx rejection semantics.
 		if code == "" || isCodexPlaceholderCode(code) {
 			code = typeID
 		}
