@@ -137,6 +137,7 @@ Aho-Corasick 候选扫描；只有出现候选词时才进入关键词增强的�
 ```yaml
 content-audit:
   enabled: true
+  mode: strict
   audit-only: true
   policy-file: "content-audit/policy.yaml"
   database-path: "content-audit/audit.db"
@@ -146,6 +147,16 @@ content-audit:
   raw-retention-days: 30
   metadata-retention-days: 180
 ```
+
+管理 API 提供独立的临时开关：`GET /v0/management/content-audit/enabled` 查看状态，
+`PUT` 或 `PATCH` 并提交 `{"value":false}` 可关闭请求时审计；提交 `{"value":true}`
+即可恢复。该开关走现有配置热加载，不需要重启或重建镜像；关闭期间请求不会被审计拦截，
+但审计策略、历史证据和数据库不会删除。接口受管理 API 鉴权和现有配置并发版本保护。
+
+管理中心还提供三档模式：`strict` 保持当前完整策略；`simple` 只拦截高置信度的违法操作和
+明确危险生成，政治宽泛规则及宽泛色情/角色扮演规则仅观察；`off` 完全关闭请求时审计。
+通过 `GET /v0/management/content-audit/mode` 查看，提交 `PUT` 或 `PATCH` 请求体
+`{"value":"strict"}`、`{"value":"simple"}` 或 `{"value":"off"}` 即时切换。
 
 请通过环境变量提供 `CPA_AUDIT_IDENTITY_SECRET` 和 `CPA_AUDIT_EVIDENCE_KEY`。
 审计证据由管理 API 身份验证后直接查看。策略文件应放在可写的持久化目录，

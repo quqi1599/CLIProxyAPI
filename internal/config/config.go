@@ -206,6 +206,7 @@ type Config struct {
 // Secret fields should normally be supplied through the matching environment variables.
 type ContentAuditConfig struct {
 	Enabled                 bool   `yaml:"enabled" json:"enabled"`
+	Mode                    string `yaml:"mode,omitempty" json:"mode,omitempty"`
 	AuditOnly               bool   `yaml:"audit-only" json:"audit-only"`
 	PolicyFile              string `yaml:"policy-file" json:"policy-file"`
 	DatabasePath            string `yaml:"database-path" json:"database-path"`

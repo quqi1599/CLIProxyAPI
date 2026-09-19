@@ -30,6 +30,10 @@ type contentAuditPolicyRollbackRequest struct {
 	Reason string `json:"reason"`
 }
 
+type contentAuditModeRequest struct {
+	Value string `json:"value"`
+}
+
 func (h *Handler) contentAuditService() *contentaudit.Service {
 	if h == nil {
 		return nil
@@ -37,6 +41,87 @@ func (h *Handler) contentAuditService() *contentaudit.Service {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.contentAudit
+}
+
+// GetContentAuditEnabled returns the request-time audit switch.
+func (h *Handler) GetContentAuditEnabled(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": h.cfg.ContentAudit.Enabled})
+}
+
+// PutContentAuditEnabled persists and hot-reloads the request-time audit switch.
+// The existing audit database and policy remain unchanged when the switch is off.
+func (h *Handler) PutContentAuditEnabled(c *gin.Context) {
+	h.updateBoolField(c, func(enabled bool) {
+		h.cfg.ContentAudit.Enabled = enabled
+		if enabled {
+			if h.cfg.ContentAudit.Mode == contentaudit.ModeOff {
+				h.cfg.ContentAudit.Mode = contentaudit.ModeStrict
+			}
+		} else {
+			h.cfg.ContentAudit.Mode = contentaudit.ModeOff
+			h.cfg.ContentAudit.AuditOnly = false
+		}
+	})
+}
+
+// GetContentAuditMode returns the current enforcement mode.
+func (h *Handler) GetContentAuditMode(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(h.cfg.ContentAudit.Mode))
+	if mode == "" {
+		if !h.cfg.ContentAudit.Enabled {
+			mode = contentaudit.ModeOff
+		} else if h.cfg.ContentAudit.AuditOnly {
+			mode = contentaudit.ModeSimple
+		} else {
+			mode = contentaudit.ModeStrict
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"mode": mode, "audit_only": h.cfg.ContentAudit.AuditOnly})
+}
+
+// PutContentAuditMode persists and hot-reloads one of the three audit modes.
+func (h *Handler) PutContentAuditMode(c *gin.Context) {
+	var request contentAuditModeRequest
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &request); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(request.Value))
+	if mode != contentaudit.ModeStrict && mode != contentaudit.ModeSimple && mode != contentaudit.ModeOff {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid content audit mode", "allowed": []string{contentaudit.ModeStrict, contentaudit.ModeSimple, contentaudit.ModeOff}})
+		return
+	}
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	h.cfg.ContentAudit.Mode = mode
+	h.cfg.ContentAudit.Enabled = mode != contentaudit.ModeOff
+	h.cfg.ContentAudit.AuditOnly = false
+	h.mu.Unlock()
+	h.persist(c)
 }
 
 // GetContentAuditStatus returns readiness and policy statistics without secrets.

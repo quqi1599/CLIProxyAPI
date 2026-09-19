@@ -46,6 +46,127 @@ func TestNormalizeModelReviewConfigAllowsBoundedExtendedTimeout(t *testing.T) {
 	}
 }
 
+func TestNormalizeAuditModePreservesLegacyAndExplicitModes(t *testing.T) {
+	tests := []struct {
+		name               string
+		cfg                config.ContentAuditConfig
+		wantMode           string
+		wantEnabled        bool
+		wantSimpleBlock    bool
+		wantPoliticalBlock bool
+	}{
+		{name: "legacy disabled", cfg: config.ContentAuditConfig{}, wantMode: ModeOff, wantEnabled: false},
+		{name: "legacy strict", cfg: config.ContentAuditConfig{Enabled: true}, wantMode: ModeStrict, wantEnabled: true, wantSimpleBlock: true, wantPoliticalBlock: true},
+		{name: "legacy observe", cfg: config.ContentAuditConfig{Enabled: true, AuditOnly: true}, wantMode: ModeSimple, wantEnabled: true, wantSimpleBlock: true},
+		{name: "explicit simple", cfg: config.ContentAuditConfig{Enabled: true, Mode: ModeSimple}, wantMode: ModeSimple, wantEnabled: true, wantSimpleBlock: true},
+		{name: "explicit off", cfg: config.ContentAuditConfig{Enabled: true, Mode: ModeOff}, wantMode: ModeOff, wantEnabled: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := test.cfg
+			normalizeAuditConfig(&cfg)
+			if cfg.Mode != test.wantMode || cfg.Enabled != test.wantEnabled {
+				t.Fatalf("normalized mode/enabled = %q/%v, want %q/%v", cfg.Mode, cfg.Enabled, test.wantMode, test.wantEnabled)
+			}
+			if test.wantMode == ModeSimple && modeAllowsBlock(ModeSimple, "block-cyber-malicious-attack-intent") != test.wantSimpleBlock {
+				t.Fatal("simple mode did not retain the high-confidence cyber rule")
+			}
+			if test.wantMode == ModeSimple && modeAllowsBlock(ModeSimple, "block-political-china-leadership") {
+				t.Fatal("simple mode retained the broad political rule")
+			}
+			if test.wantPoliticalBlock && !modeAllowsBlock(ModeStrict, "block-political-china-leadership") {
+				t.Fatal("strict mode did not retain the political rule")
+			}
+		})
+	}
+}
+
+func TestMiddlewareDisabledPassesThroughAndStripsIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := NewService(config.ContentAuditConfig{Enabled: false}, filepath.Join(t.TempDir(), "config.yaml"))
+	nextCalls := 0
+	identityForwarded := false
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		identityForwarded = c.GetHeader(auditHeaderUserID) != ""
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"sensitive synthetic phrase"}`))
+	request.Header.Set(auditHeaderUserID, "42")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent || nextCalls != 1 {
+		t.Fatalf("status=%d next=%d body=%s", response.Code, nextCalls, response.Body.String())
+	}
+	if identityForwarded {
+		t.Fatal("CPA audit identity header was forwarded while audit was disabled")
+	}
+}
+
+func TestMiddlewareSimpleModeKeepsHighConfidenceBlocksOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(evidenceKeyEnv, "0123456789abcdef0123456789abcdef")
+	tempDir := t.TempDir()
+	policyPath := filepath.Join(tempDir, "policy.yaml")
+	policy := `version: mode-v1
+rules:
+  - id: block-political-china-leadership
+    category: political
+    severity: high
+    action: block
+    keywords: ["political fixture"]
+  - id: block-cyber-malicious-attack-intent
+    category: cyber
+    severity: high
+    action: block
+    keywords: ["cyber fixture"]
+`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	service := NewService(config.ContentAuditConfig{
+		Enabled:       true,
+		Mode:          ModeSimple,
+		PolicyFile:    policyPath,
+		DatabasePath:  filepath.Join(tempDir, "audit.db"),
+		EvidenceKeyID: "test-key",
+	}, filepath.Join(tempDir, "config.yaml"))
+	state := service.state.Load()
+	if state == nil || state.store == nil {
+		t.Fatalf("service state = %#v, want initialized store", state)
+	}
+	defer func() { _ = state.store.Close() }()
+
+	nextCalls := 0
+	router := gin.New()
+	router.Use(service.Middleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		nextCalls++
+		c.Status(http.StatusNoContent)
+	})
+
+	political := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"political fixture"}`))
+	politicalResponse := httptest.NewRecorder()
+	router.ServeHTTP(politicalResponse, political)
+	if politicalResponse.Code != http.StatusNoContent {
+		t.Fatalf("simple political status = %d body=%s, want pass-through", politicalResponse.Code, politicalResponse.Body.String())
+	}
+
+	cyber := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"cyber fixture"}`))
+	cyberResponse := httptest.NewRecorder()
+	router.ServeHTTP(cyberResponse, cyber)
+	if cyberResponse.Code != http.StatusBadRequest {
+		t.Fatalf("simple cyber status = %d body=%s, want block", cyberResponse.Code, cyberResponse.Body.String())
+	}
+	if nextCalls != 1 {
+		t.Fatalf("next handler calls = %d, want 1", nextCalls)
+	}
+}
+
 func TestMiddlewareBlocksBeforeNextAndPersistsCustomerEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv(identitySecretEnv, "identity-shared-secret")

@@ -240,7 +240,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if item.Get("name").Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.name", parsed.ToolCall.Name)
+					name := qualifyResponsesNamespaceToolName(strings.TrimSpace(item.Get("namespace").String()), parsed.ToolCall.Name)
+					toolCall, _ = sjson.SetBytes(toolCall, "function.name", name)
 				}
 
 				if item.Get("arguments").Exists() {
@@ -278,7 +279,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				// converting custom tool definitions.
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 				toolCall, _ = sjson.SetBytes(toolCall, "id", parsed.ToolCall.ID)
-				toolCall, _ = sjson.SetBytes(toolCall, "function.name", parsed.ToolCall.Name)
+				name := qualifyResponsesNamespaceToolName(strings.TrimSpace(item.Get("namespace").String()), parsed.ToolCall.Name)
+				toolCall, _ = sjson.SetBytes(toolCall, "function.name", name)
 				wrappedArgs, _ := sjson.SetBytes([]byte(`{"input":""}`), "input", parsed.ToolCall.Input)
 				toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", string(wrappedArgs))
 				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
@@ -318,13 +320,25 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// "additional_tools" input item instead of the top-level "tools" field,
 	// so merge both sources.
 	var chatCompletionsTools []interface{}
+	seenChatTools := make(map[string]struct{})
 	appendChatTools := func(tools gjson.Result) {
 		if !tools.Exists() || !tools.IsArray() {
 			return
 		}
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			for _, chatTool := range convertResponsesToolToOpenAIChatTools(tool) {
-				chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
+				value := gjson.ParseBytes(chatTool).Value()
+				// Additional tool announcements can repeat declarations. Remove
+				// only identical definitions, never tools by count or name alone.
+				canonical, err := json.Marshal(value)
+				if err == nil {
+					key := string(canonical)
+					if _, exists := seenChatTools[key]; exists {
+						continue
+					}
+					seenChatTools[key] = struct{}{}
+				}
+				chatCompletionsTools = append(chatCompletionsTools, value)
 			}
 			return true
 		})

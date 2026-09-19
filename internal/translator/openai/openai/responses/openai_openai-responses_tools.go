@@ -88,6 +88,13 @@ func convertResponsesFunctionToolToOpenAIChat(tool gjson.Result, overrideName st
 	if parameters := responsesToolParameters(tool); parameters.Exists() {
 		chatTool, _ = sjson.SetRawBytes(chatTool, "function.parameters", []byte(parameters.Raw))
 	}
+	strict := tool.Get("strict")
+	if !strict.Exists() {
+		strict = tool.Get("function.strict")
+	}
+	if strict.Exists() {
+		chatTool, _ = sjson.SetRawBytes(chatTool, "function.strict", []byte(strict.Raw))
+	}
 	return chatTool, true
 }
 

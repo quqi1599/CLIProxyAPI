@@ -12,6 +12,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestCodexToolCompatibilityErrorOnlyTargetsExplicitToolSignals(t *testing.T) {
+	if !codexToolCompatibilityError(http.StatusBadRequest, []byte("Invalid schema for function 'lookup'")) {
+		t.Fatal("expected explicit tool schema error to trigger compatibility retry")
+	}
+	if !codexToolCompatibilityError(http.StatusBadRequest, []byte("Unknown name encrypted at function declaration property")) {
+		t.Fatal("expected function declaration field error to trigger compatibility retry")
+	}
+	if codexToolCompatibilityError(http.StatusBadRequest, []byte("invalid_request_error: malformed payload")) {
+		t.Fatal("generic invalid request must remain non-retryable")
+	}
+	if codexToolCompatibilityError(http.StatusInternalServerError, []byte("invalid schema for function")) {
+		t.Fatal("tool compatibility retry must remain limited to request statuses")
+	}
+}
+
 func TestParseCodexRetryAfter(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 

@@ -99,6 +99,8 @@ usage-retention-days: 30
 #   CPA_AUDIT_IDENTITY_SECRET, CPA_AUDIT_EVIDENCE_KEY
 content-audit:
   enabled: false
+  # strict, simple, or off. Omit for legacy enabled/audit-only behavior.
+  mode: off
   # Start with true to record encrypted hits without rejecting requests; switch to false after review.
   audit-only: true
   policy-file: "content-audit-policy.yaml"

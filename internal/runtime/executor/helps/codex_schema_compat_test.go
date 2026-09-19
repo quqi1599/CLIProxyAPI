@@ -18,3 +18,14 @@ func TestCodexRequestSchemaScope(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexRequestSchemaScopeIncludesAdditionalTools(t *testing.T) {
+	body := []byte(`{"input":[{"type":"additional_tools","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"value":{"pattern":"\\p{L}"}}}}]}]}`)
+	out := NormalizeCodexRequestSchemas(body)
+	if gjson.GetBytes(out, "input.0.tools.0.parameters.properties.value.pattern").Exists() {
+		t.Fatalf("additional tool schema was not normalized: %s", out)
+	}
+	if got := gjson.GetBytes(out, "input.0.tools.0.parameters.type").String(); got != "object" {
+		t.Fatalf("parameters.type = %q, want object", got)
+	}
+}

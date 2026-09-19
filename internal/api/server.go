@@ -677,6 +677,12 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/content-audit/enabled", s.mgmt.GetContentAuditEnabled)
+		mgmt.PUT("/content-audit/enabled", s.mgmt.PutContentAuditEnabled)
+		mgmt.PATCH("/content-audit/enabled", s.mgmt.PutContentAuditEnabled)
+		mgmt.GET("/content-audit/mode", s.mgmt.GetContentAuditMode)
+		mgmt.PUT("/content-audit/mode", s.mgmt.PutContentAuditMode)
+		mgmt.PATCH("/content-audit/mode", s.mgmt.PutContentAuditMode)
 		mgmt.GET("/content-audit/status", s.mgmt.GetContentAuditStatus)
 		mgmt.GET("/content-audit/policy", s.mgmt.GetContentAuditPolicy)
 		mgmt.PUT("/content-audit/policy", s.mgmt.UpdateContentAuditPolicy)

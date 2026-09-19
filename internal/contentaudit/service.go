@@ -47,6 +47,7 @@ type runtimeState struct {
 // Status reports whether enforcement is configured and ready without exposing secrets.
 type Status struct {
 	Enabled                     bool                    `json:"enabled"`
+	Mode                        string                  `json:"mode"`
 	AuditOnly                   bool                    `json:"audit_only"`
 	Ready                       bool                    `json:"ready"`
 	Error                       string                  `json:"error,omitempty"`
@@ -219,6 +220,10 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 }
 
 func normalizeAuditConfig(cfg *config.ContentAuditConfig) {
+	cfg.Mode = normalizeMode(cfg.Mode, cfg.Enabled, cfg.AuditOnly)
+	if cfg.Mode == ModeOff {
+		cfg.Enabled = false
+	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = defaultMaxBodyBytes
 	}
@@ -383,6 +388,7 @@ func (s *Service) Status() Status {
 	}
 	status := Status{
 		Enabled:                     state.cfg.Enabled,
+		Mode:                        state.cfg.Mode,
 		AuditOnly:                   state.cfg.AuditOnly,
 		Ready:                       state.initErr == nil,
 		DatabaseAvailable:           state.store != nil,
@@ -533,9 +539,13 @@ func (s *Service) Middleware() gin.HandlerFunc {
 				modelReview = state.modelReview.review(c.Request.Context(), reviewRequest)
 			}
 		}
-		keywordShouldBlock := decision.Action == RuleActionBlock
+		modeCanBlock := modeAllowsBlock(state.cfg.Mode, decision.RuleID)
+		if !modeCanBlock {
+			cachedBlock = false
+		}
+		keywordShouldBlock := decision.Action == RuleActionBlock && modeCanBlock
 		shouldBlock := keywordShouldBlock || cachedBlock
-		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed {
+		if state.cfg.ModelReview.Mode == ModelReviewModeEnforce && modelReview.Reviewed && modeCanBlock {
 			switch modelReview.Decision {
 			case ModelReviewBlock:
 				if modelReview.Confidence >= state.cfg.ModelReview.BlockMinConfidence {

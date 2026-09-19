@@ -148,6 +148,7 @@ observation. The gate never bans a session, user, or API key.
 ```yaml
 content-audit:
   enabled: true
+  mode: strict
   audit-only: true
   policy-file: "content-audit/policy.yaml"
   database-path: "content-audit/audit.db"
@@ -157,6 +158,19 @@ content-audit:
   raw-retention-days: 30
   metadata-retention-days: 180
 ```
+
+For a temporary runtime pause, use the management API: `GET /v0/management/content-audit/enabled`
+reports the switch, while `PUT` or `PATCH` with `{"value":false}` disables request-time auditing
+and `{"value":true}` restores it. The switch uses the existing hot-reload path, so no restart or
+image rebuild is required. Disabling the switch does not delete the policy, database, or retained
+evidence; management authentication and config-version protection still apply.
+
+The Management Center also exposes three audit modes. `strict` keeps the current
+full policy, `simple` blocks only high-confidence illegal operations and explicit
+dangerous generation while leaving broad political and role-play matches observable,
+and `off` disables request-time auditing. Read the mode with
+`GET /v0/management/content-audit/mode` and switch it with `PUT` or `PATCH` using
+`{"value":"strict"}`, `{"value":"simple"}`, or `{"value":"off"}`.
 
 Provide `CPA_AUDIT_IDENTITY_SECRET` and `CPA_AUDIT_EVIDENCE_KEY` through the
 environment. Management API authentication controls evidence viewing. Keep the

@@ -42,6 +42,7 @@ const (
 	codexOriginator             = "codex-tui"
 	codexDefaultImageToolModel  = "gpt-image-2"
 	codexAlphaSearchBodyBytes   = 32 << 20
+	codexToolSurfaceRetryLimit  = 32
 	codexModelCapacityErrorJSON = `{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"server_error","code":"model_at_capacity"}}`
 )
 
@@ -103,6 +104,68 @@ func (e *CodexExecutor) retryCodexRequestWithoutEncryptedState(ctx context.Conte
 		return retryBody, nil, true, transportErr
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
+	return retryBody, retryResp, true, nil
+}
+
+func codexToolCompatibilityError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	for _, marker := range []string{
+		"invalid schema for function",
+		"invalid function schema",
+		"tool schema",
+		"schema validation",
+		"function declaration",
+		"function_declarations",
+		"too many tools",
+		"maximum number of tools",
+		"tool count",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "unknown name") &&
+		(strings.Contains(lower, "tool") || strings.Contains(lower, "function") || strings.Contains(lower, "property"))
+}
+
+func (e *CodexExecutor) retryCodexRequestWithReducedTools(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, url string, req cliproxyexecutor.Request, body []byte, apiKey string, stream bool, httpClient *http.Client, statusCode int, errorBody []byte) ([]byte, *http.Response, bool, error) {
+	if !codexToolCompatibilityError(statusCode, errorBody) {
+		return body, nil, false, nil
+	}
+	retryBody, reduction := helps.ReduceCodexToolSurface(body, codexToolSurfaceRetryLimit)
+	if reduction.Dropped == 0 || bytes.Equal(retryBody, body) {
+		return body, nil, false, nil
+	}
+	entry := log.WithFields(log.Fields{
+		"event":          "codex_tool_surface_retry",
+		"tool_limit":     codexToolSurfaceRetryLimit,
+		"tools_original": reduction.Original,
+		"tools_kept":     reduction.Kept,
+		"tools_dropped":  reduction.Dropped,
+	})
+	entry.WithContext(ctx).Warn("codex executor: retrying request with reduced tool surface after upstream schema rejection")
+
+	transformStarted := time.Now()
+	httpReq, err := e.prepareCodexAPIRequest(ctx, from, url, req, retryBody, auth, apiKey, stream)
+	if err != nil {
+		return body, nil, true, err
+	}
+	internalpayload.RecordTransformStageSince(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.codex.tool_surface_retry",
+		InputBytes:  int64(len(body)),
+		OutputBytes: int64(len(retryBody)),
+	}, transformStarted, internalpayload.AmplificationOverride{})
+	retryResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		transportErr := newCodexHTTPDoStatusErr(ctx, err, false)
+		entry.WithContext(ctx).WithError(transportErr).Warn("codex executor: reduced tool surface retry failed")
+		return retryBody, nil, true, transportErr
+	}
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
+	entry.WithField("retry_status", retryResp.StatusCode).WithContext(ctx).Info("codex executor: reduced tool surface retry completed")
 	return retryBody, retryResp, true, nil
 }
 
@@ -1287,6 +1350,20 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
 		return resp, transportErr
 	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		if retryBody, retryResp, retried, retryErr := e.retryCodexRequestWithReducedTools(ctx, auth, from, url, req, body, apiKey, false, httpClient, httpResp.StatusCode, data); retryErr != nil {
+			return resp, retryErr
+		} else if retried {
+			body = retryBody
+			httpResp = retryResp
+			data, err = helps.ReadBoundedUpstreamHTTPResponse(httpResp, helps.UpstreamBodyLimits{})
+			if err != nil {
+				transportErr := newCodexTransportStatusErr(httpResp.StatusCode, httpResp.Header, err, false)
+				helps.RecordAPIResponseError(ctx, e.cfg, transportErr)
+				return resp, transportErr
+			}
+		}
+	}
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -1559,6 +1636,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, transportErr
 		}
 		if retryBody, retryResp, retried, retryErr := e.retryCodexRequestWithoutEncryptedState(requestCtx, auth, from, url, req, body, apiKey, true, httpClient, httpResp.StatusCode, data); retryErr != nil {
+			return nil, retryErr
+		} else if retried {
+			body = retryBody
+			httpResp = retryResp
+		} else if retryBody, retryResp, retried, retryErr := e.retryCodexRequestWithReducedTools(requestCtx, auth, from, url, req, body, apiKey, true, httpClient, httpResp.StatusCode, data); retryErr != nil {
 			return nil, retryErr
 		} else if retried {
 			body = retryBody

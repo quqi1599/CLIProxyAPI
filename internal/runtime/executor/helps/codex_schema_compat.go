@@ -31,5 +31,13 @@ func NormalizeCodexRequestSchemas(body []byte) []byte {
 		}
 	}
 	visit(gjson.GetBytes(body, "tools"), "tools")
+	input := gjson.GetBytes(body, "input")
+	if input.IsArray() {
+		for index, item := range input.Array() {
+			if item.Get("type").String() == "additional_tools" {
+				visit(item.Get("tools"), "input."+strconv.Itoa(index)+".tools")
+			}
+		}
+	}
 	return body
 }

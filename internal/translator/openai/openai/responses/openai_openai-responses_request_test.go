@@ -331,6 +331,17 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FlattensNamespaceC
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DeduplicatesRepeatedAdditionalTools(t *testing.T) {
+	raw := []byte(`{
+		"tools":[{"type":"function","name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{}}}],
+		"input":[{"type":"additional_tools","tools":[{"type":"function","name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{}}}]}]
+	}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-6-astra", raw, false)
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("tools count = %d, want 1; output=%s", got, out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesStructuredToolChoice(t *testing.T) {
 	raw := []byte(`{
 		"input": [
