@@ -22,6 +22,10 @@ func userFacingOpenAICompatToolHistoryMessage() string {
 	return "当前 GPT/OpenAI-compatible 路由检测到历史工具调用过多、文件工具结果过多或上下文过大，继续原样转发会显著拖慢或中断请求。请新开会话，或将历史工具调用/文件结果压缩成普通文本摘要，减少重复文件提交；也可以切换到更适合长文件上下文的模型后重试。原样重复提交不会提高成功率。"
 }
 
+func userFacingCodexToolHistoryMessage() string {
+	return "当前 WorkBuddy/Codex 对话已累积较长的工具调用历史，当前非原生 Responses/tool calls 路由无法安全承载，CPA 已停止向上游发送且不会继续轮换重试。请新建会话，或先把历史工具调用、MCP/文件工具结果压缩成普通文本摘要；也可以切换到原生支持 Responses 和 tool calls 的渠道后重试。"
+}
+
 func userFacingDeepSeekChatJSONSchemaMessage() string {
 	return "当前选择的 DeepSeek Chat 接口不支持本次 Codex 请求使用的“结构化 JSON 输出”。这是 DeepSeek 对该输出方式的兼容性限制，不是账号或余额问题。请在 Codex 的模型选择器中切换到原生 GPT 模型后重试；如果继续使用 DeepSeek，请改用普通 JSON 输出。原样重试不会成功。"
 }
@@ -209,6 +213,8 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 	message := UserFacingRequestFeatureUnsupportedMessage()
 	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
 		switch {
+		case hasCodexToolHistorySignal(candidate):
+			message = userFacingCodexToolHistoryMessage()
 		case hasClaudeCodeDeepSeekComplexToolsSignal(candidate):
 			message = userFacingClaudeCodeDeepSeekComplexToolsMessage()
 		case hasClaudeCodeDeepSeekToolHistorySignal(candidate):
@@ -304,6 +310,9 @@ func hasRequestFeatureUnsupportedSignal(text string) bool {
 	if strings.Contains(lower, requestFeatureUnsupportedErrorCode) {
 		return true
 	}
+	if hasCodexToolHistorySignal(lower) {
+		return true
+	}
 	if strings.Contains(lower, "large_claude_tool_history") {
 		return true
 	}
@@ -326,6 +335,10 @@ func hasRequestFeatureUnsupportedSignal(text string) bool {
 		return true
 	}
 	return false
+}
+
+func hasCodexToolHistorySignal(text string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(text)), "codex_tool_history_too_large")
 }
 
 func hasOpenAICompatToolHistorySignal(text string) bool {

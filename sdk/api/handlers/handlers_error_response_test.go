@@ -620,6 +620,21 @@ func TestBuildErrorResponseBody_NormalizesOpenAICompatToolHistoryRequestFeatureU
 	}
 }
 
+func TestBuildErrorResponseBody_NormalizesCodexToolHistoryRequestFeatureUnsupported(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusBadRequest, `{"error":{"message":"request_feature_unsupported: codex_tool_history_too_large. non-native route","type":"invalid_request_error","code":"request_feature_unsupported"}}`)
+
+	var payload ErrorResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Error.Message != userFacingCodexToolHistoryMessage() {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, userFacingCodexToolHistoryMessage())
+	}
+	if payload.Error.Type != requestFeatureUnsupportedErrorType || payload.Error.Code != requestFeatureUnsupportedErrorCode {
+		t.Fatalf("error detail = %#v, want request_feature_unsupported invalid_request_error", payload.Error)
+	}
+}
+
 func TestBuildErrorResponseBody_NormalizesWorkBuddyDeepSeekTutorials(t *testing.T) {
 	tests := []struct {
 		name    string

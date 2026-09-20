@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/url"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -13,6 +14,9 @@ const (
 	gptLargeToolHistoryMultiplier          = 3
 	gptLargeToolHistoryMessages            = gptLargeToolHistoryMultiplier * 100
 	gptLargeToolHistoryTools               = gptLargeToolHistoryMultiplier * 40
+	gptWorkBuddyToolHistoryMessages        = 240
+	gptWorkBuddyToolHistoryInteractions    = 8
+	gptWorkBuddyToolHistoryDeclaredTools   = 8
 	gptLargeToolHistoryMaxRetryCredentials = 5 // Six total attempts: initial credential plus five fallbacks.
 )
 
@@ -76,13 +80,79 @@ func isGPTLargeToolHistoryResponsesRequest(providers []string, routeModel string
 		return false
 	}
 	shape := requestShapeFromOptions(opts)
-	return shape.MessageCount >= gptLargeToolHistoryMessages || shape.ToolCount >= gptLargeToolHistoryTools
+	if shape.MessageCount >= gptLargeToolHistoryMessages || shape.ToolCount >= gptLargeToolHistoryTools {
+		return true
+	}
+	profile := strings.ToLower(strings.TrimSpace(metadataString(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)))
+	if profile != "workbuddy" && profile != "codex" && profile != "codex_cli" && profile != "codex_tui" {
+		return false
+	}
+	if shape.MessageCount < gptWorkBuddyToolHistoryMessages {
+		return false
+	}
+	toolInteractions := intMetadataValue(opts.Metadata[cliproxyexecutor.ToolInteractionCountMetadataKey])
+	declaredTools := intMetadataValue(opts.Metadata[cliproxyexecutor.DeclaredToolCountMetadataKey])
+	return toolInteractions >= gptWorkBuddyToolHistoryInteractions ||
+		declaredTools >= gptWorkBuddyToolHistoryDeclaredTools ||
+		shape.ToolCount >= gptWorkBuddyToolHistoryInteractions
 }
 
 func isGPTLargeToolHistoryResponsesModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
 	switch model {
-	case "gpt-5.5", "gpt-5.4":
+	case "gpt-5.5", "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra":
+		return true
+	default:
+		return strings.HasPrefix(model, "gpt-6-")
+	}
+}
+
+// preferGPTNativeResponsesAuths keeps long WorkBuddy/Codex tool histories on
+// OAuth or explicitly native Responses credentials when such a route exists.
+// If no native route is configured, the executor is allowed to return the
+// actionable request_feature_unsupported message instead of silently dropping
+// tools or retrying the same incompatible request on every credential.
+func preferGPTNativeResponsesAuths(auths []*Auth, providers []string, model string, opts cliproxyexecutor.Options) ([]*Auth, int) {
+	if !isGPTLargeToolHistoryResponsesRequest(providers, model, opts) {
+		return auths, 0
+	}
+	native := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if isNativeGPTResponsesAuth(auth) {
+			native = append(native, auth)
+		}
+	}
+	if len(native) == 0 {
+		return auths, 0
+	}
+	return native, len(auths) - len(native)
+}
+
+func isNativeGPTResponsesAuth(auth *Auth) bool {
+	if auth == nil || !isCodexAuth(auth) {
+		return false
+	}
+	if auth.Attributes != nil {
+		switch strings.ToLower(strings.TrimSpace(auth.Attributes["native_responses"])) {
+		case "true", "1", "yes":
+			return true
+		case "false", "0", "no":
+			return false
+		}
+	}
+	baseURL := ""
+	if auth.Attributes != nil {
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	if baseURL == "" {
+		return true
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Hostname())) {
+	case "api.openai.com", "chatgpt.com", "chat.openai.com":
 		return true
 	default:
 		return false

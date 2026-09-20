@@ -608,6 +608,9 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *clipr
 	logCodexToolSearchHistoryRepair(ctx, toolHistoryRepairStats.toolSearchRepairs)
 	if mode != codexRequestPlanCount {
 		body = normalizeCodexToolSchemas(body)
+		if err = rejectLargeCodexToolHistory(ctx, body, opts.Metadata, auth); err != nil {
+			return codexRequestPlan{}, err
+		}
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 			body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexExecutor", body, requestedModel, baseModel, requestPath, auth)
 			if err != nil {

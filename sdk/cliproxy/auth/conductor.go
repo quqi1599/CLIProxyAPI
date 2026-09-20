@@ -11248,6 +11248,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
 	candidates, deepSeekExcluded := prefilterDeepSeekResponsesAuths(candidates, model, opts)
 	compatibilityExcluded += deepSeekExcluded
+	candidates, nativeResponsesExcluded := preferGPTNativeResponsesAuths(candidates, []string{provider}, model, opts)
+	compatibilityExcluded += nativeResponsesExcluded
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
@@ -11355,6 +11357,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
+	if isGPTLargeToolHistoryResponsesRequest([]string{provider}, model, opts) {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
@@ -11523,6 +11528,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	candidates, compatibilityExcluded := m.preferClaudeSonnet46HistoryCompatibleAuths(ctx, candidates, model, cliproxyexecutor.Request{Model: model}, opts)
 	candidates, deepSeekExcluded := prefilterDeepSeekResponsesAuths(candidates, model, opts)
 	compatibilityExcluded += deepSeekExcluded
+	candidates, nativeResponsesExcluded := preferGPTNativeResponsesAuths(candidates, providers, model, opts)
+	compatibilityExcluded += nativeResponsesExcluded
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
@@ -11589,6 +11596,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
+	if isGPTLargeToolHistoryResponsesRequest(providers, model, opts) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
