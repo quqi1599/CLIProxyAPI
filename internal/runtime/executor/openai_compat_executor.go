@@ -1224,7 +1224,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		return plan, err
 	}
 	if stream {
-		if profile.SupportsStreamUsage && plan.endpoint == "/chat/completions" {
+		if openAICompatCapabilityProfileForModel(profile, baseModel).SupportsStreamUsage && plan.endpoint == "/chat/completions" {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 		}
 	} else if opts.Alt == "responses/compact" {
