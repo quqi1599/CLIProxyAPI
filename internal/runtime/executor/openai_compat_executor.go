@@ -1837,6 +1837,20 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		defer closeResponse()
 		var param any
 		cleanEOF := false
+		var integrity *helps.OpenAIStreamIntegrity
+		var pendingUsage *cliproxyusage.Detail
+		if plan.upstreamFormat.String() == "openai" && gjson.GetBytes(plan.body, "stream_options.include_usage").Bool() {
+			integrity = helps.NewAliyunDeepSeekStreamIntegrity(profile.Kind, baseModel)
+		}
+		failIntegrity := func(streamErr error) {
+			helps.LogWithRequestID(ctx).WithField("event", "upstream_stream_integrity_failed").WithField("model", baseModel).WithError(streamErr).Warn("upstream stream did not satisfy the completion and usage contract")
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(failureCtx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-requestCtx.Done():
+			}
+		}
 		for {
 			event, errRead := sseStream.ReadEvent()
 			if errRead != nil {
@@ -1858,9 +1872,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				break
 			}
 			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
-				if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
 				trimmedLine := bytes.TrimSpace(line)
 				if len(trimmedLine) == 0 {
 					continue
@@ -1885,6 +1896,17 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 
 				// OpenAI-compatible streams must use SSE data lines.
+				if errIntegrity := integrity.Observe(trimmedLine); errIntegrity != nil {
+					failIntegrity(errIntegrity)
+					return
+				}
+				if detail, ok := helps.ParseOpenAIStreamUsage(trimmedLine); ok {
+					if integrity == nil {
+						reporter.Publish(ctx, detail)
+					} else {
+						pendingUsage = &detail
+					}
+				}
 				chunks := sdktranslator.TranslateStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, plan.namespaceNames.Restore(internalpayload.CloneBytes(trimmedLine)), &param)
 				for i := range chunks {
 					select {
@@ -1899,6 +1921,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		if cleanEOF && plan.upstreamFormat.String() != "openai-response" {
+			if errIntegrity := integrity.Finish(); errIntegrity != nil {
+				failIntegrity(errIntegrity)
+				return
+			}
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
@@ -1912,6 +1938,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
+		if cleanEOF && pendingUsage != nil {
+			reporter.Publish(ctx, *pendingUsage)
+		}
 		reporter.EnsurePublished(ctx)
 	}()
 	result := &cliproxyexecutor.StreamResult{Headers: decodedResponseHeaders(httpResp.Header), Chunks: out, Cancel: closeResponse}
