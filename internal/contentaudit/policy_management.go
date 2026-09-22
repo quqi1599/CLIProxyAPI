@@ -71,7 +71,7 @@ func (s *Service) ApplyPolicy(ctx context.Context, policy Policy, reason, actor 
 	}
 
 	next := *state
-	next.matcher = matcher
+	next.matcher = matcher.withMode(state.cfg.Mode)
 	next.initErr = nil
 	s.state.Store(&next)
 	return s.currentPolicyLocked(ctx, &next)

@@ -184,4 +184,14 @@ func TestCachedBlockMiddlewareBlocksRepeatWithoutProviderWait(t *testing.T) {
 	if auditOnly := request("42", "73", true); auditOnly.Code != http.StatusNoContent {
 		t.Fatal("cache ignored audit-only mode")
 	}
+	cfg.AuditOnly, cfg.Mode = false, ModeSimple
+	service.Update(cfg, filepath.Join(filepath.Dir(cfg.PolicyFile), "config.yaml"))
+	if simple := request("42", "73", true); simple.Code != http.StatusNoContent {
+		t.Fatal("cached verdict bypassed simple-mode observation")
+	}
+	cfg.Mode = ModeStrict
+	service.Update(cfg, filepath.Join(filepath.Dir(cfg.PolicyFile), "config.yaml"))
+	if strict := request("42", "73", true); strict.Code != http.StatusBadRequest {
+		t.Fatal("returning to strict lost the cached verdict")
+	}
 }

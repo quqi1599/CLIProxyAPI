@@ -71,12 +71,13 @@ type ahoNode struct {
 
 // Matcher is immutable after compilation and safe for concurrent use.
 type Matcher struct {
-	policy         Policy
-	nodes          []ahoNode
-	candidateNodes []ahoNode
-	terms          []compiledTerm
-	keywordCount   int
-	analyzer       *moderationAnalyzer
+	enforcementMode string
+	policy          Policy
+	nodes           []ahoNode
+	candidateNodes  []ahoNode
+	terms           []compiledTerm
+	keywordCount    int
+	analyzer        *moderationAnalyzer
 }
 
 type preparedPolicyTerm struct {
@@ -441,6 +442,7 @@ func (m *Matcher) matchNormalized(normalizedText, action string, continuation bo
 				continue
 			}
 			rule := m.policy.Rules[term.ruleIndex]
+			rule.Action = m.ruleAction(rule)
 			if !matchOnRuleBoundaries(normalized, start, position+1, rule) || m.allowlisted(normalized, start, position+1, term.ruleIndex) {
 				continue
 			}
@@ -495,7 +497,7 @@ type thresholdMatch struct {
 func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuation bool) map[int]map[int]bool {
 	hasThresholdRule := false
 	for _, rule := range m.policy.Rules {
-		if rule.MinKeywordMatches > 1 && (action == "" || rule.Action == action) {
+		if rule.MinKeywordMatches > 1 && (action == "" || m.ruleAction(rule) == action) {
 			hasThresholdRule = true
 			break
 		}
@@ -523,7 +525,7 @@ func (m *Matcher) qualifyingThresholdRules(text []rune, action string, continuat
 		for _, termIndex := range m.nodes[nodeIndex].out {
 			term := m.terms[termIndex]
 			rule := m.policy.Rules[term.ruleIndex]
-			if rule.MinKeywordMatches <= 1 || action != "" && rule.Action != action {
+			if rule.MinKeywordMatches <= 1 || action != "" && m.ruleAction(rule) != action {
 				continue
 			}
 			start := position - term.runeLen + 1
@@ -898,9 +900,9 @@ func (m *Matcher) RuleActionCounts() (block, observe, disabled int) {
 		switch {
 		case rule.Disabled:
 			disabled++
-		case rule.Action == RuleActionBlock:
+		case m.ruleAction(rule) == RuleActionBlock:
 			block++
-		case rule.Action == RuleActionObserve:
+		case m.ruleAction(rule) == RuleActionObserve:
 			observe++
 		}
 	}

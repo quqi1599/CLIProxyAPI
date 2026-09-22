@@ -57,7 +57,7 @@ func TestNormalizeAuditModePreservesLegacyAndExplicitModes(t *testing.T) {
 	}{
 		{name: "legacy disabled", cfg: config.ContentAuditConfig{}, wantMode: ModeOff, wantEnabled: false},
 		{name: "legacy strict", cfg: config.ContentAuditConfig{Enabled: true}, wantMode: ModeStrict, wantEnabled: true, wantSimpleBlock: true, wantPoliticalBlock: true},
-		{name: "legacy observe", cfg: config.ContentAuditConfig{Enabled: true, AuditOnly: true}, wantMode: ModeSimple, wantEnabled: true, wantSimpleBlock: true},
+		{name: "legacy observe", cfg: config.ContentAuditConfig{Enabled: true, AuditOnly: true}, wantMode: ModeStrict, wantEnabled: true, wantPoliticalBlock: true},
 		{name: "explicit simple", cfg: config.ContentAuditConfig{Enabled: true, Mode: ModeSimple}, wantMode: ModeSimple, wantEnabled: true, wantSimpleBlock: true},
 		{name: "explicit off", cfg: config.ContentAuditConfig{Enabled: true, Mode: ModeOff}, wantMode: ModeOff, wantEnabled: false},
 	}
@@ -161,6 +161,12 @@ rules:
 	router.ServeHTTP(cyberResponse, cyber)
 	if cyberResponse.Code != http.StatusBadRequest {
 		t.Fatalf("simple cyber status = %d body=%s, want block", cyberResponse.Code, cyberResponse.Body.String())
+	}
+	combined := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"political fixture and cyber fixture"}`))
+	combinedResponse := httptest.NewRecorder()
+	router.ServeHTTP(combinedResponse, combined)
+	if combinedResponse.Code != http.StatusBadRequest {
+		t.Fatalf("simple combined status = %d, want block: broad rule must not mask cyber rule", combinedResponse.Code)
 	}
 	if nextCalls != 1 {
 		t.Fatalf("next handler calls = %d, want 1", nextCalls)
@@ -281,6 +287,7 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 	fullSample := 1.0
 	tests := []struct {
 		name            string
+		auditMode       string
 		mode            string
 		keywordAction   string
 		modelDecision   string
@@ -296,6 +303,7 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 		{name: "enforce low confidence allow keeps keyword block", mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewAllow, modelConfidence: 0.95, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
 		{name: "enforce block escalates observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.91, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusBadRequest, wantFinalAction: ModelReviewBlock},
 		{name: "enforce low confidence block keeps observation", mode: ModelReviewModeEnforce, keywordAction: RuleActionObserve, modelDecision: ModelReviewBlock, modelConfidence: 0.89, allowMin: 0.98, blockMin: 0.90, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
+		{name: "simple cannot escalate excluded rule via model", auditMode: ModeSimple, mode: ModelReviewModeEnforce, keywordAction: RuleActionBlock, modelDecision: ModelReviewBlock, modelConfidence: 0.99, wantStatus: http.StatusNoContent, wantNextCalls: 1, wantFinalAction: ModelReviewAllow},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -308,6 +316,7 @@ func TestMiddlewareModelReviewDecisionModes(t *testing.T) {
 			}
 			service := NewServiceWithReviewer(config.ContentAuditConfig{
 				Enabled:       true,
+				Mode:          test.auditMode,
 				PolicyFile:    policyPath,
 				DatabasePath:  filepath.Join(tempDir, "audit.db"),
 				EvidenceKeyID: "test-key",

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/contentaudit"
 )
 
@@ -55,21 +56,35 @@ func (h *Handler) GetContentAuditEnabled(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": h.cfg.ContentAudit.Enabled})
+	c.JSON(http.StatusOK, gin.H{"enabled": contentaudit.EffectiveMode(h.cfg.ContentAudit) != contentaudit.ModeOff})
 }
 
 // PutContentAuditEnabled persists and hot-reloads the request-time audit switch.
 // The existing audit database and policy remain unchanged when the switch is off.
 func (h *Handler) PutContentAuditEnabled(c *gin.Context) {
-	h.updateBoolField(c, func(enabled bool) {
-		h.cfg.ContentAudit.Enabled = enabled
+	var request struct {
+		Value *bool `json:"value"`
+	}
+	if err := decodeManagementJSONBody(c, maxManagementJSONBodyBytes, &request); err != nil {
+		writeManagementRequestBodyError(c, err)
+		return
+	}
+	if request.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "value is required"})
+		return
+	}
+	h.updateContentAuditConfig(c, func(cfg *config.ContentAuditConfig) {
+		enabled := *request.Value
+		mode := contentaudit.EffectiveMode(*cfg)
+		cfg.Enabled = enabled
 		if enabled {
-			if h.cfg.ContentAudit.Mode == contentaudit.ModeOff {
-				h.cfg.ContentAudit.Mode = contentaudit.ModeStrict
+			if mode == contentaudit.ModeOff {
+				mode = contentaudit.ModeStrict
 			}
+			cfg.Mode = mode
 		} else {
-			h.cfg.ContentAudit.Mode = contentaudit.ModeOff
-			h.cfg.ContentAudit.AuditOnly = false
+			cfg.Mode = contentaudit.ModeOff
+			cfg.AuditOnly = false
 		}
 	})
 }
@@ -86,16 +101,7 @@ func (h *Handler) GetContentAuditMode(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
 		return
 	}
-	mode := strings.ToLower(strings.TrimSpace(h.cfg.ContentAudit.Mode))
-	if mode == "" {
-		if !h.cfg.ContentAudit.Enabled {
-			mode = contentaudit.ModeOff
-		} else if h.cfg.ContentAudit.AuditOnly {
-			mode = contentaudit.ModeSimple
-		} else {
-			mode = contentaudit.ModeStrict
-		}
-	}
+	mode := contentaudit.EffectiveMode(h.cfg.ContentAudit)
 	c.JSON(http.StatusOK, gin.H{"mode": mode, "audit_only": h.cfg.ContentAudit.AuditOnly})
 }
 
@@ -111,17 +117,33 @@ func (h *Handler) PutContentAuditMode(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid content audit mode", "allowed": []string{contentaudit.ModeStrict, contentaudit.ModeSimple, contentaudit.ModeOff}})
 		return
 	}
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
+	h.updateContentAuditConfig(c, func(cfg *config.ContentAuditConfig) {
+		cfg.Mode = mode
+		cfg.Enabled = mode != contentaudit.ModeOff
+		cfg.AuditOnly = false
+	})
+}
+
+// updateContentAuditConfig serializes edits and keeps failed saves from changing
+// the shared runtime configuration. A conflict may reload a newer disk snapshot.
+func (h *Handler) updateContentAuditConfig(c *gin.Context, update func(*config.ContentAuditConfig)) {
+	if h == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
 		return
 	}
-	h.cfg.ContentAudit.Mode = mode
-	h.cfg.ContentAudit.Enabled = mode != contentaudit.ModeOff
-	h.cfg.ContentAudit.AuditOnly = false
-	h.mu.Unlock()
-	h.persist(c)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	previous := h.cfg
+	next := previous.CloneForRuntime()
+	update(&next.ContentAudit)
+	h.cfg = next
+	if !h.persistLocked(c) && h.cfg == next {
+		h.cfg = previous
+	}
 }
 
 // GetContentAuditStatus returns readiness and policy statistics without secrets.

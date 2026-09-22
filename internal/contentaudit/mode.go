@@ -1,6 +1,10 @@
 package contentaudit
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+)
 
 const (
 	ModeStrict = "strict"
@@ -32,7 +36,13 @@ var simpleModeBlockRules = map[string]struct{}{
 	"block-gambling-operational-intent":             {},
 }
 
-func normalizeMode(mode string, enabled, auditOnly bool) string {
+// EffectiveMode resolves legacy configuration without treating observation as
+// simple enforcement. AuditOnly remains a separate, non-blocking override.
+func EffectiveMode(cfg config.ContentAuditConfig) string {
+	return normalizeMode(cfg.Mode, cfg.Enabled)
+}
+
+func normalizeMode(mode string, enabled bool) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
 	case ModeStrict, ModeSimple:
@@ -46,17 +56,35 @@ func normalizeMode(mode string, enabled, auditOnly bool) string {
 		if !enabled {
 			return ModeOff
 		}
-		if auditOnly {
-			return ModeSimple
-		}
 		return ModeStrict
 	}
 }
 
 func modeAllowsBlock(mode, ruleID string) bool {
+	if mode == ModeOff {
+		return false
+	}
 	if mode != ModeSimple {
 		return true
 	}
 	_, ok := simpleModeBlockRules[strings.TrimSpace(ruleID)]
 	return ok
+}
+
+// withMode shares the immutable automaton and original policy. Only candidate
+// actions change, before priority selection, so observation cannot hide a block.
+func (m *Matcher) withMode(mode string) *Matcher {
+	if m == nil {
+		return nil
+	}
+	snapshot := *m
+	snapshot.enforcementMode = mode
+	return &snapshot
+}
+
+func (m *Matcher) ruleAction(rule Rule) string {
+	if rule.Action == RuleActionBlock && !modeAllowsBlock(m.enforcementMode, rule.ID) {
+		return RuleActionObserve
+	}
+	return rule.Action
 }

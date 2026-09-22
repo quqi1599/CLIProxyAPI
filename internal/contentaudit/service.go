@@ -186,7 +186,7 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 			if err != nil {
 				state.initErr = err
 			} else {
-				state.matcher = matcher
+				state.matcher = matcher.withMode(cfg.Mode)
 			}
 		}
 	}
@@ -220,7 +220,7 @@ func (s *Service) Update(cfg config.ContentAuditConfig, configFilePath string) {
 }
 
 func normalizeAuditConfig(cfg *config.ContentAuditConfig) {
-	cfg.Mode = normalizeMode(cfg.Mode, cfg.Enabled, cfg.AuditOnly)
+	cfg.Mode = EffectiveMode(*cfg)
 	if cfg.Mode == ModeOff {
 		cfg.Enabled = false
 	}
