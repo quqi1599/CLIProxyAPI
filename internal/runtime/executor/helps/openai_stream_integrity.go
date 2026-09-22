@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strings"
@@ -37,6 +38,17 @@ func (s *OpenAIStreamIntegrity) Observe(line []byte) error {
 		return s.Finish()
 	}
 	root := gjson.ParseBytes(data)
+	if upstreamErr := root.Get("error"); upstreamErr.Exists() && upstreamErr.Type != gjson.Null {
+		// HTTP 200 only establishes the transport. An error inside the stream
+		// must never be translated or published as a successful usage record.
+		digest := sha256.Sum256(data)
+		return &failurecontract.Failure{
+			Kind: failurecontract.UpstreamProtocolError, Scope: failurecontract.ScopeProvider,
+			HTTPStatus: http.StatusBadGateway, OuterStatus: http.StatusOK,
+			ProviderCode: "upstream_stream_error", SemanticCode: "upstream_stream_error", Retryable: false,
+			PublicMessage: fmt.Sprintf("upstream returned an error event inside an HTTP 200 stream; usage is unavailable; event_bytes=%d event_sha256=%x; no automatic replay of partial output", len(data), digest),
+		}
+	}
 	for _, choice := range root.Get("choices").Array() {
 		if reason := choice.Get("finish_reason"); reason.Type == gjson.String && strings.TrimSpace(reason.String()) != "" {
 			s.finishSeen = true

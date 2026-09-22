@@ -42,6 +42,8 @@ func TestOpenAICompatAliyunDeepSeekStreamIntegrity(t *testing.T) {
 			{"partial usage is not complete", finish + "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100}}\n\n" + done, "upstream_stream_usage_missing"},
 			{"negative usage", finish + strings.ReplaceAll(usage, `"completion_tokens":8`, `"completion_tokens":-1`) + "\n\n" + done, "upstream_stream_usage_missing"},
 			{"string usage", finish + strings.ReplaceAll(usage, `"completion_tokens":8`, `"completion_tokens":"8"`) + "\n\n" + done, "upstream_stream_usage_missing"},
+			{"HTTP 200 stream error", "data: {\"error\":{\"type\":\"server_error\",\"message\":\"private-upstream-content\"}}\n\n" + done, "upstream_stream_error"},
+			{"HTTP 200 stream error then EOF", "data: {\"error\":{\"message\":\"private-upstream-content\"}}", "upstream_stream_error"},
 		} {
 			t.Run(format+"/"+tt.name, func(t *testing.T) {
 				var attempts atomic.Int32
@@ -93,6 +95,9 @@ func TestOpenAICompatAliyunDeepSeekStreamIntegrity(t *testing.T) {
 					}
 					if strings.Contains(output.String(), `"type":"response.completed"`) || strings.Contains(output.String(), `"type":"message_stop"`) {
 						t.Fatal("incomplete stream emitted successful completion")
+					}
+					if strings.Contains(output.String(), "private-upstream-content") || strings.Contains(streamErr.Error(), "private-upstream-content") {
+						t.Fatal("raw upstream error leaked")
 					}
 				}
 				if attempts.Load() != 1 {
