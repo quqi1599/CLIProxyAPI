@@ -561,6 +561,20 @@ func inferClientProfileFromHeaders(headers http.Header) string {
 			return "claude_code"
 		}
 	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "codex" {
+			return "codex"
+		}
+		// Match known client product tokens, not model names or arbitrary titles.
+		for _, product := range strings.Fields(value) {
+			switch {
+			case strings.HasPrefix(product, "codex_cli_rs/"):
+				return "codex_cli"
+			case strings.HasPrefix(product, "codex-tui/"):
+				return "codex_tui"
+			}
+		}
+	}
 	return ""
 }
 

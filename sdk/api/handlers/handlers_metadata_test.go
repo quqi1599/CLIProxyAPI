@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -84,6 +88,58 @@ func TestInferClientProfileFromHeadersPrefersWorkBuddyWrapper(t *testing.T) {
 
 	if got := inferClientProfileFromHeaders(headers); got != "workbuddy" {
 		t.Fatalf("profile = %q, want workbuddy", got)
+	}
+}
+
+func TestHTTPCodexMetadataReachesToolHistoryGuard(t *testing.T) {
+	input := make([]map[string]string, 240)
+	for index := range input {
+		input[index] = map[string]string{"role": "user", "content": "synthetic history"}
+	}
+	tools := make([]map[string]any, 8)
+	for index := range tools {
+		tools[index] = map[string]any{"type": "function", "name": "synthetic_tool", "parameters": map[string]any{"type": "object"}}
+	}
+	body, err := json.Marshal(map[string]any{"model": "gpt-5.6-sol", "input": input, "tools": tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		headers map[string]string
+		profile string
+		guard   bool
+	}{
+		{name: "official cli", headers: map[string]string{"User-Agent": "codex_cli_rs/0.133.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"}, profile: "codex_cli", guard: true},
+		{name: "tui", headers: map[string]string{"User-Agent": "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"}, profile: "codex_tui", guard: true},
+		{name: "client name", headers: map[string]string{"X-Client-Name": "Codex"}, profile: "codex", guard: true},
+		{name: "app name", headers: map[string]string{"X-App-Name": " codex "}, profile: "codex", guard: true},
+		{name: "embedded product token", headers: map[string]string{"User-Agent": "HTTPClient/1.0 codex_cli_rs/0.133.0"}, profile: "codex_cli", guard: true},
+		{name: "case insensitive", headers: map[string]string{"User-Agent": "CODEX_CLI_RS/0.133.0"}, profile: "codex_cli", guard: true},
+		{name: "workbuddy wrapper wins", headers: map[string]string{"User-Agent": "codex_cli_rs/0.133.0", "X-App-Name": "WorkBuddy"}, profile: "workbuddy", guard: true},
+		{name: "ordinary client", headers: map[string]string{"User-Agent": "curl/8.1.0"}},
+		{name: "model name is not client", headers: map[string]string{"X-Title": "gpt-5.3-codex"}},
+		{name: "arbitrary codex text", headers: map[string]string{"X-Title": "My Codex Project"}},
+		{name: "lookalike product", headers: map[string]string{"User-Agent": "notcodex_cli_rs/1.0"}},
+		{name: "unrecognized wrapper", headers: map[string]string{"User-Agent": "my-codex-client/1.0"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			for key, value := range test.headers {
+				ginCtx.Request.Header.Set(key, value)
+			}
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			meta := requestExecutionMetadata(ctx)
+			setRequestShapeAndToolMetadata(meta, body)
+			gotProfile, _ := meta[coreexecutor.ClientProfileMetadataKey].(string)
+			if gotProfile != test.profile {
+				t.Fatalf("HTTP metadata profile = %q, want %q", gotProfile, test.profile)
+			}
+			if got := coreauth.RequiresNativeResponsesToolHistory(meta, body); got != test.guard {
+				t.Fatalf("HTTP metadata guard = %t, want %t", got, test.guard)
+			}
+		})
 	}
 }
 
