@@ -751,6 +751,10 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// NativeResponses declares verified support for native Responses with complex tool history.
+	// Nil preserves automatic route inference; false explicitly marks an incompatible route.
+	NativeResponses *bool `yaml:"native-responses,omitempty" json:"native-responses,omitempty"`
+
 	// ResponsesCompaction declares remote-compaction protocol capabilities for this route.
 	ResponsesCompaction ResponsesCompactionConfig `yaml:"responses-compaction,omitempty" json:"responses-compaction,omitempty"`
 

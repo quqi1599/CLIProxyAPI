@@ -23,7 +23,7 @@ func userFacingOpenAICompatToolHistoryMessage() string {
 }
 
 func userFacingCodexToolHistoryMessage() string {
-	return "当前 WorkBuddy/Codex 对话已累积较长的工具调用历史，当前非原生 Responses/tool calls 路由无法安全承载，CPA 已停止向上游发送且不会继续轮换重试。请新建会话，或先把历史工具调用、MCP/文件工具结果压缩成普通文本摘要；也可以切换到原生支持 Responses 和 tool calls 的渠道后重试。"
+	return "当前 WorkBuddy/Codex 对话已累积较长的工具调用历史，当前路由未确认或未声明支持原生 Responses/tool calls，已停止向上游发送且不会原样轮换重试。请新建会话，或先把历史工具调用、MCP/文件工具结果压缩成普通文本摘要；也可以切换到已验证支持该能力的渠道，或联系管理员核验并配置渠道能力。"
 }
 
 func userFacingDeepSeekChatJSONSchemaMessage() string {

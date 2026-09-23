@@ -416,7 +416,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
-	cooldownCount := 0
+	rateLimitedCount := 0
 	earliest := time.Time{}
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
@@ -427,24 +427,14 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, localRateLimitedCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried), now)
 		total += localTotal
-		cooldownCount += localCooldownCount
+		rateLimitedCount += localRateLimitedCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
 			earliest = localEarliest
 		}
 	}
-	if total == 0 {
-		return &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	if cooldownCount == total && !earliest.IsZero() {
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, "", resetIn)
-	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	return blockedRouteSelectionError(model, "", total, rateLimitedCount, earliest, now)
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -837,31 +827,17 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
 	now := time.Now()
-	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate)
-	if total == 0 {
-		return &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	if cooldownCount == total && !earliest.IsZero() {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		resetIn := earliest.Sub(now)
-		if resetIn < 0 {
-			resetIn = 0
-		}
-		return newModelCooldownError(model, providerForError, resetIn)
-	}
-	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+	total, rateLimitedCount, earliest := m.availabilitySummaryLocked(predicate, now)
+	return blockedRouteSelectionError(model, provider, total, rateLimitedCount, earliest, now)
 }
 
-// availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
-func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool) (int, int, time.Time) {
+// availabilitySummaryLocked summarizes candidates, verified rate blocks, and earliest recovery.
+func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool, now time.Time) (int, int, time.Time) {
 	if m == nil {
 		return 0, 0, time.Time{}
 	}
 	total := 0
-	cooldownCount := 0
+	rateLimitedCount := 0
 	earliest := time.Time{}
 	for _, entry := range m.entries {
 		if predicate != nil && !predicate(entry) {
@@ -871,15 +847,21 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown {
+		if entry.state != scheduledStateCooldown && entry.state != scheduledStateBlocked {
 			continue
 		}
-		cooldownCount++
+		healthBlocked := false
+		if isGPTRetryRoute([]string{entry.auth.Provider}, m.modelKey) {
+			healthBlocked, _ = healthBlockStateForAuth(entry.auth, m.modelKey, now)
+		}
+		if routeTemporalBlockIsRateLimited(entry.auth, m.modelKey, now, healthBlocked) {
+			rateLimitedCount++
+		}
 		if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
 			earliest = entry.nextRetryAt
 		}
 	}
-	return total, cooldownCount, earliest
+	return total, rateLimitedCount, earliest
 }
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.

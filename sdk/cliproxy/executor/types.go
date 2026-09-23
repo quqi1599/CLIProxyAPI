@@ -284,6 +284,9 @@ type RequestAfterAuthInterceptResponse struct {
 
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
+	// TokenCount is set by the auth manager for CountTokens selection only.
+	// Generation entry points reset it; it must never come from HTTP metadata.
+	TokenCount bool
 	// Stream toggles streaming mode.
 	Stream bool
 	// Alt carries optional alternate format hint (e.g. SSE JSON key).

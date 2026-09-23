@@ -50,6 +50,9 @@ attempts:
 			return managerAttemptOutcome[T]{result: result, success: true}
 		}
 		lastErr = errRun
+		if hasCommittedOutput(errRun) {
+			break attempts
+		}
 		if trace != nil && trace.totalAttemptBudgetExhausted() {
 			break attempts
 		}
@@ -106,7 +109,7 @@ attempts:
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if runner.fallback != nil && !remoteCompaction {
+	if runner.fallback != nil && !remoteCompaction && !hasCommittedOutput(lastErr) {
 		result, ok, errFallback := runner.fallback(ctx, providers, req, opts, lastErr)
 		if errFallback != nil {
 			return managerAttemptOutcome[T]{returnErr: errFallback, finalErr: errFallback}

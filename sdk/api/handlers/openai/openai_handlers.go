@@ -730,7 +730,7 @@ func (h *OpenAIAPIHandler) handleStreamResult(summaryCtx context.Context, c *gin
 			}
 			status = handlers.NormalizeKnownUserErrorStatus(status, errText)
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildErrorResponseBodyWithCause(status, errText, errMsg.Error)
 			writeOpenAIChatSSEChunk(w, body)
 		},
 		WriteDone: func(w handlers.StreamBodyWriter) {

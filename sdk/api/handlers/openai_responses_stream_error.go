@@ -178,3 +178,12 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	}
 	return []byte(`{"type":"error","error":{"type":"server_error","code":"internal_server_error","message":"internal error","param":null},"sequence_number":0}`)
 }
+
+// BuildOpenAIResponsesStreamErrorChunkWithCause preserves typed local selection
+// errors without changing the existing Responses event framing or other errors.
+func BuildOpenAIResponsesStreamErrorChunkWithCause(status int, errText string, sequenceNumber int, cause error) []byte {
+	if body, ok := buildRouteUnavailableErrorBody(status, cause); ok {
+		errText = string(body)
+	}
+	return BuildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber)
+}

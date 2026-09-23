@@ -387,6 +387,8 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
+#     native-responses: true # Set only after verifying native Responses and complex tool history support.
+#                            # false explicitly opts out; omitted keeps automatic route inference.
 #     responses-compaction:
 #       legacy-endpoint: "native" # native | unsupported; omitted leaves custom routes disabled
 #       trigger-mode: "native-stream" # native-stream | bridge-legacy | unsupported

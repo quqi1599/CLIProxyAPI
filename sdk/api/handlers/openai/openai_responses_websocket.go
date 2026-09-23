@@ -2549,7 +2549,11 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog websocketT
 	}
 	status, errText = handlers.NormalizeKnownUserError(status, errText, nil)
 
-	body := handlers.BuildErrorResponseBody(status, errText)
+	var originalError error
+	if errMsg != nil {
+		originalError = errMsg.Error
+	}
+	body := handlers.BuildErrorResponseBodyWithCause(status, errText, originalError)
 	payload := []byte(`{}`)
 	var errSet error
 	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)

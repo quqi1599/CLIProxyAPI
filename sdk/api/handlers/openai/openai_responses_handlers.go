@@ -602,7 +602,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(summaryCtx context.Co
 				errText = errMsg.Error.Error()
 			}
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
-			chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
+			chunk := handlers.BuildOpenAIResponsesStreamErrorChunkWithCause(status, errText, 0, errMsg.Error)
 			_, _ = fmt.Fprintf(w, "\nevent: error\ndata: %s\n\n", string(chunk))
 		},
 		WriteDone: func(w handlers.StreamBodyWriter) {

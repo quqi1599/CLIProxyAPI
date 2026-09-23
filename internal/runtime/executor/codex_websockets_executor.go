@@ -443,6 +443,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
+	if err = rejectLargeCodexToolHistory(ctx, body, opts.Metadata, auth); err != nil {
+		return resp, err
+	}
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexWebsocketsExecutor", body, requestedModel, baseModel, requestPath, auth)
 		if err != nil {
@@ -770,6 +773,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
+	if err = rejectLargeCodexToolHistory(ctx, body, opts.Metadata, auth); err != nil {
+		return nil, err
+	}
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body, err = applyCodexImageGenerationToolPolicy(ctx, "CodexWebsocketsExecutor", body, requestedModel, baseModel, requestPath, auth)
 		if err != nil {

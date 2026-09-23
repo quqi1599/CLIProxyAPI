@@ -39,7 +39,7 @@ func TestPreferGPTNativeResponsesAuths(t *testing.T) {
 	}
 }
 
-func TestPreferGPTNativeResponsesAuthsKeepsFallbackWhenNoNativeRoute(t *testing.T) {
+func TestPreferGPTNativeResponsesAuthsExcludesUnknownRoutes(t *testing.T) {
 	opts := cliproxyexecutor.Options{
 		Metadata: map[string]any{
 			cliproxyexecutor.RequestPathMetadataKey:          "/v1/responses",
@@ -52,14 +52,14 @@ func TestPreferGPTNativeResponsesAuthsKeepsFallbackWhenNoNativeRoute(t *testing.
 	a := &Auth{ID: "a", Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "key", "base_url": "https://a.example.com/v1"}}
 	b := &Auth{ID: "b", Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "key", "base_url": "https://b.example.com/v1"}}
 	got, excluded := preferGPTNativeResponsesAuths([]*Auth{a, b}, []string{"codex"}, "gpt-5.6-sol", opts)
-	if excluded != 0 || len(got) != 2 {
-		t.Fatalf("got auths=%v excluded=%d, want all configured fallbacks", got, excluded)
+	if excluded != 2 || len(got) != 0 {
+		t.Fatalf("got auths=%v excluded=%d, want no unverified fallbacks", got, excluded)
 	}
 }
 
 func TestNativeGPTResponsesAuthRejectsCustomOAuthBaseURL(t *testing.T) {
 	auth := &Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth", "base_url": "https://compat.example.com/v1"}}
-	if isNativeGPTResponsesAuth(auth) {
+	if SupportsNativeResponses(auth) {
 		t.Fatal("custom OAuth base URL must not be treated as a native Responses route")
 	}
 }

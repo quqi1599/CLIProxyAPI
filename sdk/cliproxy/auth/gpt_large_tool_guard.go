@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -107,36 +108,60 @@ func isGPTLargeToolHistoryResponsesModel(model string) bool {
 	}
 }
 
-// preferGPTNativeResponsesAuths keeps long WorkBuddy/Codex tool histories on
-// OAuth or explicitly native Responses credentials when such a route exists.
-// If no native route is configured, the executor is allowed to return the
-// actionable request_feature_unsupported message instead of silently dropping
-// tools or retrying the same incompatible request on every credential.
+// preferGPTNativeResponsesAuths filters by capability, not by credential origin
+// or health. Every declared compatible route remains eligible for health-aware
+// selection and failover. Unknown routes must not become a fallback merely
+// because all compatible credentials are unavailable or have been tried.
 func preferGPTNativeResponsesAuths(auths []*Auth, providers []string, model string, opts cliproxyexecutor.Options) ([]*Auth, int) {
-	if !isGPTLargeToolHistoryResponsesRequest(providers, model, opts) {
+	if !requiresNativeResponsesToolHistoryRouting(providers, opts) {
 		return auths, 0
 	}
 	native := make([]*Auth, 0, len(auths))
 	for _, auth := range auths {
-		if isNativeGPTResponsesAuth(auth) {
+		if auth != nil && (!isCodexAuth(auth) || SupportsNativeResponses(auth)) {
 			native = append(native, auth)
 		}
-	}
-	if len(native) == 0 {
-		return auths, 0
 	}
 	return native, len(auths) - len(native)
 }
 
-func isNativeGPTResponsesAuth(auth *Auth) bool {
+func requiresNativeResponsesToolHistoryRouting(providers []string, opts cliproxyexecutor.Options) bool {
+	if opts.TokenCount {
+		return false
+	}
+	for _, provider := range providers {
+		if isCodexProviderName(provider) {
+			return RequiresNativeResponsesToolHistory(opts.Metadata, opts.OriginalRequest)
+		}
+	}
+	return false
+}
+
+func nativeResponsesToolHistorySelectionError() error {
+	return &Error{
+		Code:       "request_feature_unsupported",
+		Message:    "codex_tool_history_too_large: no configured route is verified to support this long tool history. Start a new conversation, summarize tool history, or configure native-responses on a verified compatible route.",
+		HTTPStatus: http.StatusBadRequest,
+	}
+}
+
+// SupportsNativeResponses is the shared dispatch/execution capability contract.
+// Explicit declarations override defaults, including false on official routes.
+// A custom endpoint is unknown until its native Responses/tool-history support
+// has been verified and declared; websockets alone do not prove that support.
+func SupportsNativeResponses(auth *Auth) bool {
 	if auth == nil || !isCodexAuth(auth) {
 		return false
 	}
 	if auth.Attributes != nil {
-		switch strings.ToLower(strings.TrimSpace(auth.Attributes["native_responses"])) {
+		declaration := strings.ToLower(strings.TrimSpace(auth.Attributes["native_responses"]))
+		switch declaration {
 		case "true", "1", "yes":
 			return true
 		case "false", "0", "no":
+			return false
+		}
+		if declaration != "" {
 			return false
 		}
 	}
@@ -148,7 +173,7 @@ func isNativeGPTResponsesAuth(auth *Auth) bool {
 		return true
 	}
 	parsed, err := url.Parse(baseURL)
-	if err != nil {
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(parsed.Hostname())) {

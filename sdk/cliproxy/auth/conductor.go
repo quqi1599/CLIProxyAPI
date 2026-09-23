@@ -3181,7 +3181,8 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	availableAll := make([]*Auth, 0, len(auths))
 	availableByPriority := make(map[int][]*Auth)
 	fallbackCandidates := make([]cooldownFallbackCandidate, 0, len(auths))
-	cooldownCount := 0
+	temporalBlockCount := 0
+	rateLimitedCount := 0
 	activeFallbackAvailable := false
 	var earliest time.Time
 	recordAvailable := func(candidate *Auth, checkModel string, includeHealth bool) {
@@ -3199,8 +3200,11 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 		priority := effectiveSelectionPriorityForRoute(candidate, checkModel, now, includeHealth)
 		availableByPriority[priority] = append(availableByPriority[priority], candidate)
 	}
-	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota, includeHealth bool) {
-		cooldownCount++
+	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota, includeHealth, healthBlocked bool) {
+		temporalBlockCount++
+		if routeTemporalBlockIsRateLimited(candidate, checkModel, now, healthBlocked) {
+			rateLimitedCount++
+		}
 		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 			earliest = next
 		}
@@ -3229,7 +3233,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			}
 			if healthBlocked {
 				availabilitySummary.skippedBreaker++
-				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth)
+				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth, true)
 				continue
 			}
 			recordAvailable(candidate, checkModel, includeHealth)
@@ -3242,7 +3246,11 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 				recordAvailable(candidate, checkModel, includeHealth)
 				continue
 			}
-			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth)
+			healthBlocked := false
+			if includeHealth {
+				healthBlocked, _ = healthBlockStateForAuth(candidate, checkModel, now)
+			}
+			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth, healthBlocked)
 		}
 		switch reason {
 		case blockReasonDisabled:
@@ -3268,7 +3276,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 
 	if spreadAcrossPriorities {
 		if len(availableAll) == 0 {
-			if cooldownCount == len(auths) && !earliest.IsZero() {
+			if temporalBlockCount == len(auths) && !earliest.IsZero() {
 				if fallback, probeNext := m.zeroEligibleFallbackProbe(ctx, routeModel, fallbackCandidates, now, gptRoute); fallback != nil {
 					return []*Auth{fallback.auth}, nil
 				} else if !probeNext.IsZero() && probeNext.Before(earliest) {
@@ -3282,9 +3290,12 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 				if resetIn < 0 {
 					resetIn = 0
 				}
-				return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+				if rateLimitedCount == len(auths) {
+					return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+				}
+				return nil, newRouteUnavailableError(&resetIn)
 			}
-			return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+			return nil, newRouteUnavailableError(nil)
 		}
 		if gptRoute {
 			availableAll, availabilitySummary.healthDeferred = m.preferHealthyGPTRoutes(availableAll, routeModel, now)
@@ -3296,7 +3307,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 	}
 
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		if temporalBlockCount == len(auths) && !earliest.IsZero() {
 			if fallback, probeNext := m.zeroEligibleFallbackProbe(ctx, routeModel, fallbackCandidates, now, gptRoute); fallback != nil {
 				return []*Auth{fallback.auth}, nil
 			} else if !probeNext.IsZero() && probeNext.Before(earliest) {
@@ -3310,9 +3321,12 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			if resetIn < 0 {
 				resetIn = 0
 			}
-			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+			if rateLimitedCount == len(auths) {
+				return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+			}
+			return nil, newRouteUnavailableError(&resetIn)
 		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, newRouteUnavailableError(nil)
 	}
 
 	bestPriority := 0
@@ -4015,26 +4029,46 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	}
 }
 
-func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, bool, error) {
+func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
 	if m == nil || m.scheduler == nil {
 		return nil, false, nil
+	}
+	allowed := make(map[string]*Auth, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != nil {
+			allowed[candidate.ID] = candidate
+		}
+	}
+	localTried := copyTriedMap(tried)
+	if localTried == nil {
+		localTried = make(map[string]struct{})
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 	for {
+		// Delegation must preserve the caller's capability and health prefilters.
+		// Keep the native scheduler's rotation state, but exclude every auth not
+		// offered to the plugin before selecting from its global index.
+		m.scheduler.mu.Lock()
+		for authID := range m.scheduler.authProviders {
+			if _, ok := allowed[authID]; !ok {
+				localTried[authID] = struct{}{}
+			}
+		}
+		m.scheduler.mu.Unlock()
 		var selected *Auth
 		var errPick error
 		if providerKey == "mixed" {
-			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
+			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, localTried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 				m.syncSchedulerOnPickFailure(time.Now())
-				selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
+				selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, localTried, strategy)
 			}
 		} else {
-			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, localTried, strategy)
 			if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 				m.syncSchedulerOnPickFailure(time.Now())
-				selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+				selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, localTried, strategy)
 			}
 		}
 		if errPick != nil {
@@ -4043,11 +4077,15 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		if selected == nil {
 			return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
+		candidate, permitted := allowed[selected.ID]
+		if !permitted {
+			// A concurrent scheduler refresh may introduce a new credential after
+			// the exclusion snapshot. Never dispatch it without the original checks.
+			localTried[selected.ID] = struct{}{}
+			continue
+		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
-			if tried == nil {
-				tried = make(map[string]struct{})
-			}
-			tried[selected.ID] = struct{}{}
+			localTried[selected.ID] = struct{}{}
 			continue
 		}
 		switch strategy {
@@ -4056,7 +4094,7 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		default:
 			recordSelectorReason(ctx, "builtin_scheduler_round_robin")
 		}
-		return selected, true, nil
+		return candidate, true, nil
 	}
 }
 
@@ -4093,7 +4131,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
-	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
+	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried, candidates)
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
@@ -4700,6 +4738,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			requestInvalid := isRequestInvalidError(errStream)
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
+				!hasCommittedOutput(errStream) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4713,6 +4752,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				trace.recordFinalStatus(statusCodeFromError(errStream))
 			}
 			m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, errStream)
+			if hasCommittedOutput(errStream) {
+				return nil, errStream
+			}
 			if isKimiInsufficientQuotaError(auth, errStream) {
 				return nil, errStream
 			}
@@ -4840,6 +4882,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			requestInvalid := isRequestInvalidError(bootstrapErr)
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
+				!hasCommittedOutput(bootstrapErr) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4856,6 +4899,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
 			}
 			cleanupAttempt()
+			if hasCommittedOutput(bootstrapErr) {
+				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
+			}
 			if isKimiInsufficientQuotaError(auth, bootstrapErr) {
 				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 			}
@@ -5638,6 +5684,10 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	opts.TokenCount = operation == "count"
+	if len(opts.OriginalRequest) == 0 {
+		opts.OriginalRequest = internalpayload.CloneBytes(req.Payload)
+	}
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = classifyClaudeSonnet46MiMoHistory(routeModel, req, opts)
 	compactionIntent := compactionIntentFromRequest(req, opts)
@@ -5863,6 +5913,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				requestInvalid := isRequestInvalidError(errExec)
 				routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec)
 				result.keepSelectorLease = idx < len(models)-1 &&
+					!hasCommittedOutput(errExec) &&
 					!channelFailover &&
 					!unauthorized &&
 					(!requestInvalid || routeFallback)
@@ -5874,6 +5925,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				}
 				trace.recordFinalStatus(statusCodeFromError(errExec))
 				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
+				if hasCommittedOutput(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				authErr = errExec
 				countAttempt = true
 				if isKimiInsufficientQuotaError(auth, errExec) {
@@ -5979,6 +6033,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	opts.TokenCount = false
+	if len(opts.OriginalRequest) == 0 {
+		opts.OriginalRequest = internalpayload.CloneBytes(req.Payload)
+	}
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	opts = classifyClaudeSonnet46MiMoHistory(routeModel, req, opts)
 	compactionIntent := compactionIntentFromRequest(req, opts)
@@ -6140,6 +6198,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, newCallerRequestFailure(errCtx)
+			}
+			if hasCommittedOutput(errStream) {
+				return nil, errStream
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
@@ -7181,7 +7242,7 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 
 func shouldRetryGPTRound(err error, completedRound int, providers []string, model string, trace *requestAttemptTrace) (time.Duration, bool) {
 	_, maxRounds := trace.gptFirstEventRetryLimits()
-	if err == nil || completedRound < 0 || completedRound >= maxRounds-1 {
+	if err == nil || hasCommittedOutput(err) || completedRound < 0 || completedRound >= maxRounds-1 {
 		return 0, false
 	}
 	if isRequestInvalidError(err) {
@@ -7243,7 +7304,7 @@ func isGPTThirdRoundFailure(err error) bool {
 }
 
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
-	if err == nil {
+	if err == nil || hasCommittedOutput(err) {
 		return 0, false
 	}
 	if shouldFailoverGPTChannel(err, providers, model) {
@@ -7379,7 +7440,7 @@ func markGPTChannelFailoverError(err error) error {
 }
 
 func shouldFailoverGPTChannel(err error, providers []string, model string) bool {
-	if err == nil || !isGPTRetryRoute(providers, model) {
+	if err == nil || hasCommittedOutput(err) || !isGPTRetryRoute(providers, model) {
 		return false
 	}
 	var marked *gptChannelFailoverError
@@ -7411,7 +7472,11 @@ func shouldFailoverGPTChannel(err error, providers []string, model string) bool 
 // responses remain failover signals during routing; only the terminal error is
 // converted to a stable gateway envelope for downstream clients.
 func normalizeExhaustedGPTChannelError(err error, providers []string, model string) error {
-	if err == nil || !isGPTRetryRoute(providers, model) {
+	if err == nil || hasCommittedOutput(err) || !isGPTRetryRoute(providers, model) {
+		return err
+	}
+	var unavailable *routeUnavailableError
+	if errors.As(err, &unavailable) {
 		return err
 	}
 	status := statusCodeFromError(err)
@@ -11168,6 +11233,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		if err == nil {
+			if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) && isCodexAuth(auth) && !SupportsNativeResponses(auth) {
+				return nil, nil, nativeResponsesToolHistorySelectionError()
+			}
 			intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
 			if !remoteCompactionCandidateAllowed(auth, intent) {
 				return nil, nil, remoteCompactionSelectionError(intent)
@@ -11250,10 +11318,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	compatibilityExcluded += deepSeekExcluded
 	candidates, nativeResponsesExcluded := preferGPTNativeResponsesAuths(candidates, []string{provider}, model, opts)
 	compatibilityExcluded += nativeResponsesExcluded
-	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
 	}
+	if len(candidates) == 0 && nativeResponsesExcluded > 0 {
+		m.mu.RUnlock()
+		return nil, nil, nativeResponsesToolHistorySelectionError()
+	}
+	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
@@ -11357,7 +11429,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
-	if isGPTLargeToolHistoryResponsesRequest([]string{provider}, model, opts) {
+	if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {
@@ -11440,6 +11512,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if m.HomeEnabled() {
 		auth, exec, provider, err := m.pickNextViaHome(ctx, model, opts, tried)
 		if err == nil {
+			if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) && isCodexAuth(auth) && !SupportsNativeResponses(auth) {
+				return nil, nil, "", nativeResponsesToolHistorySelectionError()
+			}
 			intent := compactionIntentFromRequest(cliproxyexecutor.Request{}, opts)
 			if !remoteCompactionCandidateAllowed(auth, intent) {
 				return nil, nil, "", remoteCompactionSelectionError(intent)
@@ -11530,10 +11605,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	compatibilityExcluded += deepSeekExcluded
 	candidates, nativeResponsesExcluded := preferGPTNativeResponsesAuths(candidates, providers, model, opts)
 	compatibilityExcluded += nativeResponsesExcluded
-	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if trace := requestAttemptTraceFromContext(ctx); trace != nil {
 		trace.recordSelectionCompatibilityPrefiltered(compatibilityExcluded)
 	}
+	if len(candidates) == 0 && nativeResponsesExcluded > 0 {
+		m.mu.RUnlock()
+		return nil, nil, "", nativeResponsesToolHistorySelectionError()
+	}
+	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		if cliproxyexecutor.IsRemoteCompactionIntent(intent) {
@@ -11596,7 +11675,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
-	if isGPTLargeToolHistoryResponsesRequest(providers, model, opts) {
+	if requiresNativeResponsesToolHistoryRouting(providers, opts) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {
@@ -12771,7 +12850,7 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 }
 
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
-	if m == nil || auth == nil || alreadyTried || execErr == nil {
+	if m == nil || auth == nil || alreadyTried || execErr == nil || hasCommittedOutput(execErr) {
 		return auth, false
 	}
 	if !isCodexAuth(auth) ||

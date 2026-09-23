@@ -319,7 +319,7 @@ func (h *GeminiAPIHandler) forwardGeminiStream(summaryCtx context.Context, c *gi
 			}
 			status = handlers.NormalizeKnownUserErrorStatus(status, errText)
 			handlers.LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildErrorResponseBodyWithCause(status, errText, errMsg.Error)
 			if alt == "" {
 				_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(body))
 			} else {

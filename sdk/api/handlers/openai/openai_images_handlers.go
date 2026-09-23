@@ -123,7 +123,7 @@ func writeImagesStreamErrorEvent(c *gin.Context, errMsg *interfaces.ErrorMessage
 	if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 		errText = errMsg.Error.Error()
 	}
-	body := handlers.BuildErrorResponseBody(status, errText)
+	body := handlers.BuildErrorResponseBodyWithCause(status, errText, errMsg.Error)
 	_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
 }
 

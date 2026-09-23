@@ -633,6 +633,11 @@ func TestBuildErrorResponseBody_NormalizesCodexToolHistoryRequestFeatureUnsuppor
 	if payload.Error.Type != requestFeatureUnsupportedErrorType || payload.Error.Code != requestFeatureUnsupportedErrorCode {
 		t.Fatalf("error detail = %#v, want request_feature_unsupported invalid_request_error", payload.Error)
 	}
+	for _, marker := range []string{"未确认或未声明", "新建会话", "管理员核验"} {
+		if !strings.Contains(payload.Error.Message, marker) {
+			t.Fatalf("message = %q, missing actionable marker %q", payload.Error.Message, marker)
+		}
+	}
 }
 
 func TestBuildErrorResponseBody_NormalizesWorkBuddyDeepSeekTutorials(t *testing.T) {

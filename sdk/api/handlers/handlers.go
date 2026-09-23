@@ -2598,7 +2598,11 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	status, errText = NormalizeKnownUserError(status, errText, previous)
 
 	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
-	body := BuildErrorResponseBody(status, errText)
+	var originalError error
+	if msg != nil {
+		originalError = msg.Error
+	}
+	body := BuildErrorResponseBodyWithCause(status, errText, originalError)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	appendAPIResponse(c, body)
 	trimmedErrText := strings.TrimSpace(errText)

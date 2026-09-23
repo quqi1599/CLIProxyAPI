@@ -251,6 +251,10 @@ func mergeCodexKeysPreservingMissing(existing, incoming []config.CodexKey) []con
 		idx := findUnusedIdentityMatch(used, apiKeyEntryIdentity(entry.APIKey, entry.BaseURL, entry.ProxyURL), identityAt)
 		if idx >= 0 {
 			used[idx] = true
+			if entry.NativeResponses == nil && existing[idx].NativeResponses != nil {
+				value := *existing[idx].NativeResponses
+				entry.NativeResponses = &value
+			}
 			if entry.RoutingGroup == "" {
 				entry.RoutingGroup = existing[idx].RoutingGroup
 			}
@@ -280,6 +284,10 @@ func mergeCodexKeyFields(existing, incoming []config.CodexKey) []config.CodexKey
 		idx := findUnusedIdentityMatch(used, apiKeyEntryIdentity(entry.APIKey, entry.BaseURL, entry.ProxyURL), identityAt)
 		if idx >= 0 {
 			used[idx] = true
+			if entry.NativeResponses == nil && existing[idx].NativeResponses != nil {
+				value := *existing[idx].NativeResponses
+				entry.NativeResponses = &value
+			}
 			if entry.RoutingGroup == "" {
 				entry.RoutingGroup = existing[idx].RoutingGroup
 			}
@@ -1411,16 +1419,17 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
-		APIKey         *string              `json:"api-key"`
-		Priority       *int                 `json:"priority"`
-		Prefix         *string              `json:"prefix"`
-		RoutingGroup   *string              `json:"routing-group"`
-		Disabled       *bool                `json:"disabled"`
-		BaseURL        *string              `json:"base-url"`
-		ProxyURL       *string              `json:"proxy-url"`
-		Models         *[]config.CodexModel `json:"models"`
-		Headers        *map[string]string   `json:"headers"`
-		ExcludedModels *[]string            `json:"excluded-models"`
+		APIKey          *string              `json:"api-key"`
+		Priority        *int                 `json:"priority"`
+		Prefix          *string              `json:"prefix"`
+		RoutingGroup    *string              `json:"routing-group"`
+		Disabled        *bool                `json:"disabled"`
+		BaseURL         *string              `json:"base-url"`
+		NativeResponses json.RawMessage      `json:"native-responses"`
+		ProxyURL        *string              `json:"proxy-url"`
+		Models          *[]config.CodexModel `json:"models"`
+		Headers         *map[string]string   `json:"headers"`
+		ExcludedModels  *[]string            `json:"excluded-models"`
 	}
 	var body struct {
 		Index *int           `json:"index"`
@@ -1434,6 +1443,13 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	if body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
+	}
+	var nativeResponses *bool
+	if len(body.Value.NativeResponses) > 0 {
+		if err := json.Unmarshal(body.Value.NativeResponses, &nativeResponses); err != nil {
+			c.JSON(400, gin.H{"error": "native-responses must be a boolean or null"})
+			return
+		}
 	}
 
 	h.mu.Lock()
@@ -1457,6 +1473,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 
 	entry := h.cfg.CodexKey[targetIndex]
+	if len(body.Value.NativeResponses) > 0 {
+		entry.NativeResponses = nativeResponses
+	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}

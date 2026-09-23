@@ -701,45 +701,53 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available map[int][]*Auth, rateLimitedCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, model)
-		blocked, reason, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
+		blocked, _, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
 		if !blocked {
 			priority := effectiveSelectionPriorityForRoute(candidate, model, now, includeHealth)
 			available[priority] = append(available[priority], candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		healthBlocked := false
+		if includeHealth {
+			healthBlocked, _ = healthBlockStateForAuth(candidate, model, now)
+		}
+		if routeTemporalBlockIsRateLimited(candidate, model, now, healthBlocked) {
+			rateLimitedCount++
+		}
+		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, rateLimitedCount, earliest
 }
 
-func collectAvailableIgnoringPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available []*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableIgnoringPriority(auths []*Auth, model string, now time.Time, gptRoute bool) (available []*Auth, rateLimitedCount int, earliest time.Time) {
 	available = make([]*Auth, 0, len(auths))
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, model)
-		blocked, reason, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
+		blocked, _, next := isAuthBlockedForModelRoute(candidate, model, now, includeHealth)
 		if !blocked {
 			available = append(available, candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
+		healthBlocked := false
+		if includeHealth {
+			healthBlocked, _ = healthBlockStateForAuth(candidate, model, now)
+		}
+		if routeTemporalBlockIsRateLimited(candidate, model, now, healthBlocked) {
+			rateLimitedCount++
+		}
+		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, rateLimitedCount, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -751,20 +759,9 @@ func getAvailableAuthsForRoute(auths []*Auth, provider, model string, now time.T
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now, gptRoute)
+	availableByPriority, rateLimitedCount, earliest := collectAvailableByPriority(auths, model, now, gptRoute)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(model, providerForError, resetIn)
-		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, blockedRouteSelectionError(model, provider, len(auths), rateLimitedCount, earliest, now)
 	}
 
 	bestPriority := 0
@@ -792,20 +789,9 @@ func getSpreadAvailableAuthsForRoute(auths []*Auth, provider, model string, now 
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	available, cooldownCount, earliest := collectAvailableIgnoringPriority(auths, model, now, gptRoute)
+	available, rateLimitedCount, earliest := collectAvailableIgnoringPriority(auths, model, now, gptRoute)
 	if len(available) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(model, providerForError, resetIn)
-		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+		return nil, blockedRouteSelectionError(model, provider, len(auths), rateLimitedCount, earliest, now)
 	}
 
 	if len(available) > 1 {

@@ -212,6 +212,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.Websockets {
 			attrs["websockets"] = "true"
 		}
+		if ck.NativeResponses != nil {
+			attrs["native_responses"] = strconv.FormatBool(*ck.NativeResponses)
+		}
 		applyResponsesCompactionAttributes(attrs, ck.ResponsesCompaction)
 		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
