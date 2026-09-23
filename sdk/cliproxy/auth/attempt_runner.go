@@ -32,6 +32,7 @@ type managerAttemptRunner[T any] struct {
 	fallback                     managerAttemptFallbackFunc[T]
 	recovery                     managerAttemptRecoveryFunc[T]
 	configureGPTFirstEventPolicy bool
+	tokenCount                   bool
 }
 
 func (runner managerAttemptRunner[T]) run(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration) managerAttemptOutcome[T] {
@@ -50,7 +51,7 @@ attempts:
 			return managerAttemptOutcome[T]{result: result, success: true}
 		}
 		lastErr = errRun
-		if hasCommittedOutput(errRun) {
+		if isTerminalRoutingFailure(req.Model, opts, errRun) {
 			break attempts
 		}
 		if trace != nil && trace.totalAttemptBudgetExhausted() {
@@ -109,7 +110,7 @@ attempts:
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if runner.fallback != nil && !remoteCompaction && !hasCommittedOutput(lastErr) {
+	if runner.fallback != nil && !remoteCompaction && !isTerminalRoutingFailure(req.Model, opts, lastErr) {
 		result, ok, errFallback := runner.fallback(ctx, providers, req, opts, lastErr)
 		if errFallback != nil {
 			return managerAttemptOutcome[T]{returnErr: errFallback, finalErr: errFallback}
@@ -223,6 +224,13 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 	if len(providers) == 0 {
 		outcome.returnErr = &Error{Code: "provider_not_found", Message: "no provider supplied"}
 		outcome.finalErr = outcome.returnErr
+		return outcome.result, outcome.returnErr
+	}
+	var errShape error
+	opts, errShape = classifyNativeResponsesToolHistory(ctx, providers, req, opts, runner.tokenCount, runner.configureGPTFirstEventPolicy)
+	if errShape != nil {
+		outcome.returnErr = errShape
+		outcome.finalErr = errShape
 		return outcome.result, outcome.returnErr
 	}
 	remoteCompaction := cliproxyexecutor.IsRemoteCompactionIntent(compactionIntentFromRequest(req, opts))
@@ -369,8 +377,9 @@ func (m *Manager) runExecuteAttempts(ctx context.Context, providers []string, re
 
 func (m *Manager) runCountAttempts(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	runner := managerAttemptRunner[cliproxyexecutor.Response]{
-		manager: m,
-		runOnce: m.executeCountMixedOnce,
+		manager:    m,
+		runOnce:    m.executeCountMixedOnce,
+		tokenCount: true,
 	}
 	return runManagerAttemptOperation(ctx, m, providers, req, opts, runner)
 }

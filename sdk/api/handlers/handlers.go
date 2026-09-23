@@ -1595,6 +1595,7 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 	}
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	managerOwnsRetryBudget := h.AuthManager.OwnsStreamRetryBudget(providers, req, opts)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		releaseAdmission()
@@ -1715,6 +1716,11 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 		chunkIndex := 0
 		var historyChunks [][]byte
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		if managerOwnsRetryBudget {
+			// Re-entering Manager would restart the inbound request's retry and
+			// wait budgets. Manager has already exhausted its allowed recovery.
+			maxBootstrapRetries = 0
+		}
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -1743,6 +1749,12 @@ func (h *BaseAPIHandler) executeAdmittedStreamWithAuthManagerFormats(ctx context
 		}
 
 		bootstrapEligible := func(err error) bool {
+			if typed, ok := failurecontract.As(err); ok {
+				if typed.OutputCommitted || typed.StreamPhase == failurecontract.StreamPhaseAfterOutput ||
+					typed.Scope == failurecontract.ScopeRequest || !typed.Retryable {
+					return false
+				}
+			}
 			status := statusFromError(err)
 			if status == 0 {
 				return true

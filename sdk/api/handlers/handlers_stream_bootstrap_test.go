@@ -484,16 +484,18 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamWithAuthManager_RetriesSameAuthBeforeFirstByte(t *testing.T) {
-	executor := &failOnceStreamExecutor{}
+func TestExecuteStreamWithAuthManager_RetriesNonGPTSameAuthBeforeFirstByte(t *testing.T) {
+	executor := &retryContractStreamExecutor{provider: "legacy-bootstrap", failure: &coreauth.Error{
+		Code: "request_timeout", Message: "request timed out", Retryable: true, HTTPStatus: http.StatusRequestTimeout,
+	}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
 		ID:       "auth1",
-		Provider: "codex",
+		Provider: executor.Identifier(),
 		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"email": "test1@example.com"},
+		Metadata: map[string]any{"email": "test1@example.com", "disable_cooling": true},
 	}
 	if _, err := manager.Register(context.Background(), auth1); err != nil {
 		t.Fatalf("manager.Register(auth1): %v", err)

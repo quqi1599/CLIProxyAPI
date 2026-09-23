@@ -45,6 +45,14 @@ uses the WorkBuddy/Codex client profile plus at least 240 messages with at least
 Metadata and actual body evidence are combined conservatively. Large-request
 retry budgets are a separate concern, not evidence of protocol incompatibility.
 
+Source messages are not Responses items. Before candidate selection, generation
+measures the actual request-scoped translator output once outside the retry loop;
+one source message may expand into multiple messages, calls and results. The
+result only adds a restrictive capability requirement. Do not duplicate the
+translator's expansion algorithm or let low-reported metadata override the body.
+Plugin translators and existing untranslated fallbacks retain their registry
+semantics. Execution still checks its final body as a defense-in-depth boundary.
+
 SDK calls use the request payload when no original payload was provided. Count
 selection is explicitly distinguished from generation. Built-in scheduler
 delegation must not escape the candidate set that passed compatibility and health
@@ -59,6 +67,10 @@ the remote Home scheduler's own candidate policy remains its responsibility.
   known recovery delay as `Retry-After`; do not claim an upstream request occurred.
 - Preserve actual upstream failures separately from local selection failures.
 - Do not replay deterministic 400 failures or responses whose output is committed.
+- GPT and remote-compaction streaming retry budgets belong to Manager. The HTTP
+  bootstrap wrapper must not start another Manager operation after that budget
+  ends. Non-GPT legacy bootstrap still respects explicit terminal request errors
+  and committed/after-output markers.
 - Downstream NewAPI can try a different aggregate entry point, but an entry point
   reporting `auth_unavailable` must stay excluded for that client request across
   retry rounds. This is not a persistent/global channel disable.
@@ -78,6 +90,10 @@ the remote Home scheduler's own candidate policy remains its responsibility.
    later round may retry B but never resets A's request-scoped exclusion.
 10. Configuring generic 400 retry must not make `request_feature_unsupported`
     retryable; committed output must never be replayed.
+11. Exercise the real Handler-to-Manager path with bootstrap retries set to 0, 1
+    and 3; total attempts must stay within the same request budget.
+12. A source history below the item threshold that expands above it must select
+    a compatible route before execution, including plugin-only translators.
 
 ## Release boundary
 

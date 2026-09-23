@@ -1,20 +1,96 @@
 package auth
 
 import (
+	"bytes"
+	"context"
 	"strings"
 
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+const nativeResponsesToolHistoryRequiredMetadataKey = "__cliproxy_native_responses_tool_history_required"
+
+// classifyNativeResponsesToolHistory runs once before the manager's retry loop.
+// Source messages are not Responses items: one Anthropic/Chat message can expand
+// to multiple messages, calls and results. Use the request-scoped translator,
+// rather than a second approximation of its conversion rules, before selection.
+// Only a restrictive result is propagated; false/untrusted metadata can never
+// override the actual source or executor body evidence.
+func classifyNativeResponsesToolHistory(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, tokenCount, stream bool) (cliproxyexecutor.Options, error) {
+	if tokenCount || !isProtectedResponsesToolHistoryClient(opts.Metadata) {
+		return opts, nil
+	}
+	hasCodex := false
+	for _, provider := range providers {
+		hasCodex = hasCodex || isCodexProviderName(provider)
+	}
+	if !hasCodex {
+		return opts, nil
+	}
+	bodies := [][]byte{req.Payload}
+	if len(opts.OriginalRequest) > 0 && !bytes.Equal(req.Payload, opts.OriginalRequest) {
+		bodies = append(bodies, opts.OriginalRequest)
+	}
+	required := false
+	for _, body := range bodies {
+		if RequiresNativeResponsesToolHistory(opts.Metadata, body) {
+			required = true
+			break
+		}
+	}
+	if !required {
+		registry := sdktranslator.RegistryFromContext(ctx)
+		for _, body := range bodies {
+			if len(body) == 0 {
+				continue
+			}
+			// Preserve registry semantics, including plugin-only transforms and
+			// passthrough for an unregistered format. Missing conversion is not
+			// a new global request error that may suppress non-Codex candidates.
+			translated := registry.TranslateRequest(opts.SourceFormat, sdktranslator.FormatCodex,
+				thinking.ParseSuffix(req.Model).ModelName, internalpayload.CloneBytes(body), stream)
+			if err := internalpayload.EnforceRequestTransform(ctx, "routing.codex.tool_history", int64(len(body)), int64(len(translated)), internalpayload.AmplificationOverride{}); err != nil {
+				return opts, err
+			}
+			if RequiresNativeResponsesToolHistory(opts.Metadata, translated) {
+				required = true
+				break
+			}
+		}
+	}
+	if required {
+		metadata := make(map[string]any, len(opts.Metadata)+1)
+		for key, value := range opts.Metadata {
+			metadata[key] = value
+		}
+		metadata[nativeResponsesToolHistoryRequiredMetadataKey] = true
+		opts.Metadata = metadata
+	}
+	return opts, nil
+}
+
+func isProtectedResponsesToolHistoryClient(metadata map[string]any) bool {
+	switch strings.ToLower(metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey)) {
+	case "workbuddy", "codex", "codex_cli", "codex_tui":
+		return true
+	default:
+		return false
+	}
+}
 
 // RequiresNativeResponsesToolHistory describes the request shape protected by
 // both routing and execution. Retry-budget thresholds are intentionally separate:
 // a long plain-text conversation alone is not a tool compatibility failure.
 func RequiresNativeResponsesToolHistory(metadata map[string]any, body []byte) bool {
-	switch strings.ToLower(metadataString(metadata, cliproxyexecutor.ClientProfileMetadataKey)) {
-	case "workbuddy", "codex", "codex_cli", "codex_tui":
-	default:
+	if !isProtectedResponsesToolHistoryClient(metadata) {
 		return false
+	}
+	if required, _ := metadata[nativeResponsesToolHistoryRequiredMetadataKey].(bool); required {
+		return true
 	}
 	messages := intMetadataValue(metadata[cliproxyexecutor.MessageCountMetadataKey])
 	tools := intMetadataValue(metadata[cliproxyexecutor.ToolCountMetadataKey])

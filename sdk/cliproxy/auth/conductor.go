@@ -4738,7 +4738,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			requestInvalid := isRequestInvalidError(errStream)
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
-				!hasCommittedOutput(errStream) &&
+				!isTerminalRoutingFailure(routeModel, opts, errStream) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4752,7 +4752,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				trace.recordFinalStatus(statusCodeFromError(errStream))
 			}
 			m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, errStream)
-			if hasCommittedOutput(errStream) {
+			if isTerminalRoutingFailure(routeModel, opts, errStream) {
 				return nil, errStream
 			}
 			if isKimiInsufficientQuotaError(auth, errStream) {
@@ -4882,7 +4882,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			requestInvalid := isRequestInvalidError(bootstrapErr)
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
-				!hasCommittedOutput(bootstrapErr) &&
+				!isTerminalRoutingFailure(routeModel, opts, bootstrapErr) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4899,7 +4899,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.recordContentSafetyRequest(ctx, auth, provider, routeModel, execModel, opts, req.Payload, bootstrapErr)
 			}
 			cleanupAttempt()
-			if hasCommittedOutput(bootstrapErr) {
+			if isTerminalRoutingFailure(routeModel, opts, bootstrapErr) {
 				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 			}
 			if isKimiInsufficientQuotaError(auth, bootstrapErr) {
@@ -5913,7 +5913,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				requestInvalid := isRequestInvalidError(errExec)
 				routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec)
 				result.keepSelectorLease = idx < len(models)-1 &&
-					!hasCommittedOutput(errExec) &&
+					!isTerminalRoutingFailure(routeModel, opts, errExec) &&
 					!channelFailover &&
 					!unauthorized &&
 					(!requestInvalid || routeFallback)
@@ -5925,7 +5925,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				}
 				trace.recordFinalStatus(statusCodeFromError(errExec))
 				m.recordContentSafetyRequest(execCtx, auth, provider, routeModel, upstreamModel, opts, req.Payload, errExec)
-				if hasCommittedOutput(errExec) {
+				if isTerminalRoutingFailure(routeModel, opts, errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -6199,7 +6199,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, newCallerRequestFailure(errCtx)
 			}
-			if hasCommittedOutput(errStream) {
+			if isTerminalRoutingFailure(routeModel, opts, errStream) {
 				return nil, errStream
 			}
 			channelFailover := shouldFailoverGPTChannel(errStream, providers, routeModel) ||
@@ -7441,6 +7441,9 @@ func markGPTChannelFailoverError(err error) error {
 
 func shouldFailoverGPTChannel(err error, providers []string, model string) bool {
 	if err == nil || hasCommittedOutput(err) || !isGPTRetryRoute(providers, model) {
+		return false
+	}
+	if isTerminalRoutingFailure(model, cliproxyexecutor.Options{}, err) {
 		return false
 	}
 	var marked *gptChannelFailoverError
@@ -12851,6 +12854,9 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool) (*Auth, bool) {
 	if m == nil || auth == nil || alreadyTried || execErr == nil || hasCommittedOutput(execErr) {
+		return auth, false
+	}
+	if failure, ok := failurecontract.As(execErr); ok && failure.Scope == failurecontract.ScopeRequest {
 		return auth, false
 	}
 	if !isCodexAuth(auth) ||
