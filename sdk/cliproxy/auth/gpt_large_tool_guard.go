@@ -108,21 +108,28 @@ func isGPTLargeToolHistoryResponsesModel(model string) bool {
 	}
 }
 
-// preferGPTNativeResponsesAuths filters by capability, not by credential origin
-// or health. Every declared compatible route remains eligible for health-aware
-// selection and failover. Unknown routes must not become a fallback merely
-// because all compatible credentials are unavailable or have been tried.
+// preferGPTNativeResponsesAuths filters by request compatibility, not by
+// credential origin or health. A Codex-only transform rejection excludes Codex
+// candidates even if they declare native support. Unknown routes must not become
+// a fallback merely because compatible credentials are unavailable or tried.
 func preferGPTNativeResponsesAuths(auths []*Auth, providers []string, model string, opts cliproxyexecutor.Options) ([]*Auth, int) {
-	if !requiresNativeResponsesToolHistoryRouting(providers, opts) {
+	if !requiresCodexToolHistoryRouting(providers, opts) {
 		return auths, 0
 	}
+	preflightRejected := codexToolHistoryPreflightError(opts) != nil
+	requireNative := requiresNativeResponsesToolHistoryRouting(providers, opts)
 	native := make([]*Auth, 0, len(auths))
 	for _, auth := range auths {
-		if auth != nil && (!isCodexAuth(auth) || SupportsNativeResponses(auth)) {
-			native = append(native, auth)
+		if auth == nil || (isCodexAuth(auth) && (preflightRejected || (requireNative && !SupportsNativeResponses(auth)))) {
+			continue
 		}
+		native = append(native, auth)
 	}
 	return native, len(auths) - len(native)
+}
+
+func requiresCodexToolHistoryRouting(providers []string, opts cliproxyexecutor.Options) bool {
+	return codexToolHistoryPreflightError(opts) != nil || requiresNativeResponsesToolHistoryRouting(providers, opts)
 }
 
 func requiresNativeResponsesToolHistoryRouting(providers []string, opts cliproxyexecutor.Options) bool {

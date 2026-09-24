@@ -52,6 +52,12 @@ result only adds a restrictive capability requirement. Do not duplicate the
 translator's expansion algorithm or let low-reported metadata override the body.
 Plugin translators and existing untranslated fallbacks retain their registry
 semantics. Execution still checks its final body as a defense-in-depth boundary.
+If speculative Codex conversion exceeds the configured amplification allowance,
+exclude only Codex candidates for that request. A healthy provider that uses the
+source protocol must remain selectable. If only rejected Codex candidates remain,
+preserve the original transform error; a native Responses capability declaration
+does not override it. Observe mode and count-only selection retain their existing
+semantics, and the selected executor still enforces its own actual transformation.
 
 SDK calls use the request payload when no original payload was provided. Count
 selection is explicitly distinguished from generation. Built-in scheduler

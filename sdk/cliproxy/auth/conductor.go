@@ -11236,6 +11236,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		if err == nil {
+			if preflightErr := codexToolHistoryPreflightError(opts); preflightErr != nil && isCodexAuth(auth) {
+				return nil, nil, preflightErr
+			}
 			if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) && isCodexAuth(auth) && !SupportsNativeResponses(auth) {
 				return nil, nil, nativeResponsesToolHistorySelectionError()
 			}
@@ -11326,7 +11329,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if len(candidates) == 0 && nativeResponsesExcluded > 0 {
 		m.mu.RUnlock()
-		return nil, nil, nativeResponsesToolHistorySelectionError()
+		return nil, nil, codexToolHistorySelectionError(opts)
 	}
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, provider, model, time.Now())
 	if errAvailable != nil {
@@ -11432,7 +11435,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
-	if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) {
+	if requiresCodexToolHistoryRouting([]string{provider}, opts) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {
@@ -11515,6 +11518,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if m.HomeEnabled() {
 		auth, exec, provider, err := m.pickNextViaHome(ctx, model, opts, tried)
 		if err == nil {
+			if preflightErr := codexToolHistoryPreflightError(opts); preflightErr != nil && isCodexAuth(auth) {
+				return nil, nil, "", preflightErr
+			}
 			if requiresNativeResponsesToolHistoryRouting([]string{provider}, opts) && isCodexAuth(auth) && !SupportsNativeResponses(auth) {
 				return nil, nil, "", nativeResponsesToolHistorySelectionError()
 			}
@@ -11613,7 +11619,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if len(candidates) == 0 && nativeResponsesExcluded > 0 {
 		m.mu.RUnlock()
-		return nil, nil, "", nativeResponsesToolHistorySelectionError()
+		return nil, nil, "", codexToolHistorySelectionError(opts)
 	}
 	available, errAvailable := m.availableAuthsForRouteModelContext(ctx, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
@@ -11678,7 +11684,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	opts = m.relaxPinnedAuthForFallback(ctx, opts, model, tried)
-	if requiresNativeResponsesToolHistoryRouting(providers, opts) {
+	if requiresCodexToolHistoryRouting(providers, opts) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	if shouldPrefilterDeepSeekResponses(model, opts) {

@@ -14,6 +14,42 @@ import (
 
 const nativeResponsesToolHistoryRequiredMetadataKey = "__cliproxy_native_responses_tool_history_required"
 
+const codexToolHistoryPreflightFailureMetadataKey = "__cliproxy_codex_tool_history_preflight_failure"
+
+// Keep a rejected speculative transform local to Codex candidates. A different
+// provider may execute the source protocol without this conversion at all.
+// The private wrapper cannot be supplied through client JSON metadata.
+type codexToolHistoryPreflightFailure struct {
+	err error
+}
+
+func codexToolHistoryPreflightError(opts cliproxyexecutor.Options) error {
+	if opts.TokenCount {
+		return nil
+	}
+	if failure, ok := opts.Metadata[codexToolHistoryPreflightFailureMetadataKey].(*codexToolHistoryPreflightFailure); ok && failure != nil {
+		return failure.err
+	}
+	return nil
+}
+
+func codexToolHistorySelectionError(opts cliproxyexecutor.Options) error {
+	if err := codexToolHistoryPreflightError(opts); err != nil {
+		return err
+	}
+	return nativeResponsesToolHistorySelectionError()
+}
+
+func withCodexToolHistoryMetadata(opts cliproxyexecutor.Options, key string, value any) cliproxyexecutor.Options {
+	metadata := make(map[string]any, len(opts.Metadata)+1)
+	for key, value := range opts.Metadata {
+		metadata[key] = value
+	}
+	metadata[key] = value
+	opts.Metadata = metadata
+	return opts
+}
+
 // classifyNativeResponsesToolHistory runs once before the manager's retry loop.
 // Source messages are not Responses items: one Anthropic/Chat message can expand
 // to multiple messages, calls and results. Use the request-scoped translator,
@@ -54,7 +90,7 @@ func classifyNativeResponsesToolHistory(ctx context.Context, providers []string,
 			translated := registry.TranslateRequest(opts.SourceFormat, sdktranslator.FormatCodex,
 				thinking.ParseSuffix(req.Model).ModelName, internalpayload.CloneBytes(body), stream)
 			if err := internalpayload.EnforceRequestTransform(ctx, "routing.codex.tool_history", int64(len(body)), int64(len(translated)), internalpayload.AmplificationOverride{}); err != nil {
-				return opts, err
+				return withCodexToolHistoryMetadata(opts, codexToolHistoryPreflightFailureMetadataKey, &codexToolHistoryPreflightFailure{err: err}), nil
 			}
 			if RequiresNativeResponsesToolHistory(opts.Metadata, translated) {
 				required = true
@@ -63,12 +99,7 @@ func classifyNativeResponsesToolHistory(ctx context.Context, providers []string,
 		}
 	}
 	if required {
-		metadata := make(map[string]any, len(opts.Metadata)+1)
-		for key, value := range opts.Metadata {
-			metadata[key] = value
-		}
-		metadata[nativeResponsesToolHistoryRequiredMetadataKey] = true
-		opts.Metadata = metadata
+		opts = withCodexToolHistoryMetadata(opts, nativeResponsesToolHistoryRequiredMetadataKey, true)
 	}
 	return opts, nil
 }
