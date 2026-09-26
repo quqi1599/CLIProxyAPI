@@ -97,3 +97,34 @@ func TestChooseConfigBootstrapMode(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresAuthMirrorResetPreservesRuntimeStateAndLogs(t *testing.T) {
+	dir := t.TempDir()
+	retained := []string{".runtime/spread/default.json", "logs/main.log", "account.cds"}
+	removed := []string{"old.json", "nested/stale.json"}
+	for _, name := range append(append([]string{}, retained...), removed...) {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		if err := resetPostgresAuthMirror(dir); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range retained {
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil || string(data) != "fixture" {
+				t.Fatalf("retained %s: %q %v", name, data, err)
+			}
+		}
+		for _, name := range removed {
+			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Fatalf("stale credential remains: %s %v", name, err)
+			}
+		}
+	}
+}
