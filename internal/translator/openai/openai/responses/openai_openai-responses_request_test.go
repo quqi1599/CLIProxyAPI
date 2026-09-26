@@ -19,6 +19,19 @@ func prettyJSONForTest(raw []byte) string {
 	return out.String()
 }
 
+func BenchmarkPayloadGrowthConvertOpenAIResponsesRequest(b *testing.B) {
+	body := []byte(`{"input":[{"role":"user","content":"run the request"}],"thinking":{"type":"enabled"},"enable_thinking":true,"thinking_budget":1024,"reasoning_effort":"high"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-6-astra", body, false)
+		if len(out) == 0 {
+			b.Fatal("Responses request conversion returned an empty payload")
+		}
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MergeConsecutiveFunctionCalls(t *testing.T) {
 	raw := []byte(`{
 		"input": [

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 type countingRequestReader struct {
@@ -28,10 +29,12 @@ func (r *countingRequestReader) Read(p []byte) (int, error) {
 func TestIngressAdmissionRejectsBeforeReadingRequestBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := NewBaseAPIHandlers(nil, nil)
-	controller := newAdmissionController(1, 1, time.Second)
-	controller.maxWait = time.Millisecond
-	handler.admission.Store(controller)
-	releaseActive, err := controller.acquire(context.Background(), 1)
+	executionController := newAdmissionController(1, 1, time.Second)
+	readController := newAdmissionController(1, 1, time.Second)
+	readController.maxWait = time.Millisecond
+	handler.admission.Store(executionController)
+	handler.readAdmission.Store(readController)
+	releaseActive, err := readController.acquire(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("fill admission capacity: %v", err)
 	}
@@ -54,8 +57,68 @@ func TestIngressAdmissionRejectsBeforeReadingRequestBody(t *testing.T) {
 	if reader.reads != 0 {
 		t.Fatalf("request body reads = %d, want 0", reader.reads)
 	}
-	if active, queued := controller.snapshot(); active != 1 || queued != 0 {
+	if active, queued := readController.snapshot(); active != 1 || queued != 0 {
 		t.Fatalf("admission snapshot = %d/%d, want 1/0", active, queued)
+	}
+}
+
+func TestAdmissionSnapshotSeparatesReadAndExecution(t *testing.T) {
+	cfg := &config.SDKConfig{}
+	cfg.RequestGuards.GlobalAdmission.Enabled = true
+	cfg.RequestGuards.GlobalAdmission.Capacity = 8
+	handler := NewBaseAPIHandlers(cfg, nil)
+	execution := handler.admission.Load()
+	read := handler.readAdmission.Load()
+	if execution == nil || read == nil || execution == read {
+		t.Fatal("expected independent execution and read admission controllers")
+	}
+	releaseExecution, err := execution.acquire(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("acquire execution capacity: %v", err)
+	}
+	defer releaseExecution()
+	releaseRead, err := read.acquire(context.Background(), 8)
+	if err != nil {
+		t.Fatalf("acquire read capacity: %v", err)
+	}
+	defer releaseRead()
+	snapshot := handler.AdmissionSnapshot()
+	if snapshot.ActiveWeight != 3 || snapshot.ReadActiveWeight != 8 {
+		t.Fatalf("snapshot = execution:%d read:%d, want 3/8", snapshot.ActiveWeight, snapshot.ReadActiveWeight)
+	}
+}
+
+func TestReadAdmissionIsNotReacquiredAfterBodyRead(t *testing.T) {
+	handler := NewBaseAPIHandlers(nil, nil)
+	execution := newAdmissionController(8, 1, time.Second)
+	read := newAdmissionController(8, 1, time.Second)
+	handler.admission.Store(execution)
+	handler.readAdmission.Store(read)
+	engine := gin.New()
+	engine.Use(handler.PreAuthIngressAdmissionMiddleware())
+	engine.Use(func(c *gin.Context) {
+		if _, errRead := ReadRequestBody(c); errRead != nil {
+			t.Fatalf("ReadRequestBody() error = %v", errRead)
+		}
+		c.Next()
+	})
+	engine.Use(handler.IngressAdmissionMiddleware())
+	engine.POST("/v1/chat/completions", func(c *gin.Context) {
+		if active, queued := read.snapshot(); active != 0 || queued != 0 {
+			t.Fatalf("read admission after body read = %d/%d, want 0/0", active, queued)
+		}
+		if active, queued := execution.snapshot(); active != 0 || queued != 0 {
+			t.Fatalf("execution admission before execution = %d/%d, want 0/0", active, queued)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"messages":[]}`)))
+	request.ContentLength = -1
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusNoContent, response.Body.String())
 	}
 }
 
@@ -63,7 +126,7 @@ func TestPreAuthAdmissionRejectsBeforeBodyReadingMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := NewBaseAPIHandlers(nil, nil)
 	controller := newAdmissionController(1, 1, time.Second)
-	handler.admission.Store(controller)
+	handler.readAdmission.Store(controller)
 	releaseActive, err := controller.acquire(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("fill admission capacity: %v", err)
@@ -105,21 +168,25 @@ func TestIngressAdmissionUsesPhysicalDecodedCeilingAndReleases(t *testing.T) {
 		contentLength int64
 		encoding      string
 		cancel        bool
-		wantWeight    int
+		wantExecution int
+		wantRead      int
 	}{
-		{name: "gzip", contentLength: 2, encoding: "gzip", wantWeight: capacity},
-		{name: "unknown-length", contentLength: -1, wantWeight: capacity},
-		{name: "unknown-length-canceled", contentLength: -1, cancel: true, wantWeight: capacity},
-		{name: "known-identity", contentLength: 4 << 20, wantWeight: 3},
+		{name: "gzip", contentLength: 2, encoding: "gzip", wantExecution: 0, wantRead: capacity},
+		{name: "unknown-length", contentLength: -1, wantExecution: 0, wantRead: capacity},
+		{name: "unknown-length-canceled", contentLength: -1, cancel: true, wantExecution: 0, wantRead: capacity},
+		{name: "known-identity", contentLength: 4 << 20, wantExecution: 0, wantRead: 0},
 	}
 
 	for _, middleware := range middlewares {
 		for _, requestCase := range requests {
 			t.Run(middleware.name+"/"+requestCase.name, func(t *testing.T) {
 				handler := newPayloadBodyLimitTestHandler(payloadBodyLimitObserve, 64, false)
-				controller := newAdmissionController(capacity, 1, time.Second)
-				handler.admission.Store(controller)
-				observedWeight := -1
+				executionController := newAdmissionController(capacity, 1, time.Second)
+				readController := newAdmissionController(capacity, 1, time.Second)
+				handler.admission.Store(executionController)
+				handler.readAdmission.Store(readController)
+				observedExecutionWeight := -1
+				observedReadWeight := -1
 				observedCanceled := false
 
 				request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
@@ -137,7 +204,8 @@ func TestIngressAdmissionUsesPhysicalDecodedCeilingAndReleases(t *testing.T) {
 				engine := gin.New()
 				engine.Use(middleware.use(handler))
 				engine.POST("/v1/chat/completions", func(c *gin.Context) {
-					observedWeight, _ = controller.snapshot()
+					observedExecutionWeight, _ = executionController.snapshot()
+					observedReadWeight, _ = readController.snapshot()
 					if cancel != nil {
 						cancel()
 						observedCanceled = errors.Is(c.Request.Context().Err(), context.Canceled)
@@ -153,14 +221,20 @@ func TestIngressAdmissionUsesPhysicalDecodedCeilingAndReleases(t *testing.T) {
 				if response.Code != http.StatusNoContent {
 					t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusNoContent, response.Body.String())
 				}
-				if observedWeight != requestCase.wantWeight {
-					t.Fatalf("active weight = %d, want %d", observedWeight, requestCase.wantWeight)
+				if observedExecutionWeight != requestCase.wantExecution {
+					t.Fatalf("execution active weight = %d, want %d", observedExecutionWeight, requestCase.wantExecution)
+				}
+				if observedReadWeight != requestCase.wantRead {
+					t.Fatalf("read active weight = %d, want %d", observedReadWeight, requestCase.wantRead)
 				}
 				if requestCase.cancel && !observedCanceled {
 					t.Fatal("request context was not canceled in the handler")
 				}
-				if active, queued := controller.snapshot(); active != 0 || queued != 0 {
-					t.Fatalf("released snapshot = %d/%d, want 0/0", active, queued)
+				if active, queued := executionController.snapshot(); active != 0 || queued != 0 {
+					t.Fatalf("released execution snapshot = %d/%d, want 0/0", active, queued)
+				}
+				if active, queued := readController.snapshot(); active != 0 || queued != 0 {
+					t.Fatalf("released read snapshot = %d/%d, want 0/0", active, queued)
 				}
 			})
 		}
@@ -171,26 +245,40 @@ func TestPreAuthAdmissionReweightsUnknownLengthAfterParsing(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const capacity = 8
 	handler := newPayloadBodyLimitTestHandler(payloadBodyLimitObserve, 64, false)
-	controller := newAdmissionController(capacity, 1, time.Second)
-	handler.admission.Store(controller)
+	executionController := newAdmissionController(capacity, 1, time.Second)
+	readController := newAdmissionController(capacity, 1, time.Second)
+	handler.admission.Store(executionController)
+	handler.readAdmission.Store(readController)
 	body := admissionRequestWithMessages(1)
 	wantVector, valid := inspectRequestComplexity(body)
 	if !valid {
 		t.Fatal("test request complexity is invalid")
 	}
-	wantWeight := complexityAdmissionWeight(wantVector)
+	wantWeight := executionAdmissionWeight(wantVector)
 
 	engine := gin.New()
 	engine.Use(handler.PreAuthIngressAdmissionMiddleware())
 	engine.POST("/v1/chat/completions", func(c *gin.Context) {
-		if active, queued := controller.snapshot(); active != capacity || queued != 0 {
-			t.Fatalf("pre-parse admission = %d/%d, want %d/0", active, queued, capacity)
+		if active, queued := executionController.snapshot(); active != 0 || queued != 0 {
+			t.Fatalf("pre-parse execution admission = %d/%d, want 0/0", active, queued)
+		}
+		if active, queued := readController.snapshot(); active != capacity || queued != 0 {
+			t.Fatalf("pre-parse read admission = %d/%d, want %d/0", active, queued, capacity)
 		}
 		if _, errRead := ReadRequestBody(c); errRead != nil {
 			t.Fatalf("ReadRequestBody() error = %v", errRead)
 		}
-		if active, queued := controller.snapshot(); active != wantWeight || queued != 0 {
-			t.Fatalf("post-parse admission = %d/%d, want %d/0", active, queued, wantWeight)
+		if active, queued := readController.snapshot(); active != 0 || queued != 0 {
+			t.Fatalf("post-parse read admission = %d/%d, want 0/0", active, queued)
+		}
+		ctx := context.WithValue(context.Background(), "gin", c)
+		_, releaseExecution, errAcquire := handler.inspectAndAcquireAdmission(ctx, body, &modelExecutionOptions{})
+		if errAcquire != nil {
+			t.Fatalf("execution admission error = %v", errAcquire)
+		}
+		defer releaseExecution()
+		if active, queued := executionController.snapshot(); active != wantWeight || queued != 0 {
+			t.Fatalf("post-parse execution admission = %d/%d, want %d/0", active, queued, wantWeight)
 		}
 		c.Status(http.StatusNoContent)
 	})
@@ -202,8 +290,11 @@ func TestPreAuthAdmissionReweightsUnknownLengthAfterParsing(t *testing.T) {
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
 	}
-	if active, queued := controller.snapshot(); active != 0 || queued != 0 {
-		t.Fatalf("released admission = %d/%d, want 0/0", active, queued)
+	if active, queued := executionController.snapshot(); active != 0 || queued != 0 {
+		t.Fatalf("released execution admission = %d/%d, want 0/0", active, queued)
+	}
+	if active, queued := readController.snapshot(); active != 0 || queued != 0 {
+		t.Fatalf("released read admission = %d/%d, want 0/0", active, queued)
 	}
 }
 
@@ -277,7 +368,7 @@ func TestIngressAdmissionUpgradeAndExecutionReuseOneLease(t *testing.T) {
 	if !valid {
 		t.Fatal("test request complexity is invalid")
 	}
-	wantWeight := complexityAdmissionWeight(wantVector)
+	wantWeight := executionAdmissionWeight(wantVector)
 
 	engine := gin.New()
 	engine.Use(handler.IngressAdmissionMiddleware())
@@ -309,36 +400,37 @@ func TestIngressAdmissionUpgradeAndExecutionReuseOneLease(t *testing.T) {
 	}
 }
 
-func TestIngressAdmissionUpgradeFailsWithoutQueueingBehindItself(t *testing.T) {
+func TestIngressBodyAdmissionUpgradeFailsWithoutQueueingBehindItself(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := NewBaseAPIHandlers(nil, nil)
-	controller := newAdmissionController(3, 2, time.Second)
-	handler.admission.Store(controller)
+	body := admissionRequestWithMessages(257)
+	controller := newAdmissionController(len(body), 2, time.Second)
+	controller.strictCapacity = true
+	handler.bodyAdmission.Store(controller)
 	releaseOther, err := controller.acquire(context.Background(), 1)
 	if err != nil {
-		t.Fatalf("acquire unrelated capacity: %v", err)
+		t.Fatal(err)
 	}
 	defer releaseOther()
-	body := admissionRequestWithMessages(257)
-
 	engine := gin.New()
 	engine.Use(handler.IngressAdmissionMiddleware())
 	engine.POST("/v1/chat/completions", func(c *gin.Context) {
-		if _, errRead := ReadRequestBody(c); errRead == nil {
-			t.Fatal("ReadRequestBody() succeeded, want admission upgrade rejection")
+		if _, errRead := ReadRequestBody(c); !errors.Is(errRead, errAdmissionQueueFull) {
+			t.Fatalf("want byte rejection, got %v", errRead)
 		} else {
 			WriteRequestBodyError(c, errRead)
 		}
 	})
-
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	// Exercise an underestimated body; real unknown bodies take the same measured transfer.
+	request.ContentLength = 1
 	recorder := httptest.NewRecorder()
 	engine.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+		t.Fatalf("status %d", recorder.Code)
 	}
 	if active, queued := controller.snapshot(); active != 1 || queued != 0 {
-		t.Fatalf("post-rejection snapshot = %d/%d, want 1/0", active, queued)
+		t.Fatalf("leaked byte lease %d/%d", active, queued)
 	}
 }
 

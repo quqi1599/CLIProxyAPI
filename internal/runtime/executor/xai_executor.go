@@ -869,6 +869,11 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 }
 
 func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, to sdktranslator.Format) (*xaiPreparedRequest, error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)

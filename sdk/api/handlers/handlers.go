@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -308,6 +309,9 @@ func normalizeKnownUserErrorStatus(status int, errText string) (int, bool) {
 	if _, normalizedStatus, ok := remoteCompactionErrorDetail(status, errText); ok {
 		return normalizedStatus, true
 	}
+	if isUpstreamModelUnavailableError(status, errText) {
+		return status, true
+	}
 	if isInvalidRequestParameterError(status, errText) {
 		return http.StatusBadRequest, true
 	}
@@ -352,6 +356,13 @@ func BuildClientHintErrorBody(status int, errText string) ([]byte, bool) {
 }
 
 func clientHintErrorDetail(status int, errText string) (ErrorDetail, bool) {
+	if isUpstreamModelUnavailableError(status, errText) {
+		return ErrorDetail{
+			Message: "上游接口不支持该模型、模型不存在或当前凭据未开通。请管理员核实模型 ID、接口和渠道支持范围；修改 temperature 或清理工具历史不能解决此问题。",
+			Type:    "invalid_request_error",
+			Code:    "model_not_supported",
+		}, true
+	}
 	if isInvalidRequestParameterError(status, errText) {
 		return ErrorDetail{
 			Message: "请求参数不兼容或格式不正确。请检查模型、接口路径和工具调用历史；移除当前模型不支持的 temperature、reasoning、tool_choice、max_tokens 等参数，或清理失配的 tool_result 后重试。原样重复提交不会提高成功率。",
@@ -376,7 +387,26 @@ func clientHintErrorDetail(status int, errText string) (ErrorDetail, bool) {
 	return ErrorDetail{}, false
 }
 
+func isUpstreamModelUnavailableError(status int, errText string) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired,
+		http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity:
+	default:
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(errText))
+	for _, marker := range []string{"model_not_supported", "model_not_found", "model not exist", "model does not exist", "model not found", "requested model is not supported"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func isInvalidRequestParameterError(status int, errText string) bool {
+	if isUpstreamModelUnavailableError(status, errText) {
+		return false
+	}
 	if status > 0 && status < http.StatusBadRequest {
 		return false
 	}
@@ -706,10 +736,14 @@ type BaseAPIHandler struct {
 	// executor, or a built-in provider before model-to-provider resolution and auth selection.
 	ModelRouterHost PluginModelRouterHost
 
-	admissionUpdateMu sync.Mutex
-	admission         atomic.Pointer[admissionController]
-	payloadBodyLimit  atomic.Pointer[payloadBodyLimitPolicy]
-	amplification     atomic.Pointer[amplificationGuardPolicy]
+	admissionUpdateMu  sync.Mutex
+	admission          atomic.Pointer[admissionController]
+	readAdmission      atomic.Pointer[admissionController]
+	bodyAdmission      atomic.Pointer[admissionController]
+	transformAdmission atomic.Pointer[admissionController]
+	transformCosts     transformCostHistory
+	payloadBodyLimit   atomic.Pointer[payloadBodyLimitPolicy]
+	amplification      atomic.Pointer[amplificationGuardPolicy]
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -850,6 +884,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithClientRequestID(parentCtx, requestID)
 		}
 	}
+	parentCtx = routemetrics.Copy(parentCtx, requestCtx)
 	newCtx, cancel := context.WithCancelCause(parentCtx)
 
 	endpointMethod := ""
@@ -2002,7 +2037,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	if len(providers) == 0 {
-		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusNotFound, Error: fmt.Errorf("no provider route configured for model %s", modelName)}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no

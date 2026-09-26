@@ -341,7 +341,13 @@ nonstream-keepalive-interval: 0
 #                                      # A fixed 256 MiB emergency ceiling always applies and is not configurable.
 #   global-admission:
 #     enabled: true                  # Default: false. Opt in after calibrating limits for this deployment.
-#     capacity: 128                  # Total weighted in-flight request capacity. <= 0 uses 128.
+#     capacity: 128                  # Execution slots. <=16 MiB costs 1; larger inputs cost 4 per started 32 MiB.
+#     body-capacity-bytes: 536870912  # Retained decoded inputs, separate from slots (default 512 MiB). No ingress wait.
+#     read-capacity: 128             # Unknown/encoded reads; omitted inherits capacity. Released after decoding.
+#     transform-capacity: 16         # Preparation units: <=1 MiB: 1, <=16 MiB: 2, >16 MiB: 8.
+#                                    # A size bucket with >1s elapsed EWMA costs double. This is wall time, not CPU time.
+#     transform-max-queue: 64        # Independent bounded preparation queue; omitted inherits max-queue.
+#     transform-max-wait-milliseconds: 1000 # Preparation queue only; never an upstream timeout.
 #     max-queue: 64                  # Maximum local waiters. <= 0 uses 64.
 #     max-wait-seconds: 30           # Pre-upstream queue wait only. <= 0 uses 30; it never limits an established upstream request.
 #     saturation-grace-seconds: 5   # Sustained capacity pressure or queued work before /readyz returns 503. <= 0 uses 5.

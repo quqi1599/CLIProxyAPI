@@ -305,6 +305,12 @@ func (e *GeminiVertexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.A
 // executeWithServiceAccount handles authentication using service account credentials.
 // This method contains the original service account authentication logic.
 func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (resp cliproxyexecutor.Response, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -380,6 +386,8 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return resp, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -455,6 +463,12 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 
 // executeWithAPIKey handles authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (resp cliproxyexecutor.Response, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -522,6 +536,8 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return resp, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	httpReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewReq != nil {
@@ -584,6 +600,12 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 
 // executeStreamWithServiceAccount handles streaming authentication using service account credentials.
 func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (_ *cliproxyexecutor.StreamResult, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -647,6 +669,8 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return nil, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	httpReq, errNewReq := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
@@ -771,6 +795,12 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 
 // executeStreamWithAPIKey handles streaming authentication using API key credentials.
 func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (_ *cliproxyexecutor.StreamResult, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -837,6 +867,8 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return nil, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	httpReq, errNewReq := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
@@ -957,6 +989,12 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 
 // countTokensWithServiceAccount counts tokens using service account credentials.
 func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, projectID, location string, saJSON []byte) (cliproxyexecutor.Response, error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -998,6 +1036,8 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return cliproxyexecutor.Response{}, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	baseURL := vertexBaseURL(location)
 	url := fmt.Sprintf("%s/%s/projects/%s/locations/%s/publishers/google/models/%s:%s", baseURL, vertexAPIVersion, projectID, location, baseModel, "countTokens")
@@ -1062,6 +1102,12 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 
 // countTokensWithAPIKey handles token counting using API key credentials.
 func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, apiKey, baseURL string) (cliproxyexecutor.Response, error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1103,6 +1149,8 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return cliproxyexecutor.Response{}, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	// For API key auth, use simpler URL format without project/location
 	if baseURL == "" {

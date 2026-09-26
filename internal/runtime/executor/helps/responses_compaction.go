@@ -389,6 +389,7 @@ func validateResponsesCompactionEventSequence(data []byte) ([]byte, error) {
 			completedIndex = eventIndex
 			completed = payload.CloneBytes(payloadData)
 			if eventType == "response.done" {
+				//nolint:payload-growth benchmark=BenchmarkPayloadGrowthValidateResponsesCompactionEventSequence bounded single terminal-event rewrite; protocol requires exactly one completion
 				completed, _ = sjson.SetBytes(completed, "type", "response.completed")
 			}
 			completed = restoreCompactionCompletedOutput(completed, outputItemsByIndex, outputItemsFallback)

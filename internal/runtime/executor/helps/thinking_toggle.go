@@ -70,6 +70,7 @@ func NormalizeDeepSeekResponsesThinking(body []byte) []byte {
 	}
 	body, _ = sjson.SetBytes(body, "reasoning.effort", "none")
 	for _, field := range []string{"thinking", "enable_thinking", "thinking_budget", "reasoning_effort"} {
+		//nolint:payload-growth benchmark=BenchmarkPayloadGrowthNormalizeDeepSeekResponsesThinking bounded fixed-field cleanup loop; low risk
 		body, _ = sjson.DeleteBytes(body, field)
 	}
 	return body

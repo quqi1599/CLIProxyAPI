@@ -209,6 +209,29 @@ func BenchmarkConvertOpenAIResponsesRequestToCodex_LargePayload_WithSystemRoles(
 	}
 }
 
+func BenchmarkStripUnsupportedCodexPromptCacheFields(b *testing.B) {
+	cases := []struct {
+		name        string
+		inputCount  int
+		contentSize int
+	}{
+		{name: "64_large", inputCount: 64, contentSize: 4096},
+		{name: "256_large", inputCount: 256, contentSize: 4096},
+		{name: "1024_large", inputCount: 1024, contentSize: 4096},
+	}
+
+	for _, tc := range cases {
+		raw := buildPromptCacheRequestJSON(b, tc.inputCount, tc.contentSize)
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(raw)))
+			for i := 0; i < b.N; i++ {
+				_ = stripUnsupportedCodexPromptCacheFields(raw)
+			}
+		})
+	}
+}
+
 type responsesBenchmarkCase struct {
 	name            string
 	inputCount      int
@@ -268,6 +291,34 @@ func buildResponsesRequestJSON(tb testing.TB, tc responsesBenchmarkCase) []byte 
 	raw, err := json.Marshal(request)
 	if err != nil {
 		tb.Fatalf("marshal benchmark request: %v", err)
+	}
+	return raw
+}
+
+func buildPromptCacheRequestJSON(tb testing.TB, inputCount, contentSize int) []byte {
+	tb.Helper()
+
+	input := make([]map[string]any, 0, inputCount)
+	for i := 0; i < inputCount; i++ {
+		input = append(input, map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{{
+				"type":                    "input_text",
+				"text":                    buildPayloadText(i, contentSize),
+				"prompt_cache_breakpoint": map[string]string{"type": "ephemeral"},
+				"keep":                    "yes",
+			}},
+		})
+	}
+
+	raw, err := json.Marshal(map[string]any{
+		"model":                "gpt-5.5",
+		"prompt_cache_options": map[string]string{"retention": "24h"},
+		"input":                input,
+	})
+	if err != nil {
+		tb.Fatalf("marshal prompt cache benchmark request: %v", err)
 	}
 	return raw
 }

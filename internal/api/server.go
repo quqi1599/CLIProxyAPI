@@ -317,6 +317,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
+	engine.Use(middleware.RouteMetrics())
 	engine.Use(baseAPIHandlers.PreAuthIngressAdmissionMiddleware())
 
 	// Add request logging middleware (positioned after recovery, before auth)

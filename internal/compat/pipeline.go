@@ -83,6 +83,11 @@ func (pipeline *Pipeline) Apply(ctx context.Context, match MatchContext, input [
 		return result, nil
 	}
 
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(len(input)))
+	if errAdmission != nil {
+		return PipelineResult{}, errAdmission
+	}
+	defer releaseTransform()
 	normalizeMatchContext(&match)
 	current := input
 	owned := false

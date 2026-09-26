@@ -14,6 +14,11 @@ request-guards:
   global-admission:
     enabled: true
     capacity: 96
+    body-capacity-bytes: 536870912
+    read-capacity: 32
+    transform-capacity: 16
+    transform-max-queue: 8
+    transform-max-wait-milliseconds: 500
     max-queue: 24
     max-wait-seconds: 30
     saturation-grace-seconds: 7
@@ -22,6 +27,9 @@ request-guards:
 		t.Fatalf("ParseConfigBytes() error = %v", err)
 	}
 	admission := cfg.RequestGuards.GlobalAdmission
+	if admission.BodyCapacityBytes != 536870912 || admission.ReadCapacity != 32 || admission.TransformCapacity != 16 || admission.TransformMaxQueue != 8 || admission.TransformMaxWaitMilliseconds != 500 {
+		t.Fatalf("dimension config = %+v", admission)
+	}
 	if !admission.Enabled || admission.Capacity != 96 || admission.MaxQueue != 24 || admission.MaxWaitSeconds != 30 || admission.SaturationGraceSeconds != 7 {
 		t.Fatalf("global admission config = %+v", admission)
 	}

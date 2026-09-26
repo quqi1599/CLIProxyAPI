@@ -360,6 +360,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// provider policy, not the translator, decides which controls it supports.
 	for _, field := range []string{"thinking", "enable_thinking", "thinking_budget", "reasoning_effort"} {
 		if value := root.Get(field); value.Exists() {
+			//nolint:payload-growth benchmark=BenchmarkPayloadGrowthConvertOpenAIResponsesRequest bounded fixed-field copy loop; low risk
 			out, _ = sjson.SetRawBytes(out, field, []byte(value.Raw))
 		}
 	}

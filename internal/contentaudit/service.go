@@ -21,6 +21,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 )
@@ -608,7 +609,9 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			dedupeWindow:             time.Duration(state.cfg.EvidenceDedupeSeconds) * time.Second,
 		}
 		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 3*time.Second)
+		writeStarted := time.Now()
 		err = state.store.Record(storeCtx, event, extracted.Evidence)
+		routemetrics.Observe(c.Request.Context(), "audit_write", time.Since(writeStarted))
 		cancel()
 		if err != nil {
 			log.WithFields(log.Fields{

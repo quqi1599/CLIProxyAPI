@@ -120,6 +120,12 @@ func resolveKimiBaseURL(auth *cliproxyauth.Auth) string {
 
 // Execute performs a non-streaming chat completion request to Kimi.
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	planStarted := time.Now()
 	planInputBytes := int64(len(req.Payload))
 	from := opts.SourceFormat
@@ -181,6 +187,8 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}, internalpayload.AmplificationOverride{}); err != nil {
 		return resp, err
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/v1/chat/completions"
@@ -244,6 +252,12 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 // ExecuteStream performs a streaming chat completion request to Kimi.
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	planStarted := time.Now()
 	planInputBytes := int64(len(req.Payload))
 	from := opts.SourceFormat
@@ -308,6 +322,8 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}, internalpayload.AmplificationOverride{}); err != nil {
 		return nil, err
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/v1/chat/completions"

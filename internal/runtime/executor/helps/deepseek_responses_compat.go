@@ -103,7 +103,9 @@ func FlattenDeepSeekNamespaces(body []byte) ([]byte, DeepSeekNamespaceMap, error
 		if err != nil {
 			return body, nil, err
 		}
+		//nolint:payload-growth benchmark=BenchmarkPayloadGrowthFlattenDeepSeekNamespaces real function-call history rewrite benchmark
 		out, _ = sjson.SetBytes(out, fmt.Sprintf("input.%d.name", i), wire)
+		//nolint:payload-growth benchmark=BenchmarkPayloadGrowthFlattenDeepSeekNamespaces paired namespace-field deletion benchmark
 		out, _ = sjson.DeleteBytes(out, fmt.Sprintf("input.%d.namespace", i))
 	}
 	choice := root.Get("tool_choice")

@@ -25,6 +25,8 @@ const (
 	lightAdmissionWeight            = 4
 	heavyAdmissionAging             = 100 * time.Millisecond
 	ingressAdmissionGinKey          = "cliproxy_ingress_admission"
+	ingressReadAdmissionGinKey      = "cliproxy_ingress_read_admission"
+	ingressReadAdmissionReleasedKey = "cliproxy_ingress_read_admission_released"
 	imagesEditIngressBodyBytes      = 128 << 20
 	downstreamWebsocketBodyBytes    = 64 << 20
 )
@@ -49,13 +51,20 @@ type AdmissionRejectCounters struct {
 	WaitTimeout uint64 `json:"wait_timeout"`
 }
 
-// AdmissionSnapshot is an immutable in-memory view of the global admission pool.
+// AdmissionSnapshot exposes independent input, read, preparation, and execution pools.
 type AdmissionSnapshot struct {
+	Body                AdmissionDimensionSnapshot   `json:"body"`
+	Transform           AdmissionDimensionSnapshot   `json:"transform"`
+	Execution           AdmissionDimensionSnapshot   `json:"execution"`
+	Read                AdmissionDimensionSnapshot   `json:"read"`
 	Enabled             bool                         `json:"enabled"`
 	ActiveWeight        int                          `json:"active_weight"`
 	QueueDepth          int                          `json:"queue_depth"`
+	ReadActiveWeight    int                          `json:"read_active_weight"`
+	ReadQueueDepth      int                          `json:"read_queue_depth"`
 	WaitDurationBuckets AdmissionWaitDurationBuckets `json:"wait_duration_buckets"`
 	Rejects             AdmissionRejectCounters      `json:"rejects"`
+	ReadRejects         AdmissionRejectCounters      `json:"read_rejects"`
 }
 
 type admissionHeldContextKey struct{}
@@ -92,6 +101,7 @@ type admissionController struct {
 	saturatedSince  time.Time
 	waitBuckets     AdmissionWaitDurationBuckets
 	rejects         AdmissionRejectCounters
+	strictCapacity  bool
 	now             func() time.Time
 }
 
@@ -149,16 +159,24 @@ func (h *BaseAPIHandler) updateAdmissionController(cfg *config.SDKConfig) {
 	defer h.admissionUpdateMu.Unlock()
 
 	next := admissionControllerFromConfig(cfg)
+	nextRead := readControllerFromConfig(cfg)
+	h.updateDimensionControllers(cfg)
 	current := h.admission.Load()
+	currentRead := h.readAdmission.Load()
 	if current == nil {
 		h.admission.Store(next)
-		return
-	}
-	if next == nil {
+	} else if next == nil {
 		current.updateSettings(false, 0, 0, 0, 0)
-		return
+	} else {
+		current.updateSettings(true, next.capacity, next.maxQueue, next.maxWait, next.saturationGrace)
 	}
-	current.updateSettings(true, next.capacity, next.maxQueue, next.maxWait, next.saturationGrace)
+	if currentRead == nil {
+		h.readAdmission.Store(nextRead)
+	} else if nextRead == nil {
+		currentRead.updateSettings(false, 0, 0, 0, 0)
+	} else {
+		currentRead.updateSettings(true, nextRead.capacity, nextRead.maxQueue, nextRead.maxWait, nextRead.saturationGrace)
+	}
 }
 
 func newAdmissionLease(controller *admissionController, weight int) *admissionLease {
@@ -181,7 +199,11 @@ func (r *admissionLeaseReference) retain(ctx context.Context, controller *admiss
 		l.mu.Unlock()
 		return nil, nil, false, nil
 	}
-	normalizedWeight := controller.normalizedWeight(weight)
+	normalizedWeight, errWeight := controller.leaseWeight(weight)
+	if errWeight != nil {
+		l.mu.Unlock()
+		return nil, nil, true, errWeight
+	}
 	child := &admissionLeaseReference{
 		lease:     l,
 		parent:    r,
@@ -213,7 +235,10 @@ func (r *admissionLeaseReference) upgrade(ctx context.Context, weight int) error
 	if l.references == 0 || !r.active || l.controller == nil {
 		return nil
 	}
-	normalizedWeight := l.controller.normalizedWeight(weight)
+	normalizedWeight, errWeight := l.controller.leaseWeight(weight)
+	if errWeight != nil {
+		return errWeight
+	}
 	if normalizedWeight == r.weight {
 		return nil
 	}
@@ -300,22 +325,26 @@ func complexityAdmissionWeight(vector complexityVector) int {
 	return weight
 }
 
-// IngressAdmissionMiddleware reserves weighted capacity before request parsing
-// and compatibility transforms allocate copies of the request body.
+// IngressAdmissionMiddleware reserves read protection before request parsing
+// and retained-body capacity without occupying an execution slot.
 func (h *BaseAPIHandler) IngressAdmissionMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c == nil {
 			return
 		}
-		if h == nil || c.Request == nil || admissionReferenceFromGin(c) != nil {
+		if h == nil || c.Request == nil || bodyAdmissionReferenceFromGin(c) != nil {
 			c.Next()
 			return
 		}
 		if payloadBodyLimitPolicyFromContext(c) == nil {
 			injectPayloadBodyLimitPolicy(c, h.payloadBodyLimit.Load())
 		}
-		controller := h.admission.Load()
-		if controller == nil {
+		c.Request = c.Request.WithContext(h.withTransformAdmission(c.Request.Context()))
+		controller := h.bodyAdmission.Load()
+		c.Set(bodyAdmissionControllerGinKey, controller)
+		defer releaseIngressBodyAdmission(c)
+		readController := h.readAdmission.Load()
+		if controller == nil && readController == nil {
 			c.Next()
 			return
 		}
@@ -331,29 +360,51 @@ func (h *BaseAPIHandler) IngressAdmissionMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		_, admittedWeight, admitted, err := controller.acquireTracked(c.Request.Context(), ingressAdmissionWeight(c.Request, vector, decision))
+		if readController != nil && readAdmissionReferenceFromGin(c) == nil && !readAdmissionReleasedFromGin(c) {
+			if readWeight := readAdmissionWeight(c.Request, vector, decision); readWeight > 0 {
+				_, admittedWeight, admitted, err := readController.acquireImmediate(c.Request.Context(), readWeight)
+				if err != nil {
+					writeAdmissionHTTPError(c, err)
+					c.Abort()
+					return
+				}
+				if admitted {
+					readLease := newAdmissionLease(readController, admittedWeight)
+					c.Set(ingressReadAdmissionGinKey, readLease.root)
+					defer releaseIngressReadAdmission(c)
+				}
+			}
+		}
+		if controller == nil {
+			c.Next()
+			return
+		}
+		bodyWeight := ingressBodyAdmissionWeight(c.Request, vector)
+		if bodyWeight <= 0 {
+			c.Next()
+			return
+		}
+		_, admittedWeight, admitted, err := controller.acquireImmediate(c.Request.Context(), bodyWeight)
 		if err != nil {
 			writeAdmissionHTTPError(c, err)
 			c.Abort()
 			return
 		}
-		if !admitted {
-			c.Next()
-			return
+		if admitted {
+			lease := newAdmissionLease(controller, admittedWeight)
+			c.Set(ingressBodyAdmissionGinKey, lease.root)
+			defer func() {
+				c.Set(ingressBodyAdmissionGinKey, (*admissionLeaseReference)(nil))
+				lease.root.releaseReference()
+			}()
 		}
-		lease := newAdmissionLease(controller, admittedWeight)
-		c.Set(ingressAdmissionGinKey, lease.root)
-		defer func() {
-			c.Set(ingressAdmissionGinKey, (*admissionLeaseReference)(nil))
-			lease.root.releaseReference()
-		}()
 		c.Next()
 	}
 }
 
-// PreAuthIngressAdmissionMiddleware takes a non-queueing capacity lease before
+// PreAuthIngressAdmissionMiddleware takes a non-queueing read lease before
 // request logging or body-reading authentication plugins can allocate payload
-// copies. Route-level admission reuses and upgrades this lease after auth.
+// copies. Execution slots are acquired only by the execution entry points.
 func (h *BaseAPIHandler) PreAuthIngressAdmissionMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c == nil || h == nil || c.Request == nil {
@@ -365,12 +416,16 @@ func (h *BaseAPIHandler) PreAuthIngressAdmissionMiddleware() gin.HandlerFunc {
 			return
 		}
 		injectPayloadBodyLimitPolicy(c, h.payloadBodyLimit.Load())
-		if admissionReferenceFromGin(c) != nil {
+		if bodyAdmissionReferenceFromGin(c) != nil {
 			c.Next()
 			return
 		}
-		controller := h.admission.Load()
-		if controller == nil {
+		c.Request = c.Request.WithContext(h.withTransformAdmission(c.Request.Context()))
+		controller := h.bodyAdmission.Load()
+		c.Set(bodyAdmissionControllerGinKey, controller)
+		defer releaseIngressBodyAdmission(c)
+		readController := h.readAdmission.Load()
+		if controller == nil && readController == nil {
 			c.Next()
 			return
 		}
@@ -386,22 +441,44 @@ func (h *BaseAPIHandler) PreAuthIngressAdmissionMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		_, admittedWeight, admitted, err := controller.acquireImmediate(c.Request.Context(), ingressAdmissionWeight(c.Request, vector, decision))
+		if readController != nil && !readAdmissionReleasedFromGin(c) {
+			if readWeight := readAdmissionWeight(c.Request, vector, decision); readWeight > 0 {
+				_, admittedWeight, admitted, err := readController.acquireImmediate(c.Request.Context(), readWeight)
+				if err != nil {
+					writeAdmissionHTTPError(c, err)
+					c.Abort()
+					return
+				}
+				if admitted {
+					readLease := newAdmissionLease(readController, admittedWeight)
+					c.Set(ingressReadAdmissionGinKey, readLease.root)
+					defer releaseIngressReadAdmission(c)
+				}
+			}
+		}
+		if controller == nil {
+			c.Next()
+			return
+		}
+		bodyWeight := ingressBodyAdmissionWeight(c.Request, vector)
+		if bodyWeight <= 0 {
+			c.Next()
+			return
+		}
+		_, admittedWeight, admitted, err := controller.acquireImmediate(c.Request.Context(), bodyWeight)
 		if err != nil {
 			writeAdmissionHTTPError(c, err)
 			c.Abort()
 			return
 		}
-		if !admitted {
-			c.Next()
-			return
+		if admitted {
+			lease := newAdmissionLease(controller, admittedWeight)
+			c.Set(ingressBodyAdmissionGinKey, lease.root)
+			defer func() {
+				c.Set(ingressBodyAdmissionGinKey, (*admissionLeaseReference)(nil))
+				lease.root.releaseReference()
+			}()
 		}
-		lease := newAdmissionLease(controller, admittedWeight)
-		c.Set(ingressAdmissionGinKey, lease.root)
-		defer func() {
-			c.Set(ingressAdmissionGinKey, (*admissionLeaseReference)(nil))
-			lease.root.releaseReference()
-		}()
 		c.Next()
 	}
 }
@@ -439,12 +516,17 @@ func ingressAdmissionEstimate(request *http.Request) (complexityVector, int64, b
 	return vector, limit, true
 }
 
-func ingressAdmissionWeight(request *http.Request, vector complexityVector, decision payloadBodyLimitDecision) int {
-	if request != nil && (request.ContentLength <= 0 || !identityContentEncoding(request.Header.Get("Content-Encoding"))) {
-		vector.DecodedBytes = decision.maxDecodedBytes
-		if vector.InlineImageBytes > 0 {
-			vector.InlineImageBytes = decision.maxDecodedBytes
-		}
+// readAdmissionWeight reserves only the physical capacity needed while an
+// unknown-length or encoded body is being read and decoded. Once parsing
+// finishes, the read lease is released and execution admission uses the
+// measured complexity vector instead.
+func readAdmissionWeight(request *http.Request, vector complexityVector, decision payloadBodyLimitDecision) int {
+	if request == nil || (request.ContentLength > 0 && identityContentEncoding(request.Header.Get("Content-Encoding"))) {
+		return 0
+	}
+	vector.DecodedBytes = decision.maxDecodedBytes
+	if vector.InlineImageBytes > 0 {
+		vector.InlineImageBytes = decision.maxDecodedBytes
 	}
 	return complexityAdmissionWeight(vector)
 }
@@ -461,6 +543,43 @@ func admissionReferenceFromGin(c *gin.Context) *admissionLeaseReference {
 	return reference
 }
 
+func readAdmissionReferenceFromGin(c *gin.Context) *admissionLeaseReference {
+	if c == nil {
+		return nil
+	}
+	value, exists := c.Get(ingressReadAdmissionGinKey)
+	if !exists {
+		return nil
+	}
+	reference, _ := value.(*admissionLeaseReference)
+	return reference
+}
+
+func releaseIngressReadAdmission(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(ingressReadAdmissionReleasedKey, true)
+	reference := readAdmissionReferenceFromGin(c)
+	if reference == nil {
+		return
+	}
+	c.Set(ingressReadAdmissionGinKey, (*admissionLeaseReference)(nil))
+	reference.releaseReference()
+}
+
+func readAdmissionReleasedFromGin(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, exists := c.Get(ingressReadAdmissionReleasedKey)
+	if !exists {
+		return false
+	}
+	released, _ := value.(bool)
+	return released
+}
+
 func admissionReferenceFromContext(ctx context.Context) *admissionLeaseReference {
 	if ctx == nil {
 		return nil
@@ -473,15 +592,7 @@ func admissionReferenceFromContext(ctx context.Context) *admissionLeaseReference
 }
 
 func upgradeIngressAdmission(c *gin.Context, vector complexityVector) error {
-	reference := admissionReferenceFromGin(c)
-	if reference == nil {
-		return nil
-	}
-	ctx := context.Background()
-	if c != nil && c.Request != nil {
-		ctx = c.Request.Context()
-	}
-	return reference.upgrade(ctx, complexityAdmissionWeight(vector))
+	return reserveMeasuredBody(c, vector)
 }
 
 func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON []byte, options *modelExecutionOptions) (context.Context, func(), error) {
@@ -500,6 +611,11 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 	if _, err := enforceRequestBodyLimit(rawJSON, requestBodyLimit, true); err != nil {
 		return ctx, nil, err
 	}
+	ctx, releaseBody, errBody := h.acquireExecutionBody(ctx, int64(len(rawJSON)))
+	if errBody != nil {
+		return ctx, nil, errBody
+	}
+	ctx = h.withTransformAdmission(ctx)
 	dimensions := complexityDimensions{}
 	if options != nil {
 		dimensions = options.complexityDimensions
@@ -510,7 +626,13 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 		vector, valid, cached = requestComplexityFromContext(ctx)
 	}
 	if !cached {
+		_, releaseScan, errScan := internalpayload.BeginTransformScope(ctx, int64(len(rawJSON)))
+		if errScan != nil {
+			releaseBody()
+			return ctx, nil, errScan
+		}
 		vector, valid = inspectRequestComplexityWithDimensions(rawJSON, dimensions)
+		releaseScan()
 	}
 	vector.applyDimensions(dimensions)
 	if ctx == nil {
@@ -531,6 +653,7 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 		return func() {
 			release()
 			releaseReport()
+			releaseBody()
 		}
 	}
 	if options != nil {
@@ -546,11 +669,12 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 		allowAdmissionKeepAlive(ctx)
 		return ctx, finish(nil), nil
 	}
-	weight := complexityAdmissionWeight(vector)
+	weight := executionAdmissionWeight(complexityVector{DecodedBytes: int64(len(rawJSON))})
 	if held := admissionReferenceFromContext(ctx); held != nil {
 		if reference, release, retained, err := held.retain(ctx, controller, weight); retained {
 			if err != nil {
 				releaseReport()
+				releaseBody()
 				return ctx, nil, err
 			}
 			allowAdmissionKeepAlive(ctx)
@@ -560,6 +684,7 @@ func (h *BaseAPIHandler) inspectAndAcquireAdmission(ctx context.Context, rawJSON
 	_, admittedWeight, admitted, err := controller.acquireTracked(ctx, weight)
 	if err != nil {
 		releaseReport()
+		releaseBody()
 		return ctx, nil, err
 	}
 	if !admitted {
@@ -587,25 +712,38 @@ func setExecutionRequestShapeMetadata(meta map[string]any, rawJSON []byte, optio
 	setRequestShapeAndToolMetadata(meta, rawJSON)
 }
 
-// AdmissionReady reports whether the shared execution pool has avoided sustained saturation.
+// AdmissionReady reports whether all resource pools have avoided sustained saturation.
 func (h *BaseAPIHandler) AdmissionReady() bool {
 	if h == nil {
 		return true
 	}
 	controller := h.admission.Load()
-	return controller == nil || controller.ready()
+	readController := h.readAdmission.Load()
+	return controller.ready() && readController.ready() && h.bodyAdmission.Load().ready() && h.transformAdmission.Load().ready()
 }
 
-// AdmissionSnapshot returns a low-cardinality snapshot of the shared execution pool.
+// AdmissionSnapshot returns low-cardinality snapshots for every admission pool.
 func (h *BaseAPIHandler) AdmissionSnapshot() AdmissionSnapshot {
 	if h == nil {
 		return AdmissionSnapshot{}
 	}
 	controller := h.admission.Load()
-	if controller == nil {
+	readController := h.readAdmission.Load()
+	if controller == nil && readController == nil && h.bodyAdmission.Load() == nil && h.transformAdmission.Load() == nil {
 		return AdmissionSnapshot{}
 	}
-	return controller.metricsSnapshot()
+	snapshot := controller.metricsSnapshot()
+	readSnapshot := readController.metricsSnapshot()
+	snapshot.Enabled = snapshot.Enabled || readSnapshot.Enabled
+	snapshot.ReadActiveWeight = readSnapshot.ActiveWeight
+	snapshot.ReadQueueDepth = readSnapshot.QueueDepth
+	snapshot.ReadRejects = readSnapshot.Rejects
+	snapshot.Body = dimensionSnapshot(h.bodyAdmission.Load())
+	snapshot.Transform = dimensionSnapshot(h.transformAdmission.Load())
+	snapshot.Execution = dimensionSnapshot(controller)
+	snapshot.Read = dimensionSnapshot(readController)
+	snapshot.Enabled = snapshot.Enabled || snapshot.Body.Enabled || snapshot.Transform.Enabled
+	return snapshot
 }
 
 func admissionErrorMessage(err error) *interfaces.ErrorMessage {
@@ -715,6 +853,11 @@ func (c *admissionController) acquireImmediate(ctx context.Context, requestedWei
 		c.mu.Unlock()
 		return func() {}, 0, false, nil
 	}
+	if c.strictCapacity && requestedWeight > c.capacity {
+		c.observeRejectLocked(errAdmissionQueueFull)
+		c.mu.Unlock()
+		return nil, 0, false, errAdmissionQueueFull
+	}
 	weight := c.normalizeWeightLocked(requestedWeight)
 	if c.queueDepthLocked() > 0 || c.activeWeight+weight > c.capacity {
 		c.observeRejectLocked(errAdmissionQueueFull)
@@ -743,6 +886,11 @@ func (c *admissionController) acquireTracked(ctx context.Context, requestedWeigh
 		c.mu.Unlock()
 		return func() {}, 0, false, nil
 	}
+	if c.strictCapacity && requestedWeight > c.capacity {
+		c.observeRejectLocked(errAdmissionQueueFull)
+		c.mu.Unlock()
+		return nil, 0, false, errAdmissionQueueFull
+	}
 	weight := c.normalizeWeightLocked(requestedWeight)
 	if c.queueDepthLocked() == 0 && c.activeWeight+weight <= c.capacity {
 		c.assignWeightLocked(weight)
@@ -764,12 +912,19 @@ func (c *admissionController) acquireTracked(ctx context.Context, requestedWeigh
 		enqueuedAt:      time.Now(),
 	}
 	waiter.deadline = waiter.enqueuedAt.Add(c.maxWait)
+	budget := admissionQueueBudgetFromContext(ctx)
+	if budget != nil {
+		waiter.deadline = minTime(waiter.deadline, waiter.enqueuedAt.Add(budget.remaining()))
+	}
 	bucket := admissionBucket(weight)
 	c.waiters[bucket] = append(c.waiters[bucket], waiter)
 	c.dispatchLocked()
 	c.updateSaturationLocked()
 	c.mu.Unlock()
 
+	if budget != nil {
+		defer func() { budget.consume(time.Since(waiter.enqueuedAt)) }()
+	}
 	return c.waitForAdmission(ctx, waiter)
 }
 
@@ -791,6 +946,13 @@ func (c *admissionController) waitForAdmission(ctx context.Context, waiter *admi
 		}
 		if !waiter.admitted {
 			return func() {}, 0, false, nil
+		}
+		if !time.Now().Before(waiter.deadline) {
+			c.mu.Lock()
+			c.observeRejectLocked(errAdmissionWaitTimeout)
+			c.releaseAssignedLocked(waiter.weight)
+			c.mu.Unlock()
+			return nil, 0, false, errAdmissionWaitTimeout
 		}
 		return c.releaseFunc(waiter.weight), waiter.weight, true, nil
 	case <-ctx.Done():
@@ -858,10 +1020,14 @@ func (c *admissionController) normalizeWeightLocked(weight int) int {
 	return weight
 }
 
-func (c *admissionController) normalizedWeight(weight int) int {
+func (c *admissionController) leaseWeight(weight int) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.normalizeWeightLocked(weight)
+	if c.enabled && c.strictCapacity && weight > c.capacity {
+		c.observeRejectLocked(errAdmissionQueueFull)
+		return 0, errAdmissionQueueFull
+	}
+	return c.normalizeWeightLocked(weight), nil
 }
 
 func (c *admissionController) updateSettings(enabled bool, capacity, maxQueue int, maxWait, saturationGrace time.Duration) {

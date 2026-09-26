@@ -1,8 +1,10 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -70,31 +72,62 @@ func normalizeResponsesStructuredOutputSchema(rawJSON []byte) []byte {
 }
 
 func stripUnsupportedCodexPromptCacheFields(rawJSON []byte) []byte {
-	result, errDelete := sjson.DeleteBytes(rawJSON, "prompt_cache_options")
-	if errDelete != nil {
-		result = rawJSON
+	// Decode the request once and marshal it once so cleanup stays linear in payload size.
+	decoder := json.NewDecoder(bytes.NewReader(rawJSON))
+	decoder.UseNumber()
+	var request map[string]any
+	if errDecodeRequest := decoder.Decode(&request); errDecodeRequest != nil {
+		return rawJSON
+	}
+	var trailing any
+	if errDecodeTrailing := decoder.Decode(&trailing); errDecodeTrailing != io.EOF {
+		return rawJSON
 	}
 
-	input := gjson.GetBytes(result, "input")
-	if !input.IsArray() {
-		return result
+	_, removedTopLevel := request["prompt_cache_options"]
+	delete(request, "prompt_cache_options")
+
+	input, inputIsArray := request["input"].([]any)
+	if !inputIsArray {
+		if !removedTopLevel {
+			return rawJSON
+		}
+		return marshalCodexPromptCacheRequest(request, rawJSON)
 	}
-	for inputIndex, item := range input.Array() {
-		content := item.Get("content")
-		if !content.IsArray() {
+
+	changed := removedTopLevel
+	for _, item := range input {
+		itemObject, ok := item.(map[string]any)
+		if !ok {
 			continue
 		}
-		for contentIndex, part := range content.Array() {
-			if !part.Get("prompt_cache_breakpoint").Exists() {
+		content, ok := itemObject["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, part := range content {
+			partObject, ok := part.(map[string]any)
+			if !ok {
 				continue
 			}
-			path := fmt.Sprintf("input.%d.content.%d.prompt_cache_breakpoint", inputIndex, contentIndex)
-			if updated, errNestedDelete := sjson.DeleteBytes(result, path); errNestedDelete == nil {
-				result = updated
+			if _, exists := partObject["prompt_cache_breakpoint"]; exists {
+				delete(partObject, "prompt_cache_breakpoint")
+				changed = true
 			}
 		}
 	}
-	return result
+	if !changed {
+		return rawJSON
+	}
+	return marshalCodexPromptCacheRequest(request, rawJSON)
+}
+
+func marshalCodexPromptCacheRequest(request map[string]any, fallback []byte) []byte {
+	updated, errMarshalRequest := json.Marshal(request)
+	if errMarshalRequest != nil {
+		return fallback
+	}
+	return updated
 }
 
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction

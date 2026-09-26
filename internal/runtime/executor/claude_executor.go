@@ -333,6 +333,11 @@ type claudeRequestPlan struct {
 }
 
 func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, streamResponse bool) (plan claudeRequestPlan, err error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return plan, errAdmission
+	}
+	defer releaseTransform()
 	plan.apiKey, plan.baseURL = claudeCreds(auth)
 	if plan.baseURL == "" {
 		plan.baseURL = "https://api.anthropic.com"

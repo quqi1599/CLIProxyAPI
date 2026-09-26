@@ -33,12 +33,21 @@ type RoundRobinSelector struct {
 // SpreadSelector distributes requests across all available credentials using
 // configured priority and recent load, with channel-aware GPT health metrics.
 type SpreadSelector struct {
-	mu             sync.Mutex
-	cursors        map[string]int
-	currentWeights map[string]map[string]int
-	load           *spreadLoadTracker
-	maxKeys        int
-	channelAware   bool
+	mu              sync.Mutex
+	cursors         map[string]int
+	currentWeights  map[string]map[string]int
+	load            *spreadLoadTracker
+	maxKeys         int
+	channelAware    bool
+	stateNamespace  string
+	stateStore      SpreadStateStore
+	stateLoaded     bool
+	statePersistMu  sync.Mutex
+	statePersistAt  time.Time
+	statePersisting bool
+	stateStopped    bool
+	statePersistWG  sync.WaitGroup
+	stateStopOnce   sync.Once
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
@@ -877,6 +886,7 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 		}
 		s.cursors[innerKey] = innerIndex + 1
 		s.mu.Unlock()
+		s.persistSpreadStateIfDue()
 		if s.channelAware {
 			recordSelectorReason(ctx, "channel_spread")
 		} else {
@@ -887,6 +897,7 @@ func (s *SpreadSelector) Pick(ctx context.Context, provider, model string, opts 
 
 	selected := s.pickWeightedLocked(key, model, now, available, limit, gptRoute)
 	s.mu.Unlock()
+	s.persistSpreadStateIfDue()
 	if selected == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
@@ -2038,6 +2049,9 @@ func truncateSessionID(id string) string {
 func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
+	}
+	if stoppable, ok := s.fallback.(StoppableSelector); ok {
+		stoppable.Stop()
 	}
 }
 

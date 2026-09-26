@@ -6,6 +6,19 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func BenchmarkPayloadGrowthNormalizeDeepSeekResponsesThinking(b *testing.B) {
+	body := []byte(`{"thinking":{"type":"disabled","budget_tokens":1024},"reasoning":{"summary":"auto"},"reasoning_effort":"high"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out := NormalizeDeepSeekResponsesThinking(body)
+		if len(out) == 0 {
+			b.Fatal("thinking normalization returned an empty payload")
+		}
+	}
+}
+
 func TestNormalizeOpenAICompatDisabledThinking(t *testing.T) {
 	for _, kind := range []string{"qwen", "zhipu", "doubao"} {
 		for _, payload := range []string{`{}`, `{"enable_thinking":null}`, `{"thinking":{"type":"enabled"}}`, `{"reasoning_effort":"high"}`} {

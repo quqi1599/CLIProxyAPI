@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 )
 
@@ -28,6 +29,7 @@ type healthDetailsResponse struct {
 	Amplification     handlers.AmplificationGuardSnapshot `json:"amplification_guard"`
 	Transforms        internalpayload.TransformMetrics    `json:"transforms"`
 	LargeClones       internalpayload.LargeCloneMetrics   `json:"large_clones"`
+	Routes            routemetrics.Snapshot               `json:"route_metrics"`
 }
 
 type healthBuildDetails struct {
@@ -128,6 +130,7 @@ func (s *Server) healthDetails(c *gin.Context) {
 		Amplification:     amplification,
 		Transforms:        internalpayload.CurrentTransformMetrics(),
 		LargeClones:       internalpayload.CurrentLargeCloneMetrics(),
+		Routes:            routemetrics.Default.Snapshot(),
 	})
 }
 

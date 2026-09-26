@@ -671,6 +671,12 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	originalTranslated, translated, errTranslate := helps.TranslateRequestPairGuarded(
 		ctx,
@@ -699,6 +705,8 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
+	releaseTransform()
+	ctx = originalTransformContext
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -918,6 +926,12 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	originalTranslated, translated, errTranslate := helps.TranslateRequestPairGuarded(
 		ctx,
@@ -946,6 +960,8 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
+	releaseTransform()
+	ctx = originalTransformContext
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -1437,6 +1453,12 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		auth = updatedAuth
 	}
 
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	originalTranslated, translated, errTranslate := helps.TranslateRequestPairGuarded(
 		ctx,
@@ -1465,6 +1487,8 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
 
+	releaseTransform()
+	ctx = originalTransformContext
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -1815,6 +1839,12 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	}
 
 	// Prepare payload once (doesn't depend on baseURL)
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	payload, err := helps.TranslateRequestGuarded(
 		ctx,
@@ -1839,6 +1869,8 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	payload = helps.DeleteJSONField(payload, "model")
 	payload = helps.DeleteJSONField(payload, "request.safetySettings")
 
+	releaseTransform()
+	ctx = originalTransformContext
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 
@@ -2337,6 +2369,11 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 }
 
 func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string) (*http.Request, error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(len(payload)))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	if token == "" {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}

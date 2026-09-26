@@ -12,6 +12,19 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func BenchmarkPayloadGrowthValidateResponsesCompactionEventSequence(b *testing.B) {
+	data := []byte("event: response.done\ndata: {\"type\":\"response.done\",\"response\":{\"output\":[]}}\n\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out, err := validateResponsesCompactionEventSequence(data)
+		if err != nil || len(out) == 0 {
+			b.Fatalf("compaction event validation failed: err=%v output=%d", err, len(out))
+		}
+	}
+}
+
 func TestValidateLegacyResponsesCompaction(t *testing.T) {
 	t.Parallel()
 	valid := []byte(`{"id":"resp_1","output":[{"type":"message","role":"user","content":[]},{"type":"compaction","encrypted_content":"opaque"}]}`)

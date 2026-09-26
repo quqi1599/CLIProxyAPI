@@ -161,7 +161,7 @@ func safeUpstreamFailureReasons(body []byte, errorCode, errorType, errorStatus s
 	if identifierIs("model_not_found", "model_not_supported") || contains(
 		"requested model is not supported", "requested model is unsupported", "requested model is unavailable",
 		"requested model does not exist", "requested model is not available", "model is not supported",
-		"model not supported", "model does not exist", "model not found", "unsupported model",
+		"model not supported", "model does not exist", "model not exist", "model not found", "unsupported model",
 		"model unavailable", "not available for your plan", "not available for your account",
 		"not available for this account", "not enabled for your account", "not enabled for this account",
 		"does not have access to model", "model has been disabled", "模型不存在", "模型未开通", "模型不可用", "没有该模型权限",

@@ -108,11 +108,17 @@ type PayloadBodyLimitConfig struct {
 // GlobalAdmissionConfig bounds aggregate request complexity before upstream execution.
 // File-based server configuration requires an explicit opt-in.
 type GlobalAdmissionConfig struct {
-	Enabled                bool `yaml:"enabled" json:"enabled"`
-	Capacity               int  `yaml:"capacity,omitempty" json:"capacity,omitempty"`
-	MaxQueue               int  `yaml:"max-queue,omitempty" json:"max-queue,omitempty"`
-	MaxWaitSeconds         int  `yaml:"max-wait-seconds,omitempty" json:"max-wait-seconds,omitempty"`
-	SaturationGraceSeconds int  `yaml:"saturation-grace-seconds,omitempty" json:"saturation-grace-seconds,omitempty"`
+	Enabled  bool `yaml:"enabled" json:"enabled"`
+	Capacity int  `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	// BodyCapacityBytes bounds retained decoded input independently of execution slots.
+	BodyCapacityBytes            int64 `yaml:"body-capacity-bytes,omitempty" json:"body-capacity-bytes,omitempty"`
+	ReadCapacity                 int   `yaml:"read-capacity,omitempty" json:"read-capacity,omitempty"`
+	TransformCapacity            int   `yaml:"transform-capacity,omitempty" json:"transform-capacity,omitempty"`
+	TransformMaxQueue            int   `yaml:"transform-max-queue,omitempty" json:"transform-max-queue,omitempty"`
+	TransformMaxWaitMilliseconds int   `yaml:"transform-max-wait-milliseconds,omitempty" json:"transform-max-wait-milliseconds,omitempty"`
+	MaxQueue                     int   `yaml:"max-queue,omitempty" json:"max-queue,omitempty"`
+	MaxWaitSeconds               int   `yaml:"max-wait-seconds,omitempty" json:"max-wait-seconds,omitempty"`
+	SaturationGraceSeconds       int   `yaml:"saturation-grace-seconds,omitempty" json:"saturation-grace-seconds,omitempty"`
 }
 
 // MiniMaxHighspeedNarrativeGuardConfig limits large narrative-roleplay workloads

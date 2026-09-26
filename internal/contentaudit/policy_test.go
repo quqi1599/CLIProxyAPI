@@ -8,6 +8,46 @@ import (
 	"testing"
 )
 
+func TestMatcherCandidateFastPathsAvoidNormalizationAllocation(t *testing.T) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "test-v1",
+		Rules: []Rule{{
+			ID:       "fast-paths",
+			Category: "synthetic",
+			Severity: "high",
+			Keywords: []string{"explicit phrase", "敏感测试短语"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompilePolicy() error = %v", err)
+	}
+	cases := []struct {
+		name          string
+		text          string
+		wantCandidate bool
+	}{
+		{name: "ascii", text: "ordinary EXPLICIT phrase request", wantCandidate: true},
+		{name: "ascii_no_candidate", text: "ordinary request content", wantCandidate: false},
+		{name: "normalized", text: "普通敏感测试短语请求", wantCandidate: true},
+		{name: "normalized_no_candidate", text: "普通请求内容", wantCandidate: false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := matcher.hasCandidateText(test.text); got != test.wantCandidate {
+				t.Fatalf("hasCandidateText(%q) = %v, want %v", test.text, got, test.wantCandidate)
+			}
+			allocs := testing.AllocsPerRun(1_000, func() {
+				if got := matcher.hasCandidateText(test.text); got != test.wantCandidate {
+					t.Fatalf("fast candidate scan = %v, want %v", got, test.wantCandidate)
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("candidate scan allocations = %f, want zero", allocs)
+			}
+		})
+	}
+}
+
 func TestMatcherNormalizesInvisibleCharactersAndHonorsNearbyAllowlist(t *testing.T) {
 	matcher, err := CompilePolicy(Policy{
 		Version: "test-v1",

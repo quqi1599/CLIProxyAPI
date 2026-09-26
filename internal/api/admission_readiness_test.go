@@ -43,7 +43,7 @@ func TestAdmissionSaturationOnlyFailsReadiness(t *testing.T) {
 	server.handlers.UpdateClients(&sdkconfig.SDKConfig{RequestGuards: sdkconfig.RequestGuardsConfig{
 		GlobalAdmission: sdkconfig.GlobalAdmissionConfig{
 			Enabled:                true,
-			Capacity:               128,
+			Capacity:               1,
 			MaxQueue:               64,
 			SaturationGraceSeconds: 1,
 		},

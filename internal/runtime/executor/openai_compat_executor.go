@@ -1008,6 +1008,11 @@ func openAICompatCompatibilityDowngrades(input, output []byte) []string {
 }
 
 func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, baseModel string, profile openAICompatProfile, stream bool) (plan openAICompatRequestPlan, err error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return plan, errAdmission
+	}
+	defer releaseTransform()
 	plan.failureCtx = ctx
 	from := opts.SourceFormat
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)

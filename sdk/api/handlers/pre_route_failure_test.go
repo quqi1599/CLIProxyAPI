@@ -18,10 +18,10 @@ import (
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
-func TestProviderResolutionBadGatewayLogsSafePreRouteCorrelation(t *testing.T) {
+func TestProviderResolutionNotFoundLogsSafePreRouteCorrelation(t *testing.T) {
 	const (
-		requestID       = "cpa-502-test"
-		clientRequestID = "oneapi-502-test"
+		requestID       = "cpa-404-test"
+		clientRequestID = "oneapi-404-test"
 		model           = "missing-provider-observability-model"
 		secret          = "secret-prompt-must-not-appear"
 	)
@@ -32,8 +32,8 @@ func TestProviderResolutionBadGatewayLogsSafePreRouteCorrelation(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
 
 	_, _, errMsg := handler.ExecuteWithAuthManager(ctx, "openai", model, rawJSON, "")
-	if errMsg == nil || errMsg.StatusCode != http.StatusBadGateway {
-		t.Fatalf("ExecuteWithAuthManager() error = %+v, want 502", errMsg)
+	if errMsg == nil || errMsg.StatusCode != http.StatusNotFound {
+		t.Fatalf("ExecuteWithAuthManager() error = %+v, want 404", errMsg)
 	}
 
 	entry := findPreRouteFailureEntry(t, hook)
@@ -42,10 +42,10 @@ func TestProviderResolutionBadGatewayLogsSafePreRouteCorrelation(t *testing.T) {
 		"request_id":          requestID,
 		"client_request_id":   clientRequestID,
 		"routing_phase":       "pre_route",
-		"failure_class":       "pre_route_bad_gateway",
+		"failure_class":       "model_route_not_found",
 		"failure_kind":        preRouteFailureKindProviderResolution,
 		"failure_scope":       "request",
-		"status_code":         http.StatusBadGateway,
+		"status_code":         http.StatusNotFound,
 		"error_code":          preRouteErrorProviderNotResolved,
 		"attempt_count":       0,
 		"endpoint_method":     http.MethodPost,
@@ -72,16 +72,16 @@ func TestProviderResolutionBadGatewayLogsSafePreRouteCorrelation(t *testing.T) {
 	}
 }
 
-func TestProviderResolutionBadGatewayLogsStreamingPreRoutePhase(t *testing.T) {
+func TestProviderResolutionNotFoundLogsStreamingPreRoutePhase(t *testing.T) {
 	hook := installPreRouteFailureTestHook(t)
-	ctx := preRouteFailureTestContext(t, "cpa-stream-502", "oneapi-stream-502", "/v1/chat/completions")
+	ctx := preRouteFailureTestContext(t, "cpa-stream-404", "oneapi-stream-404", "/v1/chat/completions")
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
 	rawJSON := []byte(`{"model":"missing-stream-provider","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
 
 	_, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "missing-stream-provider", rawJSON, "")
 	errMsg, ok := <-errChan
-	if !ok || errMsg == nil || errMsg.StatusCode != http.StatusBadGateway {
-		t.Fatalf("stream error = %+v, %v; want 502", errMsg, ok)
+	if !ok || errMsg == nil || errMsg.StatusCode != http.StatusNotFound {
+		t.Fatalf("stream error = %+v, %v; want 404", errMsg, ok)
 	}
 
 	entry := findPreRouteFailureEntry(t, hook)

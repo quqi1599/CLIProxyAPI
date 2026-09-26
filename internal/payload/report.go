@@ -80,6 +80,8 @@ type TransformReportObserver func(TransformReport)
 // TransformMetrics is the low-cardinality process aggregate exported through
 // diagnostics. It contains counters only and never request payload data.
 type TransformMetrics struct {
+	SlowReports           uint64                           `json:"slow_reports_over_one_second"`
+	Preparation           PreparationMetrics               `json:"preparation"`
 	Reports               uint64                           `json:"reports"`
 	InstrumentedReports   uint64                           `json:"instrumented_reports"`
 	FinalizedReports      uint64                           `json:"finalized_reports"`
@@ -99,6 +101,7 @@ type TransformMetrics struct {
 }
 
 var transformMetrics struct {
+	slowReports           atomic.Uint64
 	reports               atomic.Uint64
 	instrumentedReports   atomic.Uint64
 	finalizedReports      atomic.Uint64
@@ -315,6 +318,8 @@ func RetainTransformReport(ctx context.Context) func() {
 func CurrentTransformMetrics() TransformMetrics {
 	reports, stages, policies := currentTransformDistributions()
 	return TransformMetrics{
+		SlowReports:           transformMetrics.slowReports.Load(),
+		Preparation:           currentPreparationMetrics(),
 		Reports:               transformMetrics.reports.Load(),
 		InstrumentedReports:   transformMetrics.instrumentedReports.Load(),
 		FinalizedReports:      transformMetrics.finalizedReports.Load(),
@@ -335,6 +340,9 @@ func CurrentTransformMetrics() TransformMetrics {
 }
 
 func observeTransformMetrics(report TransformReport) {
+	if report.Duration > time.Second {
+		transformMetrics.slowReports.Add(1)
+	}
 	transformMetrics.reports.Add(1)
 	transformMetrics.stages.Add(uint64(len(report.Stages)))
 	transformMetrics.wireInputBytes.Add(uint64(nonNegativeBytes(report.WireInputBytes)))

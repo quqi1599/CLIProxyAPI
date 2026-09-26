@@ -1,10 +1,34 @@
 package helps
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func BenchmarkPayloadGrowthNormalizeCodexRequestSchemas(b *testing.B) {
+	var builder strings.Builder
+	builder.WriteString(`{"tools":[`)
+	for index := 0; index < 64; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		fmt.Fprintf(&builder, `{"type":"function","name":"tool_%d","parameters":{"type":"object","properties":{"value":{"type":"string","pattern":"\\p{L}"}}}}`, index)
+	}
+	builder.WriteString(`]}`)
+	body := []byte(builder.String())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out := NormalizeCodexRequestSchemas(body)
+		if len(out) == 0 {
+			b.Fatal("schema normalization returned an empty payload")
+		}
+	}
+}
 
 func TestCodexRequestSchemaScope(t *testing.T) {
 	body := []byte(`{"input":[{"type":"function_call_output","output":{"pattern":"\\p{L}"}}],"tools":[{"type":"function","parameters":{"type":"object","properties":{"x":{"pattern":"\\p{L}"}},"default":{"pattern":"\\p{L}"}}},{"type":"namespace","tools":[{"type":"function","parameters":{"$id":"remove","type":"object"}}]},{"type":"custom","format":{"pattern":"\\p{L}"}}]}`)

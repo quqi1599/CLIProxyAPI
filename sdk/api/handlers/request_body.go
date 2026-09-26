@@ -16,6 +16,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -100,6 +103,7 @@ func parseMultipartFormWithDecision(c *gin.Context, decision payloadBodyLimitDec
 	if c == nil || c.Request == nil {
 		return nil, errors.New("request is unavailable")
 	}
+	defer releaseIngressReadAdmission(c)
 	if !identityContentEncoding(c.Request.Header.Get("Content-Encoding")) {
 		return nil, errors.New("multipart requests do not support Content-Encoding")
 	}
@@ -223,6 +227,7 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 	if c == nil || c.Request == nil {
 		return nil, errors.New("request is unavailable")
 	}
+	defer releaseIngressReadAdmission(c)
 	maxWireBytes := normalizeRequestBodyLimit(decision.maxWireBytes)
 	maxDecodedBytes := normalizeRequestBodyLimit(decision.maxDecodedBytes)
 	decision.maxWireBytes = maxWireBytes
@@ -263,6 +268,15 @@ func readRequestBodyWithDecision(c *gin.Context, decision payloadBodyLimitDecisi
 	wireBytes = int64(len(raw))
 	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 
+	scanBytes := int64(len(raw))
+	if !identityContentEncoding(c.Request.Header.Get("Content-Encoding")) {
+		scanBytes = maxDecodedBytes
+	}
+	_, releaseScan, errScan := internalpayload.BeginTransformScope(c.Request.Context(), scanBytes)
+	if errScan != nil {
+		return nil, errScan
+	}
+	defer releaseScan()
 	var errLimit error
 	encoding := strings.TrimSpace(c.Request.Header.Get("Content-Encoding"))
 	if encoding == "" || strings.EqualFold(encoding, "identity") {
@@ -317,6 +331,7 @@ func cacheDecodedRequestBody(c *gin.Context, body []byte, wireBytes int64) {
 		return
 	}
 	c.Set(decodedRequestBodyGinKey, cachedDecodedRequestBody{body: body, wireBytes: wireBytes})
+	routemetrics.SetModel(c.Request.Context(), gjson.GetBytes(body, "model").String())
 }
 
 func decodedRequestBodyFromContext(c *gin.Context) (cachedDecodedRequestBody, bool) {
@@ -339,6 +354,9 @@ type cachedRequestComplexity struct {
 func cacheRequestComplexity(c *gin.Context, body []byte, wireBytes int64) error {
 	if c == nil {
 		return nil
+	}
+	if err := reserveMeasuredBody(c, complexityVector{DecodedBytes: int64(len(body))}); err != nil {
+		return err
 	}
 	vector, valid := inspectRequestComplexity(body)
 	vector.WireBytes = wireBytes

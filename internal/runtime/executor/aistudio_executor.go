@@ -442,6 +442,11 @@ type translatedPayload struct {
 }
 
 func (e *AIStudioExecutor) translateRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, translatedPayload{}, errAdmission
+	}
+	defer releaseTransform()
 	started := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 

@@ -102,6 +102,12 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -158,6 +164,8 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}, internalpayload.AmplificationOverride{}); err != nil {
 		return resp, err
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -217,6 +225,12 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -268,6 +282,8 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}, internalpayload.AmplificationOverride{}); err != nil {
 		return nil, err
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	requestCtx, cancelRequest := context.WithCancel(ctx)
 	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(body))
@@ -387,6 +403,12 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 // CountTokens counts tokens for the given request using the Gemini API.
 func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -419,6 +441,8 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}, internalpayload.AmplificationOverride{}); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	releaseTransform()
+	ctx = originalTransformContext
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, baseModel, "countTokens")

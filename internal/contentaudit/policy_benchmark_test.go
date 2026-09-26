@@ -74,6 +74,39 @@ func BenchmarkMatcherCandidateSegmentation(b *testing.B) {
 	}
 }
 
+func BenchmarkMatcherCandidateScanFastPaths(b *testing.B) {
+	matcher, err := CompilePolicy(Policy{
+		Version: "benchmark",
+		Rules: []Rule{{
+			ID:       "benchmark-rule",
+			Category: "synthetic",
+			Severity: "high",
+			Keywords: []string{"explicit phrase", "敏感测试短语"},
+		}},
+	})
+	if err != nil {
+		b.Fatalf("CompilePolicy() error = %v", err)
+	}
+	for _, benchmark := range []struct {
+		name string
+		text string
+	}{
+		{name: "ascii", text: strings.Repeat("ordinary request content. ", 300) + "EXPLICIT phrase"},
+		{name: "normalized", text: strings.Repeat("普通请求内容", 300) + "敏感测试短语"},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(benchmark.text)))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if !matcher.hasCandidateText(benchmark.text) {
+					b.Fatal("candidate scan lost a benchmark candidate")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkMatcherScoped(b *testing.B) {
 	matcher, err := CompilePolicy(Policy{
 		Version: "benchmark",

@@ -48,6 +48,7 @@ func TestSafeUpstreamFailureMessageKeepsRoutingSignalsCanonical(t *testing.T) {
 		want string
 	}{
 		{name: "model", body: `{"error":{"message":"requested model does not exist: private-model","code":"model_not_found"}}`, want: "model_not_supported"},
+		{name: "aliyun model", body: `{"code":"InvalidParameter","message":"Model not exist.","request_id":"secret-id"}`, want: "model_not_supported"},
 		{name: "quota", body: `{"error":{"message":"You've reached your usage limit for this billing cycle. private-account"}}`, want: "usage limit billing cycle quota will be refreshed"},
 		{name: "content safety", body: `{"error":{"message":"request blocked by content policy private-prompt","code":"content_policy_violation"}}`, want: "content_policy_violation"},
 		{name: "previous response", body: `{"error":{"message":"Item with id secret-id not found. Items are not persisted when store is set to false."}}`, want: "item with id not found items are not persisted"},

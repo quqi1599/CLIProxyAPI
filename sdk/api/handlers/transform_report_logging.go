@@ -16,6 +16,7 @@ func addTransformReportLogObserver(ctx context.Context) bool {
 	return internalpayload.AddTransformReportObserver(ctx, func(report internalpayload.TransformReport) {
 		fields := log.Fields{
 			"event":                     "payload_transform_summary",
+			"transform_over_one_second": report.Duration > time.Second,
 			"wire_input_bytes":          report.WireInputBytes,
 			"decoded_input_bytes":       report.InputBytes,
 			"transform_output_bytes":    report.OutputBytes,

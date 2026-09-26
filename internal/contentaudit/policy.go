@@ -375,7 +375,7 @@ func (m *Matcher) match(text, action string, continuation bool) Decision {
 	if m == nil || len(m.nodes) == 0 {
 		return Decision{}
 	}
-	if !m.hasCandidate(moderationCandidateText(text)) {
+	if !m.hasCandidateText(text) {
 		return Decision{PolicyVersion: m.policy.Version}
 	}
 	normalizedText := m.analyzer.normalize(text)
@@ -768,6 +768,56 @@ func (m *Matcher) hasCandidate(normalized string) bool {
 		}
 	}
 	return false
+}
+
+// hasCandidateText keeps the candidate gate allocation-free for the common
+// ASCII and already-normalized paths. Inputs that may change under NFKC or
+// case folding retain the allocating normalization fallback.
+func (m *Matcher) hasCandidateText(text string) bool {
+	if m == nil || text == "" || len(m.candidateNodes) == 0 {
+		return false
+	}
+	matched, ascii := m.scanCandidateASCII(text)
+	if ascii {
+		return matched
+	}
+	if matched {
+		return true
+	}
+	if isModerationCandidateNormalized(text) {
+		return m.hasCandidate(text)
+	}
+	return m.hasCandidate(moderationCandidateText(text))
+}
+
+func (m *Matcher) scanCandidateASCII(text string) (matched, ascii bool) {
+	nodeIndex := 0
+	for index := 0; index < len(text); index++ {
+		character := text[index]
+		if character >= utf8.RuneSelf {
+			return false, false
+		}
+		if character >= 'A' && character <= 'Z' {
+			character += 'a' - 'A'
+		}
+		if !((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')) {
+			continue
+		}
+		r := rune(character)
+		for nodeIndex != 0 {
+			if _, exists := m.candidateNodes[nodeIndex].next[r]; exists {
+				break
+			}
+			nodeIndex = m.candidateNodes[nodeIndex].fail
+		}
+		if next, exists := m.candidateNodes[nodeIndex].next[r]; exists {
+			nodeIndex = next
+		}
+		if len(m.candidateNodes[nodeIndex].out) > 0 {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func matchOnTermBoundaries(text []rune, start, end int) bool {

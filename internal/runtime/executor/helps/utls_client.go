@@ -10,6 +10,7 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/transport/http2pool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
@@ -154,7 +155,14 @@ func buildUtlsHTTPClient(proxyURL string, ctxRoundTripper http.RoundTripper) *ht
 // When timeout == 0 the client is reused process-wide (keyed by proxyURL) unless
 // a context-injected RoundTripper is present. When timeout > 0 a dedicated client
 // is built and not cached, preserving the per-request timeout semantics.
-func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (result *http.Client) {
+	defer func() {
+		if result != nil && routemetrics.Enabled(ctx) {
+			copy := *result
+			copy.Transport = routemetrics.WrapTransport(ctx, result.Transport)
+			result = &copy
+		}
+	}()
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)

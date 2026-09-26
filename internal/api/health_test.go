@@ -90,6 +90,11 @@ func TestHealthDetailsRequiresManagementAuthAndReturnsLocalSnapshot(t *testing.T
 		!gjson.GetBytes(recorder.Body.Bytes(), "payload_body_limits.kinds.other.wire_size_buckets.samples").Exists() {
 		t.Fatalf("payload body-limit kind histograms missing: %s", recorder.Body.String())
 	}
+	for _, path := range []string{"admission.body.capacity", "admission.transform.wait_duration_buckets", "admission.execution.active", "admission.read.rejects", "transforms.preparation.over_one_second", "transforms.preparation.large_over_one_second"} {
+		if !gjson.GetBytes(recorder.Body.Bytes(), path).Exists() {
+			t.Fatalf("missing dimension metric %s", path)
+		}
+	}
 	if !gjson.GetBytes(recorder.Body.Bytes(), "transforms.reports").Exists() {
 		t.Fatalf("transform metrics missing: %s", recorder.Body.String())
 	}

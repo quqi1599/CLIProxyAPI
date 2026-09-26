@@ -27,6 +27,7 @@ import (
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/routemetrics"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -1596,6 +1597,7 @@ func (NoopHook) OnResult(context.Context, Result) {}
 type Manager struct {
 	store            Store
 	cooldownStore    CooldownStateStore
+	spreadStateStore SpreadStateStore
 	executors        map[string]ProviderExecutor
 	selector         Selector
 	hook             Hook
@@ -1969,6 +1971,9 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 	if normalizedStrategy == RoutingStrategySpread && strings.HasPrefix(group, "group:") {
 		selector = &SpreadSelector{channelAware: true}
 	}
+	if spread, ok := selector.(*SpreadSelector); ok {
+		spread.stateNamespace = group
+	}
 	affinityEnabled := false
 	affinityTTL := time.Hour
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -2002,8 +2007,8 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 	}, "\x00")
 
 	m.dynamicSelectorsMu.Lock()
-	defer m.dynamicSelectorsMu.Unlock()
 	if selector, ok := m.dynamicSelectors[cacheKey]; ok && selector != nil {
+		m.dynamicSelectorsMu.Unlock()
 		return selector
 	}
 
@@ -2014,6 +2019,11 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 		})
 	}
 	m.dynamicSelectors[cacheKey] = selector
+	m.dynamicSelectorsMu.Unlock()
+	m.mu.RLock()
+	spreadStateStore := m.spreadStateStore
+	m.mu.RUnlock()
+	bindSpreadStateStore(selector, spreadStateStore)
 	return selector
 }
 
@@ -2221,7 +2231,9 @@ func (m *Manager) SetSelector(selector Selector) {
 	previousSessionSelector, _ := m.selector.(*SessionAffinitySelector)
 	nextSessionSelector, _ := selector.(*SessionAffinitySelector)
 	m.selector = selector
+	spreadStateStore := m.spreadStateStore
 	m.mu.Unlock()
+	bindSpreadStateStore(selector, spreadStateStore)
 	m.stopDynamicSelectors()
 	if previousSessionSelector != nil && previousSessionSelector != nextSessionSelector {
 		previousSessionSelector.Stop()
@@ -2245,8 +2257,49 @@ func (m *Manager) SetCooldownStateStore(store CooldownStateStore) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.cooldownStore = store
+	spreadStateStore := m.spreadStateStore
+	if spreadStateStore == nil {
+		if typedStore, ok := store.(SpreadStateStore); ok {
+			spreadStateStore = typedStore
+			m.spreadStateStore = typedStore
+		}
+	}
+	m.mu.Unlock()
+	m.bindSpreadStateStore(spreadStateStore)
+}
+
+// SetSpreadStateStore swaps the independent persistent weighted-deficit store.
+func (m *Manager) SetSpreadStateStore(store SpreadStateStore) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.spreadStateStore = store
+	m.mu.Unlock()
+	m.bindSpreadStateStore(store)
+}
+
+func (m *Manager) bindSpreadStateStore(store SpreadStateStore) {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	bindSpreadStateStore(selector, store)
+
+	m.dynamicSelectorsMu.Lock()
+	selectors := make([]Selector, 0, len(m.dynamicSelectors))
+	for _, dynamic := range m.dynamicSelectors {
+		if dynamic != nil {
+			selectors = append(selectors, dynamic)
+		}
+	}
+	m.dynamicSelectorsMu.Unlock()
+	for _, dynamic := range selectors {
+		bindSpreadStateStore(dynamic, store)
+	}
 }
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
@@ -9840,6 +9893,7 @@ func isModelSupportErrorMessage(message string) bool {
 		"model is not supported",
 		"model not supported",
 		"model does not exist",
+		"model not exist",
 		"model not found",
 		"unsupported model",
 		"model unavailable",
@@ -10054,7 +10108,8 @@ func isLargeClaudeCompatToolHistoryMessage(message string) bool {
 
 func isRequestScopedInvalidParameterMessage(code, message string) bool {
 	combined := strings.ToLower(strings.TrimSpace(code + " " + message))
-	if combined == "" {
+	// Provider model availability takes precedence over a generic parameter code.
+	if combined == "" || isModelSupportErrorMessage(combined) {
 		return false
 	}
 	return strings.Contains(combined, "invalidparameter") ||
@@ -11680,6 +11735,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	selectionStarted := time.Now()
+	defer func() { routemetrics.Observe(ctx, "selection", time.Since(selectionStarted)) }()
 	if m.HomeEnabled() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
@@ -13321,6 +13378,8 @@ func authMetricTokenHash(auth *Auth) string {
 }
 
 func (m *Manager) logAuthSelectionMetric(ctx context.Context, auth *Auth, provider, model string) {
+	routemetrics.SetProvider(ctx, provider)
+	routemetrics.SetModel(ctx, model)
 	if auth == nil {
 		return
 	}
@@ -13439,6 +13498,7 @@ func (m *Manager) logAuthResultMetric(ctx context.Context, auth *Auth, result Re
 	if result.Success && status == 0 {
 		status = http.StatusOK
 	}
+	routemetrics.Attempt(ctx, result.Provider, status)
 	if status > 0 {
 		fields["status"] = status
 		fields["status_code"] = status

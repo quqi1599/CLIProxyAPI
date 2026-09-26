@@ -398,6 +398,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
 	compactionIntent := cliproxyexecutor.CompactionIntentFromOptions(req, opts)
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return cliproxyexecutor.Response{}, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -478,14 +484,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		authType, authValue = auth.AccountInfo()
 	}
 
-	executionSessionID := executionSessionIDFromOptions(opts)
-	var sess *codexWebsocketSession
-	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
-		sess.reqMu.Lock()
-		defer sess.reqMu.Unlock()
-	}
-
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
 		Stage:       "request_plan.codex.websocket",
@@ -495,6 +493,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}, internalpayload.AmplificationOverride{}); errGuard != nil {
 		return resp, errGuard
 	}
+	releaseTransform()
+	ctx = originalTransformContext
+	executionSessionID := executionSessionIDFromOptions(opts)
+	var sess *codexWebsocketSession
+	if executionSessionID != "" {
+		sess = e.getOrCreateSession(executionSessionID)
+		sess.reqMu.Lock()
+		defer sess.reqMu.Unlock()
+	}
+
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -735,6 +743,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		cliproxyexecutor.CompactionTriggerModeFromOptions(opts) == cliproxyauth.ResponsesCompactionTriggerBridgeLegacy {
 		return e.CodexExecutor.executeCompactionTriggerViaLegacy(ctx, auth, req, opts)
 	}
+	originalTransformContext := ctx
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return nil, errAdmission
+	}
+	defer releaseTransform()
 	transformStarted := time.Now()
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -806,6 +820,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authLabel = auth.Label
 	authType, authValue = auth.AccountInfo()
 
+	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
+	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
+		Stage:       "request_plan.codex.websocket_stream",
+		InputBytes:  int64(len(req.Payload)),
+		OutputBytes: int64(len(wsReqBody)),
+		Duration:    time.Since(transformStarted),
+	}, internalpayload.AmplificationOverride{}); errGuard != nil {
+		return nil, errGuard
+	}
+	releaseTransform()
+	ctx = originalTransformContext
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
@@ -815,18 +840,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
-	if errGuard := internalpayload.EnforceRequestTransformStage(ctx, internalpayload.TransformStageReport{
-		Stage:       "request_plan.codex.websocket_stream",
-		InputBytes:  int64(len(req.Payload)),
-		OutputBytes: int64(len(wsReqBody)),
-		Duration:    time.Since(transformStarted),
-	}, internalpayload.AmplificationOverride{}); errGuard != nil {
-		if sess != nil {
-			sess.reqMu.Unlock()
-		}
-		return nil, errGuard
-	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",

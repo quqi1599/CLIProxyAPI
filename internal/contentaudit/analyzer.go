@@ -231,6 +231,18 @@ func moderationCandidateText(value string) string {
 	return output.String()
 }
 
+func isModerationCandidateNormalized(value string) bool {
+	if value == "" || norm.NFKC.QuickSpanString(value) != len(value) {
+		return false
+	}
+	for _, character := range value {
+		if !(unicode.IsLetter(character) || unicode.IsNumber(character)) || unicode.ToLower(character) != character {
+			return false
+		}
+	}
+	return true
+}
+
 func isModerationInvisible(character rune) bool {
 	return unicode.Is(unicode.Cf, character) ||
 		unicode.Is(unicode.Mn, character) ||

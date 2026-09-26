@@ -1,6 +1,9 @@
 package translator
 
-import "context"
+import (
+	"context"
+	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+)
 
 // RequestEnvelope represents a request in the translation pipeline.
 type RequestEnvelope struct {
@@ -62,6 +65,11 @@ func (p *Pipeline) UseResponse(mw ResponseMiddleware) {
 
 // TranslateRequest applies middleware and registry transformations.
 func (p *Pipeline) TranslateRequest(ctx context.Context, from, to Format, req RequestEnvelope) (RequestEnvelope, error) {
+	ctx, release, errAdmission := internalpayload.BeginTransformScope(ctx, int64(len(req.Body)))
+	if errAdmission != nil {
+		return RequestEnvelope{}, errAdmission
+	}
+	defer release()
 	terminal := func(ctx context.Context, input RequestEnvelope) (RequestEnvelope, error) {
 		translated := p.registry.TranslateRequest(from, to, input.Model, input.Body, input.Stream)
 		input.Body = translated

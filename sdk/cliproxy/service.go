@@ -854,21 +854,30 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
 	if s == nil || s.coreManager == nil {
 		return
 	}
-	if cfg == nil || !cfg.SaveCooldownStatus || cfg.Home.Enabled {
+	if cfg == nil || cfg.Home.Enabled {
 		s.coreManager.SetCooldownStateStore(nil)
+		s.coreManager.SetSpreadStateStore(nil)
 		return
 	}
 	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
 	if errResolve != nil {
 		log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
 		s.coreManager.SetCooldownStateStore(nil)
+		s.coreManager.SetSpreadStateStore(nil)
 		return
 	}
 	if authDir == "" {
 		s.coreManager.SetCooldownStateStore(nil)
+		s.coreManager.SetSpreadStateStore(nil)
 		return
 	}
-	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
+	stateStore := coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
+	if cfg.SaveCooldownStatus {
+		s.coreManager.SetCooldownStateStore(stateStore)
+	} else {
+		s.coreManager.SetCooldownStateStore(nil)
+	}
+	s.coreManager.SetSpreadStateStore(stateStore)
 }
 
 func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {

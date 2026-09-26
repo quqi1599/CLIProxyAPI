@@ -441,11 +441,11 @@ func TestNestedExecutionReusesAdmissionLease(t *testing.T) {
 
 func TestConcurrentNestedExecutionsChargeFanoutWeight(t *testing.T) {
 	outerBody := admissionRequestWithMessages(0)
-	nestedBody := admissionRequestWithMessages(257)
+	nestedBody := admissionLargeRequest(17 << 20)
 	outerVector, _ := inspectRequestComplexity(outerBody)
 	nestedVector, _ := inspectRequestComplexity(nestedBody)
-	outerWeight := complexityAdmissionWeight(outerVector)
-	nestedWeight := complexityAdmissionWeight(nestedVector)
+	outerWeight := executionAdmissionWeight(outerVector)
+	nestedWeight := executionAdmissionWeight(nestedVector)
 	capacity := nestedWeight * 2
 	if outerWeight >= nestedWeight {
 		t.Fatalf("unexpected test weights: outer=%d nested=%d", outerWeight, nestedWeight)
@@ -494,9 +494,9 @@ func TestConcurrentNestedExecutionsChargeFanoutWeight(t *testing.T) {
 
 func TestConcurrentNestedExecutionsRejectFanoutOverCapacity(t *testing.T) {
 	outerBody := admissionRequestWithMessages(0)
-	nestedBody := admissionRequestWithMessages(257)
+	nestedBody := admissionLargeRequest(17 << 20)
 	nestedVector, _ := inspectRequestComplexity(nestedBody)
-	nestedWeight := complexityAdmissionWeight(nestedVector)
+	nestedWeight := executionAdmissionWeight(nestedVector)
 	handler := NewBaseAPIHandlers(nil, nil)
 	controller := newAdmissionController(nestedWeight*2-1, 2, time.Second)
 	handler.admission.Store(controller)
@@ -527,17 +527,17 @@ func TestConcurrentNestedExecutionsRejectFanoutOverCapacity(t *testing.T) {
 
 func TestNestedExecutionUpgradesAdmissionLeaseWithoutBypass(t *testing.T) {
 	handler := NewBaseAPIHandlers(nil, nil)
-	controller := newAdmissionController(5, 2, time.Second)
+	controller := newAdmissionController(8, 2, time.Second)
 	handler.admission.Store(controller)
 	outerBody := []byte(`{"messages":[]}`)
-	nestedBody := admissionRequestWithMessages(257)
-	innerBody := admissionRequestWithMessages(513)
+	nestedBody := admissionLargeRequest(17 << 20)
+	innerBody := admissionLargeRequest(33 << 20)
 	outerVector, _ := inspectRequestComplexity(outerBody)
 	nestedVector, _ := inspectRequestComplexity(nestedBody)
 	innerVector, _ := inspectRequestComplexity(innerBody)
-	outerWeight := complexityAdmissionWeight(outerVector)
-	nestedWeight := complexityAdmissionWeight(nestedVector)
-	innerWeight := complexityAdmissionWeight(innerVector)
+	outerWeight := executionAdmissionWeight(outerVector)
+	nestedWeight := executionAdmissionWeight(nestedVector)
+	innerWeight := executionAdmissionWeight(innerVector)
 	if !(outerWeight < nestedWeight && nestedWeight < innerWeight && innerWeight == controller.capacity) {
 		t.Fatalf("unexpected test weights: outer=%d nested=%d inner=%d capacity=%d", outerWeight, nestedWeight, innerWeight, controller.capacity)
 	}
@@ -546,7 +546,7 @@ func TestNestedExecutionUpgradesAdmissionLeaseWithoutBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outer acquire error: %v", err)
 	}
-	releaseBlocker, err := controller.acquire(context.Background(), 2)
+	releaseBlocker, err := controller.acquire(context.Background(), 5)
 	if err != nil {
 		t.Fatalf("blocker acquire error: %v", err)
 	}
@@ -557,8 +557,8 @@ func TestNestedExecutionUpgradesAdmissionLeaseWithoutBypass(t *testing.T) {
 	if releaseBlocked != nil {
 		t.Fatal("blocked nested upgrade returned a release function")
 	}
-	if active, queued := controller.snapshot(); active != outerWeight+2 || queued != 0 {
-		t.Fatalf("blocked nested snapshot = %d/%d, want %d/0", active, queued, outerWeight+2)
+	if active, queued := controller.snapshot(); active != outerWeight+5 || queued != 0 {
+		t.Fatalf("blocked nested snapshot = %d/%d, want %d/0", active, queued, outerWeight+5)
 	}
 	releaseBlocker()
 
@@ -672,12 +672,12 @@ func TestAdmissionLeaseConcurrentUpgradeAndReleaseKeepsExactLedger(t *testing.T)
 
 func TestNestedAdmissionUpgradeCancellationKeepsOuterLease(t *testing.T) {
 	handler := NewBaseAPIHandlers(nil, nil)
-	controller := newAdmissionController(5, 2, time.Second)
+	controller := newAdmissionController(8, 2, time.Second)
 	handler.admission.Store(controller)
 	outerBody := admissionRequestWithMessages(0)
-	nestedBody := admissionRequestWithMessages(257)
+	nestedBody := admissionLargeRequest(17 << 20)
 	outerVector, _ := inspectRequestComplexity(outerBody)
-	outerWeight := complexityAdmissionWeight(outerVector)
+	outerWeight := executionAdmissionWeight(outerVector)
 	ctx, releaseOuter, err := handler.inspectAndAcquireAdmission(context.Background(), outerBody, &modelExecutionOptions{})
 	if err != nil {
 		t.Fatalf("outer acquire error: %v", err)
@@ -711,7 +711,7 @@ func TestConcurrentNestedAdmissionUpgradesFailWithoutDeadlock(t *testing.T) {
 	controller := newAdmissionController(4, 2, time.Second)
 	handler.admission.Store(controller)
 	outerBody := admissionRequestWithMessages(0)
-	nestedBody := admissionRequestWithMessages(257)
+	nestedBody := admissionLargeRequest(17 << 20)
 	firstCtx, releaseFirst, err := handler.inspectAndAcquireAdmission(context.Background(), outerBody, &modelExecutionOptions{})
 	if err != nil {
 		t.Fatalf("first outer acquire error: %v", err)
@@ -740,8 +740,8 @@ func TestConcurrentNestedAdmissionUpgradesFailWithoutDeadlock(t *testing.T) {
 			t.Fatal("blocked concurrent upgrade returned a release function")
 		}
 	}
-	if active, queued := controller.snapshot(); active != controller.capacity || queued != 0 {
-		t.Fatalf("snapshot after concurrent upgrades = %d/%d, want %d/0", active, queued, controller.capacity)
+	if active, queued := controller.snapshot(); active != 2 || queued != 0 {
+		t.Fatalf("snapshot after concurrent upgrades = %d/%d, want 2/0", active, queued)
 	}
 	releaseFirst()
 	releaseSecond()
@@ -1097,4 +1097,8 @@ func waitAdmissionChannelClosed[T any](t *testing.T, ch <-chan T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for channel close")
 	}
+}
+
+func admissionLargeRequest(size int) []byte {
+	return []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("x", size) + `"}]}`)
 }

@@ -23,6 +23,7 @@ func NormalizeCodexRequestSchemas(body []byte) []byte {
 			case "function":
 				params := tool.Get("parameters")
 				if params.IsObject() {
+					//nolint:payload-growth benchmark=BenchmarkPayloadGrowthNormalizeCodexRequestSchemas real tool-schema rewrite benchmark covers nested tool traversal
 					if updated, err := sjson.SetRawBytes(body, path+".parameters", util.NormalizeCodexToolParameters([]byte(params.Raw))); err == nil {
 						body = updated
 					}

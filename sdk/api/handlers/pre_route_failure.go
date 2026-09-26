@@ -67,10 +67,10 @@ func logPluginExecutorFailure(ctx context.Context, statusCode int, errorCode, en
 	})
 }
 
-// logPreRouteFailure records request-safe correlation fields for gateway errors
+// logPreRouteFailure records request-safe correlation fields for routing errors
 // returned before the core auth manager emits route selection telemetry.
 func logPreRouteFailure(ctx context.Context, failure preRouteFailureLog) {
-	if failure.StatusCode != http.StatusBadGateway {
+	if failure.StatusCode != http.StatusBadGateway && !(failure.StatusCode == http.StatusNotFound && failure.FailureKind == preRouteFailureKindProviderResolution) {
 		return
 	}
 
@@ -89,10 +89,13 @@ func logPreRouteFailure(ctx context.Context, failure preRouteFailureLog) {
 		"failure_class":  "pre_route_bad_gateway",
 		"failure_kind":   failureKind,
 		"failure_scope":  "request",
-		"status_code":    http.StatusBadGateway,
+		"status_code":    failure.StatusCode,
 		"error_code":     errorCode,
 		"attempt_count":  0,
 		"request_stream": failure.Stream,
+	}
+	if failure.StatusCode == http.StatusNotFound {
+		fields["failure_class"] = "model_route_not_found"
 	}
 
 	if requestID := logging.NormalizeClientRequestID(logging.GetRequestID(ctx)); requestID != "" {

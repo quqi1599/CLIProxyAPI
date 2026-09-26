@@ -543,6 +543,11 @@ type codexRequestPlan struct {
 }
 
 func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, mode codexRequestPlanMode) (codexRequestPlan, error) {
+	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
+	if errAdmission != nil {
+		return codexRequestPlan{}, errAdmission
+	}
+	defer releaseTransform()
 	from := opts.SourceFormat
 	to := sdktranslator.FormatCodex
 	translatorStream := false

@@ -8,6 +8,23 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func BenchmarkPayloadGrowthFlattenDeepSeekNamespaces(b *testing.B) {
+	input := make([]string, 0, 64)
+	for index := 0; index < 64; index++ {
+		input = append(input, fmt.Sprintf(`{"type":"function_call","namespace":"files","name":"read","call_id":"call_%d","arguments":"{}"}`, index))
+	}
+	body := []byte(fmt.Sprintf(`{"tools":[{"type":"namespace","name":"files","tools":[{"type":"function","name":"read"}]}],"input":[%s]}`, strings.Join(input, ",")))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		out, names, err := FlattenDeepSeekNamespaces(body)
+		if err != nil || len(out) == 0 || len(names) == 0 {
+			b.Fatalf("namespace flatten failed: err=%v output=%d names=%d", err, len(out), len(names))
+		}
+	}
+}
+
 func TestDeepSeekNamespaceRoundtrip(t *testing.T) {
 	body := []byte(`{"tools":[{"type":"namespace","name":"files","description":"Local files","tools":[{"type":"function","name":"read","strict":true,"parameters":{"type":"object","properties":{"id":{"const":9007199254740993}}}}]},{"type":"custom","name":"apply_patch"}],"tool_choice":{"type":"function","namespace":"files","name":"read"},"input":[{"type":"function_call","namespace":"files","name":"read","call_id":"call_1","arguments":"{\"id\":1}"},{"type":"function_call_output","call_id":"call_1","output":"unchanged"},{"type":"reasoning","content":[{"type":"reasoning_text","text":"original reasoning"}]}]}`)
 	out, names, err := FlattenDeepSeekNamespaces(body)
