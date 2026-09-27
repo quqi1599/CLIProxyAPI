@@ -1096,16 +1096,24 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 			return plan, err
 		}
 		if (plan.endpoint == "/chat/completions" || helps.DeepSeekIsResponsesEndpoint(plan.endpoint)) && profile.Kind == "deepseek" {
-			beforeChoice := body
-			body = scrubDeepSeekThinkingToolChoice(body, baseModel, baseURL, profile.Kind)
-			choiceDowngraded := !bytes.Equal(beforeChoice, body)
-			if helps.DeepSeekIsResponsesEndpoint(plan.endpoint) {
-				body = helps.NormalizeDeepSeekResponsesThinking(body)
-			}
-			if choiceDowngraded {
-				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatDeepSeekToolChoiceDowngrade)
-			} else if !bytes.Equal(beforeChoice, body) {
-				providerResolveDowngrades = append(providerResolveDowngrades, openAICompatDeepSeekThinkingDowngrade)
+			var controlDowngrade string
+			body = helps.RewriteDeepSeekControls(body, func(controls []byte) []byte {
+				beforeChoice := controls
+				controls = scrubDeepSeekThinkingToolChoice(controls, baseModel, baseURL, profile.Kind)
+				choiceDowngraded := !bytes.Equal(beforeChoice, controls)
+				if helps.DeepSeekIsResponsesEndpoint(plan.endpoint) {
+					controls = helps.NormalizeDeepSeekResponsesThinking(controls)
+				}
+				controlDowngrade = ""
+				if choiceDowngraded {
+					controlDowngrade = openAICompatDeepSeekToolChoiceDowngrade
+				} else if !bytes.Equal(beforeChoice, controls) {
+					controlDowngrade = openAICompatDeepSeekThinkingDowngrade
+				}
+				return controls
+			})
+			if controlDowngrade != "" {
+				providerResolveDowngrades = append(providerResolveDowngrades, controlDowngrade)
 			}
 		}
 	}

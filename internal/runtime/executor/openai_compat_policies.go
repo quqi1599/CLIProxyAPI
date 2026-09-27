@@ -103,7 +103,20 @@ func scrubOpenAICompatPayloadForModelWithPolicies(ctx context.Context, payload [
 		}
 		return output, nil
 	}
-	payload = scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(payload, profile, model, baseURL)
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" && (match.Endpoint == "responses" || match.Endpoint == "compact") {
+		// Keep Responses input and instructions opaque to Chat-oriented scrubs.
+		// Include messages when supplied so legacy mixed-shape handling is retained.
+		// Repair the complete body first; the view must not hide invalid escapes.
+		if repaired, ok := helps.RepairInvalidJSONStringEscapes(payload); ok {
+			payload = repaired
+		}
+		payload = helps.RewriteJSONFields(payload, func(fields []byte) []byte {
+			return scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(fields, profile, model, baseURL)
+		}, "model", "messages", "tools", "tool_choice", "thinking", "thinking_budget", "reasoning", "reasoning_effort",
+			"store", "metadata", "parallel_tool_calls", "stream_options")
+	} else {
+		payload = scrubOpenAICompatPayloadBeforeRegisteredProviderQuirks(payload, profile, model, baseURL)
+	}
 	if err := helps.EnforceSemanticTransformStage(
 		ctx,
 		openAICompatProviderPreQuirkStage,
@@ -674,26 +687,32 @@ func openAICompatZhipuGLM53Policy() compat.Policy {
 
 func applyOpenAICompatDeepSeekPolicy(ctx context.Context, input []byte) (compat.TransformResult, error) {
 	state := openAICompatPolicyState(ctx, input)
-	output := input
-	if state.endpoint == "chat" {
-		output = normalizeDeepSeekChatAliases(output)
-	}
-	output = scrubDeepSeekThinkingBudgetForCompat(output, state.model, state.baseURL, "deepseek")
-	if state.endpoint == "responses" || state.endpoint == "compact" {
+	var downgrades []string
+	output := helps.RewriteDeepSeekControls(input, func(controls []byte) []byte {
+		output := controls
+		if state.endpoint == "chat" {
+			output = normalizeDeepSeekChatAliases(output)
+		}
+		output = scrubDeepSeekThinkingBudgetForCompat(output, state.model, state.baseURL, "deepseek")
 		output = scrubDeepSeekThinkingToolChoice(output, state.model, state.baseURL, "deepseek")
-		output = helps.NormalizeDeepSeekResponsesThinking(output)
-		return compat.TransformResult{
-			Payload:    output,
-			Downgrades: openAICompatDeepSeekPolicyDowngrades(input, output),
-		}, nil
-	}
-	output = scrubDeepSeekThinkingToolChoice(output, state.model, state.baseURL, "deepseek")
-	if requiresDeepSeekToolSchemaCompatibility(state.model) {
-		output = scrubDeepSeekToolPayload(output, state.baseURL)
+		if state.endpoint == "responses" || state.endpoint == "compact" {
+			output = helps.NormalizeDeepSeekResponsesThinking(output)
+		}
+		downgrades = openAICompatDeepSeekPolicyDowngrades(controls, output)
+		return output
+	})
+	if state.endpoint != "responses" && state.endpoint != "compact" && requiresDeepSeekToolSchemaCompatibility(state.model) {
+		beforeTools := output
+		output = scrubDeepSeekToolPayloadFields(output, state.baseURL)
+		if !bytes.Equal(beforeTools, output) {
+			// Schema cleanup can also rename the selected function. Preserve the
+			// legacy report's comparison against the final tool choice in that case.
+			downgrades = openAICompatDeepSeekPolicyDowngrades(input, output)
+		}
 	}
 	return compat.TransformResult{
 		Payload:    output,
-		Downgrades: openAICompatDeepSeekPolicyDowngrades(input, output),
+		Downgrades: downgrades,
 	}, nil
 }
 

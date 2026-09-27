@@ -35,6 +35,8 @@ docs/*
 !docs/admission-dimensions.md
 !docs/server-remediation-20260927.md
 !docs/content-audit-performance-20260927.md
+!docs/deepseek-preparation-performance-20260927.md
+!docs/deepseek-preparation-matrix-20260927.csv
 !docs/route-pipeline-matrix-20260927.csv
 !docs/responses-routing-safety.md
 AGENTS.md

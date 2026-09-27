@@ -459,8 +459,10 @@ func TestOpenAICompatExecutorDeepSeekLogsCompatibilityShapeOn400(t *testing.T) {
 	if logFieldContains(failureEntry.Data["removed_fields"], "tool_choice") {
 		t.Fatalf("failure reports preserved tool_choice as removed: %#v", failureEntry.Data["removed_fields"])
 	}
-	if got := failureEntry.Data["modified_fields"]; got != "messages,tools" {
-		t.Fatalf("failure modified_fields = %#v, want messages,tools", got)
+	// Tool schema repair now preserves the raw message array instead of
+	// reserializing its object keys as an incidental diagnostic modification.
+	if got := failureEntry.Data["modified_fields"]; got != "tools" {
+		t.Fatalf("failure modified_fields = %#v, want tools", got)
 	}
 	if got := failureEntry.Data["assistant_tool_call_messages"]; got != 1 {
 		t.Fatalf("failure assistant_tool_call_messages = %#v, want 1", got)

@@ -293,6 +293,16 @@ func scrubOpenAICompatCapabilityFields(payload []byte, profile openAICompatProfi
 }
 
 func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProfile, model string, baseURL string, endpoint compat.EndpointKind) []byte {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "deepseek" && (endpoint == "responses" || endpoint == "compact") {
+		return helps.RewriteJSONFields(payload, func(fields []byte) []byte {
+			return scrubOpenAICompatPostConfigFields(fields, profile, model, baseURL, endpoint)
+		}, "model", "messages", "tools", "tool_choice", "thinking", "thinking_budget", "reasoning", "reasoning_effort",
+			"enable_thinking", "max_completion_tokens", "max_tokens", "store", "metadata", "parallel_tool_calls", "stream_options", "output_config")
+	}
+	return scrubOpenAICompatPostConfigFields(payload, profile, model, baseURL, endpoint)
+}
+
+func scrubOpenAICompatPostConfigFields(payload []byte, profile openAICompatProfile, model string, baseURL string, endpoint compat.EndpointKind) []byte {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
 	if compatKind == "kimi" {
 		payload = omitKimiEmptyAssistantToolCallContent(payload)
@@ -348,12 +358,26 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 	if compatKind == "doubao" && (registeredPolicies || hasCanonicalDoubaoDeepSeekReasoning(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)) {
 		capabilityProfile.SupportsReasoning = true
 	}
-	payload = scrubOpenAICompatPayload(payload, capabilityProfile)
+	if compatKind == "deepseek" {
+		fields := []string{"store", "metadata", "parallel_tool_calls", "stream_options", "reasoning", "reasoning_effort"}
+		if !capabilityProfile.SupportsReasoning && !capabilityProfile.PreserveReasoningContent {
+			fields = append(fields, "messages")
+		}
+		payload = helps.RewriteJSONFields(payload, func(fields []byte) []byte {
+			return scrubOpenAICompatPayload(fields, capabilityProfile)
+		}, fields...)
+	} else {
+		payload = scrubOpenAICompatPayload(payload, capabilityProfile)
+	}
 	if compatKind == "doubao" && !registeredPolicies {
 		payload = applyDoubaoDeepSeekReasoningIntent(payload, model, doubaoDeepSeekEffort, doubaoDeepSeekThinkingDisabled)
 	}
 	payload = repairOpenAICompatToolCallHistory(payload)
-	payload = sanitizeOpenAICompatToolSchemas(payload)
+	if compatKind == "deepseek" {
+		payload = helps.RewriteJSONFields(payload, sanitizeOpenAICompatToolSchemas, "tools")
+	} else {
+		payload = sanitizeOpenAICompatToolSchemas(payload)
+	}
 	if !registeredPolicies || compatKind != "deepseek" {
 		payload = scrubDeepSeekThinkingBudgetForCompat(payload, model, baseURL, profile.Kind)
 	}
@@ -462,7 +486,11 @@ func scrubOpenAICompatPayloadAfterProviderQuirksMode(payload []byte, profile ope
 		payload = scrubDoubaoPayloadForModel(payload, model)
 	}
 	if requiresDeepSeekToolSchemaCompatibility(model) && (!registeredPolicies || compatKind != "deepseek") {
-		payload = scrubDeepSeekToolPayload(payload, baseURL)
+		if compatKind == "deepseek" {
+			payload = scrubDeepSeekToolPayloadFields(payload, baseURL)
+		} else {
+			payload = scrubDeepSeekToolPayload(payload, baseURL)
+		}
 	}
 	return payload
 }
@@ -3065,17 +3093,36 @@ func requiresDeepSeekToolSchemaCompatibility(model string) bool {
 }
 
 func scrubDeepSeekToolPayload(payload []byte, baseURL string) []byte {
+	out, _ := scrubDeepSeekToolPayloadWithNames(payload, baseURL)
+	return out
+}
+
+func scrubDeepSeekToolPayloadFields(payload []byte, baseURL string) []byte {
+	if view, ok := helps.NewJSONFieldView(payload, "tools", "tool_choice"); ok {
+		out, renamed := scrubDeepSeekToolPayloadWithNames(view.Bytes(), baseURL)
+		// A renamed function also changes references in messages. Keep the
+		// complete legacy traversal for that case instead of hiding history.
+		if !renamed {
+			if merged, okMerge := view.Merge(out); okMerge {
+				return merged
+			}
+		}
+	}
+	return scrubDeepSeekToolPayload(payload, baseURL)
+}
+
+func scrubDeepSeekToolPayloadWithNames(payload []byte, baseURL string) ([]byte, bool) {
 	if len(payload) == 0 || !gjson.GetBytes(payload, "tools").IsArray() {
-		return payload
+		return payload, false
 	}
 
 	var root map[string]any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return payload
+		return payload, false
 	}
 	tools, ok := root["tools"].([]any)
 	if !ok || len(tools) == 0 {
-		return payload
+		return payload, false
 	}
 
 	keepStrict := deepSeekBaseURLUsesBeta(baseURL) && allDeepSeekFunctionToolsStrict(tools)
@@ -3102,15 +3149,15 @@ func scrubDeepSeekToolPayload(payload []byte, baseURL string) []byte {
 		changed = true
 	}
 	if !changed {
-		return payload
+		return payload, len(nameMapping) > 0
 	}
 
 	root["tools"] = cleanedTools
 	out, err := json.Marshal(root)
 	if err != nil || !gjson.ValidBytes(out) {
-		return payload
+		return payload, len(nameMapping) > 0
 	}
-	return out
+	return out, len(nameMapping) > 0
 }
 
 func deepSeekBaseURLUsesBeta(baseURL string) bool {
