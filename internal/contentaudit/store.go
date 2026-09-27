@@ -325,6 +325,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		ON audit_events(action, rule_id, matched_term, policy_version, content_fingerprint, created_at DESC)`); err != nil {
 		return fmt.Errorf("create content audit fingerprint index: %w", err)
 	}
+	// Legacy databases need the review columns above before this partial index.
+	if _, err := s.db.ExecContext(ctx, shadowPendingIndexSQL); err != nil {
+		return fmt.Errorf("create content audit pending review index: %w", err)
+	}
 	return nil
 }
 

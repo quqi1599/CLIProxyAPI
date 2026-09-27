@@ -7,6 +7,14 @@ import (
 	"strings"
 )
 
+const shadowPendingIndexSQL = `CREATE INDEX IF NOT EXISTS idx_audit_events_shadow_pending
+	ON audit_events(created_at)
+	WHERE model_review_mode='shadow' AND model_review_fallback='shadow_pending'`
+
+const recoverInterruptedShadowReviewsSQL = `UPDATE audit_events
+	SET model_review_decision='uncertain', model_review_fallback='shadow_interrupted'
+	WHERE model_review_mode='shadow' AND model_review_fallback='shadow_pending' AND created_at<=?`
+
 func safeReviewDiagnostics(values map[string]int64) map[string]int64 {
 	out := make(map[string]int64)
 	for _, key := range []string{"shadow_queue", "queue", "admission", "provider", "total", "auth_select", "connect", "request_write", "ttfb", "transport", "read", "parse"} {
@@ -54,9 +62,7 @@ func (s *Store) InterruptShadowReviews(ctx context.Context, ids []string, reason
 // RecoverInterruptedShadowReviews is startup-only, before this service admits
 // new observations. Terminal results and decisions remain untouched.
 func (s *Store) RecoverInterruptedShadowReviews(ctx context.Context, before int64) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE audit_events
-		SET model_review_decision='uncertain', model_review_fallback='shadow_interrupted'
-		WHERE model_review_mode='shadow' AND model_review_fallback='shadow_pending' AND created_at<=?`, before)
+	result, err := s.db.ExecContext(ctx, recoverInterruptedShadowReviewsSQL, before)
 	if err != nil {
 		return 0, err
 	}

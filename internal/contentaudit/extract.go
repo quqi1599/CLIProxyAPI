@@ -116,11 +116,7 @@ func ExtractJSONRequestForPath(body []byte, requestPath string) ExtractedRequest
 func extractJSONRequest(body []byte, requestPath string) ExtractedRequest {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
-		text := strings.TrimSpace(string(body))
-		truncated := utf8.RuneCountInString(text) > maxEvidenceStringRunes
-		if truncated {
-			text = string([]rune(text)[:maxEvidenceStringRunes])
-		}
+		text, truncated := evidencePrefix(strings.TrimSpace(string(body)), maxEvidenceStringRunes)
 		evidence, _ := json.Marshal(map[string]any{
 			"invalid_json":      true,
 			"raw_text":          text,
@@ -167,9 +163,8 @@ func extractJSONRequest(body []byte, requestPath string) ExtractedRequest {
 	contextIncomplete := missingProtocolInput || current.truncated || current.role != "" && current.text == ""
 	const maxReferenceRunes = 4096
 	for _, reference := range references {
-		referenceText := reference.text
-		if utf8.RuneCountInString(referenceText) > maxReferenceRunes {
-			referenceText = string([]rune(referenceText)[utf8.RuneCountInString(referenceText)-maxReferenceRunes:])
+		referenceText, truncated := evidenceSuffix(reference.text, maxReferenceRunes)
+		if truncated {
 			contextIncomplete = true
 		}
 		referenceTexts = append(referenceTexts, reference.role+":\n"+referenceText)
@@ -402,10 +397,7 @@ func appendEnforcementSegment(text string, fields []string, segments *[]enforcem
 	if text == "" || isURLOrData(text) {
 		return
 	}
-	truncated := utf8.RuneCountInString(text) > maxEvidenceStringRunes
-	if truncated {
-		text = string([]rune(text)[utf8.RuneCountInString(text)-maxEvidenceStringRunes:])
-	}
+	text, truncated := evidenceSuffix(text, maxEvidenceStringRunes)
 	*segments = append(*segments, enforcementSegment{text: text, fields: append([]string(nil), fields...), role: "user", parts: []promptSegment{{text: text, role: "user"}}, truncated: truncated})
 }
 
@@ -421,8 +413,8 @@ func appendMessageSegment(value any, path, role string, segments *[]enforcementS
 	}
 	segment := enforcementSegment{role: role, fields: fields}
 	for index, text := range parts {
-		if utf8.RuneCountInString(text) > maxEvidenceStringRunes {
-			text = string([]rune(text)[utf8.RuneCountInString(text)-maxEvidenceStringRunes:])
+		text, truncated := evidenceSuffix(text, maxEvidenceStringRunes)
+		if truncated {
 			parts[index] = text
 			segment.truncated = true
 		}
@@ -620,9 +612,7 @@ func collectPromptFieldsWithRoles(value any, path string, active bool, sourceRol
 		if text == "" || isURLOrData(text) {
 			return
 		}
-		if utf8.RuneCountInString(text) > maxEvidenceStringRunes {
-			text = string([]rune(text)[:maxEvidenceStringRunes])
-		}
+		text, _ = evidencePrefix(text, maxEvidenceStringRunes)
 		*parts = append(*parts, text)
 		*fields = append(*fields, path)
 		if segments != nil {
@@ -718,9 +708,24 @@ func sanitizeEvidenceValue(value any, key string) any {
 
 func isURLOrData(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	lower := strings.ToLower(trimmed)
-	if strings.HasPrefix(lower, "data:") {
+	if len(trimmed) >= len("data:") && strings.EqualFold(trimmed[:len("data:")], "data:") {
 		return true
+	}
+	// A URL with a nonempty scheme and host needs a valid ASCII scheme followed
+	// by ://. Keep net/url as the authority for candidate validation.
+	schemeEnd := strings.Index(trimmed, "://")
+	if schemeEnd <= 0 {
+		return false
+	}
+	for index := 0; index < schemeEnd; index++ {
+		c := trimmed[index]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+			continue
+		}
+		if index > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.') {
+			continue
+		}
+		return false
 	}
 	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" && parsed.Host != "" {
 		return true
