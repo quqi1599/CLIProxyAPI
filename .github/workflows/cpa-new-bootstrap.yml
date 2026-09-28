@@ -1,0 +1,37 @@
+name: CPA new ephemeral runner bootstrap
+on:
+  push:
+    branches: [codex/cpa-new-release-bootstrap]
+    paths: [.github/workflows/cpa-new-bootstrap.yml]
+permissions:
+  contents: read
+concurrency:
+  group: cpa-new-runner-bootstrap
+  cancel-in-progress: false
+jobs:
+  bootstrap:
+    if: github.repository == 'quqi1599/CLIProxyAPI'
+    runs-on: [self-hosted, ci-vps]
+    timeout-minutes: 65
+    steps:
+      - name: Run one isolated CPA new release job
+        env:
+          REGISTRATION_TOKEN: ${{ secrets.CPA_NEW_RUNNER_REGISTRATION }}
+          RUNNER_ALLOW_RUNAS_ROOT: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          hostname
+          df -h /
+          source_dir="$(realpath "$RUNNER_TEMP/../..")"
+          test -f "$source_dir/config.sh"
+          slot=$(mktemp -d "$RUNNER_TEMP/cpa-new-runner.XXXXXX")
+          trap 'rm -rf -- "$slot"' EXIT
+          cp -a "$source_dir/bin" "$source_dir/externals" "$slot/"
+          find "$source_dir" -maxdepth 1 -type f -name '*.sh*' -exec cp {} "$slot/" \;
+          cd "$slot"
+          ./config.sh --unattended --ephemeral --disableupdate \
+            --url https://github.com/quqi1599/cpa-new --token "$REGISTRATION_TOKEN" \
+            --name "cpa-new-release-${GITHUB_RUN_ID}" --labels ci-vps,cpa-new-release --work _work
+          unset REGISTRATION_TOKEN
+          ./run.sh
