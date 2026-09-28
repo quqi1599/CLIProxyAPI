@@ -1593,11 +1593,17 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
 
+type spreadStateStoreSnapshot struct {
+	store SpreadStateStore
+}
+
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store            Store
-	cooldownStore    CooldownStateStore
-	spreadStateStore SpreadStateStore
+	store         Store
+	cooldownStore CooldownStateStore
+	// Dynamic selectors are also created while mu is held. Read the store
+	// independently so a waiting writer cannot deadlock a nested RLock.
+	spreadStateStore atomic.Pointer[spreadStateStoreSnapshot]
 	executors        map[string]ProviderExecutor
 	selector         Selector
 	hook             Hook
@@ -2020,9 +2026,7 @@ func (m *Manager) selectorForStrategyGroup(group, strategy string) Selector {
 	}
 	m.dynamicSelectors[cacheKey] = selector
 	m.dynamicSelectorsMu.Unlock()
-	m.mu.RLock()
-	spreadStateStore := m.spreadStateStore
-	m.mu.RUnlock()
+	spreadStateStore := m.currentSpreadStateStore()
 	bindSpreadStateStore(selector, spreadStateStore)
 	return selector
 }
@@ -2231,7 +2235,7 @@ func (m *Manager) SetSelector(selector Selector) {
 	previousSessionSelector, _ := m.selector.(*SessionAffinitySelector)
 	nextSessionSelector, _ := selector.(*SessionAffinitySelector)
 	m.selector = selector
-	spreadStateStore := m.spreadStateStore
+	spreadStateStore := m.currentSpreadStateStore()
 	m.mu.Unlock()
 	bindSpreadStateStore(selector, spreadStateStore)
 	m.stopDynamicSelectors()
@@ -2258,13 +2262,12 @@ func (m *Manager) SetCooldownStateStore(store CooldownStateStore) {
 	}
 	m.mu.Lock()
 	m.cooldownStore = store
-	spreadStateStore := m.spreadStateStore
-	if spreadStateStore == nil {
+	if m.currentSpreadStateStore() == nil {
 		if typedStore, ok := store.(SpreadStateStore); ok {
-			spreadStateStore = typedStore
-			m.spreadStateStore = typedStore
+			m.spreadStateStore.CompareAndSwap(nil, &spreadStateStoreSnapshot{store: typedStore})
 		}
 	}
+	spreadStateStore := m.currentSpreadStateStore()
 	m.mu.Unlock()
 	m.bindSpreadStateStore(spreadStateStore)
 }
@@ -2275,9 +2278,20 @@ func (m *Manager) SetSpreadStateStore(store SpreadStateStore) {
 		return
 	}
 	m.mu.Lock()
-	m.spreadStateStore = store
+	if store == nil {
+		m.spreadStateStore.Store(nil)
+	} else {
+		m.spreadStateStore.Store(&spreadStateStoreSnapshot{store: store})
+	}
 	m.mu.Unlock()
 	m.bindSpreadStateStore(store)
+}
+
+func (m *Manager) currentSpreadStateStore() SpreadStateStore {
+	if snapshot := m.spreadStateStore.Load(); snapshot != nil {
+		return snapshot.store
+	}
+	return nil
 }
 
 func (m *Manager) bindSpreadStateStore(store SpreadStateStore) {
