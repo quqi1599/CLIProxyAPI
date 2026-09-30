@@ -580,7 +580,7 @@ func (e *CodexExecutor) prepareCodexRequestPlan(ctx context.Context, auth *clipr
 	if err != nil {
 		return codexRequestPlan{}, err
 	}
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier(), req.Payload)
 	if err != nil {
 		return codexRequestPlan{}, err
 	}

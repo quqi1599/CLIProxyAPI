@@ -389,6 +389,12 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 		return errReject
 	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
+	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(model) {
+		updated, errRead = thinking.ApplyThinking(updated, model, "openai", "openai", "minimax")
+		if errRead != nil {
+			return errRead
+		}
+	}
 	if upstreamModel := helps.OfficialDeepSeekModel(model, baseURL); upstreamModel != model {
 		updated, _ = sjson.SetBytes(updated, "model", upstreamModel)
 	}
@@ -1091,7 +1097,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		if !nativeResponses {
 			body = normalizeOpenAICompatRouteReasoningEffort(body, opts, baseModel, thinkingProviderKey, baseURL, profile.Kind)
 		}
-		body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey)
+		body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProviderKey, payloadSource)
 		if err != nil {
 			return plan, err
 		}
@@ -1226,6 +1232,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
+	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
+		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "minimax")
+		if err != nil {
+			return plan, err
+		}
+	}
 	if requiresReturnedThinkingHistory(baseModel) {
 		body, _, _, _, err = normalizeThinkingHistoryForModelWithReportForClient(body, "openai", baseModel, clientProfile)
 		if err != nil {
@@ -2199,7 +2211,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 			translated = normalizeZhipuGLM53Thinking(translated, modelForCounting)
 		}
 		translated = normalizeOpenAICompatRouteReasoningEffort(translated, opts, modelForCounting, thinkingProviderKey, baseURL, profile.Kind)
-		translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), thinkingProviderKey)
+		translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), thinkingProviderKey, req.Payload)
 		if err != nil {
 			return cliproxyexecutor.Response{}, err
 		}

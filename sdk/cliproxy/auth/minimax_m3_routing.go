@@ -394,8 +394,7 @@ func isMiniMaxModel(model string) bool {
 }
 
 func isMiniMaxM3SeriesModel(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	return model == "minimax-m3" || strings.HasPrefix(model, "minimax-m3-")
+	return thinking.IsMiniMaxM3Model(model)
 }
 
 func isMiniMaxM3HighspeedModel(model string) bool {

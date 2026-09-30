@@ -18,6 +18,16 @@ import (
 )
 
 func TestOpenAICompatMiniMaxM3StreamUsage(t *testing.T) {
+	testOpenAICompatMiniMaxStreamUsage(t, "MiniMax-M3")
+}
+
+func TestOpenAICompatMiniMaxM31StreamUsage(t *testing.T) {
+	for _, model := range []string{"MiniMax-M3.1", "MiniMax-M3.1-flash", "MiniMax-M3.1-Flash-Preview"} {
+		t.Run(model, func(t *testing.T) { testOpenAICompatMiniMaxStreamUsage(t, model) })
+	}
+}
+
+func testOpenAICompatMiniMaxStreamUsage(t *testing.T, model string) {
 	const usageJSON = `{"prompt_tokens":1980,"completion_tokens":32,"total_tokens":2012,"prompt_tokens_details":{"cached_tokens":1979}}`
 	for _, tt := range []struct {
 		name         string
@@ -50,8 +60,8 @@ func TestOpenAICompatMiniMaxM3StreamUsage(t *testing.T) {
 					t.Errorf("upstream path = %q", r.URL.Path)
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = fmt.Fprint(w, "data: {\"id\":\"cache-probe\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":null}],\"usage\":null}\n\n")
-				finish := `{"id":"cache-probe","model":"MiniMax-M3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]`
+				_, _ = fmt.Fprintf(w, "data: {\"id\":\"cache-probe\",\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":null}],\"usage\":null}\n\n", model)
+				finish := fmt.Sprintf(`{"id":"cache-probe","model":%q,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]`, model)
 				// Reproduce the provider contract: usage is absent unless requested.
 				includeUsage := gjson.GetBytes(body, "stream_options.include_usage").Bool()
 				if includeUsage && tt.finishUsage {
@@ -59,7 +69,7 @@ func TestOpenAICompatMiniMaxM3StreamUsage(t *testing.T) {
 				}
 				_, _ = fmt.Fprintf(w, "data: %s}\n\n", finish)
 				if includeUsage && !tt.finishUsage {
-					_, _ = fmt.Fprintf(w, "data: {\"id\":\"cache-probe\",\"model\":\"MiniMax-M3\",\"choices\":[],\"usage\":%s}\n\n", usageJSON)
+					_, _ = fmt.Fprintf(w, "data: {\"id\":\"cache-probe\",\"model\":\"%s\",\"choices\":[],\"usage\":%s}\n\n", model, usageJSON)
 				}
 				if !tt.omitDone {
 					_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
@@ -73,7 +83,7 @@ func TestOpenAICompatMiniMaxM3StreamUsage(t *testing.T) {
 			}}
 			payload := []byte(tt.payload)
 			stream, err := executor.ExecuteStream(context.Background(), auth,
-				cliproxyexecutor.Request{Model: "MiniMax-M3", Payload: payload},
+				cliproxyexecutor.Request{Model: model, Payload: payload},
 				cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(tt.format), OriginalRequest: payload, Stream: true})
 			if err != nil {
 				t.Fatalf("ExecuteStream: %v", err)
@@ -91,7 +101,7 @@ func TestOpenAICompatMiniMaxM3StreamUsage(t *testing.T) {
 			if !gjson.GetBytes(body, "stream_options.include_usage").Bool() {
 				t.Fatalf("MiniMax-M3 stream must request usage: %s", body)
 			}
-			if got := gjson.GetBytes(body, "model").String(); got != "MiniMax-M3" {
+			if got := gjson.GetBytes(body, "model").String(); got != model {
 				t.Fatalf("upstream model = %q", got)
 			}
 			usageEvents, terminalEvents := 0, 0

@@ -387,7 +387,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	providerConfigStarted := time.Now()
 	providerConfigInput := body
 	body, _ = sjson.SetBytes(body, "model", helps.OfficialDeepSeekModel(baseModel, plan.baseURL))
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier(), payloadSource)
 	if err != nil {
 		return plan, err
 	}
@@ -402,7 +402,14 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind, plan.providerIdentity.BaseHost)
+	beforePayloadConfig := body
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if plan.providerIdentity.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(beforePayloadConfig, body) {
+		body, err = thinking.ApplyThinking(body, baseModel, "claude", "claude", e.Identifier())
+		if err != nil {
+			return plan, err
+		}
+	}
 	body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, plan.baseURL, plan.providerIdentity.Kind)
 	body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, plan.providerIdentity.Kind)
 	body = ensureModelMaxTokens(body, baseModel)
@@ -430,7 +437,12 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
 	forcedToolChoiceInput := body
-	body = disableThinkingIfToolChoiceForced(body)
+	miniMaxM31 := plan.providerIdentity.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel)
+	// MiniMax requires thinking and accepts sampling controls while it is active.
+	// Do not apply Anthropic-only restrictions to the M3.1 compatibility endpoint.
+	if !miniMaxM31 {
+		body = disableThinkingIfToolChoiceForced(body)
+	}
 	if plan.providerIdentity.Kind == "deepseek" && requiresReturnedThinkingHistory(baseModel) {
 		choice := gjson.GetBytes(body, "tool_choice.type").String()
 		if choice == "any" || choice == "tool" {
@@ -447,7 +459,9 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if !bytes.Equal(forcedToolChoiceInput, body) {
 		providerCompatibilityDowngrades = append(providerCompatibilityDowngrades, claudeForcedToolChoiceThinkingDowngrade)
 	}
-	body = normalizeClaudeTemperatureForThinking(body)
+	if !miniMaxM31 {
+		body = normalizeClaudeTemperatureForThinking(body)
+	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
 		claudeProviderCompatibilityTransformStage,
@@ -1698,6 +1712,9 @@ func applyMiniMaxStreamingThinkingDefaultForCompat(compatKind string, body []byt
 	if compatKind != "minimax" || !stream || len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
 	}
+	if thinking.IsMiniMaxM31Model(gjson.GetBytes(body, "model").String()) {
+		return body
+	}
 	if gjson.GetBytes(body, "thinking").Exists() || gjson.GetBytes(body, "output_config.effort").Exists() {
 		return body
 	}
@@ -2206,8 +2223,7 @@ func supportsMiniMaxM3ClaudeMultimodalPart(compatKind, modelID, partType string)
 }
 
 func isMiniMaxM3SeriesModel(modelID string) bool {
-	modelID = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelID).ModelName))
-	return modelID == "minimax-m3" || strings.HasPrefix(modelID, "minimax-m3-")
+	return thinking.IsMiniMaxM3Model(modelID)
 }
 
 func supportsXiaomiMimoV25ClaudeMultimodalPart(compatKind, modelID, partType string) bool {
@@ -2883,7 +2899,7 @@ func isMiniMaxM3CompatModel(model string) bool {
 	if base == "" {
 		base = model
 	}
-	return strings.EqualFold(base, "minimax-m3")
+	return strings.EqualFold(base, "minimax-m3") || thinking.IsMiniMaxM31Model(base)
 }
 
 func isMiniMaxStepClaudeCompatKind(kind string) bool {
@@ -3686,6 +3702,12 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 		return nil, errGuard
 	}
 	model := gjson.GetBytes(body, "model").String()
+	if compatKind == "minimax" && thinking.IsMiniMaxM31Model(model) {
+		body, errRead = thinking.ApplyThinking(body, model, "claude", "claude", "claude")
+		if errRead != nil {
+			return nil, errRead
+		}
+	}
 	if upstreamModel := helps.OfficialDeepSeekModel(model, requestURLString(req)); upstreamModel != model {
 		body, _ = sjson.SetBytes(body, "model", upstreamModel)
 	}

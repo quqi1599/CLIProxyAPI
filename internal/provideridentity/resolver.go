@@ -160,7 +160,7 @@ func inferIdentityKind(host, path string) string {
 	switch host {
 	case "api.moonshot.ai", "api.moonshot.cn", "api.kimi.com":
 		return "kimi"
-	case "api.minimaxi.com", "api.minimaxi.io", "api.minimax.io":
+	case "api.minimaxi.com", "api.minimaxi.io", "api.minimax.io", "api.minimax.cn":
 		return "minimax"
 	case "open.bigmodel.cn", "maas-api.lanyun.net", "api.z.ai":
 		return "zhipu"
@@ -195,7 +195,7 @@ func inferEndpointKind(host, path string) string {
 		if pathMatches(path, "/anthropic") {
 			return "deepseek"
 		}
-	case "api.minimaxi.com", "api.minimaxi.io", "api.minimax.io":
+	case "api.minimaxi.com", "api.minimaxi.io", "api.minimax.io", "api.minimax.cn":
 		if pathMatches(path, "/anthropic") {
 			return "minimax"
 		}

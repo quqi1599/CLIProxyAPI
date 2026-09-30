@@ -142,6 +142,7 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //   - fromFormat: Source request format (e.g., openai, codex, gemini)
 //   - toFormat: Target provider format for the request body (gemini, antigravity, claude, openai, codex, kimi, xai)
 //   - providerKey: Provider identifier used for registry model lookups (may differ from toFormat, e.g., openrouter -> openai)
+//   - sourceBodies: Optional pre-translation payload for preserving client thinking intent
 //
 // Returns:
 //   - Modified request body JSON with thinking configuration applied
@@ -162,7 +163,7 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //
 //	// Without suffix - uses body config
 //	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini", "gemini")
-func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
+func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string, sourceBodies ...[]byte) ([]byte, error) {
 	providerFormat := strings.ToLower(strings.TrimSpace(toFormat))
 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
 	if providerKey == "" {
@@ -185,8 +186,19 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// 2. Parse suffix and get modelInfo
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
+	if IsMiniMaxM31Model(baseModel) && (providerFormat == "openai" || providerFormat == "claude" || providerFormat == "codex") {
+		var sourceBody []byte
+		if len(sourceBodies) > 0 {
+			sourceBody = sourceBodies[0]
+		}
+		return applyMiniMaxM31Thinking(body, suffixResult, fromFormat, providerFormat, sourceBody, applier)
+	}
 	// Use provider-specific lookup to handle capability differences across providers.
 	modelInfo := registry.LookupModelInfo(baseModel, providerKey)
+	if len(sourceBodies) > 0 && len(sourceBodies[0]) > 0 && fromFormat == "claude" &&
+		strings.HasPrefix(strings.ToLower(baseModel), "gpt-") && (providerFormat == "openai" || providerFormat == "codex") {
+		return applyClaudeToGPTThinking(body, sourceBodies[0], suffixResult, providerFormat, modelInfo, applier)
+	}
 
 	// 3. Model capability check
 	// Unknown models are treated as user-defined so thinking config can still be applied.
@@ -517,24 +529,23 @@ func extractClaudeConfig(body []byte) ThinkingConfig {
 	if thinkingType == "disabled" {
 		return ThinkingConfig{Mode: ModeNone, Budget: 0}
 	}
-	if thinkingType == "adaptive" || thinkingType == "auto" {
-		// Claude adaptive thinking uses output_config.effort (low/medium/high/max).
-		// We only treat it as a thinking config when effort is explicitly present;
-		// otherwise we passthrough and let upstream defaults apply.
-		if effort := gjson.GetBytes(body, "output_config.effort"); effort.Exists() && effort.Type == gjson.String {
-			value := strings.ToLower(strings.TrimSpace(effort.String()))
-			if value == "" {
-				return ThinkingConfig{}
-			}
-			switch value {
-			case "none":
-				return ThinkingConfig{Mode: ModeNone, Budget: 0}
-			case "auto":
-				return ThinkingConfig{Mode: ModeAuto, Budget: -1}
-			default:
-				return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
-			}
+	// Explicit effort does not require a separate thinking object. An explicit
+	// disabled toggle above still takes precedence over the effort field.
+	if effort := gjson.GetBytes(body, "output_config.effort"); effort.Exists() && effort.Type == gjson.String {
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if value == "" {
+			return ThinkingConfig{}
 		}
+		switch value {
+		case "none":
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		case "auto":
+			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
+		default:
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+		}
+	}
+	if thinkingType == "adaptive" || thinkingType == "auto" {
 		return ThinkingConfig{}
 	}
 

@@ -419,6 +419,12 @@ func scrubOpenAICompatLegacyProviderQuirks(payload []byte, profile openAICompatP
 }
 
 func openAICompatCapabilityProfileForModel(profile openAICompatProfile, model string) openAICompatProfile {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "minimax" && thinking.IsMiniMaxM31Model(model) {
+		profile.SupportsStreamUsage = true
+		profile.SupportsReasoning = true
+		profile.PreserveReasoningContent = true
+		return profile
+	}
 	if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "minimax" && strings.EqualFold(strings.TrimSpace(model), "MiniMax-M3") {
 		// M3 omits streaming usage unless include_usage is requested. Enable only
 		// the verified model so legacy MiniMax and image routes keep their policy.
