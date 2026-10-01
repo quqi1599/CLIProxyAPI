@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -55,6 +56,95 @@ type ModelReviewRequest struct {
 	RuleID            string
 	Category          string
 	Severity          string
+	// The scope fields are server-derived metadata. They explain who supplied
+	// each text and why it is present without sending local rule or tenant data.
+	CurrentRole        string
+	CurrentSource      string
+	CurrentPurpose     string
+	ReferenceRoles     []string
+	ReferenceSource    string
+	ReferencePurpose   string
+	MaterialRole       string
+	MaterialSource     string
+	MaterialPurpose    string
+	CurrentTruncated   bool
+	ReferenceTruncated bool
+	MaterialTruncated  bool
+	Continuation       bool
+	ZeroHit            bool
+}
+
+type reviewScopePart struct {
+	Roles     []string `json:"roles"`
+	Source    string   `json:"source"`
+	Purpose   string   `json:"purpose"`
+	Truncated bool     `json:"truncated"`
+}
+
+type reviewScopeMetadata struct {
+	Current      reviewScopePart `json:"current"`
+	Reference    reviewScopePart `json:"reference"`
+	Material     reviewScopePart `json:"material"`
+	Continuation bool            `json:"continuation"`
+	ZeroHit      bool            `json:"zero_hit"`
+}
+
+func normalizeModelReviewRequest(request ModelReviewRequest) ModelReviewRequest {
+	if request.CurrentRole == "" {
+		request.CurrentRole = "user"
+	}
+	if request.CurrentSource == "" {
+		request.CurrentSource = "current_user_request"
+	}
+	if request.CurrentPurpose == "" {
+		request.CurrentPurpose = "enforcement_target"
+	}
+	if request.ReferenceSource == "" {
+		request.ReferenceSource = "conversation_history"
+	}
+	if request.ReferencePurpose == "" {
+		request.ReferencePurpose = "referent_only"
+	}
+	if request.MaterialRole == "" {
+		request.MaterialRole = "user"
+	}
+	if request.MaterialSource == "" {
+		request.MaterialSource = "document_material"
+	}
+	if request.MaterialPurpose == "" {
+		request.MaterialPurpose = "untrusted_material"
+	}
+	if request.ReferenceText != "" && len(request.ReferenceRoles) == 0 {
+		request.ReferenceRoles = []string{"unknown"}
+	}
+	request.ReferenceRoles = append([]string(nil), request.ReferenceRoles...)
+	return request
+}
+
+func (request ModelReviewRequest) scopeMetadata() reviewScopeMetadata {
+	request = normalizeModelReviewRequest(request)
+	return reviewScopeMetadata{
+		Current: reviewScopePart{
+			Roles: []string{request.CurrentRole}, Source: request.CurrentSource,
+			Purpose: request.CurrentPurpose, Truncated: request.CurrentTruncated,
+		},
+		Reference: reviewScopePart{
+			Roles: append([]string(nil), request.ReferenceRoles...), Source: request.ReferenceSource,
+			Purpose: request.ReferencePurpose, Truncated: request.ReferenceTruncated,
+		},
+		Material: reviewScopePart{
+			Roles: []string{request.MaterialRole}, Source: request.MaterialSource,
+			Purpose: request.MaterialPurpose, Truncated: request.MaterialTruncated,
+		},
+		Continuation: request.Continuation,
+		ZeroHit:      request.ZeroHit,
+	}
+}
+
+// ReviewScopeMetadata exposes only server-derived scope labels for provider
+// adapters; it never includes tenant, rule, credential, or raw request IDs.
+func (request ModelReviewRequest) ReviewScopeMetadata() any {
+	return request.scopeMetadata()
 }
 
 // ModelReviewResult is a bounded, non-sensitive semantic classification.
@@ -173,6 +263,7 @@ func (c *modelReviewController) cachedBlockEligible(request ModelReviewRequest) 
 // cachedBlock never starts or joins provider work. The caller must supply a
 // verified non-test tenant scope; the complete task and policy remain in the key.
 func (c *modelReviewController) cachedBlock(request ModelReviewRequest) (modelReviewOutcome, bool) {
+	request = normalizeModelReviewRequest(request)
 	if !c.cachedBlockEligible(request) {
 		return modelReviewOutcome{}, false
 	}
@@ -193,7 +284,8 @@ func (c *modelReviewController) review(ctx context.Context, request ModelReviewR
 	if c == nil || c.reviewer == nil {
 		return modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Fallback: "reviewer_disabled"}
 	}
-	if c.ruleGate {
+	request = normalizeModelReviewRequest(request)
+	if c.ruleGate && !request.ZeroHit {
 		if _, ok := c.rules[strings.TrimSpace(request.RuleID)]; !ok {
 			return modelReviewOutcome{
 				ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain},
@@ -511,6 +603,7 @@ func normalizeModelReviewResult(result ModelReviewResult) ModelReviewResult {
 }
 
 func (c *modelReviewController) fingerprint(request ModelReviewRequest) string {
+	request = normalizeModelReviewRequest(request)
 	mac := hmac.New(sha256.New, c.cacheKey[:])
 	var size [8]byte
 	for _, value := range []string{request.TenantScope, request.PolicyVersion, request.PromptVersion, request.Model, request.RuleID, request.Category, request.Severity, request.MatchedTerm, request.Profile, request.Text, request.ReferenceText, request.MaterialText} {
@@ -519,6 +612,8 @@ func (c *modelReviewController) fingerprint(request ModelReviewRequest) string {
 		_, _ = mac.Write(size[:])
 		_, _ = mac.Write([]byte(value))
 	}
+	metadata, _ := json.Marshal(request.scopeMetadata())
+	_, _ = mac.Write(metadata)
 	if request.ContextIncomplete {
 		_, _ = mac.Write([]byte{1})
 	} else {
@@ -592,17 +687,25 @@ func compactModelReviewRequest(request ModelReviewRequest, maxBytes int) ModelRe
 	if request.ReferenceText != "" {
 		currentBudget = max(1, maxBytes*3/4)
 	}
+	originalText := request.Text
 	request.Text = compactReviewText(request.Text, request.MatchedTerm, currentBudget)
+	request.CurrentTruncated = request.CurrentTruncated || request.Text != originalText
 	referenceBudget := maxBytes - len(request.Text)
 	if referenceBudget > 0 {
+		originalReference := request.ReferenceText
 		request.ReferenceText = compactReviewText(request.ReferenceText, request.MatchedTerm, referenceBudget)
+		request.ReferenceTruncated = request.ReferenceTruncated || request.ReferenceText != originalReference
 	} else {
+		request.ReferenceTruncated = request.ReferenceTruncated || request.ReferenceText != ""
 		request.ReferenceText = ""
 	}
 	materialBudget := maxBytes - len(request.Text) - len(request.ReferenceText)
 	if materialBudget > 0 {
+		originalMaterial := request.MaterialText
 		request.MaterialText = compactReviewText(request.MaterialText, request.MatchedTerm, materialBudget)
+		request.MaterialTruncated = request.MaterialTruncated || request.MaterialText != originalMaterial
 	} else {
+		request.MaterialTruncated = request.MaterialTruncated || request.MaterialText != ""
 		request.MaterialText = ""
 	}
 	return request

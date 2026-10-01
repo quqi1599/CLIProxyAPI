@@ -108,8 +108,14 @@ func TestShadowSampleAndControllerReuse(t *testing.T) {
 	}
 	cfg := config.ContentAuditModelReviewConfig{Mode: ModelReviewModeEnforce, MaxCallsPerDay: 5000, TimeoutMilliseconds: 10000}
 	normalizeModelReviewConfig(&cfg)
-	if cfg.MaxCallsPerDay != 1000 || cfg.MaxCallsPerMinute != 5 || cfg.TimeoutMilliseconds != 4000 || *cfg.ShadowSampleRate != .2 {
+	if cfg.MaxCallsPerDay != 1000 || cfg.MaxCallsPerMinute != 5 || cfg.TimeoutMilliseconds != 4000 || *cfg.ShadowSampleRate != .2 || *cfg.ZeroHitSampleRate != .01 {
 		t.Fatalf("unsafe defaults: %#v", cfg)
+	}
+	zero := 0.0
+	zeroCfg := config.ContentAuditModelReviewConfig{ZeroHitSampleRate: &zero}
+	normalizeModelReviewConfig(&zeroCfg)
+	if *zeroCfg.ZeroHitSampleRate != 0 {
+		t.Fatalf("explicit zero zero-hit sampling was not preserved: %#v", zeroCfg)
 	}
 	state.cfg.ModelReview.ShadowSampleRate = cfg.ShadowSampleRate
 	request := ModelReviewRequest{Text: "review fixture", TenantScope: "synthetic", PolicyVersion: "v1"}

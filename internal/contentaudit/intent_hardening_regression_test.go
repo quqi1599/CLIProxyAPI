@@ -123,6 +123,26 @@ func TestShadowInputLimitNormalization(t *testing.T) {
 	}
 }
 
+func TestZeroHitSamplingIsStableAndIndependent(t *testing.T) {
+	rate := 1.0
+	state := &runtimeState{cfg: config.ContentAuditConfig{ModelReview: config.ContentAuditModelReviewConfig{ZeroHitSampleRate: &rate}}}
+	request := ModelReviewRequest{TenantScope: "synthetic", Text: "ordinary request", ZeroHit: true}
+	for range 8 {
+		if !sampleZeroHitReview(state, request) {
+			t.Fatal("full zero-hit sample rate skipped a request")
+		}
+	}
+	rate = 0
+	if sampleZeroHitReview(state, request) {
+		t.Fatal("explicit zero zero-hit sample rate was overridden")
+	}
+	request.ContextIncomplete = true
+	rate = 1
+	if sampleZeroHitReview(state, request) {
+		t.Fatal("incomplete zero-hit context was sampled")
+	}
+}
+
 func TestRiskyContinuationBypassesPositiveShadowSampling(t *testing.T) {
 	rate := 0.2
 	state := &runtimeState{cfg: config.ContentAuditConfig{ModelReview: config.ContentAuditModelReviewConfig{ShadowSampleRate: &rate}}}

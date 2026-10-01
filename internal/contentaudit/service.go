@@ -73,6 +73,7 @@ type Status struct {
 	ModelReviewBlockMin         float64                 `json:"model_review_block_min_confidence"`
 	ModelReviewCachedBlockRules []string                `json:"model_review_cached_block_rules,omitempty"`
 	ModelReviewCachedBlockMin   float64                 `json:"model_review_cached_block_min_confidence"`
+	ModelReviewZeroHitRate      float64                 `json:"model_review_zero_hit_sample_rate"`
 	Shadow                      ShadowReviewStatus      `json:"shadow_review"`
 	ModelReviewBudget           ModelReviewBudgetStatus `json:"model_review_budget"`
 	IncompleteUnmatchedRequests uint64                  `json:"incomplete_unmatched_requests"`
@@ -307,6 +308,11 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 		sampleRate = *cfg.ShadowSampleRate
 	}
 	cfg.ShadowSampleRate = &sampleRate
+	zeroHitRate := 0.01
+	if cfg.ZeroHitSampleRate != nil && !math.IsNaN(*cfg.ZeroHitSampleRate) && !math.IsInf(*cfg.ZeroHitSampleRate, 0) && *cfg.ZeroHitSampleRate >= 0 && *cfg.ZeroHitSampleRate <= 1 {
+		zeroHitRate = *cfg.ZeroHitSampleRate
+	}
+	cfg.ZeroHitSampleRate = &zeroHitRate
 	if cfg.MaxCallsPerDay <= 0 || cfg.MaxCallsPerDay > 1000 {
 		cfg.MaxCallsPerDay = 1000
 	}
@@ -411,6 +417,7 @@ func (s *Service) Status() Status {
 		ModelReviewBlockMin:         state.cfg.ModelReview.BlockMinConfidence,
 		ModelReviewCachedBlockRules: append([]string(nil), state.cfg.ModelReview.CachedBlockRules...),
 		ModelReviewCachedBlockMin:   math.Max(minCachedBlockConfidence, state.cfg.ModelReview.BlockMinConfidence),
+		ModelReviewZeroHitRate:      *state.cfg.ModelReview.ZeroHitSampleRate,
 		Shadow:                      s.shadow.status(),
 		IncompleteUnmatchedRequests: s.incompleteUnmatched.Load(),
 	}
@@ -484,6 +491,35 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			if extracted.ContextIncomplete {
 				s.incompleteUnmatched.Add(1)
 			}
+			if state.modelReview != nil && state.cfg.ModelReview.Mode == ModelReviewModeShadow &&
+				state.store != nil && !extracted.ContextIncomplete {
+				reviewRequest := ModelReviewRequest{
+					Text:               extracted.CurrentUserText,
+					ReferenceText:      extracted.ReferenceText,
+					MaterialText:       extracted.MaterialText,
+					Profile:            profile,
+					ContextIncomplete:  extracted.ContextIncomplete,
+					PolicyVersion:      state.matcher.Version(),
+					TenantScope:        reviewTenantScope(identity),
+					CurrentRole:        "user",
+					CurrentSource:      "current_user_request",
+					CurrentPurpose:     "zero_hit_candidate",
+					ReferenceRoles:     extracted.ReviewReferenceRoles(),
+					ReferenceSource:    "conversation_history",
+					ReferencePurpose:   "referent_only",
+					MaterialRole:       "user",
+					MaterialSource:     "document_material",
+					MaterialPurpose:    "untrusted_material",
+					CurrentTruncated:   extracted.CurrentTruncated,
+					ReferenceTruncated: extracted.ReferenceTruncated,
+					MaterialTruncated:  extracted.MaterialTruncated,
+					Continuation:       extracted.Continuation,
+					ZeroHit:            true,
+				}
+				if sampleZeroHitReview(state, reviewRequest) {
+					s.submitZeroHitShadowReview(c, state, identity, extracted, requestBytes, reviewRequest)
+				}
+			}
 			c.Next()
 			return
 		}
@@ -500,17 +536,30 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		modelReview := modelReviewOutcome{}
 		cachedBlock := false
 		reviewRequest := ModelReviewRequest{
-			Text:              extracted.CurrentUserText,
-			ReferenceText:     extracted.ReferenceText,
-			MaterialText:      extracted.MaterialText,
-			Profile:           profile,
-			ContextIncomplete: extracted.ContextIncomplete,
-			MatchedTerm:       decision.MatchedTerm,
-			RuleID:            decision.RuleID,
-			Category:          decision.Category,
-			Severity:          decision.Severity,
-			PolicyVersion:     decision.PolicyVersion,
-			TenantScope:       auditID,
+			Text:               extracted.CurrentUserText,
+			ReferenceText:      extracted.ReferenceText,
+			MaterialText:       extracted.MaterialText,
+			Profile:            profile,
+			ContextIncomplete:  extracted.ContextIncomplete,
+			MatchedTerm:        decision.MatchedTerm,
+			RuleID:             decision.RuleID,
+			Category:           decision.Category,
+			Severity:           decision.Severity,
+			PolicyVersion:      decision.PolicyVersion,
+			TenantScope:        auditID,
+			CurrentRole:        "user",
+			CurrentSource:      "current_user_request",
+			CurrentPurpose:     "enforcement_target",
+			ReferenceRoles:     extracted.ReviewReferenceRoles(),
+			ReferenceSource:    "conversation_history",
+			ReferencePurpose:   "referent_only",
+			MaterialRole:       "user",
+			MaterialSource:     "document_material",
+			MaterialPurpose:    "untrusted_material",
+			CurrentTruncated:   extracted.CurrentTruncated,
+			ReferenceTruncated: extracted.ReferenceTruncated,
+			MaterialTruncated:  extracted.MaterialTruncated,
+			Continuation:       extracted.Continuation,
 		}
 		if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
 			reviewRequest.TenantScope = fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
@@ -644,6 +693,78 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			return
 		}
 		writeAuditError(c, http.StatusBadRequest, "cpa_content_audit_blocked", "content_safety_blocked", "请求内容触发了本地安全审计，已在发送至上游模型前停止。请移除违法、色情、暴力、电诈、毒品或未授权网络攻击相关的请求后重试。", auditID, decision.Category)
+	}
+}
+
+func reviewTenantScope(identity Identity) string {
+	if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
+		return fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
+	}
+	return "anonymous"
+}
+
+// submitZeroHitShadowReview persists only a sampled metadata event and queues
+// the semantic review. It never waits for, or applies, the model result.
+func (s *Service) submitZeroHitShadowReview(c *gin.Context, state *runtimeState, identity Identity, extracted ExtractedRequest, requestBytes int64, reviewRequest ModelReviewRequest) {
+	auditID := newAuditID()
+	reviewRequest.TenantScope = reviewTenantScope(identity)
+	requestID := identity.RequestID
+	if requestID == "" && c != nil && c.Request != nil {
+		requestID = sanitizeIdentityText(firstNonEmptySecret(c.GetHeader("X-Request-ID"), c.GetHeader("X-Request-Id")), 128)
+	}
+	model := strings.TrimSpace(extracted.Model)
+	if model == "" {
+		model = identity.Model
+	}
+	event := Event{
+		ID:                       auditID,
+		CreatedAt:                time.Now().Unix(),
+		RequestID:                requestID,
+		UserID:                   identity.UserID,
+		TokenID:                  identity.TokenID,
+		TokenName:                identity.TokenName,
+		Method:                   c.Request.Method,
+		Path:                     c.Request.URL.Path,
+		Protocol:                 protocolForPath(c.Request.URL.Path),
+		Model:                    model,
+		Stream:                   extracted.Stream,
+		Category:                 "unknown",
+		Severity:                 "low",
+		RuleID:                   "model-review-zero-hit",
+		Action:                   RuleActionObserve,
+		FinalAction:              ModelReviewAllow,
+		MatchedRoles:             []string{"user"},
+		MatchSource:              "zero_hit",
+		PolicyVersion:            reviewRequest.PolicyVersion,
+		RequestBytes:             requestBytes,
+		IdentityVerified:         identity.Verified,
+		UpstreamSent:             true,
+		ModelReviewMode:          ModelReviewModeShadow,
+		ModelReviewModel:         state.cfg.ModelReview.Model,
+		ModelReviewPromptVersion: state.cfg.ModelReview.PromptVersion,
+		ModelReviewDecision:      ModelReviewUncertain,
+		ModelReviewFallback:      "shadow_pending",
+		ReviewLabel:              defaultReviewLabel,
+		fingerprintMaterial:      extracted.FingerprintMaterial(),
+	}
+	storeCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 3*time.Second)
+	err := state.store.Record(storeCtx, event, extracted.Evidence)
+	cancel()
+	if err != nil {
+		log.WithError(err).Warn("failed to persist zero-hit content audit sample")
+		return
+	}
+	modelReview := modelReviewOutcome{ModelReviewResult: ModelReviewResult{Decision: ModelReviewUncertain}, Model: state.cfg.ModelReview.Model, Fallback: "shadow_pending"}
+	if reason := s.shadow.submit(shadowReviewJob{eventID: auditID, state: state, request: reviewRequest}); reason != "" {
+		modelReview.Fallback = reason
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		if errUpdate := state.store.UpdateShadowReview(updateCtx, auditID, reviewRequest.PolicyVersion, modelReview); errUpdate != nil {
+			s.shadow.mu.Lock()
+			s.shadow.stats.PersistenceLost++
+			s.shadow.mu.Unlock()
+			log.WithError(errUpdate).Warn("zero-hit shadow skip persistence failed")
+		}
+		updateCancel()
 	}
 }
 

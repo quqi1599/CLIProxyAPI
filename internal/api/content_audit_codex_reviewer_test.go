@@ -104,9 +104,47 @@ func TestReviewEnvelopePreservesTaskFirstWireContract(t *testing.T) {
 		Text: "synthetic current", ReferenceText: "synthetic reference", ContextIncomplete: false,
 		Category: "sexual", MatchedTerm: "fixture", PromptVersion: "test-v1", RuleID: "rule", Severity: "high",
 	})
-	want := `{"current_user_text":"synthetic current","reference_text":"synthetic reference","context_incomplete":false}`
+	want := `{"current_user_text":"synthetic current","reference_text":"synthetic reference","context_incomplete":false,"scope_metadata":{"current":{"roles":["user"],"source":"current_user_request","purpose":"enforcement_target","truncated":false},"reference":{"roles":["unknown"],"source":"conversation_history","purpose":"referent_only","truncated":false},"material":{"roles":["user"],"source":"document_material","purpose":"untrusted_material","truncated":false},"continuation":false,"zero_hit":false}}`
 	if envelope != want {
 		t.Fatalf("review envelope wire layout changed: got %s, want %s", envelope, want)
+	}
+}
+
+func TestReviewEnvelopeCarriesServerScopeMetadata(t *testing.T) {
+	envelope := reviewEnvelope(contentaudit.ModelReviewRequest{
+		Text: "current", ReferenceText: "history", MaterialText: "uploaded",
+		CurrentRole: "user", CurrentSource: "current_user_request", CurrentPurpose: "zero_hit_candidate",
+		ReferenceRoles: []string{"user", "assistant"}, ReferenceSource: "conversation_history", ReferencePurpose: "referent_only", ReferenceTruncated: true,
+		MaterialRole: "user", MaterialSource: "document_material", MaterialPurpose: "untrusted_material", MaterialTruncated: true,
+		Continuation: true, ZeroHit: true,
+	})
+	var decoded struct {
+		Scope struct {
+			Current struct {
+				Roles           []string `json:"roles"`
+				Source, Purpose string
+				Truncated       bool `json:"truncated"`
+			} `json:"current"`
+			Reference struct {
+				Roles     []string `json:"roles"`
+				Truncated bool     `json:"truncated"`
+			} `json:"reference"`
+			Material struct {
+				Source, Purpose string
+				Truncated       bool `json:"truncated"`
+			} `json:"material"`
+			Continuation bool `json:"continuation"`
+			ZeroHit      bool `json:"zero_hit"`
+		} `json:"scope_metadata"`
+	}
+	if err := json.Unmarshal([]byte(envelope), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(decoded.Scope.Current.Source, "current_user_request") || decoded.Scope.Current.Purpose != "zero_hit_candidate" ||
+		!strings.EqualFold(decoded.Scope.Material.Source, "document_material") || decoded.Scope.Reference.Truncated != true ||
+		!decoded.Scope.Material.Truncated || !decoded.Scope.Continuation || !decoded.Scope.ZeroHit ||
+		!strings.EqualFold(strings.Join(decoded.Scope.Reference.Roles, ","), "user,assistant") {
+		t.Fatalf("scope metadata=%#v", decoded.Scope)
 	}
 }
 

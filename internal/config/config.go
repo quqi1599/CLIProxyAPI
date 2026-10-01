@@ -244,10 +244,13 @@ type ContentAuditModelReviewConfig struct {
 	ShadowQueueBytes         int64    `yaml:"shadow-queue-bytes" json:"shadow-queue-bytes"`
 	ShadowMaxAgeSeconds      int      `yaml:"shadow-max-age-seconds" json:"shadow-max-age-seconds"`
 	ShadowSampleRate         *float64 `yaml:"shadow-sample-rate,omitempty" json:"shadow-sample-rate,omitempty"`
-	MaxCallsPerDay           int      `yaml:"max-calls-per-day" json:"max-calls-per-day"`
-	MaxCallsPerMinute        int      `yaml:"max-calls-per-minute" json:"max-calls-per-minute"`
-	CacheSeconds             int      `yaml:"cache-seconds" json:"cache-seconds"`
-	MaxInputBytes            int      `yaml:"max-input-bytes" json:"max-input-bytes"`
+	// ZeroHitSampleRate samples requests without a local keyword match for
+	// background semantic review. It never changes the request-time action.
+	ZeroHitSampleRate *float64 `yaml:"zero-hit-sample-rate,omitempty" json:"zero-hit-sample-rate,omitempty"`
+	MaxCallsPerDay    int      `yaml:"max-calls-per-day" json:"max-calls-per-day"`
+	MaxCallsPerMinute int      `yaml:"max-calls-per-minute" json:"max-calls-per-minute"`
+	CacheSeconds      int      `yaml:"cache-seconds" json:"cache-seconds"`
+	MaxInputBytes     int      `yaml:"max-input-bytes" json:"max-input-bytes"`
 	// MaxShadowInputBytes optionally admits larger, complete contexts only in shadow mode.
 	// Zero inherits MaxInputBytes; it never permits a verdict from missing context.
 	MaxShadowInputBytes     int     `yaml:"max-shadow-input-bytes" json:"max-shadow-input-bytes"`

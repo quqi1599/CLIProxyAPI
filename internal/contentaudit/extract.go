@@ -14,24 +14,26 @@ const maxEvidenceStringRunes = 200_000
 
 // ExtractedRequest contains the text scanned by policy and a redacted evidence payload.
 type ExtractedRequest struct {
-	Text              string
-	EnforcementText   string
-	CurrentUserText   string
-	CurrentTruncated  bool
-	ReferenceText     string
-	MaterialText      string
-	ReferenceFields   []string
-	ContextIncomplete bool
-	Model             string
-	Stream            bool
-	Evidence          []byte
-	ExtractedFields   []string
-	EnforcementFields []string
-	Continuation      bool
-	EvidenceSanitized bool
-	promptSegments    []promptSegment
-	enforcementParts  []promptSegment
-	referenceParts    []promptSegment
+	Text               string
+	EnforcementText    string
+	CurrentUserText    string
+	CurrentTruncated   bool
+	ReferenceText      string
+	ReferenceTruncated bool
+	MaterialText       string
+	MaterialTruncated  bool
+	ReferenceFields    []string
+	ContextIncomplete  bool
+	Model              string
+	Stream             bool
+	Evidence           []byte
+	ExtractedFields    []string
+	EnforcementFields  []string
+	Continuation       bool
+	EvidenceSanitized  bool
+	promptSegments     []promptSegment
+	enforcementParts   []promptSegment
+	referenceParts     []promptSegment
 }
 
 type promptSegment struct {
@@ -160,12 +162,14 @@ func extractJSONRequest(body []byte, requestPath string) ExtractedRequest {
 	referenceParts := make([]promptSegment, 0, 4)
 	referenceFields := make([]string, 0, 4)
 	referenceTexts := make([]string, 0, len(references))
+	referenceTruncated := false
 	contextIncomplete := missingProtocolInput || current.truncated || current.role != "" && current.text == ""
 	const maxReferenceRunes = 4096
 	for _, reference := range references {
 		referenceText, truncated := evidenceSuffix(reference.text, maxReferenceRunes)
 		if truncated {
 			contextIncomplete = true
+			referenceTruncated = true
 		}
 		referenceTexts = append(referenceTexts, reference.role+":\n"+referenceText)
 		referenceFields = append(referenceFields, reference.fields...)
@@ -195,24 +199,40 @@ func extractJSONRequest(body []byte, requestPath string) ExtractedRequest {
 		evidence = []byte(`{"evidence_error":"marshal_failed"}`)
 	}
 	return ExtractedRequest{
-		Text:              strings.Join(parts, "\n"),
-		EnforcementText:   current.text,
-		CurrentUserText:   current.text,
-		CurrentTruncated:  current.truncated,
-		ReferenceText:     strings.Join(referenceTexts, "\n\n"),
-		ReferenceFields:   referenceFields,
-		ContextIncomplete: contextIncomplete,
-		Model:             strings.TrimSpace(model),
-		Stream:            stream,
-		Evidence:          evidence,
-		ExtractedFields:   fields,
-		EnforcementFields: current.fields,
-		Continuation:      continuation,
-		EvidenceSanitized: true,
-		promptSegments:    promptSegments,
-		enforcementParts:  current.parts,
-		referenceParts:    referenceParts,
+		Text:               strings.Join(parts, "\n"),
+		EnforcementText:    current.text,
+		CurrentUserText:    current.text,
+		CurrentTruncated:   current.truncated,
+		ReferenceText:      strings.Join(referenceTexts, "\n\n"),
+		ReferenceTruncated: referenceTruncated,
+		ReferenceFields:    referenceFields,
+		ContextIncomplete:  contextIncomplete,
+		Model:              strings.TrimSpace(model),
+		Stream:             stream,
+		Evidence:           evidence,
+		ExtractedFields:    fields,
+		EnforcementFields:  current.fields,
+		Continuation:       continuation,
+		EvidenceSanitized:  true,
+		promptSegments:     promptSegments,
+		enforcementParts:   current.parts,
+		referenceParts:     referenceParts,
 	}
+}
+
+// ReviewReferenceRoles returns only protocol roles from referenced history.
+// Client-provided role-shaped fields inside text are never promoted here.
+func (r ExtractedRequest) ReviewReferenceRoles() []string {
+	seen := make(map[string]struct{})
+	for _, part := range r.referenceParts {
+		if strings.TrimSpace(part.text) != "" {
+			seen[part.role] = struct{}{}
+		}
+	}
+	if len(seen) == 0 && strings.TrimSpace(r.ReferenceText) != "" {
+		seen["unknown"] = struct{}{}
+	}
+	return sortedRoles(seen)
 }
 
 func protocolEnforcementRoot(root any, requestPath string) (any, bool) {

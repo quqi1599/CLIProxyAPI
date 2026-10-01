@@ -35,6 +35,31 @@ func sampleShadowReview(state *runtimeState, request ModelReviewRequest) bool {
 	return float64(value)/float64(uint64(1)<<53) < rate
 }
 
+// sampleZeroHitReview selects a small, stable subset of requests that had no
+// local keyword match. It is an observation signal only; callers must keep the
+// original request path unchanged.
+func sampleZeroHitReview(state *runtimeState, request ModelReviewRequest) bool {
+	if state == nil || state.cfg.ModelReview.ZeroHitSampleRate == nil || request.ContextIncomplete || strings.TrimSpace(request.Text) == "" {
+		return false
+	}
+	rate := *state.cfg.ModelReview.ZeroHitSampleRate
+	if rate <= 0 {
+		return false
+	}
+	if rate >= 1 {
+		return true
+	}
+	mac := hmac.New(sha256.New, state.evidenceKeyFingerprint[:])
+	var size [8]byte
+	for _, value := range []string{"zero-hit-sample-v1", request.TenantScope, request.Text, request.ReferenceText, request.MaterialText} {
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = mac.Write(size[:])
+		_, _ = mac.Write([]byte(value))
+	}
+	value := binary.BigEndian.Uint64(mac.Sum(nil)[:8]) >> 11
+	return float64(value)/float64(uint64(1)<<53) < rate
+}
+
 // Only a selected risk candidate in referenced history gets priority. History
 // remains untrusted context, never a local blocking instruction or verdict.
 func riskyContinuationReview(request ModelReviewRequest) bool {

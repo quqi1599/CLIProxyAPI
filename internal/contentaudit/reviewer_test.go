@@ -41,6 +41,23 @@ func TestModelReviewControllerOwnsStructuredOutputSetting(t *testing.T) {
 	}
 }
 
+func TestZeroHitReviewBypassesMatchedRuleSelection(t *testing.T) {
+	called := false
+	controller := newModelReviewController(config.ContentAuditModelReviewConfig{
+		Mode: ModelReviewModeShadow, Rules: []string{"selected-rule"}, MaxInputBytes: 4096,
+	}, modelReviewerFunc(func(_ context.Context, request ModelReviewRequest) (ModelReviewResult, error) {
+		called = true
+		if !request.ZeroHit {
+			t.Fatal("review request lost zero-hit scope")
+		}
+		return ModelReviewResult{Decision: ModelReviewAllow, Category: "none", Confidence: .99}, nil
+	}))
+	outcome := controller.review(t.Context(), ModelReviewRequest{Text: "unmatched semantic sample", RuleID: "model-review-zero-hit", ZeroHit: true})
+	if !called || outcome.Decision != ModelReviewAllow || outcome.Fallback != "" {
+		t.Fatalf("zero-hit outcome=%#v called=%t", outcome, called)
+	}
+}
+
 func TestModelReviewControllerCachesIdenticalContent(t *testing.T) {
 	var calls atomic.Int32
 	controller := newModelReviewController(config.ContentAuditModelReviewConfig{

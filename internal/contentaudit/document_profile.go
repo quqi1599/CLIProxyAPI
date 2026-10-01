@@ -3,6 +3,7 @@ package contentaudit
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -46,6 +47,7 @@ func (r ExtractedRequest) withDocumentProfile(profile string) ExtractedRequest {
 	}
 	r.CurrentUserText, r.EnforcementText = task, task
 	r.MaterialText = material
+	r.MaterialTruncated = utf8.RuneCountInString(material) > maxEvidenceStringRunes
 	r.enforcementParts = []promptSegment{{text: task, role: "user"}}
 	// Keep exact original source material in the fingerprint and encrypted evidence.
 	return r

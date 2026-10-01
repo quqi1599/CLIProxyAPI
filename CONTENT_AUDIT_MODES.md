@@ -25,6 +25,23 @@ zero sample rate keeps sampled review disabled. Rule selection, queue capacity,
 expiry and durable call quotas still apply. Priority does not make history a
 local blocking source or turn a shadow verdict into first-request enforcement.
 
+Requests that produce no local keyword match are independently sampled at
+`model-review.zero-hit-sample-rate` (normalized default `0.01`). A sampled
+request is recorded with `match_source=zero_hit` and `rule_id=model-review-zero-hit`
+and sent to the same bounded shadow queue. A model `block` is only a potential
+miss candidate:
+`final_action` remains `allow` and the request is still forwarded. The sample
+rate can be set to zero; it does not inherit the matched-candidate rate.
+Management event search for `model-review-zero-hit` isolates these samples;
+review `model_review_decision=block` together with `final_action=allow` as
+candidate misses, not confirmed violations.
+
+The reviewer envelope also carries server-derived `scope_metadata`: current
+user request, conversation-history reference, and untrusted document material
+each include roles, source, purpose, and truncation state. These labels help the
+model separate instructions from quoted or historical text; client-provided
+role-shaped text is never promoted to metadata.
+
 `model-review.max-shadow-input-bytes` optionally admits a larger **complete**
 current task, reference and document-material envelope in background review.
 Zero inherits `max-input-bytes`; the upper bound is 262144 bytes. Enforce mode

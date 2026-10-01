@@ -130,6 +130,56 @@ func TestShadowReturnsBeforeModelAndSurvivesRequestCancellation(t *testing.T) {
 	}
 }
 
+func TestZeroHitShadowReviewIsEvidenceOnly(t *testing.T) {
+	rate := 1.0
+	reviewedCh := make(chan ModelReviewRequest, 1)
+	service, router := newShadowTestService(t, modelReviewerFunc(func(_ context.Context, request ModelReviewRequest) (ModelReviewResult, error) {
+		reviewedCh <- request
+		return ModelReviewResult{Decision: ModelReviewBlock, Category: "sexual", Confidence: .99}, nil
+	}), config.ContentAuditModelReviewConfig{ZeroHitSampleRate: &rate})
+	if response := shadowRequest(router, "ordinary request with no local policy match", t.Context()); response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d", response.Code)
+	}
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || len(list.Items) != 1 {
+		t.Fatalf("list=%#v err=%v", list, err)
+	}
+	event := waitForShadowResult(t, service, list.Items[0].ID)
+	if event.RuleID != "model-review-zero-hit" || event.MatchSource != "zero_hit" || event.FinalAction != ModelReviewAllow || !event.UpstreamSent {
+		t.Fatalf("zero-hit event changed request action: %#v", event)
+	}
+	if event.ModelReviewDecision != ModelReviewBlock || event.ModelReviewCategory != "sexual" {
+		t.Fatalf("zero-hit result was not persisted: %#v", event)
+	}
+	var reviewed ModelReviewRequest
+	select {
+	case reviewed = <-reviewedCh:
+	case <-time.After(time.Second):
+		t.Fatal("zero-hit reviewer did not receive a request")
+	}
+	if !reviewed.ZeroHit || reviewed.CurrentSource != "current_user_request" || reviewed.CurrentPurpose != "zero_hit_candidate" || reviewed.CurrentRole != "user" {
+		t.Fatalf("missing current scope metadata: %#v", reviewed)
+	}
+	if reviewed.ReferenceSource != "conversation_history" || reviewed.ReferencePurpose != "referent_only" || reviewed.MaterialPurpose != "untrusted_material" {
+		t.Fatalf("missing reference/material metadata: %#v", reviewed)
+	}
+}
+
+func TestZeroHitSampleRateCanDisableSampling(t *testing.T) {
+	rate := 0.0
+	service, router := newShadowTestService(t, modelReviewerFunc(func(context.Context, ModelReviewRequest) (ModelReviewResult, error) {
+		t.Fatal("zero-hit sampling was disabled but reviewer ran")
+		return ModelReviewResult{}, nil
+	}), config.ContentAuditModelReviewConfig{ZeroHitSampleRate: &rate})
+	if response := shadowRequest(router, "ordinary request with no local policy match", t.Context()); response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d", response.Code)
+	}
+	list, err := service.List(t.Context(), ListFilter{})
+	if err != nil || len(list.Items) != 0 {
+		t.Fatalf("list=%#v err=%v", list, err)
+	}
+}
+
 func TestShadowQueueLimitsAndShutdown(t *testing.T) {
 	entered := make(chan struct{}, shadowWorkerCount)
 	service, router := newShadowTestService(t, modelReviewerFunc(func(ctx context.Context, _ ModelReviewRequest) (ModelReviewResult, error) {

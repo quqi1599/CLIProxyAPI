@@ -141,6 +141,10 @@ content-audit:
     # positive sampling. An explicit zero still disables sampled shadow review.
     # Durable provider-call quotas apply to both shadow and enforce. UTC+08 day.
     shadow-sample-rate: 0.2
+    # Sample requests with no local keyword match for background semantic review.
+    # The result is evidence only: it never changes the request-time action.
+    # Set to 0 to disable; the normalized default is 0.01.
+    zero-hit-sample-rate: 0.01
     max-calls-per-day: 1000
     max-calls-per-minute: 5
     cache-seconds: 600
