@@ -846,8 +846,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var pendingUsage coreusage.Detail
 		var usageSeen bool
 		var streamFailure error
+		var streamComplete bool
 		defer func() {
-			if streamFailure == nil {
+			if streamFailure == nil && !streamComplete {
 				streamFailure = requestCtx.Err()
 			}
 			if streamFailure != nil {
@@ -915,6 +916,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
+			eventComplete := helps.ClaudeSSEMessageComplete(event)
 
 			// If the response target is Claude, directly forward the SSE event without translation.
 			if direct {
@@ -928,7 +930,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				payload := terminatedSSEEvent(chunk)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
+					streamComplete = streamComplete || eventComplete
 				case <-requestCtx.Done():
+					return
+				}
+				if streamComplete {
 					return
 				}
 				continue
@@ -956,6 +962,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return true
 			})
 			if !completed {
+				return
+			}
+			if eventComplete {
+				streamComplete = true
 				return
 			}
 		}

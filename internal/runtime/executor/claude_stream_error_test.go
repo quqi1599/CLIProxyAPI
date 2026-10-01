@@ -116,3 +116,45 @@ func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeStreamCompletedBeforeClientCloseKeepsSuccessfulUsage(t *testing.T) {
+	const complete = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, complete)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	plugin := &captureAIStudioUsagePlugin{records: make(chan usage.Record, 16)}
+	usage.RegisterNamedPlugin("claude-completed-close-test", plugin)
+	ctx := logging.WithRequestID(t.Context(), "claude-completed-close-fixture")
+	payload := []byte(`{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"OK"}]}`)
+	auth := &cliproxyauth.Auth{ID: "completed-close-fixture", Provider: "claude", Attributes: map[string]string{"base_url": server.URL, "api_key": "fixture", "compat_kind": "zhipu"}}
+	result, err := NewClaudeExecutor(&config.Config{}).ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "glm-5.3-flash", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: payload, Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Cancel()
+	for chunk := range result.Chunks {
+		if strings.Contains(string(chunk.Payload), "message_stop") {
+			result.Cancel()
+		}
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case record := <-plugin.records:
+			if record.RequestID != "claude-completed-close-fixture" {
+				continue
+			}
+			if record.Failed || record.Detail.InputTokens != 17 || record.Detail.OutputTokens != 3 {
+				t.Fatalf("completed stream recorded as failed or lost usage: failed=%t detail=%+v", record.Failed, record.Detail)
+			}
+			return
+		case <-deadline.C:
+			t.Fatal("completed stream usage record missing")
+		}
+	}
+}

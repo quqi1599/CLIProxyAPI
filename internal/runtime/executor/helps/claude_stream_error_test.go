@@ -27,3 +27,20 @@ func TestClaudeSSEErrorPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeSSEMessageComplete(t *testing.T) {
+	for _, tc := range []struct {
+		event string
+		want  bool
+	}{
+		{"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", true},
+		{"data: {\"type\":\"message_stop\"}\n\n", true},
+		{"event: message_stop\ndata: invalid\n\n", false},
+		{"event: error\ndata: {\"type\":\"message_stop\"}\n\n", false},
+		{"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"message_stop\"}}\n\n", false},
+	} {
+		if got := ClaudeSSEMessageComplete([]byte(tc.event)); got != tc.want {
+			t.Fatalf("terminal=%t want=%t", got, tc.want)
+		}
+	}
+}
