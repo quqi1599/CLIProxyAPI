@@ -248,11 +248,14 @@ type ContentAuditModelReviewConfig struct {
 	MaxCallsPerMinute        int      `yaml:"max-calls-per-minute" json:"max-calls-per-minute"`
 	CacheSeconds             int      `yaml:"cache-seconds" json:"cache-seconds"`
 	MaxInputBytes            int      `yaml:"max-input-bytes" json:"max-input-bytes"`
-	MinConfidence            float64  `yaml:"min-confidence" json:"min-confidence"`
-	AllowMinConfidence       float64  `yaml:"allow-min-confidence" json:"allow-min-confidence"`
-	BlockMinConfidence       float64  `yaml:"block-min-confidence" json:"block-min-confidence"`
-	CircuitFailureThreshold  int      `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
-	CircuitOpenSeconds       int      `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
+	// MaxShadowInputBytes optionally admits larger, complete contexts only in shadow mode.
+	// Zero inherits MaxInputBytes; it never permits a verdict from missing context.
+	MaxShadowInputBytes     int     `yaml:"max-shadow-input-bytes" json:"max-shadow-input-bytes"`
+	MinConfidence           float64 `yaml:"min-confidence" json:"min-confidence"`
+	AllowMinConfidence      float64 `yaml:"allow-min-confidence" json:"allow-min-confidence"`
+	BlockMinConfidence      float64 `yaml:"block-min-confidence" json:"block-min-confidence"`
+	CircuitFailureThreshold int     `yaml:"circuit-failure-threshold" json:"circuit-failure-threshold"`
+	CircuitOpenSeconds      int     `yaml:"circuit-open-seconds" json:"circuit-open-seconds"`
 }
 
 // CacheDiagnosticsConfig groups provider-specific cache diagnostics.

@@ -10,7 +10,7 @@ import (
 )
 
 var safeUpstreamErrorIdentifiers = map[string]struct{}{
-	"1000": {}, "1026": {}, "1027": {}, "1301": {},
+	"1000": {}, "1026": {}, "1027": {}, "1234": {}, "1301": {},
 	"authentication_error": {}, "auth_unavailable": {}, "billing_cycle_quota": {},
 	"content_policy_violation": {}, "context_length_exceeded": {}, "context_too_large": {},
 	"data_inspection_failed": {}, "datainspectionfailed": {}, "deadline_exceeded": {},

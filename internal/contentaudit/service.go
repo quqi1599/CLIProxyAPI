@@ -325,6 +325,9 @@ func normalizeModelReviewConfig(cfg *config.ContentAuditModelReviewConfig) {
 	if cfg.MaxInputBytes <= 0 || cfg.MaxInputBytes > 256<<10 {
 		cfg.MaxInputBytes = 32 << 10
 	}
+	if cfg.MaxShadowInputBytes < cfg.MaxInputBytes || cfg.MaxShadowInputBytes > 256<<10 {
+		cfg.MaxShadowInputBytes = cfg.MaxInputBytes
+	}
 	if cfg.MinConfidence <= 0 || cfg.MinConfidence > 1 {
 		cfg.MinConfidence = 0.90
 	}

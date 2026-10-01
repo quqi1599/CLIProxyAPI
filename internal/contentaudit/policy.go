@@ -595,7 +595,15 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 	if rule.Action == RuleActionBlock && locallyNegatedMatch(text[start:matchStart]) {
 		return false
 	}
+	if rule.ID == "block-sexual-novel-generation-intent" && novelAnalysisTarget(text[matchEnd:end]) {
+		return false
+	}
 	overrideExclusions := containsAnyTerm(normalized, rule.OverrideExcludeAny)
+	if rule.ID == "block-sexual-novel-generation-intent" && novelGenerationObject.MatchString(strings.ReplaceAll(string(text[start:matchStart]), " ", "")) {
+		// A concrete generation verb governing this target cannot be excused by
+		// a research label elsewhere in the clause. Negation still applies below.
+		overrideExclusions = true
+	}
 	if !overrideExclusions {
 		for _, excluded := range rule.ExcludeAny {
 			if containsContextTerm(normalized, excluded) {
@@ -626,6 +634,17 @@ func ruleMatchesContext(text []rune, matchStart, matchEnd int, rule Rule, _ bool
 	}
 	return false
 }
+
+// Scope this exception to the object immediately following this occurrence,
+// not a research keyword anywhere in the task. A later generation request is
+// evaluated independently, even when it shares a clause with the analysis.
+func novelAnalysisTarget(suffix []rune) bool {
+	text := strings.ReplaceAll(string(suffix), " ", "")
+	return novelAnalysisObject.MatchString(text)
+}
+
+var novelAnalysisObject = regexp.MustCompile(`^(?:的)?(?:(?:叙事结构|叙事手法|文学特征|文体特征)(?:的)?(?:文学)?(?:分析|评论)|文学评论|文学分析|书评|发展史|历史沿革|起源研究|检测规则|分类标准|审核标准|审核规则|拦截规则|过滤规则|拒绝策略|拒绝说明)`)
+var novelGenerationObject = regexp.MustCompile(`(?:写|生成|创作|续写|扩写|润色)(?:一篇|一部|一本|一段|这篇|这部|这本|这段|一些|新的)?$`)
 
 func containsAnyTerm(text string, terms []string) bool {
 	for _, term := range terms {
@@ -745,7 +764,7 @@ func quotedReviewOutside(text string) (string, bool) {
 			offset = index + len(action)
 		}
 	}
-	return outside, containsAny(normalized, []string{"请分析", "请解释", "解释以下", "解释这段", "识别风险", "判断是否", "审核清单", "政策清单", "拒绝策略", "论文引用", "classify", "explain", "analyz", "evaluat", "safetychecklist"})
+	return outside, containsAny(normalized, []string{"请分析", "请解释", "解释以下", "解释这段", "解释拒绝", "说明拒绝", "识别风险", "判断是否", "审核清单", "政策清单", "拒绝策略", "论文引用", "classify", "explain", "analyz", "evaluat", "safetychecklist"})
 }
 
 func (m *Matcher) hasCandidate(normalized string) bool {

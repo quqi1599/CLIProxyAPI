@@ -332,7 +332,11 @@ func (c *modelReviewController) executeFlight(key string, flight *modelReviewFli
 	if err := flight.ctx.Err(); err != nil {
 		return c.flightTimings(flight), err
 	}
-	request = compactModelReviewRequest(request, c.cfg.MaxInputBytes)
+	maxInputBytes := c.cfg.MaxInputBytes
+	if c.cfg.Mode == ModelReviewModeShadow && c.cfg.MaxShadowInputBytes > maxInputBytes {
+		maxInputBytes = c.cfg.MaxShadowInputBytes
+	}
+	request = compactModelReviewRequest(request, maxInputBytes)
 	if err := flight.ctx.Err(); err != nil {
 		return c.flightTimings(flight), err
 	}

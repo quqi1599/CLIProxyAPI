@@ -17,6 +17,30 @@ history and document-material safeguards are unchanged. Effective actions are
 ranked **before** choosing the winning rule, so an observation match cannot hide
 a separate retained hard-block match.
 
+## Review coverage and context limits
+
+In shadow mode, critical candidates and explicit continuations with a matched
+risk term in referenced history bypass **positive** random sampling. An explicit
+zero sample rate keeps sampled review disabled. Rule selection, queue capacity,
+expiry and durable call quotas still apply. Priority does not make history a
+local blocking source or turn a shadow verdict into first-request enforcement.
+
+`model-review.max-shadow-input-bytes` optionally admits a larger **complete**
+current task, reference and document-material envelope in background review.
+Zero inherits `max-input-bytes`; the upper bound is 262144 bytes. Enforce mode
+continues to use `max-input-bytes`. Check supplier context limits and cost before
+opting in. Oversized or already-truncated inputs remain `context_incomplete`,
+consume no provider quota, and cannot populate a decision cache. The cache key
+always covers the original full context, tenant, policy and prompt versions.
+
+The managed novel-generation rule is eligible for semantic review. An explicit
+`model-review.rules` selection must also include
+`block-sexual-novel-generation-intent` to review it. Its local matcher separates
+narrow analysis/detection objects from generation requests; research labels are
+not general permissions. Reference review stays advisory until a separately
+validated enforcement configuration is selected. Do not enable global enforce
+or strict mode merely to compensate for an unavailable reviewer.
+
 ## Legacy settings
 
 - `enabled: false` or `mode: off` disables request-time audit.

@@ -193,6 +193,13 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 		}
 		return applyMiniMaxM31Thinking(body, suffixResult, fromFormat, providerFormat, sourceBody, applier)
 	}
+	if providerFormat == "claude" && IsQwen38Model(baseModel) {
+		var sourceBody []byte
+		if len(sourceBodies) > 0 {
+			sourceBody = sourceBodies[0]
+		}
+		return applyQwenClaudeThinking(body, suffixResult, fromFormat, sourceBody, applier)
+	}
 	// Use provider-specific lookup to handle capability differences across providers.
 	modelInfo := registry.LookupModelInfo(baseModel, providerKey)
 	if len(sourceBodies) > 0 && len(sourceBodies[0]) > 0 && fromFormat == "claude" &&

@@ -15,13 +15,13 @@ import (
 const shadowWorkerCount = 4
 
 // Selection is stable for the same scoped task and policy; it is not a content
-// decision. Quotas still apply to critical candidates that bypass sampling.
+// decision. Quotas still apply to priority candidates that bypass sampling.
 func sampleShadowReview(state *runtimeState, request ModelReviewRequest) bool {
 	rate := *state.cfg.ModelReview.ShadowSampleRate
 	if rate <= 0 {
 		return false
 	}
-	if rate >= 1 || request.Severity == "critical" {
+	if rate >= 1 || request.Severity == "critical" || riskyContinuationReview(request) {
 		return true
 	}
 	mac := hmac.New(sha256.New, state.evidenceKeyFingerprint[:])
@@ -33,6 +33,14 @@ func sampleShadowReview(state *runtimeState, request ModelReviewRequest) bool {
 	}
 	value := binary.BigEndian.Uint64(mac.Sum(nil)[:8]) >> 11
 	return float64(value)/float64(uint64(1)<<53) < rate
+}
+
+// Only a selected risk candidate in referenced history gets priority. History
+// remains untrusted context, never a local blocking instruction or verdict.
+func riskyContinuationReview(request ModelReviewRequest) bool {
+	return request.RuleID != "" && request.MatchedTerm != "" &&
+		isContinuationPrompt(request.Text) &&
+		findReviewMatchIndex(request.ReferenceText, request.MatchedTerm) >= 0
 }
 
 // ShadowReviewStatus contains only bounded operational counters, never prompts.

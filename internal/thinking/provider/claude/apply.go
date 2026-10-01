@@ -81,7 +81,11 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		body = []byte(`{}`)
 	}
 
-	supportsAdaptive := modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0
+	supportsEffort := modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0
+	levelThinkingType := "adaptive"
+	if thinking.IsQwen38Model(modelInfo.ID) {
+		levelThinkingType = "enabled"
+	}
 
 	switch config.Mode {
 	case thinking.ModeNone:
@@ -94,10 +98,10 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return result, nil
 
 	case thinking.ModeLevel:
-		// Adaptive thinking effort is only valid when the model advertises discrete levels.
-		// (Claude 4.6 uses output_config.effort.)
-		if supportsAdaptive && config.Level != "" {
-			result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
+		// Emit effort only for models advertising levels. Native Claude uses
+		// adaptive thinking, whereas Qwen requires the enabled type.
+		if supportsEffort && config.Level != "" {
+			result, _ := sjson.SetBytes(body, "thinking.type", levelThinkingType)
 			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
 			result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
 			return result, nil
@@ -138,9 +142,9 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return result, nil
 
 	case thinking.ModeAuto:
-		// For Claude 4.6 models, auto maps to adaptive thinking with upstream defaults.
-		if supportsAdaptive {
-			result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
+		// Effort-capable models use their native thinking type with upstream defaults.
+		if supportsEffort {
+			result, _ := sjson.SetBytes(body, "thinking.type", levelThinkingType)
 			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
 			// Explicit effort is optional for adaptive thinking; omit it to allow upstream default.
 			result, _ = sjson.DeleteBytes(result, "output_config.effort")

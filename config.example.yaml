@@ -137,7 +137,8 @@ content-audit:
     shadow-queue-size: 64
     shadow-queue-bytes: 4194304
     shadow-max-age-seconds: 30
-    # Normal shadow candidates are sampled; critical candidates bypass sampling.
+    # Critical candidates and continuations with matched risk in history bypass
+    # positive sampling. An explicit zero still disables sampled shadow review.
     # Durable provider-call quotas apply to both shadow and enforce. UTC+08 day.
     shadow-sample-rate: 0.2
     max-calls-per-day: 1000
@@ -149,6 +150,10 @@ content-audit:
     # Eligible observation misses bypass sampling, but retain queue/quota limits.
     cached-block-rules: []
     max-input-bytes: 32768
+    # Optional full-context allowance for background review only, up to 262144.
+    # Zero inherits max-input-bytes. Verify the supplier context limit/cost before
+    # increasing this value. Already-truncated input never yields a usable verdict.
+    max-shadow-input-bytes: 0
     # Releasing a local block should require stronger confidence than escalating
     # an observe rule. min-confidence remains the backward-compatible default.
     min-confidence: 0.90

@@ -23,6 +23,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
@@ -842,10 +843,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	go func() {
 		defer close(out)
 		defer closeResponse()
+		var pendingUsage coreusage.Detail
+		var usageSeen bool
+		var streamFailure error
+		defer func() {
+			if streamFailure == nil {
+				streamFailure = requestCtx.Err()
+			}
+			if streamFailure != nil {
+				reporter.PublishFailureWithUsage(ctx, pendingUsage, streamFailure)
+			} else if usageSeen {
+				reporter.Publish(ctx, pendingUsage)
+			}
+		}()
 
 		prepareLine := func(line []byte) []byte {
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+			if detail, ok := helps.ParseClaudeStreamUsage(line); ok && !usageSeen {
+				pendingUsage, usageSeen = detail, true
 			}
 			if event, ok := plan.cacheDiagnostic.ObserveStreamLine(line); ok {
 				logDeepSeekAnthropicCacheDiagnostic(ctx, event)
@@ -869,7 +883,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if responseLog != nil {
 					responseLog.RecordError(errRead)
 				}
-				reporter.PublishFailure(ctx, errRead)
+				streamFailure = errRead
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
 				case <-requestCtx.Done():
@@ -878,6 +892,28 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			if responseLog != nil {
 				responseLog.AppendChunk(event)
+			}
+			if payload, isError := helps.ClaudeSSEErrorPayload(event); isError {
+				upstreamErr := newUpstreamStatusErr(http.StatusBadGateway, httpResp.Header, "text/event-stream", payload)
+				code := upstreamErr.ErrorCode()
+				if code == "" {
+					code = "upstream_stream_error"
+				}
+				// HTTP 200 means the upstream may have accepted the generation.
+				// Keep it request-terminal even if another credential is available;
+				// Retryable=false alone only stops same-credential retries.
+				streamFailure = &failurecontract.Failure{
+					Kind: failurecontract.UpstreamProtocolError, Scope: failurecontract.ScopeRequest,
+					HTTPStatus: http.StatusBadGateway, OuterStatus: http.StatusOK,
+					ProviderCode: code, SemanticCode: code, Retryable: false,
+					PublicMessage: upstreamErr.Error(), Cause: upstreamErr,
+				}
+				helps.RecordAPIResponseError(ctx, e.cfg, streamFailure)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamFailure}:
+				case <-requestCtx.Done():
+				}
+				return
 			}
 
 			// If the response target is Claude, directly forward the SSE event without translation.
