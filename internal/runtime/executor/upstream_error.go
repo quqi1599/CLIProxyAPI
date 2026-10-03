@@ -40,6 +40,15 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 		errorCode:          errorCode,
 		headers:            clonedHeaders,
 	}
+	if statusCode != http.StatusRequestEntityTooLarge && (errorCode == "1301" || errorCode == "content_policy_violation") {
+		result.code = http.StatusBadRequest
+		result.failure = &failurecontract.Failure{
+			Kind: failurecontract.ContentSafetyBlocked, Scope: failurecontract.ScopeRequest,
+			HTTPStatus: http.StatusBadRequest, OuterStatus: statusCode,
+			ProviderCode: errorCode, SemanticCode: "content_policy_violation",
+			SemanticType: "invalid_request_error", Retryable: false, PublicMessage: message,
+		}
+	}
 	if statusCode == http.StatusRequestEntityTooLarge {
 		if result.errorCode == "" {
 			result.errorCode = "request_too_large"

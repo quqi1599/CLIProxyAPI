@@ -2090,7 +2090,12 @@ func toolCompatibilitySelectionError(modelName string, compatibility *complexity
 	if payloadHasBuiltinImageGenerationTool(compatibility) {
 		return &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("the image_generation builtin tool currently requires a codex-compatible channel for model %s", modelName),
+			Error: &failurecontract.Failure{
+				Kind: failurecontract.UnsupportedFeature, Scope: failurecontract.ScopeRequest,
+				HTTPStatus: http.StatusBadRequest, SemanticCode: requestFeatureUnsupportedErrorCode,
+				SemanticType: requestFeatureUnsupportedErrorType, Retryable: false,
+				PublicMessage: "builtin_image_generation_unsupported: " + userFacingBuiltinImageGenerationMessage(),
+			},
 		}
 	}
 	return &interfaces.ErrorMessage{

@@ -13,6 +13,10 @@ const (
 	requestFeatureUnsupportedErrorType = "invalid_request_error"
 )
 
+func userFacingBuiltinImageGenerationMessage() string {
+	return "当前模型的可用通道不支持内置图片生成工具（image_generation）。如不需要生图，请在客户端关闭该工具后重试；如需生图，请切换到支持该工具的 Codex 兼容通道。这不代表图片输入不受支持。原样重复提交不会成功。"
+}
+
 // UserFacingRequestFeatureUnsupportedMessage returns the normalized client-facing message for unsupported request shapes.
 func UserFacingRequestFeatureUnsupportedMessage() string {
 	return "当前请求的历史工具调用过多、上下文过大，或包含当前模型/路由不支持的工具能力，当前 Claude 兼容路由无法安全承载并转发。请新开会话，或将历史工具调用/MCP 工具结果压缩成普通文本摘要，减少工具/联网/MCP 使用；也可以切换到原生支持该能力的 Claude 路由后重试。原样重复提交不会提高成功率。"
@@ -213,6 +217,8 @@ func requestFeatureUnsupportedErrorDetail(status int, errText string) (ErrorDeta
 	message := UserFacingRequestFeatureUnsupportedMessage()
 	for _, candidate := range requestFeatureUnsupportedErrorCandidates(errText) {
 		switch {
+		case strings.Contains(candidate, "builtin_image_generation_unsupported"), strings.Contains(candidate, userFacingBuiltinImageGenerationMessage()):
+			message = userFacingBuiltinImageGenerationMessage()
 		case hasCodexToolHistorySignal(candidate):
 			message = userFacingCodexToolHistoryMessage()
 		case hasClaudeCodeDeepSeekComplexToolsSignal(candidate):
@@ -307,7 +313,7 @@ func hasRequestFeatureUnsupportedSignal(text string) bool {
 		return false
 	}
 
-	if strings.Contains(lower, requestFeatureUnsupportedErrorCode) {
+	if strings.Contains(lower, requestFeatureUnsupportedErrorCode) || strings.Contains(lower, "builtin_image_generation_unsupported") || strings.Contains(lower, userFacingBuiltinImageGenerationMessage()) {
 		return true
 	}
 	if hasCodexToolHistorySignal(lower) {

@@ -903,12 +903,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// HTTP 200 means the upstream may have accepted the generation.
 				// Keep it request-terminal even if another credential is available;
 				// Retryable=false alone only stops same-credential retries.
-				streamFailure = &failurecontract.Failure{
+				classified := &failurecontract.Failure{
 					Kind: failurecontract.UpstreamProtocolError, Scope: failurecontract.ScopeRequest,
 					HTTPStatus: http.StatusBadGateway, OuterStatus: http.StatusOK,
 					ProviderCode: code, SemanticCode: code, Retryable: false,
 					PublicMessage: upstreamErr.Error(), Cause: upstreamErr,
 				}
+				if typed, ok := failurecontract.As(upstreamErr); ok && typed.Kind == failurecontract.ContentSafetyBlocked {
+					classified.Kind = typed.Kind
+					classified.HTTPStatus = typed.HTTPStatus
+					classified.SemanticCode = typed.SemanticCode
+					classified.SemanticType = typed.SemanticType
+				}
+				streamFailure = classified
 				helps.RecordAPIResponseError(ctx, e.cfg, streamFailure)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: streamFailure}:

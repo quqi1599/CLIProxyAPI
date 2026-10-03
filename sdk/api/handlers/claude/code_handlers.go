@@ -332,6 +332,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(summaryCtx context.Context, c
 type claudeErrorDetail struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
 }
 
 type claudeErrorResponse struct {
@@ -369,6 +370,7 @@ func claudeErrorFromStatusText(status int, errText string) claudeErrorResponse {
 			Error: claudeErrorDetail{
 				Type:    errType,
 				Message: detail.Message,
+				Code:    detail.Code,
 			},
 		}
 	}

@@ -41,6 +41,25 @@ func TestNewUpstreamStatusErrClassifies413AsRequestScoped(t *testing.T) {
 	}
 }
 
+func TestNewUpstreamStatusErrClassifiesStructuredSafety(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":"1301","message":"private-fixture"}}`,
+		`{"error":{"code":1301,"message":"private-fixture"}}`,
+		`{"error":{"code":"content_policy_violation","message":"private-fixture"}}`,
+	} {
+		for _, status := range []int{400, 500, 502} {
+			err := newUpstreamStatusErr(status, nil, "application/json", []byte(body))
+			failure, ok := failurecontract.As(err)
+			if !ok || failure.Kind != failurecontract.ContentSafetyBlocked || failure.Scope != failurecontract.ScopeRequest || failure.Retryable || failure.HTTPStatus != 400 || failure.OuterStatus != status || failure.SemanticCode != "content_policy_violation" {
+				t.Fatalf("failure = %#v", failure)
+			}
+			if err.StatusCode() != 400 || err.ProviderStatusCode() != status || strings.Contains(err.Error(), "private-fixture") {
+				t.Fatalf("status or privacy contract lost: %#v", err)
+			}
+		}
+	}
+}
+
 func TestSafeUpstreamFailureMessageKeepsRoutingSignalsCanonical(t *testing.T) {
 	tests := []struct {
 		name string

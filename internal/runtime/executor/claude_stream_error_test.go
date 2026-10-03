@@ -21,8 +21,18 @@ import (
 )
 
 func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
+	t.Run("network", func(t *testing.T) {
+		testClaudeStreamFailure(t, "1234", "1234", http.StatusBadGateway, failurecontract.UpstreamProtocolError)
+	})
+	t.Run("safety", func(t *testing.T) {
+		testClaudeStreamFailure(t, "1301", "content_policy_violation", http.StatusBadRequest, failurecontract.ContentSafetyBlocked)
+	})
+}
+
+func testClaudeStreamFailure(t *testing.T, providerCode, semanticCode string, status int, kind failurecontract.Kind) {
+	t.Helper()
 	const start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"
-	const failure = "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"1234\",\"message\":\"private-upstream-content\"}}\n\n"
+	failureEvent := fmt.Sprintf("event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":%q,\"message\":\"private-upstream-content\"}}\n\n", providerCode)
 	const reportedUsage = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}\n\n"
 	const stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	for _, format := range []string{"claude", "openai", "openai-response"} {
@@ -32,7 +42,7 @@ func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					calls.Add(1)
 					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = fmt.Fprint(w, prefix+failure+stop)
+					_, _ = fmt.Fprint(w, prefix+failureEvent+stop)
 				}))
 				defer server.Close()
 				payload := []byte(`{"model":"glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"OK"}]}`)
@@ -53,7 +63,7 @@ func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
 				}
 				plugin := &captureAIStudioUsagePlugin{records: make(chan usage.Record, 16)}
 				usage.RegisterNamedPlugin("claude-stream-error-test", plugin)
-				requestID := fmt.Sprintf("glm-stream-error-%s-%d", format, len(prefix))
+				requestID := fmt.Sprintf("glm-stream-error-%s-%s-%d", providerCode, format, len(prefix))
 				ctx := logging.WithRequestID(context.Background(), requestID)
 				result, err := manager.ExecuteStream(ctx, []string{"claude"},
 					cliproxyexecutor.Request{Model: "glm-5.3-flash", Payload: payload},
@@ -77,8 +87,8 @@ func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
 					t.Fatalf("terminal errors = %d, want exactly one", len(failures))
 				}
 				failure, ok := failurecontract.As(failures[0])
-				if !ok || failure.HTTPStatus != 502 || failure.OuterStatus != 200 || failure.Retryable || failure.ErrorCode() != "1234" {
-					t.Fatalf("failure = %#v, want non-retryable in-band 1234", failure)
+				if !ok || failure.HTTPStatus != status || failure.OuterStatus != 200 || failure.Retryable || failure.ErrorCode() != semanticCode || failure.ProviderCode != providerCode || failure.Kind != kind || failure.Scope != failurecontract.ScopeRequest {
+					t.Fatalf("failure = %#v, want non-retryable request-scoped %s", failure, semanticCode)
 				}
 				for _, forbidden := range []string{"private-upstream-content", "message_stop", "response.completed", "[DONE]"} {
 					if strings.Contains(output.String(), forbidden) || strings.Contains(failures[0].Error(), forbidden) {
@@ -101,8 +111,8 @@ func TestClaudeExecutorStreamErrorIsFailureAcrossProtocols(t *testing.T) {
 						if record.RequestID != requestID {
 							continue
 						}
-						if !record.Failed || record.Fail.SemanticCode != "1234" {
-							t.Fatalf("usage outcome = %+v, want failed 1234", record.Fail)
+						if !record.Failed || record.Fail.SemanticCode != semanticCode {
+							t.Fatalf("usage outcome = %+v, want failed %s", record.Fail, semanticCode)
 						}
 						if strings.Contains(prefix, "message_delta") && (record.Detail.InputTokens != 17 || record.Detail.OutputTokens != 3) {
 							t.Fatalf("reported partial usage lost: %+v", record.Detail)
