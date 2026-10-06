@@ -751,6 +751,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data, plan.providerIdentity.Kind)
 		return resp, err
 	}
+	if !plan.upstreamStream {
+		data = helps.NormalizeMiniMaxEmptyTruncation(plan.baseURL, plan.bodyForUpstream, data)
+	}
 	if plan.upstreamStream {
 		if errValidate := validateClaudeStreamingResponse(data); errValidate != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
@@ -878,8 +881,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		direct := plan.responseFormat == plan.upstreamFormat
 		var param any
-		for {
+		reader := helps.NewMiniMaxTruncationReader(func() ([]byte, error) {
 			event, errRead := sseStream.ReadEvent()
+			if errRead == nil && responseLog != nil {
+				responseLog.AppendChunk(event)
+			}
+			return event, errRead
+		}, plan.baseURL, plan.bodyForUpstream)
+		for {
+			event, errRead := reader.ReadEvent()
 			if errRead != nil {
 				if requestCtx.Err() != nil || errors.Is(errRead, io.EOF) {
 					return
@@ -893,9 +903,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				case <-requestCtx.Done():
 				}
 				return
-			}
-			if responseLog != nil {
-				responseLog.AppendChunk(event)
 			}
 			if payload, isError := helps.ClaudeSSEErrorPayload(event); isError {
 				upstreamErr := newUpstreamStatusErr(http.StatusBadGateway, httpResp.Header, "text/event-stream", payload)
