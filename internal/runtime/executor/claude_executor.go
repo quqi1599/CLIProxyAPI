@@ -590,6 +590,10 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 
 	finalSanitizeStarted := time.Now()
 	finalSanitizeInput := body
+	body, err = helps.PreserveMiniMaxM3ThinkingOff(plan.baseURL, req.Model, from.String(), originalPayloadSource, body)
+	if err != nil {
+		return plan, err
+	}
 	if preflight.hasBetas {
 		plan.extraBetas, body = extractAndRemoveBetas(body)
 	}
@@ -3765,6 +3769,10 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 		return nil, errGuard
 	}
 	model := gjson.GetBytes(body, "model").String()
+	body, errRead = helps.PreserveMiniMaxM3ThinkingOff(requestURLString(req), model, "claude", body, body)
+	if errRead != nil {
+		return nil, errRead
+	}
 	if compatKind == "minimax" && thinking.IsMiniMaxM31Model(model) {
 		body, errRead = thinking.ApplyThinking(body, model, "claude", "claude", "claude")
 		if errRead != nil {

@@ -389,6 +389,10 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 		return errReject
 	}
 	updated := scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
+	updated, errRead = helps.PreserveMiniMaxM3ThinkingOff(baseURL, model, "openai", body, updated)
+	if errRead != nil {
+		return errRead
+	}
 	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(model) {
 		updated, errRead = thinking.ApplyThinking(updated, model, "openai", "openai", "minimax")
 		if errRead != nil {
@@ -1232,6 +1236,10 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	providerFinalizationStarted := time.Now()
 	providerFinalizationInput := body
+	body, err = helps.PreserveMiniMaxM3ThinkingOff(baseURL, req.Model, from.String(), plan.requestSource, body)
+	if err != nil {
+		return plan, err
+	}
 	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
 		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "minimax")
 		if err != nil {
