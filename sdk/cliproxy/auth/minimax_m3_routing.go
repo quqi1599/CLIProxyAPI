@@ -20,6 +20,7 @@ const (
 func filterMiniMaxM3RequiredExecutionModels(routeModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, candidates []string) []string {
 	candidates = rewriteMiniMaxM3HighspeedRouteToStandard(routeModel, opts, candidates)
 	candidates = filterClaudeSonnetMiniMaxM3Highspeed(routeModel, opts, candidates)
+	candidates = filterClaudeSonnetMiniMaxThinking(routeModel, req, opts, candidates)
 	candidates = filterMiniMaxLargeToolHistoryM3Highspeed(req, opts, candidates)
 	if len(candidates) == 0 || !miniMaxCandidateSetCanRouteToM3(routeModel, opts, candidates) {
 		return candidates
@@ -46,6 +47,28 @@ func filterMiniMaxM3RequiredExecutionModels(routeModel string, req cliproxyexecu
 	}
 	if !removed {
 		return candidates
+	}
+	return filtered
+}
+
+// Filter before executing an aggregate candidate. A model requiring thinking
+// cannot satisfy an explicit off request; preserve direct-model validation.
+func filterClaudeSonnetMiniMaxThinking(routeModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, candidates []string) []string {
+	if !isClaudeSonnet46FallbackModel(routeModel) && !isClaudeSonnet46FallbackModel(requestedModelAliasFromOptions(opts, routeModel)) {
+		return candidates
+	}
+	payload := miniMaxRoutingPayload(req, opts)
+	filtered := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		mandatory := thinking.IsMiniMaxM31Model(candidate)
+		switch strings.ToLower(thinking.ParseSuffix(candidate).ModelName) {
+		case "minimax-m2", "minimax-m2.1", "minimax-m2.1-highspeed", "minimax-m2.5", "minimax-m2.5-highspeed", "minimax-m2.7", "minimax-m2.7-highspeed":
+			mandatory = true
+		}
+		if mandatory && thinking.MiniMaxThinkingDisabled(candidate, opts.SourceFormat.String(), payload) {
+			continue
+		}
+		filtered = append(filtered, candidate)
 	}
 	return filtered
 }

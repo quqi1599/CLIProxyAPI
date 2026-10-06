@@ -5,6 +5,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/claude"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/codex"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/openai"
 	"github.com/tidwall/gjson"
 )
@@ -52,6 +53,65 @@ func TestMiniMaxM31CanonicalThinking(t *testing.T) {
 				t.Fatalf("manual budget remained: %s", out)
 			}
 		})
+	}
+}
+
+func TestMiniMaxM31DisabledSourceControlsAreNotLost(t *testing.T) {
+	for _, tc := range []struct{ from, source string }{
+		{"claude", `{"thinking":{"type":"off"},"output_config":{"effort":"max"}}`},
+		{"claude", `{"thinking":{"type":" NONE "},"output_config":{"effort":"high"}}`},
+		{"claude", `{"enable_thinking":false,"output_config":{"effort":"high"}}`},
+		{"codex", `{"thinking":{"type":"disabled"},"reasoning":{"effort":"max"}}`},
+		{"codex", `{"enable_thinking":false,"reasoning":{"effort":"max"}}`},
+		{"openai-response", `{"thinking":{"type":"off"},"reasoning":{"effort":"high"}}`},
+	} {
+		for _, to := range []string{"claude", "openai", "codex"} {
+			t.Run(tc.from+"/"+to+"/"+tc.source, func(t *testing.T) {
+				body := []byte(`{"output_config":{"effort":"max"},"reasoning_effort":"max","reasoning":{"effort":"max"}}`)
+				original := string(body)
+				_, err := thinking.ApplyThinking(body, "MiniMax-M3.1-Flash-Preview", tc.from, to, "minimax", []byte(tc.source))
+				status, ok := err.(interface{ StatusCode() int })
+				if !ok || status.StatusCode() != 400 {
+					t.Fatalf("explicit disable became mandatory thinking: %v", err)
+				}
+				if string(body) != original {
+					t.Fatal("source mutated on rejection")
+				}
+			})
+		}
+	}
+}
+
+func TestMiniMaxM31ResponsesEffortCanonicalization(t *testing.T) {
+	body := []byte(`{"reasoning":{"effort":" MAX ","summary":"auto"},"input":[{"type":"function_call","call_id":"call_fixture","arguments":"{\"n\":9007199254740993}"}]}`)
+	out, err := thinking.ApplyThinking(body, "MiniMax-M3.1-Flash-Preview", "codex", "codex", "minimax")
+	if err != nil || gjson.GetBytes(out, "reasoning.effort").String() != "max" || gjson.GetBytes(out, "reasoning.summary").String() != "auto" || gjson.GetBytes(out, "input").Raw != gjson.GetBytes(body, "input").Raw {
+		t.Fatalf("Responses thinking/history not preserved: %s, %v", out, err)
+	}
+}
+
+func TestMiniMaxM31StandaloneSDKEffortSpellings(t *testing.T) {
+	for _, from := range []string{"openai", "claude", "codex"} {
+		for _, source := range []string{`{"reasoning_effort":" LOW "}`, `{"reasoning":{"effort":" LOW "}}`, `{"output_config":{"effort":" LOW "}}`} {
+			for _, to := range []string{"openai", "claude", "codex"} {
+				out, err := thinking.ApplyThinking([]byte(`{}`), "MiniMax-M3.1-Flash-Preview", from, to, "minimax", []byte(source))
+				path := "reasoning_effort"
+				if to == "claude" {
+					path = "output_config.effort"
+				} else if to == "codex" {
+					path = "reasoning.effort"
+				}
+				if err != nil || gjson.GetBytes(out, path).String() != "low" {
+					t.Fatalf("standalone effort lost %s/%s/%s: %s, %v", from, to, source, out, err)
+				}
+			}
+		}
+		for _, source := range []string{`{"reasoning_effort":"none"}`, `{"reasoning":{"effort":"none"}}`, `{"output_config":{"effort":"none"}}`, `{"output_config":{"effort":"ultra"}}`, `{"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}`} {
+			_, err := thinking.ApplyThinking([]byte(`{}`), "MiniMax-M3.1-Flash-Preview", from, "openai", "minimax", []byte(source))
+			if err == nil {
+				t.Fatalf("invalid or disabled control silently accepted %s/%s", from, source)
+			}
+		}
 	}
 }
 

@@ -27,7 +27,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"upstream_timeout": {}, "usage_limit_reached": {}, "websocket_connection_limit_reached": {},
 }
 
-func newUpstreamStatusErr(statusCode int, headers http.Header, contentType string, body []byte) statusErr {
+func newUpstreamStatusErr(statusCode int, headers http.Header, contentType string, body []byte, providerKind ...string) statusErr {
 	message, errorCode := safeUpstreamFailureMessage(contentType, body)
 	var clonedHeaders http.Header
 	if headers != nil {
@@ -61,6 +61,35 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 			Retryable:     false,
 			PublicMessage: result.msg,
 		}
+	}
+	if len(providerKind) > 0 {
+		return withMiniMaxRejectionDiagnostic(result, providerKind[0], body)
+	}
+	return result
+}
+
+func withMiniMaxRejectionDiagnostic(result statusErr, kind string, body []byte) statusErr {
+	if kind != "minimax" || (result.code != 400 && result.code != 422) {
+		return result
+	}
+	switch result.errorCode {
+	case "", "invalid_request", "invalid_request_error", "bad_request_error":
+	default:
+		return result
+	}
+	if result.failure != nil && (result.failure.Kind != failurecontract.InvalidRequest || result.failure.Scope != failurecontract.ScopeRequest) {
+		return result
+	}
+	code, message := helps.MiniMaxRejectionDiagnostic(upstreamJSONErrorBody(body))
+	if code == "" {
+		return result
+	}
+	result.errorCode, result.msg = code, message
+	result.failure = &failurecontract.Failure{
+		Kind: failurecontract.InvalidRequest, Scope: failurecontract.ScopeRequest,
+		HTTPStatus: result.code, OuterStatus: result.ProviderStatusCode(),
+		ProviderCode: code, SemanticCode: code, SemanticType: "invalid_request_error",
+		Retryable: false, PublicMessage: message,
 	}
 	return result
 }

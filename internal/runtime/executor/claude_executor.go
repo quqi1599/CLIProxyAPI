@@ -593,6 +593,9 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if preflight.hasBetas {
 		plan.extraBetas, body = extractAndRemoveBetas(body)
 	}
+	if mapped := helps.OfficialMiniMaxModel(gjson.GetBytes(body, "model").String(), plan.baseURL); mapped != gjson.GetBytes(body, "model").String() {
+		body, _ = sjson.SetBytes(body, "model", mapped)
+	}
 	plan.bodyForTranslation = body
 	plan.bodyForUpstream = downgradeClaudeStructuredOutputForCompat(plan.baseURL, body)
 	finalSanitizeDowngrades := make([]string, 0, 1)
@@ -745,7 +748,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data)
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), data, plan.providerIdentity.Kind)
 		return resp, err
 	}
 	if plan.upstreamStream {
@@ -829,7 +832,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return nil, readErr
 		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b)
+		err = newUpstreamStatusErr(httpResp.StatusCode, httpResp.Header, httpResp.Header.Get("Content-Type"), b, plan.providerIdentity.Kind)
 		return nil, err
 	}
 	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
@@ -3761,7 +3764,7 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 			return nil, errRead
 		}
 	}
-	if upstreamModel := helps.OfficialDeepSeekModel(model, requestURLString(req)); upstreamModel != model {
+	if upstreamModel := helps.OfficialMiniMaxModel(helps.OfficialDeepSeekModel(model, requestURLString(req)), requestURLString(req)); upstreamModel != model {
 		body, _ = sjson.SetBytes(body, "model", upstreamModel)
 	}
 	body, capabilityManaged, errCapability := applyClaudeCompatProviderCapabilities(req.Context(), body, compatKind, requestURLString(req), compat.MatchContext{

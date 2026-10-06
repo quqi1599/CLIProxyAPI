@@ -4026,7 +4026,7 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 	failure := classifyOpenAICompatFailure(normalizedStatus, statusCode, classificationMessage, classificationCode, retryAfter)
 	failure.ProviderCode = errorCode
 	failure.PublicMessage = message
-	return statusErr{
+	result := statusErr{
 		code:               normalizedStatus,
 		providerStatusCode: statusCode,
 		msg:                message,
@@ -4035,6 +4035,7 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 		headers:            headers.Clone(),
 		failure:            failure,
 	}
+	return withMiniMaxRejectionDiagnostic(result, profile.Kind, body)
 }
 
 func (p openAICompatProfile) KindOrFallback(auth *cliproxyauth.Auth) string {

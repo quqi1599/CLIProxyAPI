@@ -24,6 +24,17 @@ func IsMiniMaxM3Model(model string) bool {
 	return base == "minimax-m3" || strings.HasPrefix(base, "minimax-m3-") || IsMiniMaxM31Model(base)
 }
 
+// MiniMaxThinkingDisabled resolves explicit source controls with the same
+// model-suffix precedence as M3.1 validation. It never infers an off intent
+// from a translated payload or a provider default.
+func MiniMaxThinkingDisabled(model, format string, body []byte) bool {
+	config := extractMiniMaxThinkingConfig(body, format)
+	if suffix := ParseSuffix(model); suffix.HasSuffix {
+		config = parseSuffixToConfig(suffix.RawSuffix, format, suffix.ModelName)
+	}
+	return config.Mode == ModeNone || (config.Mode == ModeLevel && strings.EqualFold(strings.TrimSpace(string(config.Level)), "none"))
+}
+
 // applyMiniMaxM31Thinking keeps the canonical config/validation/provider pipeline,
 // while enforcing MiniMax's mandatory adaptive thinking and five effort levels.
 // Source controls avoid a lossy level -> Claude budget -> level round trip.
@@ -39,6 +50,9 @@ func applyMiniMaxM31Thinking(body []byte, suffix SuffixResult, fromFormat, toFor
 	}
 	if !hasThinkingConfig(config) {
 		return body, nil
+	}
+	if config.Mode == ModeLevel {
+		config.Level = ThinkingLevel(strings.ToLower(strings.TrimSpace(string(config.Level))))
 	}
 	if config.Mode == ModeNone || (config.Mode == ModeLevel && config.Level == LevelNone) {
 		return body, NewThinkingErrorWithModel(ErrLevelNotSupported,
@@ -69,6 +83,15 @@ func applyMiniMaxM31Thinking(body []byte, suffix SuffixResult, fromFormat, toFor
 }
 
 func extractMiniMaxThinkingConfig(body []byte, format string) ThinkingConfig {
+	// These compatibility toggles occur on all three client protocols. Resolve
+	// an explicit disable before a stale effort label or a translated default.
+	if gjson.GetBytes(body, "enable_thinking").Type == gjson.False {
+		return ThinkingConfig{Mode: ModeNone}
+	}
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
+	case "disabled", "off", "none":
+		return ThinkingConfig{Mode: ModeNone}
+	}
 	if format == "openai-response" {
 		format = "codex"
 	}
@@ -78,6 +101,15 @@ func extractMiniMaxThinkingConfig(body []byte, format string) ThinkingConfig {
 	}
 	if config.Mode == ModeNone {
 		return config
+	}
+	// SDKs can carry another protocol's effort spelling without a thinking object.
+	// Keep native controls authoritative and reject an explicit none as usual.
+	if !hasThinkingConfig(config) {
+		for _, path := range []string{"reasoning_effort", "reasoning.effort", "output_config.effort"} {
+			if effort := gjson.GetBytes(body, path); effort.Type == gjson.String && strings.TrimSpace(effort.String()) != "" {
+				return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(strings.ToLower(strings.TrimSpace(effort.String())))}
+			}
+		}
 	}
 	// MiniMax accepts output_config.effort without a separate thinking object.
 	if format == "claude" {

@@ -395,7 +395,7 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 			return errRead
 		}
 	}
-	if upstreamModel := helps.OfficialDeepSeekModel(model, baseURL); upstreamModel != model {
+	if upstreamModel := helps.OfficialMiniMaxModel(helps.OfficialDeepSeekModel(model, baseURL), baseURL); upstreamModel != model {
 		updated, _ = sjson.SetBytes(updated, "model", upstreamModel)
 	}
 	inlinedImages := false
@@ -1261,6 +1261,9 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	body, err = normalizeAkoolDeepSeekChatPayload(ctx, body, baseURL, baseModel, plan.endpoint, clientProfile)
 	if err != nil {
 		return plan, err
+	}
+	if mapped := helps.OfficialMiniMaxModel(gjson.GetBytes(body, "model").String(), baseURL); mapped != gjson.GetBytes(body, "model").String() {
+		body, _ = sjson.SetBytes(body, "model", mapped)
 	}
 	if err = validateOpenAICompatOutboundJSON(body); err != nil {
 		return plan, err

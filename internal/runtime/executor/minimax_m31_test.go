@@ -40,12 +40,12 @@ func TestMiniMaxM31RequestPlansPreserveEffort(t *testing.T) {
 					if err != nil {
 						t.Fatalf("claude plan: %v", err)
 					}
-					assertMiniMaxM31Plan(t, claudePlan.bodyForUpstream, "output_config.effort", model, effort)
+					assertMiniMaxM31Plan(t, claudePlan.bodyForUpstream, "output_config.effort", "MiniMax-M3.1-Flash-Preview", effort)
 					openaiPlan, err := NewOpenAICompatExecutor("minimax-test", &config.Config{}).prepareOpenAICompatRequest(context.Background(), auth, req, opts, "https://api.minimax.cn/v1", model, openAICompatProfileForKind("minimax"), true)
 					if err != nil {
 						t.Fatalf("openai plan: %v", err)
 					}
-					assertMiniMaxM31Plan(t, openaiPlan.body, "reasoning_effort", model, effort)
+					assertMiniMaxM31Plan(t, openaiPlan.body, "reasoning_effort", "MiniMax-M3.1-Flash-Preview", effort)
 					if !gjson.GetBytes(openaiPlan.body, "stream_options.include_usage").Bool() {
 						t.Fatalf("stream usage missing: %s", openaiPlan.body)
 					}
