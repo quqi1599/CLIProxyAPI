@@ -77,6 +77,11 @@ type Failure struct {
 	UpstreamRequestID string
 	RetryAfter        *time.Duration
 	Body              string
+	// These fields contain controlled upstream diagnostics, never raw error prose.
+	UpstreamErrorParam           string
+	UpstreamReportedMaxLength    *int64
+	UpstreamReportedActualLength *int64
+	UpstreamLengthUnit           string
 }
 
 // Detail holds the token usage breakdown.

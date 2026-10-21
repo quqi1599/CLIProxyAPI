@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode"
 
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
@@ -119,6 +120,24 @@ func (p *FailureMetadataLogger) HandleUsage(ctx context.Context, record coreusag
 		}
 		if record.Fail.RetryAfter != nil {
 			fields["retry_after_ms"] = record.Fail.RetryAfter.Milliseconds()
+		}
+		diagnostic := (failurecontract.UpstreamErrorDiagnostic{
+			Param:                record.Fail.UpstreamErrorParam,
+			ReportedMaxLength:    record.Fail.UpstreamReportedMaxLength,
+			ReportedActualLength: record.Fail.UpstreamReportedActualLength,
+			LengthUnit:           record.Fail.UpstreamLengthUnit,
+		}).Normalized()
+		if diagnostic.Param != "" {
+			fields["upstream_error_param"] = diagnostic.Param
+		}
+		if diagnostic.ReportedMaxLength != nil {
+			fields["upstream_reported_max_length"] = *diagnostic.ReportedMaxLength
+		}
+		if diagnostic.ReportedActualLength != nil {
+			fields["upstream_reported_actual_length"] = *diagnostic.ReportedActualLength
+		}
+		if diagnostic.LengthUnit != "" {
+			fields["upstream_length_unit"] = diagnostic.LengthUnit
 		}
 	}
 	if status > 0 {

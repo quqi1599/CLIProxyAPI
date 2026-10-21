@@ -26,9 +26,10 @@ type codexFailureInput struct {
 }
 
 type codexFailureSemantics struct {
-	code    string
-	typeID  string
-	message string
+	code       string
+	typeID     string
+	message    string
+	diagnostic failurecontract.UpstreamErrorDiagnostic
 }
 
 // canonicalCodexFailure is the single Codex failure classification entrypoint.
@@ -57,6 +58,7 @@ func canonicalCodexFailure(input codexFailureInput) (*failurecontract.Failure, [
 		StreamPhase:       phase,
 		OutputCommitted:   input.outputCommitted,
 		UpstreamRequestID: codexUpstreamRequestID(input.headers, classifiedBody),
+		ErrorDiagnostic:   semantics.diagnostic,
 	}
 	failure.RetryAfter = codexCanonicalRetryAfter(input.headers, classifiedBody, input.now)
 	classifyCodexFailureSemantics(failure, semantics.message, classifiedBody)
@@ -283,10 +285,10 @@ func codexFailureSemanticFields(body []byte) codexFailureSemantics {
 	var fallback codexFailureSemantics
 	for _, prefix := range envelopes {
 		semantics := codexFailureSemanticsAt(body, prefix)
-		if semantics == (codexFailureSemantics{}) {
+		if semantics.code == "" && semantics.typeID == "" && semantics.message == "" {
 			continue
 		}
-		if fallback == (codexFailureSemantics{}) {
+		if fallback.code == "" && fallback.typeID == "" && fallback.message == "" {
 			fallback = semantics
 		}
 		parsed = append(parsed, semantics)
@@ -338,7 +340,10 @@ func codexFailureSemanticsAt(body []byte, prefix string) codexFailureSemantics {
 	if prefix == "" && message == "" {
 		message = firstCodexSemanticMessage(body, "detail")
 	}
-	return codexFailureSemantics{code: code, typeID: typeID, message: message}
+	return codexFailureSemantics{
+		code: code, typeID: typeID, message: message,
+		diagnostic: failurecontract.ParseUpstreamErrorDiagnosticAt(body, prefix),
+	}
 }
 
 func firstCodexSemanticIdentifier(body []byte, paths ...string) string {
@@ -397,6 +402,11 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		return
 	}
 	outerStatus := failure.OuterStatus
+	// A successful WebSocket upgrade has the same semantic-error rules as a
+	// successful HTTP stream, while OuterStatus retains the actual handshake.
+	if outerStatus == http.StatusSwitchingProtocols {
+		outerStatus = http.StatusOK
+	}
 	code := strings.ToLower(strings.TrimSpace(failure.SemanticCode))
 	typeID := strings.ToLower(strings.TrimSpace(failure.SemanticType))
 	lowerMessage := strings.ToLower(strings.TrimSpace(message))
@@ -585,7 +595,7 @@ func codexDeterministicRequestCode(code string) bool {
 	switch code {
 	case "invalid_request", "invalid_request_error", "invalid_argument", "invalidargument", "invalid_parameter",
 		"invalid_function_arguments", "invalid_tool_arguments", "tool_schema_error", "schema_validation_error",
-		"billing_config_error", "request_too_large", "unprocessable_entity":
+		"billing_config_error", "request_too_large", "unprocessable_entity", "string_above_max_length":
 		return true
 	}
 	return false

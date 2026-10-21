@@ -692,7 +692,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 			return resp, wsErr
 		}
-		if streamErr, _, ok := codexTerminalStreamErrWithMetadata(payload, upstreamHeaders, false); ok {
+		if streamErr, _, ok := codexTerminalStreamErrWithOuterStatus(payload, upstreamHeaders, false, upstreamOuterStatus); ok {
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", streamErr)
 			}
@@ -1092,7 +1092,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
 				return
 			}
-			if streamErr, _, ok := codexTerminalStreamErrWithMetadata(payload, upstreamHeaders, outputCommitted); ok {
+			if streamErr, _, ok := codexTerminalStreamErrWithOuterStatus(payload, upstreamHeaders, outputCommitted, upstreamOuterStatus); ok {
 				terminateReason = "upstream_error"
 				terminateErr = streamErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
@@ -1757,6 +1757,13 @@ func parseCodexWebsocketErrorWithMetadata(payload []byte, fallbackHeaders http.H
 		phase = failurecontract.StreamPhaseAfterOutput
 	}
 	statusError := newCodexStatusErrWithMetadata(status, headers, out, phase, outputCommitted)
+	errorPath := ""
+	if gjson.GetBytes(payload, "body.error").Exists() {
+		errorPath = "body.error"
+	} else if gjson.GetBytes(payload, "error").Exists() {
+		errorPath = "error"
+	}
+	statusError.failure.ErrorDiagnostic = failurecontract.ParseUpstreamErrorDiagnosticAt(payload, errorPath)
 	if statusError.retryAfter == nil && isCodexWebsocketConnectionLimitError(payload) {
 		retryAfter := time.Duration(0)
 		statusError.retryAfter = &retryAfter

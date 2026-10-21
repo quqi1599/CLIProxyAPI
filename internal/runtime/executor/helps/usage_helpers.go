@@ -347,21 +347,26 @@ func failFromErrors(errs ...error) usage.Failure {
 		}
 		if _, ok := failurecontract.As(err); ok {
 			classified := failurecontract.Classify(err)
+			diagnostic := classified.ErrorDiagnostic.Normalized()
 			return usage.Failure{
-				Canonical:         true,
-				StatusCode:        normalizeFailureStatus(classified.HTTPStatus),
-				OuterStatus:       normalizeFailureStatus(classified.OuterStatus),
-				ErrorCode:         sanitizeFailureErrorCode(classified.SemanticCode),
-				SemanticCode:      sanitizeFailureErrorCode(classified.SemanticCode),
-				SemanticType:      sanitizeFailureErrorCode(classified.SemanticType),
-				Kind:              string(classified.Kind),
-				Scope:             string(classified.Scope),
-				Retryable:         classified.Retryable,
-				StreamPhase:       string(classified.StreamPhase),
-				OutputCommitted:   classified.OutputCommitted,
-				UpstreamRequestID: strings.TrimSpace(classified.UpstreamRequestID),
-				RetryAfter:        cloneFailureRetryAfter(classified.RetryAfter),
-				Body:              strings.TrimSpace(err.Error()),
+				Canonical:                    true,
+				StatusCode:                   normalizeFailureStatus(classified.HTTPStatus),
+				OuterStatus:                  normalizeFailureStatus(classified.OuterStatus),
+				ErrorCode:                    sanitizeFailureErrorCode(classified.SemanticCode),
+				SemanticCode:                 sanitizeFailureErrorCode(classified.SemanticCode),
+				SemanticType:                 sanitizeFailureErrorCode(classified.SemanticType),
+				Kind:                         string(classified.Kind),
+				Scope:                        string(classified.Scope),
+				Retryable:                    classified.Retryable,
+				StreamPhase:                  string(classified.StreamPhase),
+				OutputCommitted:              classified.OutputCommitted,
+				UpstreamRequestID:            strings.TrimSpace(classified.UpstreamRequestID),
+				RetryAfter:                   cloneFailureRetryAfter(classified.RetryAfter),
+				Body:                         strings.TrimSpace(err.Error()),
+				UpstreamErrorParam:           diagnostic.Param,
+				UpstreamReportedMaxLength:    diagnostic.ReportedMaxLength,
+				UpstreamReportedActualLength: diagnostic.ReportedActualLength,
+				UpstreamLengthUnit:           diagnostic.LengthUnit,
 			}
 		}
 		status, code := failureMetadataFromError(err)

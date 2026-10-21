@@ -22,7 +22,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"permission_denied": {}, "permission_error": {}, "policy_denied": {},
 	"previous_response_not_found": {}, "quota_exceeded": {}, "quota_exhausted": {}, "rate_limit": {}, "rate_limit_error": {},
 	"rate_limit_exceeded": {}, "request_feature_unsupported": {}, "request_too_large": {}, "resource_exhausted": {},
-	"server_error": {}, "thinking_signature_invalid": {}, "timeout": {}, "unauthenticated": {},
+	"server_error": {}, "string_above_max_length": {}, "thinking_signature_invalid": {}, "timeout": {}, "unauthenticated": {},
 	"unknown": {}, "unavailable": {}, "upstream_response_too_large": {},
 	"upstream_timeout": {}, "usage_limit_reached": {}, "websocket_connection_limit_reached": {},
 }
@@ -40,6 +40,17 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 		errorCode:          errorCode,
 		headers:            clonedHeaders,
 	}
+	if errorCode == "string_above_max_length" && statusCode != http.StatusRequestEntityTooLarge {
+		result.code = http.StatusBadRequest
+		result.failure = &failurecontract.Failure{
+			Kind: failurecontract.InvalidRequest, Scope: failurecontract.ScopeRequest,
+			HTTPStatus: http.StatusBadRequest, OuterStatus: statusCode,
+			ProviderCode: errorCode, SemanticCode: errorCode, SemanticType: "invalid_request_error",
+			Retryable: false, PublicMessage: message,
+			ErrorDiagnostic: upstreamFailureDiagnostic(body, errorCode),
+		}
+		return result
+	}
 	if statusCode != http.StatusRequestEntityTooLarge && (errorCode == "1301" || errorCode == "content_policy_violation") {
 		result.code = http.StatusBadRequest
 		result.failure = &failurecontract.Failure{
@@ -54,18 +65,39 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 			result.errorCode = "request_too_large"
 		}
 		result.failure = &failurecontract.Failure{
-			Kind:          failurecontract.RequestTooLarge,
-			Scope:         failurecontract.ScopeRequest,
-			HTTPStatus:    http.StatusRequestEntityTooLarge,
-			ProviderCode:  result.errorCode,
-			Retryable:     false,
-			PublicMessage: result.msg,
+			Kind:            failurecontract.RequestTooLarge,
+			Scope:           failurecontract.ScopeRequest,
+			HTTPStatus:      http.StatusRequestEntityTooLarge,
+			ProviderCode:    result.errorCode,
+			Retryable:       false,
+			PublicMessage:   result.msg,
+			ErrorDiagnostic: upstreamFailureDiagnostic(body, result.errorCode),
 		}
 	}
 	if len(providerKind) > 0 {
 		return withMiniMaxRejectionDiagnostic(result, providerKind[0], body)
 	}
 	return result
+}
+
+// Match the same ordered code/type paths used by safeUpstreamIdentifiers. Do
+// not combine a parameter from an outer wrapper with an inner error's code.
+func upstreamFailureDiagnostic(body []byte, errorCode string) failurecontract.UpstreamErrorDiagnostic {
+	if errorCode == "" {
+		return failurecontract.UpstreamErrorDiagnostic{}
+	}
+	jsonBody := upstreamJSONErrorBody(body)
+	for _, candidate := range []struct{ field, envelope string }{
+		{"error.code", "error"}, {"body.error.code", "body.error"}, {"code", ""},
+		{"error.err_code", "error"}, {"error_code", ""},
+		{"error.type", "error"}, {"body.error.type", "body.error"}, {"type", ""},
+	} {
+		value := gjson.GetBytes(jsonBody, candidate.field)
+		if value.Type == gjson.String && strings.ToLower(strings.TrimSpace(value.Str)) == errorCode {
+			return failurecontract.ParseUpstreamErrorDiagnosticAt(jsonBody, candidate.envelope)
+		}
+	}
+	return failurecontract.UpstreamErrorDiagnostic{}
 }
 
 func withMiniMaxRejectionDiagnostic(result statusErr, kind string, body []byte) statusErr {

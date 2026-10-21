@@ -305,23 +305,33 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 }
 
 func codexTerminalStreamErrWithMetadata(eventData []byte, headers http.Header, outputCommitted bool) (statusErr, []byte, bool) {
+	return codexTerminalStreamErrWithOuterStatus(eventData, headers, outputCommitted, http.StatusOK)
+}
+
+func codexTerminalStreamErrWithOuterStatus(eventData []byte, headers http.Header, outputCommitted bool, outerStatus int) (statusErr, []byte, bool) {
 	eventType := gjson.GetBytes(eventData, "type").String()
 	var body []byte
+	errorPath := "error"
 	switch eventType {
 	case "error":
 		body = codexTerminalErrorBody(eventData, "error")
 		if len(body) == 0 {
 			body = codexTerminalTopLevelErrorBody(eventData)
+			errorPath = ""
 		}
 	case "response.failed":
+		errorPath = "response.error"
 		body = codexTerminalErrorBody(eventData, "response.error")
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
+			errorPath = "error"
 		}
 	case "response.completed", "response.done":
+		errorPath = "response.error"
 		body = codexTerminalErrorBody(eventData, "response.error")
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
+			errorPath = "error"
 		}
 		if !codexTerminalStreamErrShouldHandle(body) &&
 			(codexCompletedIsReasoningOnly(eventData) ||
@@ -340,7 +350,11 @@ func codexTerminalStreamErrWithMetadata(eventData []byte, headers http.Header, o
 	if outputCommitted {
 		phase = failurecontract.StreamPhaseAfterOutput
 	}
-	return newCodexStatusErrWithMetadata(http.StatusOK, headers, body, phase, outputCommitted), body, true
+	streamErr := newCodexStatusErrWithMetadata(outerStatus, headers, body, phase, outputCommitted)
+	// Extraction must see the original envelope so flattening cannot hide
+	// duplicate keys or associate a parameter with a different nested error.
+	streamErr.failure.ErrorDiagnostic = failurecontract.ParseUpstreamErrorDiagnosticAt(eventData, errorPath)
+	return streamErr, body, true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {

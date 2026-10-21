@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/compat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/provideridentity"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -4026,6 +4027,13 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 	failure := classifyOpenAICompatFailure(normalizedStatus, statusCode, classificationMessage, classificationCode, retryAfter)
 	failure.ProviderCode = errorCode
 	failure.PublicMessage = message
+	failure.ErrorDiagnostic = upstreamFailureDiagnostic(body, errorCode)
+	if errorCode == "string_above_max_length" && statusCode != http.StatusRequestEntityTooLarge {
+		normalizedStatus = http.StatusBadRequest
+		failure.HTTPStatus, failure.OuterStatus = normalizedStatus, statusCode
+		failure.Kind, failure.Scope, failure.Retryable = failurecontract.InvalidRequest, failurecontract.ScopeRequest, false
+		failure.SemanticCode, failure.SemanticType = errorCode, "invalid_request_error"
+	}
 	result := statusErr{
 		code:               normalizedStatus,
 		providerStatusCode: statusCode,

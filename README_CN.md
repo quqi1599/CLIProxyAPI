@@ -12,6 +12,8 @@
 
 本 fork 包含以下上游仓库中没有的增强功能：
 
+2026-10-20 本地补充 Codex 长度拒绝的请求级分类和脱敏字段诊断，阻止该类错误在流内被当作渠道故障重试；范围与验证见[长度错误分类与诊断](docs/codex-length-error-diagnostics-20261020_CN.md)。
+
 ### 通过 Gemini 实现 Web 搜索支持 (Antigravity)
 
 为 Antigravity 提供商启用基于 Gemini googleSearch 工具的网络搜索能力：

@@ -73,6 +73,7 @@ type Failure struct {
 	// downstream client. Such failures must never be replayed automatically.
 	OutputCommitted   bool
 	UpstreamRequestID string
+	ErrorDiagnostic   UpstreamErrorDiagnostic
 	// RetryAfter is nil when no delay was supplied; a non-nil zero requests an immediate retry.
 	RetryAfter    *time.Duration
 	Retryable     bool
@@ -186,6 +187,7 @@ func Classify(err error) *Failure {
 	}
 	if typed, ok := As(err); ok {
 		classified := *typed
+		classified.ErrorDiagnostic = typed.ErrorDiagnostic.Normalized()
 		if classified.HTTPStatus <= 0 {
 			classified.HTTPStatus = legacyHTTPStatus(err)
 		}
