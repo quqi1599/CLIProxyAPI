@@ -89,6 +89,7 @@ var logFieldOrder = []string{
 	"stream_output_tokens", "stream_output_tokens_observed", "output_tokens", "tokens_per_second",
 	"client_gone", "cancel_origin", "finish_reason",
 	"error_type", "upstream_status", "upstream_error_code", "upstream_error_reason", "upstream_error_field", "route_plan",
+	"upstream_error_param", "upstream_reported_max_length", "upstream_reported_actual_length", "upstream_length_unit",
 }
 
 // Format renders a single log entry with custom formatting.

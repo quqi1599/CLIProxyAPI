@@ -102,3 +102,42 @@ func TestFailureMetadataLoggerDoesNotEmitDiagnosticsForSuccess(t *testing.T) {
 		t.Fatal("successful request emitted a failure diagnostic")
 	}
 }
+
+func TestFailureMetadataLoggerProductionFormatRetainsLengthDiagnostics(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput, oldFormatter, oldLevel := logger.Out, logger.Formatter, logger.Level
+	log.SetOutput(&buf)
+	log.SetFormatter(&internallogging.LogFormatter{})
+	log.SetLevel(log.WarnLevel)
+	t.Cleanup(func() {
+		log.SetOutput(oldOutput)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	})
+	maximum, actual := int64(64), int64(85)
+	for _, unit := range []string{"", "characters"} {
+		buf.Reset()
+		(&FailureMetadataLogger{}).HandleUsage(context.Background(), coreusage.Record{
+			Model: "gpt-fixture", Failed: true, ErrorCode: "string_above_max_length",
+			Fail: coreusage.Failure{
+				Canonical: true, StatusCode: http.StatusBadRequest,
+				Kind: "invalid_request", Scope: "request", SemanticCode: "string_above_max_length",
+				Body: "private-upstream-prose", UpstreamErrorParam: "input[42].call_id",
+				UpstreamReportedMaxLength: &maximum, UpstreamReportedActualLength: &actual,
+				UpstreamLengthUnit: unit,
+			},
+		})
+		for _, field := range []string{"upstream_error_param=input[].call_id", "upstream_reported_max_length=64", "upstream_reported_actual_length=85"} {
+			if !strings.Contains(buf.String(), field) {
+				t.Fatalf("production formatter dropped %s: %s", field, buf.String())
+			}
+		}
+		if strings.Contains(buf.String(), "upstream_length_unit=") != (unit != "") {
+			t.Fatalf("production formatter changed unit presence: %s", buf.String())
+		}
+		if strings.Contains(buf.String(), "private-upstream-prose") || strings.Contains(buf.String(), "input[42]") {
+			t.Fatalf("production formatter leaked uncontrolled diagnostic data")
+		}
+	}
+}
