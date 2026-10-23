@@ -470,7 +470,7 @@ func classifyCodexFailureSemantics(failure *failurecontract.Failure, message str
 		failure.HTTPStatus = http.StatusBadRequest
 		failure.Kind = failurecontract.InvalidThinkingHistory
 		failure.Scope = failurecontract.ScopeRequest
-	case identifierIs("content_policy_violation", "data_inspection_failed", "datainspectionfailed", "policy_denied"):
+	case identifierIs("content_policy_violation", "data_inspection_failed", "datainspectionfailed", "policy_denied", "cyber_policy"):
 		if code == "" {
 			code = "content_policy_violation"
 		}
