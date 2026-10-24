@@ -72,7 +72,7 @@ func GetCodexProModels() []*ModelInfo {
 
 // GetKimiModels returns the standard Kimi (Moonshot AI) model definitions.
 func GetKimiModels() []*ModelInfo {
-	return cloneModelInfos(getModels().Kimi)
+	return withKimiCodeBuiltins(cloneModelInfos(getModels().Kimi))
 }
 
 // GetAntigravityModels returns the standard Antigravity model definitions.
@@ -306,6 +306,9 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 func LookupStaticModelInfo(modelID string) *ModelInfo {
 	if modelID == "" {
 		return nil
+	}
+	if info := KimiCodeModelInfo(modelID); info != nil {
+		return info
 	}
 
 	data := getModels()

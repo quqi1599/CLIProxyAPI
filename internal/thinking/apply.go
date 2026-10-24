@@ -173,6 +173,9 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	if fromFormat == "" {
 		fromFormat = providerFormat
 	}
+	if providerFormat == "openai-response" && IsKimiCodeModel(model) {
+		providerFormat = "codex"
+	}
 	// 1. Route check: Get provider applier
 	applier := GetProviderApplier(providerFormat)
 	if applier == nil {
@@ -186,6 +189,13 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// 2. Parse suffix and get modelInfo
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
+	if IsKimiCodeModel(baseModel) && (providerFormat == "openai" || providerFormat == "kimi" || providerFormat == "claude" || providerFormat == "codex") {
+		var sourceBody []byte
+		if len(sourceBodies) > 0 {
+			sourceBody = sourceBodies[0]
+		}
+		return applyKimiCodeThinking(body, suffixResult, fromFormat, providerFormat, sourceBody, applier)
+	}
 	if IsMiniMaxM31Model(baseModel) && (providerFormat == "openai" || providerFormat == "claude" || providerFormat == "codex") {
 		var sourceBody []byte
 		if len(sourceBodies) > 0 {

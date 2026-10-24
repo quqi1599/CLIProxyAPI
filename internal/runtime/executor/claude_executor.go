@@ -405,6 +405,12 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind, plan.providerIdentity.BaseHost)
 	beforePayloadConfig := body
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if thinking.IsKimiCodeModel(baseModel) && !bytes.Equal(beforePayloadConfig, body) {
+		body, err = thinking.ApplyThinking(body, baseModel, "claude", "claude", e.Identifier())
+		if err != nil {
+			return plan, err
+		}
+	}
 	if plan.providerIdentity.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(beforePayloadConfig, body) {
 		body, err = thinking.ApplyThinking(body, baseModel, "claude", "claude", e.Identifier())
 		if err != nil {

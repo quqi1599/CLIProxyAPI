@@ -30,7 +30,7 @@ import (
 const kimiRequestPlanTransformStage = "request_plan.kimi"
 const openAICompatReasoningUnavailable = "[reasoning unavailable]"
 
-// KimiExecutor is a stateless executor for Kimi API using OpenAI-compatible chat completions.
+// KimiExecutor supports chat completions and native Coding Plan Responses.
 type KimiExecutor struct {
 	ClaudeExecutor
 	cfg *config.Config
@@ -118,8 +118,38 @@ func resolveKimiBaseURL(auth *cliproxyauth.Auth) string {
 	return baseURL
 }
 
+// nativeResponsesAuth adapts existing Kimi credentials and headers to the shared
+// Responses executor without mutating stored authentication or changing identity.
+func (e *KimiExecutor) nativeResponsesAuth(auth *cliproxyauth.Auth, stream bool) *cliproxyauth.Auth {
+	adapted := &cliproxyauth.Auth{Provider: "kimi"}
+	if auth != nil {
+		adapted = auth.Clone()
+	}
+	if adapted.Attributes == nil {
+		adapted.Attributes = make(map[string]string)
+	}
+	adapted.Attributes["base_url"] = resolveKimiBaseURL(auth) + "/v1"
+	adapted.Attributes["api_key"] = kimiCreds(auth)
+	adapted.Attributes["compat_kind"] = "kimi"
+	request := &http.Request{Header: make(http.Header)}
+	applyKimiHeadersWithAuth(request, kimiCreds(auth), stream, auth)
+	util.ApplyCustomHeadersFromAttrs(request, adapted.Attributes)
+	for name := range adapted.Attributes {
+		if strings.HasPrefix(name, "header:") {
+			delete(adapted.Attributes, name)
+		}
+	}
+	for name, values := range request.Header {
+		adapted.Attributes["header:"+name] = strings.Join(values, ", ")
+	}
+	return adapted
+}
+
 // Execute performs a non-streaming chat completion request to Kimi.
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.Alt == "" && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && thinking.IsKimiCodeModel(req.Model) {
+		return NewOpenAICompatExecutor("kimi", e.cfg).Execute(ctx, e.nativeResponsesAuth(auth, false), req, opts)
+	}
 	originalTransformContext := ctx
 	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
 	if errAdmission != nil {
@@ -167,7 +197,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier(), originalPayloadSource)
 	if err != nil {
 		return resp, err
 	}
@@ -252,6 +282,9 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 // ExecuteStream performs a streaming chat completion request to Kimi.
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.Alt == "" && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && thinking.IsKimiCodeModel(req.Model) {
+		return NewOpenAICompatExecutor("kimi", e.cfg).ExecuteStream(ctx, e.nativeResponsesAuth(auth, true), req, opts)
+	}
 	originalTransformContext := ctx
 	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
 	if errAdmission != nil {
@@ -298,7 +331,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), "kimi", e.Identifier(), originalPayloadSource)
 	if err != nil {
 		return nil, err
 	}
@@ -874,6 +907,13 @@ func sanitizeKimiOpenAICompatibleRequestBody(body []byte) ([]byte, error) {
 }
 
 func sanitizeKimiOpenAICompatibleRequestBodyForModel(body []byte, model string, baseURL string) ([]byte, error) {
+	if thinking.IsKimiCodeModel(model) {
+		var err error
+		body, err = thinking.ApplyThinking(body, thinking.ParseSuffix(model).ModelName, "openai", "kimi", "kimi")
+		if err != nil {
+			return body, err
+		}
+	}
 	profile := openAICompatProfileForKind("kimi")
 	body = scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
 	return body, nil
@@ -1438,6 +1478,9 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
 // stripKimiPrefix removes the "kimi-" prefix from model names for the upstream API.
 func stripKimiPrefix(model string) string {
 	model = strings.TrimSpace(model)
+	if thinking.IsKimiCodeModel(model) {
+		return model
+	}
 	if strings.HasPrefix(strings.ToLower(model), "kimi-") {
 		return model[5:]
 	}

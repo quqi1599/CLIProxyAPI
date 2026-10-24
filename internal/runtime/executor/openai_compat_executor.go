@@ -208,7 +208,7 @@ func openAICompatModelSupportsNativeResponses(profile openAICompatProfile, model
 			strings.HasPrefix(modelName, "qwen3.8-") ||
 			strings.HasPrefix(modelName, "qwen3-max")
 	case "kimi":
-		return modelName == "kimi-k3" || strings.HasPrefix(modelName, "kimi-k3-") ||
+		return thinking.IsKimiCodeModel(modelName) || modelName == "kimi-k3" || strings.HasPrefix(modelName, "kimi-k3-") ||
 			modelName == "kimi-k2.8" || strings.HasPrefix(modelName, "kimi-k2.8-")
 	case "xiaomi":
 		return isXiaomiMimoV25Model(modelName)
@@ -1239,6 +1239,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	body, err = helps.PreserveMiniMaxM3ThinkingOff(baseURL, req.Model, from.String(), plan.requestSource, body)
 	if err != nil {
 		return plan, err
+	}
+	if profile.Kind == "kimi" && thinking.IsKimiCodeModel(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
+		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "kimi", configuredBody)
+		if err != nil {
+			return plan, err
+		}
 	}
 	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
 		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "minimax")
