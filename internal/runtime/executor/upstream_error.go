@@ -75,7 +75,37 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 		}
 	}
 	if len(providerKind) > 0 {
-		return withMiniMaxRejectionDiagnostic(result, providerKind[0], body)
+		result = withMiniMaxRejectionDiagnostic(result, providerKind[0], body)
+		return withKimiRejectionDiagnostic(result, providerKind[0], body)
+	}
+	return result
+}
+
+func withKimiRejectionDiagnostic(result statusErr, kind string, body []byte) statusErr {
+	if kind != "kimi" || (result.ProviderStatusCode() != http.StatusBadRequest && result.ProviderStatusCode() != http.StatusUnprocessableEntity) {
+		return result
+	}
+	switch result.errorCode {
+	case "", "invalid_request", "invalid_request_error", "bad_request_error":
+	default:
+		return result
+	}
+	if result.failure != nil && (result.failure.Kind != failurecontract.InvalidRequest || result.failure.Scope != failurecontract.ScopeRequest || result.failure.OutputCommitted) {
+		return result
+	}
+	code, param, message := failurecontract.KimiRejectionDiagnostic(upstreamJSONErrorBody(body))
+	if code == "" {
+		return result
+	}
+	// Keep the provider's status, headers and retry hint for diagnostics. The
+	// recognized request rejection must not trigger credential rotation.
+	result.errorCode, result.msg = code, message
+	result.failure = &failurecontract.Failure{
+		Kind: failurecontract.InvalidRequest, Scope: failurecontract.ScopeRequest,
+		HTTPStatus: result.code, OuterStatus: result.ProviderStatusCode(),
+		ProviderCode: code, SemanticCode: code, SemanticType: "invalid_request_error",
+		Retryable: false, RetryAfter: result.retryAfter, PublicMessage: message,
+		ErrorDiagnostic: failurecontract.UpstreamErrorDiagnostic{Param: param}.Normalized(),
 	}
 	return result
 }

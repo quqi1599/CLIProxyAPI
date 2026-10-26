@@ -198,7 +198,7 @@ func upstreamErrorParameter(param string) string {
 			switch name {
 			case "content", "role", "type", "text", "image_url", "url", "detail", "input_audio", "audio", "data",
 				"mime_type", "function", "name", "parameters", "input_schema", "strict", "description", "arguments",
-				"id", "call_id", "tool_call_id", "tool_use_id", "tool_calls", "reasoning", "effort", "summary", "enabled",
+				"id", "call_id", "tool_call_id", "tool_use_id", "tool_calls", "reasoning", "reasoning_content", "effort", "summary", "enabled",
 				"format", "json_schema", "schema", "max_tokens", "budget_tokens":
 			default:
 				return strings.Join(result, ".")

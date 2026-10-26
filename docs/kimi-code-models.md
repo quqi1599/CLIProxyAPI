@@ -45,6 +45,10 @@ For adjustable models, `ultra/max/xhigh` map to `max`, `high/medium` to `high`, 
 
 Only root-level thinking controls are normalized. Returned reasoning, encrypted reasoning items, tool history and schema numbers are retained. Legacy `kimi-k3` Moonshot behavior is unchanged; it is not the Coding Plan `k3` ID. Existing K2 sampling compatibility is retained.
 
+Coding Plan `k3` also requires `temperature=1`. Explicit temperature values are normalized after payload overrides, while the requested effort and response format remain intact. A synthetic Coding Plan request confirmed that temperature 0 is rejected and temperature 1 completes successfully. This sampling rule does not change native Responses payloads or infer sampling support for K3.1.
+
+Known Kimi request rejections now retain fixed reason codes and reviewed field names in failure metadata. Raw upstream prose, tool names, URLs, credentials and client content are not recorded. Unknown errors keep the existing sanitized diagnostics; these labels do not enable retries or credential rotation.
+
 For Claude Code's documented 1M mode, map `k3.1-pro[1m]` explicitly if using that client ID; see the [official Claude Code setup](https://www.kimi.com/code/docs/third-party-tools/claude-code.html). This does not grant 1M account permission. Start a new session when changing model families, and avoid changing effort repeatedly within a session.
 
 ## Local verification

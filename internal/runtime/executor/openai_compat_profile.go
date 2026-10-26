@@ -508,7 +508,9 @@ func scrubOpenAICompatPayloadAfterProviderQuirksMode(payload []byte, profile ope
 
 func scrubKimiPayloadForModel(payload []byte, model string) []byte {
 	if thinking.IsKimiCodeModel(model) {
-		if requiresKimiForCodingCompatibility(model) {
+		// Coding Plan K3 still requires temperature=1. Keep its published
+		// effort controls instead of applying the legacy Moonshot K3 scrub.
+		if requiresKimiForCodingCompatibility(model) || requiresKimiK3Compatibility(model) {
 			return normalizeKimiForCodingTemperature(payload)
 		}
 		return payload
@@ -4053,7 +4055,8 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 		headers:            headers.Clone(),
 		failure:            failure,
 	}
-	return withMiniMaxRejectionDiagnostic(result, profile.Kind, body)
+	result = withMiniMaxRejectionDiagnostic(result, profile.Kind, body)
+	return withKimiRejectionDiagnostic(result, profile.Kind, body)
 }
 
 func (p openAICompatProfile) KindOrFallback(auth *cliproxyauth.Auth) string {
