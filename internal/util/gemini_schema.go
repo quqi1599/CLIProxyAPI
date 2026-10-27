@@ -26,22 +26,22 @@ var unsupportedSchemaKeywords = keywordSet(append(append([]string(nil), unsuppor
 
 // CleanJSONSchemaForAntigravity transforms a JSON schema to be compatible with Antigravity API.
 func CleanJSONSchemaForAntigravity(jsonStr string) string {
-	return cleanJSONSchema(jsonStr, true)
+	return cleanJSONSchema(jsonStr, true, true)
 }
 
 // CleanJSONSchemaForGemini transforms a JSON schema to be compatible with Gemini tool calling.
 func CleanJSONSchemaForGemini(jsonStr string) string {
-	return cleanJSONSchema(jsonStr, false)
+	return cleanJSONSchema(jsonStr, false, true)
 }
 
 // cleanJSONSchema parses and encodes once so schema size does not multiply transformation cost.
-func cleanJSONSchema(jsonStr string, addPlaceholder bool) string {
+func cleanJSONSchema(jsonStr string, addPlaceholder, stringifyEnums bool) string {
 	root, ok := decodeSchema(jsonStr)
 	if !ok {
 		return jsonStr
 	}
 
-	root = addCompatibilityHints(root)
+	root = addCompatibilityHints(root, stringifyEnums)
 	root = mergeAllOf(root)
 	root = flattenComposition(root, "anyOf")
 	root = flattenComposition(root, "oneOf")
@@ -76,15 +76,15 @@ func decodeSchema(jsonStr string) (any, bool) {
 	return root, true
 }
 
-func addCompatibilityHints(value any) any {
+func addCompatibilityHints(value any, stringifyEnums bool) any {
 	switch current := value.(type) {
 	case []any:
 		for i := range current {
-			current[i] = addCompatibilityHints(current[i])
+			current[i] = addCompatibilityHints(current[i], stringifyEnums)
 		}
 		return current
 	case map[string]any:
-		walkObjectChildren(current, addCompatibilityHints)
+		walkObjectChildren(current, func(child any) any { return addCompatibilityHints(child, stringifyEnums) })
 
 		if ref, exists := current["$ref"]; exists {
 			refValue := valueString(ref)
@@ -104,7 +104,7 @@ func addCompatibilityHints(value any) any {
 				current["enum"] = []any{constant}
 			}
 		}
-		if values, ok := current["enum"].([]any); ok {
+		if values, ok := current["enum"].([]any); ok && stringifyEnums {
 			stringsOnly := make([]any, len(values))
 			for i, item := range values {
 				stringsOnly[i] = valueString(item)

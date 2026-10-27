@@ -70,6 +70,13 @@ jobs:
               run.head_repository?.full_name === context.repo.owner + '/' + context.repo.repo);
             if (!trusted) core.setFailed('No successful trusted-ci for this exact SHA');
 
+      - name: Isolate Docker registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker_config="$RUNNER_TEMP/cliproxy-docker-config-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          install -d -m 700 "$docker_config"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

@@ -31,13 +31,13 @@ func cleanJSONSchemaForStrictUpstream(jsonStr string, requireAllObjectProperties
 		return fallback
 	}
 
-	jsonStr = CleanJSONSchemaForGemini(jsonStr)
+	jsonStr = cleanJSONSchema(jsonStr, false, false)
 	if !gjson.Valid(jsonStr) {
 		return fallback
 	}
 
-	var parsed any
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+	parsed, ok := decodeSchema(jsonStr)
+	if !ok {
 		return fallback
 	}
 
@@ -94,6 +94,11 @@ func normalizeStrictSchemaNode(node any) any {
 	case map[string]any:
 		normalized := make(map[string]any, len(value))
 		for key, raw := range value {
+			if members, ok := raw.([]any); key == "enum" && ok {
+				// Enum members are JSON values; preserve their types and null entries.
+				normalized[key] = members
+				continue
+			}
 			if key == "properties" {
 				normalized[key] = normalizeStrictSchemaProperties(raw)
 				continue
