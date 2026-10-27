@@ -145,7 +145,7 @@ func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
 		transport = http.DefaultTransport
 	}
 	tracked.Transport = usageTTFTRoundTripper{
-		base:     transport,
+		base:     cliproxyauth.WrapGatewayRetryTransport(transport),
 		reporter: r,
 	}
 	return &tracked

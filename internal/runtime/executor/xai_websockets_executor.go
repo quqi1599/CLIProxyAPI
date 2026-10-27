@@ -973,7 +973,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		sess.setActive(readCh)
 	}
 
-	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+	if errSend := writeCodexWebsocketMessage(ctx, sess, conn, wsReqBody); errSend != nil {
 		errSend = mapXAIWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
@@ -1016,7 +1016,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			logXAIWebsocketRequest(executionSessionID, authID, wsURL, wsReqBodyRetry)
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
-			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
+			if errSendRetry := writeCodexWebsocketMessage(ctx, sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)

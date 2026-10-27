@@ -389,6 +389,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if msg != nil && msg.Addon != nil {
 		handlers.WriteErrorAddonHeaders(c.Writer.Header(), msg.Addon, handlers.PassthroughHeadersEnabled(h.Cfg))
 	}
+	handlers.WriteGatewayRetryHeaders(c, msg, status)
 
 	body, err := json.Marshal(claudeErrorFromStatusText(status, errText))
 	if err != nil {

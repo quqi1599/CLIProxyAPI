@@ -904,6 +904,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		newCtx = logging.WithEndpointParts(newCtx, endpointMethod, endpointPath)
 	}
 	newCtx = coreauth.WithStreamSummaryTracking(newCtx)
+	newCtx = withGatewayRetryEvidence(c, newCtx)
 	newCtx = logging.WithToolStreamRepairTracking(newCtx)
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
@@ -2662,6 +2663,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		previous = existingBytes
 	}
 	status, errText = NormalizeKnownUserError(status, errText, previous)
+	WriteGatewayRetryHeaders(c, msg, status)
 
 	LogContextWindowExceededEvent(c, status, errText, h.AuthManager)
 	var originalError error

@@ -576,7 +576,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.clearActive(readCh)
 	}
 
-	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+	if errSend := writeCodexWebsocketMessage(ctx, sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil {
 			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -614,7 +614,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				})
 				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 				reporter.StartResponseTTFT()
-				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
+				if errSendRetry := writeCodexWebsocketMessage(ctx, sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBody = wsReqBodyRetry
 					if respHSRetry != nil {
@@ -918,7 +918,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		sess.setActive(readCh)
 	}
 
-	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+	if errSend := writeCodexWebsocketMessage(ctx, sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
@@ -962,7 +962,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
-			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
+			if errSendRetry := writeCodexWebsocketMessage(ctx, sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)
@@ -1183,12 +1183,13 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	return conn, resp, err
 }
 
-func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
-	if sess != nil {
-		return sess.writeMessage(conn, websocket.TextMessage, payload)
-	}
+func writeCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
 	if conn == nil {
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
+	}
+	cliproxyauth.ObserveGatewayWebsocketSend(ctx)
+	if sess != nil {
+		return sess.writeMessage(conn, websocket.TextMessage, payload)
 	}
 	return conn.WriteMessage(websocket.TextMessage, payload)
 }

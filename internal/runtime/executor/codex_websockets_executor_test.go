@@ -79,7 +79,8 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
-	ctx := internalpayload.WithTransformReport(context.Background(), int64(len(req.Payload)))
+	ctx, evidence := cliproxyauth.WithGatewayRetryEvidence(context.Background(), nil)
+	ctx = internalpayload.WithTransformReport(ctx, int64(len(req.Payload)))
 	releaseReport := internalpayload.RetainTransformReport(ctx)
 	if _, err := exec.Execute(ctx, auth, req, opts); err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -99,6 +100,9 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		t.Fatal("timed out waiting for upstream websocket payload")
 	}
 	assertTransformStageContract(t, ctx, releaseReport, "request_plan.codex.websocket", upstreamRequestBytes)
+	if n, reason := evidence.Snapshot(nil); n != 1 || reason != "accepted_outcome_unknown" {
+		t.Fatalf("websocket model dispatch evidence = %d/%s", n, reason)
+	}
 }
 
 func TestCodexWebsocketsExecuteContextManagementRestoresRequestAndValidatesOutput(t *testing.T) {
@@ -298,10 +302,11 @@ func TestCodexWebsocketsExecuteStreamHandshakeErrorReturnsWithoutLockingSession(
 		},
 	}
 
+	ctx, evidence := cliproxyauth.WithGatewayRetryEvidence(context.Background(), nil)
 	for i := 0; i < 2; i++ {
 		done := make(chan error, 1)
 		go func() {
-			_, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+			_, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
 				Model:   "gpt-5.4",
 				Payload: []byte(`{"model":"gpt-5.4","input":[{"type":"message","id":"msg-1"}]}`),
 			}, opts)
@@ -316,6 +321,9 @@ func TestCodexWebsocketsExecuteStreamHandshakeErrorReturnsWithoutLockingSession(
 		case <-time.After(5 * time.Second):
 			t.Fatalf("attempt %d timed out; execution session remained locked", i+1)
 		}
+	}
+	if n, reason := evidence.Snapshot(nil); n != 0 || reason != "" {
+		t.Fatalf("handshake invented model dispatch: %d/%s", n, reason)
 	}
 }
 
