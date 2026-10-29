@@ -1749,11 +1749,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
 				translatedLine := internalpayload.CloneBytes(line)
 				eventType := ""
+				responseComplete := false
 				var data []byte
 
 				if bytes.HasPrefix(line, dataTag) {
 					data = bytes.TrimSpace(line[5:])
 					eventType = gjson.GetBytes(data, "type").String()
+					responseComplete = eventType == "response.completed" && helps.CodexResponseCompleted(data)
 					switch eventType {
 					case "response.output_item.done":
 						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
@@ -1851,6 +1853,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					case <-requestCtx.Done():
 						return
 					}
+				}
+				if responseComplete {
+					return
 				}
 			}
 		}

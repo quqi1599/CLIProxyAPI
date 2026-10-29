@@ -41,6 +41,7 @@ docs/*
 !docs/route-pipeline-matrix-20260927.csv
 !docs/responses-routing-safety.md
 !docs/codex-length-error-diagnostics-20261020_CN.md
+!docs/codex-stream-completion-20261030_CN.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

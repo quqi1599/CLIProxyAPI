@@ -214,3 +214,86 @@ func TestCodexExecutorStreamCancelClosesResponseOnce(t *testing.T) {
 		t.Fatalf("response body close count = %d, want 1", got)
 	}
 }
+
+func TestCodexExecutorCompletedStreamClosesWithoutWaitingForConnection(t *testing.T) {
+	for _, format := range []string{"openai-response", "openai", "claude"} {
+		t.Run(format, func(t *testing.T) {
+			const completed = `data: {"type":"response.completed","response":{"id":"resp_terminal_fixture","object":"response","status":"completed","model":"gpt-6.1-sol","output":[{"id":"msg_terminal_fixture","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":17,"output_tokens":3,"total_tokens":20}}}` + "\n\n"
+			body := &codexBlockingBody{closed: make(chan struct{}), prefix: []byte(completed)}
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", codexRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: req}, nil
+			}))
+			result, err := NewCodexExecutor(&config.Config{}).ExecuteStream(ctx, &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}, cliproxyexecutor.Request{
+				Model: "gpt-6.1-sol", Payload: []byte(`{"model":"gpt-6.1-sol","input":"OK","stream":true}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), ResponseFormat: sdktranslator.FromString(format), Stream: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer result.Close()
+			done := make(chan error, 1)
+			go func() {
+				var terminalErr error
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						terminalErr = chunk.Err
+					}
+				}
+				done <- terminalErr
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("completed stream became a failure: %v", err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				result.Close()
+				<-done
+				t.Fatal("completed response still waits for transport EOF or caller cancellation")
+			}
+			if got := body.closes.Load(); got != 1 {
+				t.Fatalf("body closed %d times, want 1", got)
+			}
+		})
+	}
+}
+
+type codexTrailingReadError struct{}
+
+func (codexTrailingReadError) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestCodexExecutorOnlyIgnoresReadFailureAfterConfirmedCompletion(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before_terminal", true: "after_terminal"}[completed], func(t *testing.T) {
+			prefix := `data: {"type":"response.output_text.delta","item_id":"msg_fixture","output_index":0,"content_index":0,"delta":"OK"}` + "\n\n"
+			if completed {
+				prefix += `data: {"type":"response.completed","response":{"id":"resp_fixture","object":"response","status":"completed","output":[{"id":"msg_fixture","type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":17,"output_tokens":3,"total_tokens":20}}}` + "\n\n"
+			}
+			body := &codexCountingBody{Reader: io.MultiReader(strings.NewReader(prefix), codexTrailingReadError{})}
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", codexRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: req}, nil
+			}))
+			result, err := NewCodexExecutor(&config.Config{}).ExecuteStream(ctx, &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "fixture"}}, cliproxyexecutor.Request{Model: "gpt-6.1-sol", Payload: []byte(`{"model":"gpt-6.1-sol","input":"OK"}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var streamErr error
+			var output strings.Builder
+			for chunk := range result.Chunks {
+				output.Write(chunk.Payload)
+				if chunk.Err != nil {
+					streamErr = chunk.Err
+				}
+			}
+			if completed {
+				if streamErr != nil || !strings.Contains(output.String(), `"type":"response.completed"`) {
+					t.Fatalf("completion lost or became a failure: %v", streamErr)
+				}
+			} else if streamErr == nil {
+				t.Fatal("pre-terminal read failure was swallowed")
+			}
+			if body.closes != 1 {
+				t.Fatalf("body closed %d times, want 1", body.closes)
+			}
+		})
+	}
+}
