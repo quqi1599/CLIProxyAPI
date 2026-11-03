@@ -13,34 +13,45 @@ import (
 )
 
 const (
-	auditIdentityVersion = "1"
-	auditHeaderPrefix    = "x-cpa-audit-"
+	auditIdentityVersion           = "1"
+	auditPlaygroundIdentityVersion = "2"
+	auditPlaygroundIdentityKind    = "playground"
+	auditHeaderPrefix              = "x-cpa-audit-"
 
-	auditHeaderVersion     = "X-CPA-Audit-Version"
-	auditHeaderUserID      = "X-CPA-Audit-User-ID"
-	auditHeaderTokenID     = "X-CPA-Audit-Token-ID"
-	auditHeaderTokenName   = "X-CPA-Audit-Token-Name"
-	auditHeaderRequestID   = "X-CPA-Audit-Request-ID"
-	auditHeaderTimestamp   = "X-CPA-Audit-Timestamp"
-	auditHeaderModel       = "X-CPA-Audit-Model"
-	auditHeaderChannelTest = "X-CPA-Audit-Channel-Test"
-	auditHeaderSignature   = "X-CPA-Audit-Signature"
+	auditHeaderVersion      = "X-CPA-Audit-Version"
+	auditHeaderUserID       = "X-CPA-Audit-User-ID"
+	auditHeaderTokenID      = "X-CPA-Audit-Token-ID"
+	auditHeaderTokenName    = "X-CPA-Audit-Token-Name"
+	auditHeaderRequestID    = "X-CPA-Audit-Request-ID"
+	auditHeaderTimestamp    = "X-CPA-Audit-Timestamp"
+	auditHeaderModel        = "X-CPA-Audit-Model"
+	auditHeaderChannelTest  = "X-CPA-Audit-Channel-Test"
+	auditHeaderSignature    = "X-CPA-Audit-Signature"
+	auditHeaderIdentityKind = "X-CPA-Audit-Identity-Kind"
 )
 
 // Identity is the verified NewAPI customer reference attached to a CPA request.
 type Identity struct {
-	UserID      int64  `json:"user_id,omitempty"`
-	TokenID     int64  `json:"token_id,omitempty"`
-	TokenName   string `json:"token_name,omitempty"`
-	RequestID   string `json:"request_id,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Verified    bool   `json:"verified"`
-	ChannelTest bool   `json:"channel_test,omitempty"`
+	UserID       int64  `json:"user_id,omitempty"`
+	TokenID      int64  `json:"token_id,omitempty"`
+	TokenName    string `json:"token_name,omitempty"`
+	RequestID    string `json:"request_id,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Verified     bool   `json:"verified"`
+	ChannelTest  bool   `json:"channel_test,omitempty"`
+	IdentityKind string `json:"identity_kind,omitempty"`
 }
 
 func identityCanonicalValues(version, timestamp, requestID, userID, tokenID, tokenName, method, path, model, channelTest string) string {
+	return identityCanonicalValuesWithKind(version, timestamp, requestID, userID, tokenID, tokenName, method, path, model, channelTest, "")
+}
+
+func identityCanonicalValuesWithKind(version, timestamp, requestID, userID, tokenID, tokenName, method, path, model, channelTest, identityKind string) string {
 	values := url.Values{}
 	values.Set("channel_test", channelTest)
+	if identityKind != "" {
+		values.Set("identity_kind", identityKind)
+	}
 	values.Set("method", strings.ToUpper(strings.TrimSpace(method)))
 	values.Set("model", model)
 	values.Set("path", path)
@@ -66,7 +77,7 @@ func hasIdentityHeaders(header http.Header) bool {
 func StripIdentityHeaders(header http.Header) {
 	for name := range header {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), auditHeaderPrefix) {
-			header.Del(name)
+			delete(header, name)
 		}
 	}
 }
@@ -89,28 +100,41 @@ func VerifyIdentity(request *http.Request, secret string, required bool, now tim
 	}
 
 	version := strings.TrimSpace(request.Header.Get(auditHeaderVersion))
+	identityKind := strings.TrimSpace(request.Header.Get(auditHeaderIdentityKind))
 	userIDText := strings.TrimSpace(request.Header.Get(auditHeaderUserID))
 	tokenIDText := strings.TrimSpace(request.Header.Get(auditHeaderTokenID))
 	tokenName := sanitizeIdentityText(request.Header.Get(auditHeaderTokenName), 128)
 	requestID := sanitizeIdentityText(request.Header.Get(auditHeaderRequestID), 128)
 	timestampText := strings.TrimSpace(request.Header.Get(auditHeaderTimestamp))
 	model := sanitizeIdentityText(request.Header.Get(auditHeaderModel), 256)
-	channelTest := strings.TrimSpace(request.Header.Get(auditHeaderChannelTest)) == "1"
+	channelTestText := strings.TrimSpace(request.Header.Get(auditHeaderChannelTest))
+	channelTest := channelTestText == "1"
 	channelTestValue := "0"
 	if channelTest {
 		channelTestValue = "1"
 	}
 	signatureText := strings.TrimSpace(request.Header.Get(auditHeaderSignature))
-	if version != auditIdentityVersion {
+	playground := version == auditPlaygroundIdentityVersion
+	if version != auditIdentityVersion && !playground {
 		return Identity{}, fmt.Errorf("unsupported CPA audit identity version")
+	}
+	if playground {
+		if identityKind != auditPlaygroundIdentityKind || (channelTestText != "" && channelTestText != "0") {
+			return Identity{}, fmt.Errorf("invalid CPA audit playground identity")
+		}
+	} else if identityKind != "" {
+		return Identity{}, fmt.Errorf("unexpected CPA audit identity kind")
 	}
 	userID, err := strconv.ParseInt(userIDText, 10, 64)
 	if err != nil || userID < 0 || !channelTest && userID == 0 {
 		return Identity{}, fmt.Errorf("invalid CPA audit user id")
 	}
 	tokenID, err := strconv.ParseInt(tokenIDText, 10, 64)
-	if err != nil || tokenID < 0 || !channelTest && tokenID == 0 {
+	if err != nil || tokenID < 0 || !channelTest && !playground && tokenID == 0 {
 		return Identity{}, fmt.Errorf("invalid CPA audit token id")
+	}
+	if playground && (tokenID != 0 || tokenName != "__playground__") {
+		return Identity{}, fmt.Errorf("invalid CPA audit playground identity")
 	}
 	if requestID == "" {
 		return Identity{}, fmt.Errorf("invalid CPA audit request id")
@@ -137,7 +161,7 @@ func VerifyIdentity(request *http.Request, secret string, required bool, now tim
 	if path == "" {
 		path = "/"
 	}
-	canonical := identityCanonicalValues(
+	canonical := identityCanonicalValuesWithKind(
 		version,
 		timestampText,
 		requestID,
@@ -148,6 +172,7 @@ func VerifyIdentity(request *http.Request, secret string, required bool, now tim
 		path,
 		model,
 		channelTestValue,
+		identityKind,
 	)
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(canonical))
@@ -155,14 +180,30 @@ func VerifyIdentity(request *http.Request, secret string, required bool, now tim
 		return Identity{}, fmt.Errorf("invalid CPA audit signature")
 	}
 	return Identity{
-		UserID:      userID,
-		TokenID:     tokenID,
-		TokenName:   tokenName,
-		RequestID:   requestID,
-		Model:       model,
-		Verified:    true,
-		ChannelTest: channelTest,
+		UserID:       userID,
+		TokenID:      tokenID,
+		TokenName:    tokenName,
+		RequestID:    requestID,
+		Model:        model,
+		Verified:     true,
+		ChannelTest:  channelTest,
+		IdentityKind: identityKind,
 	}, nil
+}
+
+// reviewTenantScope separates signed browser users from API tokens and tests.
+// An empty scope leaves the caller with a unique per-request audit ID.
+func (identity Identity) reviewTenantScope() string {
+	if !identity.Verified || identity.ChannelTest || identity.UserID <= 0 {
+		return ""
+	}
+	if identity.IdentityKind == auditPlaygroundIdentityKind && identity.TokenID == 0 && identity.TokenName == "__playground__" {
+		return fmt.Sprintf("verified-playground:%d", identity.UserID)
+	}
+	if identity.IdentityKind == "" && identity.TokenID > 0 {
+		return fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
+	}
+	return ""
 }
 
 func sanitizeIdentityText(value string, maxRunes int) string {

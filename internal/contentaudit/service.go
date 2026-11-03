@@ -561,8 +561,9 @@ func (s *Service) Middleware() gin.HandlerFunc {
 			MaterialTruncated:  extracted.MaterialTruncated,
 			Continuation:       extracted.Continuation,
 		}
-		if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
-			reviewRequest.TenantScope = fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
+		verifiedTenantScope := identity.reviewTenantScope()
+		if verifiedTenantScope != "" {
+			reviewRequest.TenantScope = verifiedTenantScope
 		}
 		if reviewRequest.Text == "" {
 			reviewRequest.Text = extracted.EnforcementText
@@ -570,7 +571,7 @@ func (s *Service) Middleware() gin.HandlerFunc {
 		if decision.ModelReview && state.modelReview != nil {
 			if state.cfg.ModelReview.Mode == ModelReviewModeShadow {
 				priorityReview := false
-				if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
+				if verifiedTenantScope != "" {
 					priorityReview = decision.Action == RuleActionObserve && state.modelReview.cachedBlockEligible(reviewRequest)
 					modelReview, cachedBlock = state.modelReview.cachedBlock(reviewRequest)
 				}
@@ -697,8 +698,8 @@ func (s *Service) Middleware() gin.HandlerFunc {
 }
 
 func reviewTenantScope(identity Identity) string {
-	if identity.Verified && !identity.ChannelTest && identity.UserID > 0 && identity.TokenID > 0 {
-		return fmt.Sprintf("verified:%d:%d", identity.UserID, identity.TokenID)
+	if scope := identity.reviewTenantScope(); scope != "" {
+		return scope
 	}
 	return "anonymous"
 }
