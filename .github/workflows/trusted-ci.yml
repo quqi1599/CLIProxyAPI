@@ -32,7 +32,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          # Persistent runners retain local Go caches; avoid remote cache restores.
+          cache: false
 
       - name: Test
         run: go test ./...
