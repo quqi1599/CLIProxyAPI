@@ -1513,6 +1513,23 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
+	if helps.IsKimiCodeEndpoint(r.URL) {
+		r.Header.Set("Anthropic-Version", "2023-06-01")
+		r.Header.Set("Accept-Encoding", "identity")
+		r.Header.Set("Accept", "application/json")
+		if stream {
+			r.Header.Set("Accept", "text/event-stream")
+		}
+		if beta := ginHeaders.Get("Anthropic-Beta"); beta != "" {
+			r.Header.Set("Anthropic-Beta", beta)
+		}
+		helps.ApplyKimiCodeClientIdentity(r, ginHeaders.Get("User-Agent"))
+		if auth != nil {
+			util.ApplyCustomHeadersFromAttrs(r, auth.Attributes)
+		}
+		r.Header.Set("Accept-Encoding", "identity")
+		return nil
+	}
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	var deviceProfile helps.ClaudeDeviceProfile
 	if stabilizeDeviceProfile {

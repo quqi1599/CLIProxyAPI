@@ -12,6 +12,31 @@ import (
 
 const kimiInsufficientQuotaMaxAccountsPerRequest = 2
 
+func sameKimiCredential(a, b *Auth) bool {
+	fingerprint := kimiCredentialFingerprint(a)
+	return fingerprint != "" && fingerprint == kimiCredentialFingerprint(b)
+}
+
+// preserveKimiRuntimeState keeps runtime observations across configuration
+// reloads of the same secret. A changed secret or explicit disable is a new
+// lifecycle; neither inherits the previous credential's cooldown.
+func preserveKimiRuntimeState(next, current *Auth, now time.Time) {
+	if next == nil || current == nil || next.Disabled || current.Disabled ||
+		next.Status == StatusDisabled || current.Status == StatusDisabled || !sameKimiCredential(next, current) {
+		return
+	}
+	next.Health = current.Health
+	next.Success, next.Failed, next.recentRequests = current.Success, current.Failed, current.recentRequests
+	if !current.Unavailable || !current.NextRetryAfter.After(now) {
+		return
+	}
+	next.Unavailable = current.Unavailable
+	next.NextRetryAfter = current.NextRetryAfter
+	next.Quota = current.Quota
+	next.LastError = cloneError(current.LastError)
+	next.Status, next.StatusMessage = current.Status, current.StatusMessage
+}
+
 func isKimiCredentialAuth(auth *Auth) bool {
 	if auth == nil {
 		return false

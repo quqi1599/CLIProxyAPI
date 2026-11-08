@@ -80,6 +80,7 @@ var logFieldOrder = []string{
 	"first_event_policy_source", "first_event_timeout_ms", "first_event_max_channels", "first_event_max_rounds",
 	"first_event_wait_budget_ms", "first_event_wait_budget_exhausted", "retry_admission_wait_budget_ms",
 	"retry_pressure_wait_ms", "retry_pressure_permit_limit", "retry_pressure_eligible_routes",
+	"kimi_retry_queue_depth", "kimi_retry_queue_full", "kimi_retry_wait_ms",
 	"retry_pressure_degraded_routes", "retry_pressure_throttled",
 	"final_success", "final_status", "final_error_type", "final_error_code", "final_provider", "final_model", "final_executor",
 	"terminal_outcome", "summary_phase", "http_status",

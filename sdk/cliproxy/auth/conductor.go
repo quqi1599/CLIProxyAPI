@@ -1624,6 +1624,7 @@ type Manager struct {
 	maxRetryCredentials  atomic.Int32
 	maxRetryInterval     atomic.Int64
 	retryQueueDelay      atomic.Int64
+	kimiRetryWaiters     atomic.Int32
 	gptFirstEventTimeout atomic.Int64
 	schedulerHotSyncDue  atomic.Int64
 	translatorRegistry   atomic.Pointer[sdktranslator.Registry]
@@ -5360,11 +5361,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
+		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 &&
+			(!isKimiCredentialAuth(existing) || sameKimiCredential(auth, existing)) {
+			auth.ModelStates = existing.Clone().ModelStates
 		}
 	}
 	now := time.Now()
+	if !m.cooldownDisabledForAuth(auth) {
+		preserveKimiRuntimeState(auth, existing, now)
+	}
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
@@ -5376,7 +5381,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	authClone := auth.Clone()
 	m.mu.Lock()
+	// Persistence runs without m.mu. Retain a quota failure that arrived while
+	// this configuration update was being saved.
+	if !m.cooldownDisabledForAuth(authClone) {
+		preserveKimiRuntimeState(authClone, m.auths[auth.ID], time.Now())
+	}
 	m.auths[auth.ID] = authClone
+	// Publish an immutable snapshot after releasing the manager lock.
+	authClone = authClone.Clone()
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -5385,11 +5397,11 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	m.hook.OnAuthUpdated(ctx, authClone.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
 	}
-	return auth.Clone(), nil
+	return authClone.Clone(), nil
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -7812,7 +7824,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					resetModelState(aliasState, now)
 					applyHealthSuccess(&aliasState.Health, now)
 					aliasState.UpdatedAt = now
-					clearAggregatedAvailability(auth)
+					clearAggregatedAvailabilityUnlessExplicitCredentialCooldown(auth, now)
 				}
 				if !preserveAuthLevelCooldown && !hasModelError(auth, now) {
 					auth.LastError = nil

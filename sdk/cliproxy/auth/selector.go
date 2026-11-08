@@ -1009,6 +1009,11 @@ func spreadChannelBaseKey(auth *Auth) string {
 	if auth == nil {
 		return ""
 	}
+	// Kimi protocol entries are views of one credential's capacity. Adding an
+	// alias must not multiply its traffic share or hide its active requests.
+	if fingerprint := kimiCredentialFingerprint(auth); fingerprint != "" {
+		return "kimi-credential\x00" + fingerprint
+	}
 	if key := routingChannelBaseKey(auth); key != "" && !strings.HasPrefix(key, "auth\x00") {
 		return key
 	}
@@ -1055,7 +1060,9 @@ func (s *SpreadSelector) pickChannelWeightedLocked(key, model string, now time.T
 			channelKeys = append(channelKeys, channelKey)
 		}
 		group.auths = append(group.auths, auth)
-		if weight := spreadSelectionWeightForRoute(auth, model, now, false, true); weight > group.baseWeight {
+		// Keep enough integer precision for Kimi's default-priority weights to
+		// decrease under load; a weight of one otherwise cannot be downweighted.
+		if weight := spreadSelectionWeightForRoute(auth, model, now, isKimiCredentialAuth(auth), true); weight > group.baseWeight {
 			group.baseWeight = weight
 		}
 		if auth != nil && strings.TrimSpace(auth.ID) != "" {
@@ -1616,6 +1623,9 @@ func isAuthBlockedForModelRoute(auth *Auth, model string, now time.Time, gptRout
 				}
 				if state.Unavailable {
 					if state.NextRetryAfter.IsZero() {
+						if authBlocked {
+							return true, authReason, authNext
+						}
 						return false, blockReasonNone, time.Time{}
 					}
 					if state.NextRetryAfter.After(now) {
@@ -1625,6 +1635,9 @@ func isAuthBlockedForModelRoute(auth *Auth, model string, now time.Time, gptRout
 						}
 						if next.Before(now) {
 							next = now
+						}
+						if authBlocked && !authNext.Before(next) {
+							return true, authReason, authNext
 						}
 						if state.Quota.Exceeded {
 							return true, blockReasonCooldown, next

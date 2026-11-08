@@ -51,6 +51,35 @@ Known Kimi request rejections now retain fixed reason codes and reviewed field n
 
 For Claude Code's documented 1M mode, map `k3.1-pro[1m]` explicitly if using that client ID; see the [official Claude Code setup](https://www.kimi.com/code/docs/third-party-tools/claude-code.html). This does not grant 1M account permission. Start a new session when changing model families, and avoid changing effort repeatedly within a session.
 
+## Credential scheduling and client identity
+
+Kimi `spread` routing groups protocol aliases by the exact underlying credential,
+so adding an OpenAI/Anthropic entry for the same key does not increase its traffic
+share. Active-request load is shared between those aliases within the selected
+route/model. Different keys from one membership cannot be identified as the same
+account without an explicit account mapping; this change does not infer one.
+
+Configuration reloads of an unchanged Kimi key retain its active cooldown and
+health state. A late success on a model alias cannot clear a current credential
+quota cooldown. Key replacement and explicit cooling/disable controls retain
+their existing lifecycle semantics.
+
+At most 64 Kimi requests per Manager may wait for a retry cooldown concurrently.
+The existing `request-retry` and `max-retry-interval` settings still decide whether
+and how long to wait. Cancellation releases the waiting slot; a full queue
+preserves the current failure. This is a bound on cooldown waiters, not an
+upstream concurrency cap or a FIFO request scheduler. Long quota resets outside
+the retry interval are not queued. Existing insufficient-quota fallback remains
+bounded to two distinct credentials.
+
+On the official HTTPS `/coding` endpoints, compatible OpenAI and Messages
+requests forward the incoming User-Agent (or identify as `CLIProxyAPI` if none
+is usable). Messages requests no longer acquire a synthesized Anthropic OAuth
+device/session fingerprint. Explicit configured headers still take precedence;
+operators should review fixed client-identity overrides separately. The native
+Kimi OAuth executor retains its acquired identity. The [official integration
+guide](https://www.kimi.com/code/docs/en/) requires the tool's real identity.
+
 ## Local verification
 
 Tests cover the thinking source/target protocol matrix, effort aliases/defaults, suffix priority, strict rejection before upstream calls (including payload overrides), exact model IDs, native Responses JSON/SSE, OAuth identity preservation, and unchanged tool/reasoning content and large integer schema literals. Local fake-upstream tests do not verify account permissions or production routing.

@@ -215,11 +215,14 @@ func inferOpenAICompatKindFromBaseURL(rawBaseURL string) string {
 }
 
 func applyOpenAICompatDefaultHeaders(req *http.Request, profile openAICompatProfile) {
-	if req == nil || len(profile.DefaultHeaders) == 0 {
+	if req == nil {
 		return
 	}
 	if req.Header == nil {
 		req.Header = make(http.Header)
+	}
+	if profile.Kind == "kimi" {
+		helps.ApplyKimiCodeClientIdentity(req, getClientUserAgent(req.Context()))
 	}
 	for key, value := range profile.DefaultHeaders {
 		if req.Header.Get(key) != "" {

@@ -27,6 +27,20 @@ func TestLogFormatterPrintsVersionField(t *testing.T) {
 	}
 }
 
+func TestLogFormatterKimiRetryWaitFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Data = log.Fields{"event": "kimi_retry_wait", "kimi_retry_queue_depth": 64, "kimi_retry_queue_full": true, "kimi_retry_wait_ms": 500}
+	formatted, err := (&LogFormatter{}).Format(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range entry.Data {
+		if !strings.Contains(string(formatted), key+"=") {
+			t.Fatalf("missing %s", key)
+		}
+	}
+}
+
 func TestLogFormatterDeepSeekCompatibilityDetails(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Data = log.Fields{

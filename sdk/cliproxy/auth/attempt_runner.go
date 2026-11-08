@@ -101,8 +101,12 @@ attempts:
 			trace.recordEmptyResponseRetry()
 		}
 		wait = runner.manager.effectiveRetryWait(errRun, wait)
-		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+		admitted, errWait := runner.manager.waitForRetryCooldown(ctx, req.Model, wait)
+		if errWait != nil {
 			return managerAttemptOutcome[T]{returnErr: errWait, finalErr: errWait}
+		}
+		if !admitted {
+			break
 		}
 		attempt++
 	}
