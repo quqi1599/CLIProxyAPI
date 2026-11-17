@@ -95,7 +95,7 @@ func extractKimiCodeThinking(body []byte, format string) ThinkingConfig {
 	}
 	// Preserve effort from the original protocol before translators turn it into
 	// a numeric budget or discard it. Null means the model's default.
-	paths := []string{"reasoning_effort", "reasoning.effort", "output_config.effort"}
+	paths := []string{"thinking.effort", "reasoning_effort", "reasoning.effort", "output_config.effort"}
 	if format == "claude" {
 		paths = []string{"output_config.effort", "reasoning_effort", "reasoning.effort"}
 	} else if format == "codex" || format == "openai-response" {

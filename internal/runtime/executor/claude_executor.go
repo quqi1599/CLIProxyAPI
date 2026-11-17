@@ -623,7 +623,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	if preflight.hasTools && plan.oauthToken {
 		plan.bodyForUpstream, plan.oauthToolNamesReverseMap = remapOAuthToolNames(plan.bodyForUpstream)
 	}
-	if preflight.hasTools {
+	if preflight.hasTools && !(plan.providerIdentity.Kind == "kimi" && helps.KimiCodeRequiresThinking(baseModel)) {
 		plan.bodyForUpstream, plan.toolNameSanitization = sanitizeClaudeToolNamesForUpstream(plan.bodyForUpstream)
 	}
 	plan.bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, plan.bodyForUpstream, baseModel)
@@ -732,6 +732,9 @@ func rejectDeepSeekFIMForClaudeRoute(model, requestPath string, body []byte) err
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req.Model, opts); nativeAuth != nil {
+		return NewOpenAICompatExecutor(e.Identifier(), e.cfg).Execute(ctx, nativeAuth, req, opts)
+	}
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -811,6 +814,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req.Model, opts); nativeAuth != nil {
+		return NewOpenAICompatExecutor(e.Identifier(), e.cfg).ExecuteStream(ctx, nativeAuth, req, opts)
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
@@ -4580,6 +4586,11 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	//   -> per-credential settings from auth attributes/metadata
 	//   -> per claude-api-key cloak config
 	cloakMode := "auto"
+	if _, baseURL := claudeCreds(auth); claudeProviderIdentity(auth, baseURL).Kind == "kimi" {
+		// Kimi does not need Anthropic's system prompt or synthetic user ID.
+		// Explicit per-credential cloaking settings still take precedence.
+		cloakMode = "never"
+	}
 	if cfg != nil && cfg.DisableClaudeCloakMode {
 		cloakMode = "never"
 	}

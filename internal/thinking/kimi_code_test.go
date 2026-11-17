@@ -87,6 +87,25 @@ func TestKimiCodeThinkingValidation(t *testing.T) {
 	}
 }
 
+func TestKimiCodeNativeThinkingEffortPriority(t *testing.T) {
+	for _, tc := range []struct{ model, source, want string }{
+		{"k3.1-pro", `{"thinking":{"type":"enabled","effort":"low"},"reasoning_effort":"max"}`, "low"},
+		{"k3.1-pro", `{"thinking":{"effort":"high"},"reasoning_effort":"typo"}`, "high"},
+		{"k3.1-pro", `{"thinking":{"effort":null},"reasoning_effort":"low"}`, "low"},
+		{"k3.1-pro", `{"thinking":{"type":"disabled","effort":"max"}}`, "low"},
+		{"k3.1-pro(max)", `{"thinking":{"effort":"low"}}`, "max"},
+	} {
+		for _, target := range []struct{ format, path string }{{"openai", "reasoning_effort"}, {"kimi", "reasoning_effort"}, {"claude", "output_config.effort"}, {"openai-response", "reasoning.effort"}} {
+			t.Run(tc.model+"/"+tc.source+"/"+target.format, func(t *testing.T) {
+				out, err := thinking.ApplyThinking([]byte(`{}`), tc.model, "openai", target.format, "kimi", []byte(tc.source))
+				if err != nil || gjson.GetBytes(out, target.path).String() != tc.want {
+					t.Fatalf("effort priority: out=%s err=%v want=%s", out, err, tc.want)
+				}
+			})
+		}
+	}
+}
+
 func TestKimiCodeDisabledThinkingUsesLowestSupportedEffort(t *testing.T) {
 	for _, model := range []string{"k3.1-pro", "k3.1-pro-highspeed", "k3.1-pro[1m]", "k3.1-pro-highspeed[1m]"} {
 		for _, control := range []string{

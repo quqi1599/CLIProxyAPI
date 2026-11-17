@@ -308,6 +308,11 @@ func scrubOpenAICompatPostConfigPayload(payload []byte, profile openAICompatProf
 
 func scrubOpenAICompatPostConfigFields(payload []byte, profile openAICompatProfile, model string, baseURL string, endpoint compat.EndpointKind) []byte {
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
+	if compatKind == "kimi" && helps.KimiCodeRequiresThinking(model) {
+		// K3.1 validates its native contract. Do not erase invalid fields or
+		// normalize tools/history using older providers' restrictions.
+		return payload
+	}
 	if compatKind == "kimi" {
 		payload = omitKimiEmptyAssistantToolCallContent(payload)
 		payload = normalizeKimiThinkingConfig(payload, model)
@@ -353,6 +358,11 @@ func scrubOpenAICompatPayloadBeforeProviderQuirksMode(payload []byte, profile op
 		payload = repaired
 	}
 	compatKind := config.NormalizeOpenAICompatibilityKind(profile.Kind)
+	if compatKind == "kimi" && helps.KimiCodeRequiresThinking(model) {
+		// Preserve dynamic definitions, long names, strict schemas and numeric
+		// literals. Shared tool repair would drop or rewrite these fields.
+		return payload
+	}
 	if compatKind == "kimi" {
 		payload = omitKimiEmptyAssistantToolCallContent(payload)
 		payload = normalizeKimiThinkingConfig(payload, model)
