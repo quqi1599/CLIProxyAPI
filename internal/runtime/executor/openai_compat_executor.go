@@ -1240,6 +1240,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	if err != nil {
 		return plan, err
 	}
+	if profile.Kind == "kimi" {
+		body, err = helps.NormalizeKimiCodeToolChoice(body, baseModel, plan.upstreamFormat.String())
+		if err != nil {
+			return plan, err
+		}
+	}
 	if profile.Kind == "kimi" && thinking.IsKimiCodeModel(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
 		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "kimi", configuredBody)
 		if err != nil {

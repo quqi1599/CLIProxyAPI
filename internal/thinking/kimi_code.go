@@ -43,7 +43,9 @@ func applyKimiCodeThinking(body []byte, suffix SuffixResult, fromFormat, toForma
 		}
 	}
 	if config.Mode == ModeNone && !info.Thinking.ZeroAllowed {
-		return body, NewThinkingErrorWithModel(ErrThinkingNotSupported, "K3.1 Pro requires thinking; use low, high or max instead of disabling it", suffix.ModelName)
+		// K3.1 cannot disable thinking. Adapt generic client off switches to its
+		// lowest supported effort before validation and protocol translation.
+		config = ThinkingConfig{Mode: ModeLevel, Level: LevelLow}
 	}
 	if len(info.Thinking.Levels) == 0 {
 		if config.Mode == ModeLevel || (config.Mode == ModeBudget && config.Budget > 0) {

@@ -445,9 +445,10 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	}
 	forcedToolChoiceInput := body
 	miniMaxM31 := plan.providerIdentity.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel)
+	kimiCodeThinking := plan.providerIdentity.Kind == "kimi" && helps.KimiCodeRequiresThinking(baseModel)
 	// MiniMax requires thinking and accepts sampling controls while it is active.
 	// Do not apply Anthropic-only restrictions to the M3.1 compatibility endpoint.
-	if !miniMaxM31 {
+	if !miniMaxM31 && !kimiCodeThinking {
 		body = disableThinkingIfToolChoiceForced(body)
 	}
 	if plan.providerIdentity.Kind == "deepseek" && requiresReturnedThinkingHistory(baseModel) {
@@ -465,6 +466,12 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	providerCompatibilityDowngrades := make([]string, 0, 1)
 	if !bytes.Equal(forcedToolChoiceInput, body) {
 		providerCompatibilityDowngrades = append(providerCompatibilityDowngrades, claudeForcedToolChoiceThinkingDowngrade)
+	}
+	if kimiCodeThinking {
+		body, err = helps.NormalizeKimiCodeToolChoice(body, baseModel, "claude")
+		if err != nil {
+			return plan, err
+		}
 	}
 	if !miniMaxM31 {
 		body = normalizeClaudeTemperatureForThinking(body)

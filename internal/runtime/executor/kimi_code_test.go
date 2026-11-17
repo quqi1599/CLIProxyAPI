@@ -143,12 +143,12 @@ func TestKimiCodeRejectsBeforeUpstream(t *testing.T) {
 					format, path = "openai-response", "reasoning.effort"
 				}
 				if kind == "claude" {
-					format, path = "claude", "thinking.type"
+					format, path = "claude", "output_config.effort"
 				}
-				body := `{"model":"k3.1-pro","messages":[{"role":"user","content":"hello"}],"input":"hello","thinking":{"type":"disabled"}}`
+				body := `{"model":"k3.1-pro","messages":[{"role":"user","content":"hello"}],"input":"hello","reasoning_effort":"typo"}`
 				if override {
 					body = `{"model":"k3.1-pro","messages":[{"role":"user","content":"hello"}],"input":"hello"}`
-					cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "k3.1-pro"}}, Params: map[string]any{path: "disabled"}}}
+					cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "k3.1-pro"}}, Params: map[string]any{path: "typo"}}}
 				}
 				var executor kimiCodeTestExecutor = NewOpenAICompatExecutor("kimi", cfg)
 				if strings.HasPrefix(kind, "dedicated") {
@@ -174,6 +174,95 @@ func TestKimiCodeRejectsBeforeUpstream(t *testing.T) {
 					t.Fatalf("invalid request reached upstream %d times", calls.Load())
 				}
 			})
+		}
+	}
+}
+
+func TestKimiCodeDisabledThinkingWire(t *testing.T) {
+	for _, kind := range []string{"compat-chat", "compat-responses", "dedicated-chat", "dedicated-responses", "claude"} {
+		for _, stream := range []bool{false, true} {
+			for _, override := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stream=%t/override=%t", kind, stream, override), func(t *testing.T) {
+					format, effortPath, endpoint := "openai", "reasoning_effort", "/chat/completions"
+					if strings.HasSuffix(kind, "responses") {
+						format, effortPath, endpoint = "openai-response", "reasoning.effort", "/responses"
+					} else if kind == "claude" {
+						format, effortPath, endpoint = "claude", "output_config.effort", "/messages"
+					}
+					var calls atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						wire, errRead := io.ReadAll(r.Body)
+						if errRead != nil {
+							t.Error(errRead)
+						}
+						if !strings.HasSuffix(r.URL.Path, endpoint) || gjson.GetBytes(wire, effortPath).String() != "low" {
+							t.Errorf("unexpected upstream request: path=%s body=%s", r.URL.Path, wire)
+						}
+						if gjson.GetBytes(wire, "enable_thinking").Exists() || gjson.GetBytes(wire, "thinking.budget_tokens").Exists() || gjson.GetBytes(wire, "thinking.type").String() == "disabled" {
+							t.Errorf("off switch survived normalization: %s", wire)
+						}
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							switch format {
+							case "openai-response":
+								_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-kimi\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n")
+							case "claude":
+								_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-kimi\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"k3.1-pro\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+							default:
+								_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-kimi\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+							}
+							return
+						}
+						w.Header().Set("Content-Type", "application/json")
+						switch format {
+						case "openai-response":
+							_, _ = io.WriteString(w, `{"id":"resp-kimi","object":"response","status":"completed","output":[]}`)
+						case "claude":
+							_, _ = io.WriteString(w, `{"id":"msg-kimi","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+						default:
+							_, _ = io.WriteString(w, `{"id":"chatcmpl-kimi","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+						}
+					}))
+					defer server.Close()
+					cfg := &config.Config{}
+					control := `,"enable_thinking":false,"thinking":{"type":"disabled","budget_tokens":0},"reasoning_effort":"none"`
+					if override {
+						control = ""
+						cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "k3.1-pro"}}, Params: map[string]any{effortPath: "disabled"}}}
+					}
+					var executor kimiCodeTestExecutor = NewOpenAICompatExecutor("kimi", cfg)
+					if strings.HasPrefix(kind, "dedicated") {
+						executor = NewKimiExecutor(cfg)
+					} else if kind == "claude" {
+						executor = NewClaudeExecutor(cfg)
+					}
+					auth := &cliproxyauth.Auth{Provider: "kimi", Attributes: map[string]string{"base_url": server.URL + "/coding/v1", "api_key": "test", "compat_kind": "kimi"}}
+					req := cliproxyexecutor.Request{Model: "k3.1-pro", Payload: []byte(`{"model":"k3.1-pro","messages":[{"role":"user","content":"hello"}],"input":"hello"` + control + `}`)}
+					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(format)}
+					if stream {
+						result, err := executor.ExecuteStream(context.Background(), auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						chunks := 0
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+							chunks++
+						}
+						if chunks == 0 {
+							t.Fatal("stream returned no events")
+						}
+					} else if _, err := executor.Execute(context.Background(), auth, req, opts); err != nil {
+						t.Fatal(err)
+					}
+					if calls.Load() != 1 {
+						t.Fatalf("expected one upstream call, got %d", calls.Load())
+					}
+				})
+			}
 		}
 	}
 }

@@ -45,7 +45,7 @@ func TestKimiCodeThinkingProtocols(t *testing.T) {
 
 func TestKimiCodeThinkingValidation(t *testing.T) {
 	for _, model := range []string{"k3.1-pro", "k3.1-pro-highspeed", "k3.1-pro[1m]"} {
-		for _, control := range []string{`"reasoning_effort":"off"`, `"reasoning":{"effort":"none"}`, `"thinking":{"type":"disabled"}`, `"enable_thinking":false`, `"thinking":{"type":"enabled","budget_tokens":0}`, `"output_config":{"effort":"disabled"}`, `"reasoning_effort":"typo"`, `"reasoning_effort":"auto"`, `"reasoning_effort":123`} {
+		for _, control := range []string{`"reasoning_effort":"typo"`, `"reasoning_effort":"auto"`, `"reasoning_effort":123`} {
 			t.Run(model+control, func(t *testing.T) {
 				body := []byte("{" + control + "}")
 				out, err := thinking.ApplyThinking(body, model, "openai", "openai", "kimi")
@@ -69,7 +69,9 @@ func TestKimiCodeThinkingValidation(t *testing.T) {
 		{"kimi-for-coding-highspeed", `{"reasoning_effort":"low"}`, "", "", true},
 		{"k3.1-pro(low)", `{"thinking":{"type":"disabled"}}`, "reasoning_effort", "low", false},
 		{"k3.1-pro(ultra)", `{}`, "reasoning_effort", "max", false},
-		{"k3.1-pro(off)", `{}`, "", "", true},
+		{"k3.1-pro(off)", `{}`, "reasoning_effort", "low", false},
+		{"k3.1-pro(0)", `{"reasoning_effort":"max"}`, "reasoning_effort", "low", false},
+		{"k3.1-pro(max)", `{"enable_thinking":false}`, "reasoning_effort", "max", false},
 		{"k3.1-pro(unknown)", `{}`, "", "", true},
 	} {
 		t.Run(fmt.Sprint(tc), func(t *testing.T) {
@@ -82,6 +84,47 @@ func TestKimiCodeThinkingValidation(t *testing.T) {
 				t.Fatalf("got %s, %v; want %s", out, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestKimiCodeDisabledThinkingUsesLowestSupportedEffort(t *testing.T) {
+	for _, model := range []string{"k3.1-pro", "k3.1-pro-highspeed", "k3.1-pro[1m]", "k3.1-pro-highspeed[1m]"} {
+		for _, control := range []string{
+			`"reasoning_effort":"off"`, `"reasoning_effort":"none"`, `"reasoning_effort":"disabled"`,
+			`"reasoning":{"effort":"none"}`, `"output_config":{"effort":"disabled"}`,
+			`"thinking":{"type":"disabled"}`, `"thinking":{"type":"off"}`, `"thinking":{"type":"none"}`,
+			`"enable_thinking":false`, `"thinking":{"type":"enabled","budget_tokens":0}`,
+			`"thinking":{"reasoning_effort":"none"}`, `"enable_thinking":false,"reasoning_effort":"max"`,
+		} {
+			for _, target := range []struct{ format, path string }{{"openai", "reasoning_effort"}, {"kimi", "reasoning_effort"}, {"openai-response", "reasoning.effort"}, {"claude", "output_config.effort"}} {
+				t.Run(model+"/"+target.format+"/"+control, func(t *testing.T) {
+					body := []byte(`{"messages":[{"role":"user","content":"hello"}],"input":[{"type":"reasoning","encrypted_content":"opaque","summary":[]}],"tools":[{"name":"lookup","parameters":{"const":9007199254740993}}]}`)
+					source := []byte("{" + control + "}")
+					out, err := thinking.ApplyThinking(body, model, "openai", target.format, "kimi", source)
+					if err != nil || gjson.GetBytes(out, target.path).String() != "low" {
+						t.Fatalf("expected low effort, got %s, %v", out, err)
+					}
+					for _, path := range []string{"messages", "input", "tools"} {
+						if gjson.GetBytes(out, path).Raw != gjson.GetBytes(body, path).Raw {
+							t.Fatalf("%s changed: %s", path, out)
+						}
+					}
+					second, err := thinking.ApplyThinking(out, model, target.format, target.format, "kimi")
+					if err != nil || string(second) != string(out) {
+						t.Fatalf("not idempotent: %s => %s, %v", out, second, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestKimiCodeOlderModelsStillAllowDisabledThinking(t *testing.T) {
+	for _, model := range []string{"k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"} {
+		out, err := thinking.ApplyThinking([]byte(`{"enable_thinking":false}`), model, "openai", "kimi", "kimi")
+		if err != nil || gjson.GetBytes(out, "thinking.type").String() != "disabled" || gjson.GetBytes(out, "reasoning_effort").Exists() {
+			t.Fatalf("%s: disabled thinking changed: %s, %v", model, out, err)
+		}
 	}
 }
 

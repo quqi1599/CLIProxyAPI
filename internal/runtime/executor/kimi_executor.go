@@ -907,6 +907,10 @@ func sanitizeKimiOpenAICompatibleRequestBody(body []byte) ([]byte, error) {
 }
 
 func sanitizeKimiOpenAICompatibleRequestBodyForModel(body []byte, model string, baseURL string) ([]byte, error) {
+	body, err := helps.NormalizeKimiCodeToolChoice(body, model, "openai")
+	if err != nil {
+		return body, err
+	}
 	if thinking.IsKimiCodeModel(model) {
 		var err error
 		body, err = thinking.ApplyThinking(body, thinking.ParseSuffix(model).ModelName, "openai", "kimi", "kimi")

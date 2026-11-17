@@ -1,13 +1,13 @@
 # Kimi Code model compatibility
 
-Verified against the [Kimi Code model documentation](https://www.kimi.com/code/docs/kimi-code/models.html) on 2026-10-24.
+Thinking compatibility checked against the [Kimi Code model documentation](https://www.kimi.com/code/docs/kimi-code/models.html) on 2026-11-17. Other model metadata was verified on 2026-10-24.
 
 Use the exact upstream IDs. Display names and invented aliases can silently select a different model at Kimi. Client-facing aliases must map explicitly to one of these IDs.
 
-| Upstream ID | Maximum context* | Default effort | Thinking off |
+| Upstream ID | Maximum context* | Proxy default effort | Thinking off |
 | --- | ---: | --- | --- |
-| `k3.1-pro` | 1,048,576 | `max` | Rejected locally with HTTP 400 |
-| `k3.1-pro-highspeed` | 1,048,576 | `max` | Rejected locally with HTTP 400 |
+| `k3.1-pro` | 1,048,576 | `max` | Normalized to `low` |
+| `k3.1-pro-highspeed` | 1,048,576 | `max` | Normalized to `low` |
 | `k3` | 1,048,576 | `high` | Kimi routes to non-thinking K2.8 |
 | `k3-256k` | 262,144 | `high` | Kimi routes to non-thinking K2.8 |
 | `kimi-for-coding` | 1,048,576 | `max` | Kimi routes to non-thinking K2.8 |
@@ -41,7 +41,15 @@ For native Anthropic Messages, use a `claude-api-key` entry with `base-url: "htt
 
 Chat uses `reasoning_effort`, Responses uses `reasoning.effort`, and Messages uses `output_config.effort`. Original client controls are read before protocol conversion. Model suffixes such as `k3.1-pro(low)` take precedence over body controls; final payload overrides are validated again.
 
-For adjustable models, `ultra/max/xhigh` map to `max`, `high/medium` to `high`, and `low/minimum/light` to `low`. The proxy also accepts its existing `minimal` level as `low`. Unknown effort values return HTTP 400. K2.7 Code Highspeed rejects explicit effort adjustment. Disabling K3.1 through an effort value, boolean toggle, zero budget or Messages thinking object returns HTTP 400 before contacting the upstream.
+For adjustable models, `ultra/max/xhigh` map to `max`, `high/medium` to `high`, and `low/minimum/light` to `low`. The proxy also accepts its existing `minimal` level as `low`. Unknown effort values return HTTP 400. K2.7 Code Highspeed rejects explicit effort adjustment. For K3.1 Pro and Pro Highspeed (including `[1m]` IDs), disabling thinking through an effort value, boolean toggle, zero budget, model suffix or Messages thinking object is normalized to `low`, the minimum supported effort. This is proxy compatibility behavior: Kimi itself still rejects disabled thinking. The proxy removes conflicting root-level off controls before sending the enabled effort in the target protocol, including after payload overrides. Valid explicit efforts and suffix priority are preserved. Older Coding Plan models retain their supported disabled-thinking behavior.
+
+The proxy retains its existing default `max` for K3.1 when no thinking control is supplied; the current upstream default documented by Kimi is `high`. This compatibility fix does not change the proxy default.
+
+## Forced tool selection
+
+Kimi rejects a named `tool_choice` while thinking is enabled. For K3.1 Pro and Pro Highspeed, the proxy preserves a named function constraint by sending only that function's root-level definition with `required` (Chat/Responses) or `any` (Messages). The requested thinking effort remains enabled, including on Messages routes that previously applied Anthropic's forced-tool thinking removal. With a nonempty tool list, existing `auto`, `none` and required/any controls retain their handling. When root tools are absent, null or empty and there are no dynamic definitions in history, orphan auto/none/required/any controls are removed so the request can produce text without calling tools. A named choice with no matching definition still returns a local 400.
+
+Missing or duplicate named definitions, unsupported tool types, and dynamic tool definitions in history return a request-scoped HTTP 400 before sending. The proxy does not broaden a named choice to other tools, rewrite historical tool calls or invent tool results. Payload overrides receive the same validation. See Kimi's [tool-choice guide](https://platform.kimi.com/docs/guide/use-tool-choice) and [Messages reference](https://platform.kimi.com/docs/api/messages); the exact field value of the November 17 customer rejection was not retained, so local synthetic coverage does not establish recovery of that production request.
 
 Only root-level thinking controls are normalized. Returned reasoning, encrypted reasoning items, tool history and schema numbers are retained. Legacy `kimi-k3` Moonshot behavior is unchanged; it is not the Coding Plan `k3` ID. Existing K2 sampling compatibility is retained.
 
@@ -82,4 +90,4 @@ guide](https://www.kimi.com/code/docs/en/) requires the tool's real identity.
 
 ## Local verification
 
-Tests cover the thinking source/target protocol matrix, effort aliases/defaults, suffix priority, strict rejection before upstream calls (including payload overrides), exact model IDs, native Responses JSON/SSE, OAuth identity preservation, and unchanged tool/reasoning content and large integer schema literals. Local fake-upstream tests do not verify account permissions or production routing.
+Tests cover the thinking source/target protocol matrix, effort aliases/defaults, suffix priority, disabled-to-low normalization and rejection of unknown efforts before upstream calls (including payload overrides), exact model IDs, native Responses JSON/SSE, OAuth identity preservation, and unchanged tool/reasoning content and large integer schema literals. Local fake-upstream tests do not verify account permissions or production routing.
