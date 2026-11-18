@@ -86,7 +86,11 @@ func sanitizeKimiHTTPRequestBody(req *http.Request) error {
 	if errRead != nil {
 		return errRead
 	}
-	updated, err := sanitizeKimiOpenAICompatibleRequestBody(body)
+	baseURL := ""
+	if req.URL != nil && strings.HasSuffix(req.URL.Path, "/v1/chat/completions") {
+		baseURL = req.URL.String()
+	}
+	updated, err := sanitizeKimiOpenAICompatibleRequestBodyForModel(body, gjson.GetBytes(body, "model").String(), baseURL)
 	if err != nil {
 		return err
 	}
@@ -920,7 +924,7 @@ func sanitizeKimiOpenAICompatibleRequestBodyForModel(body []byte, model string, 
 	}
 	profile := openAICompatProfileForKind("kimi")
 	body = scrubOpenAICompatPayloadForModel(body, profile, model, baseURL)
-	return body, nil
+	return helps.NormalizeKimiChatSampling(body, thinking.ParseSuffix(model).ModelName, baseURL)
 }
 
 func omitKimiEmptyAssistantToolCallContent(body []byte) []byte {

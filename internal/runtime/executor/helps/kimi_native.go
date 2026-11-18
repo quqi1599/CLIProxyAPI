@@ -7,6 +7,8 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // KimiCodeNativeOpenAIAuth keeps K3.1 requests in their original protocol when
@@ -37,4 +39,35 @@ func KimiCodeNativeOpenAIAuth(auth *cliproxyauth.Auth, model string, opts clipro
 	adapted.Attributes["base_url"] = endpoint.String()
 	adapted.Attributes["compat_kind"] = "kimi"
 	return adapted
+}
+
+// NormalizeKimiChatSampling runs after thinking and payload overrides. For
+// official K3.1 Chat, let the upstream choose its fixed sampling defaults.
+// Invalid types and out-of-range values remain available to its validator.
+func NormalizeKimiChatSampling(body []byte, baseModel, baseURL string) ([]byte, error) {
+	switch strings.ToLower(baseModel) {
+	case "k3", "k3[1m]":
+		switch gjson.GetBytes(body, "reasoning_effort").String() {
+		case "low", "high", "max":
+			return sjson.DeleteBytes(body, "top_p")
+		}
+	case "k3.1-pro", "k3.1-pro[1m]", "k3.1-pro-highspeed", "k3.1-pro-highspeed[1m]":
+		endpoint, err := url.Parse(baseURL)
+		if err != nil || !IsKimiCodeEndpoint(endpoint) {
+			return body, nil
+		}
+		for _, field := range []struct {
+			name string
+			max  float64
+		}{{"temperature", 2}, {"top_p", 1}} {
+			v := gjson.GetBytes(body, field.name)
+			if v.Type == gjson.Number && v.Float() >= 0 && v.Float() <= field.max {
+				body, err = sjson.DeleteBytes(body, field.name)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return body, nil
 }

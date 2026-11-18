@@ -11,7 +11,7 @@ var kimiMessageSizeError = regexp.MustCompile(`^total message size [0-9]+ exceed
 var kimiTokenLimitError = regexp.MustCompile(`^(invalid request: )?your request exceeded model token limit: [0-9]+ \(requested: [0-9]+\)$`)
 var kimiMissingReasoningError = regexp.MustCompile(`^thinking is enabled but reasoning_content is missing in assistant tool call message at index [0-9]+$`)
 var kimiDuplicateToolError = regexp.MustCompile(`^function name [^\r\n]{1,128} is duplicated$`)
-var kimiParameterError = regexp.MustCompile("^(?:invalid request: )?(?:invalid value for |unsupported |invalid )?[`'\"]?(temperature|top_p|max_tokens|max_completion_tokens|max_output_tokens|reasoning_effort|response_format|tool_choice)[`'\"]?(?:[ .:=]|$)")
+var kimiParameterError = regexp.MustCompile("^(?:invalid request: )?(?:invalid value for |unsupported |invalid )?[`'\"]?(temperature|top_p|max_tokens|max_completion_tokens|max_output_tokens|reasoning_effort|response_format|tool_choice|presence_penalty|frequency_penalty|top_logprobs|logprobs|n)[`'\"]?(?:[ .:=]|$)")
 
 // KimiRejectionDiagnostic recognizes request-validation failures from a bounded,
 // unambiguous error envelope. Outputs are fixed labels, not upstream prose,
@@ -65,7 +65,7 @@ func KimiRejectionDiagnostic(body []byte) (code, param, message string) {
 	}
 	if match := kimiParameterError.FindStringSubmatch(text); match != nil &&
 		(strings.Contains(text, "invalid") || strings.Contains(text, "not supported") || strings.Contains(text, "unsupported") || strings.Contains(text, "must be") || strings.Contains(text, "out of range")) {
-		return "kimi_request_parameter_invalid", match[1], "Kimi rejected a request parameter; check the reported field against the model capabilities"
+		return "kimi_request_parameter_invalid", match[1], "Kimi rejected the request parameter " + match[1] + "; check the supported values for this model"
 	}
 	return "", "", ""
 }

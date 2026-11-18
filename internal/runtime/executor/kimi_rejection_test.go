@@ -53,7 +53,7 @@ func TestKimiRejectionOnChatResponsesAndMessages(t *testing.T) {
 						}
 					}
 					f := failurecontract.Classify(err)
-					if calls != 1 || f == nil || f.SemanticCode != "kimi_request_parameter_invalid" || f.ErrorDiagnostic.Param != "response_format" || f.Scope != failurecontract.ScopeRequest || f.Retryable || strings.Contains(err.Error(), "private-upstream-text") {
+					if calls != 1 || f == nil || f.SemanticCode != "kimi_request_parameter_invalid" || f.ErrorDiagnostic.Param != "response_format" || f.Scope != failurecontract.ScopeRequest || f.Retryable || !strings.Contains(f.PublicMessage, "response_format") || strings.Contains(err.Error(), "private-upstream-text") {
 						t.Fatalf("missing or unsafe diagnostic: calls=%d err=%v failure=%+v", calls, err, f)
 					}
 				})

@@ -46,3 +46,26 @@ func TestKimiNativeAuthEndpointAndCredentialBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeKimiChatSamplingBoundaries(t *testing.T) {
+	const official = "https://api.kimi.ai/coding/v1"
+	const raw = `{"temperature":0,"top_p":1,"reasoning_effort":"high","n":2,"messages":[{"role":"user","content":"temperature top_p"}],"tools":[{"const":9007199254740993}]}`
+	const adapted = `{"reasoning_effort":"high","n":2,"messages":[{"role":"user","content":"temperature top_p"}],"tools":[{"const":9007199254740993}]}`
+	for _, tc := range []struct{ model, base, input, want string }{
+		{"k3.1-pro[1m]", official, raw, adapted},
+		{"k3.1-pro-highspeed", official, raw, adapted},
+		{"k3.1-pro", "https://other.invalid/coding/v1", raw, raw},
+		{"k3.1-pro", "https://api.kimi.ai/v1", raw, raw},
+		{"kimi-for-coding", official, raw, raw},
+		{"k3.1-pro", official, `{"temperature":2.1,"top_p":-0.1}`, `{"temperature":2.1,"top_p":-0.1}`},
+		{"k3.1-pro", official, `{"temperature":"0","top_p":true}`, `{"temperature":"0","top_p":true}`},
+		{"k3.1-pro", official, `{"temperature":1,"top_p":1.1}`, `{"top_p":1.1}`},
+	} {
+		t.Run(tc.model+"/"+tc.base+"/"+tc.input, func(t *testing.T) {
+			got, err := NormalizeKimiChatSampling([]byte(tc.input), tc.model, tc.base)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("got %s, err %v; want %s", got, err, tc.want)
+			}
+		})
+	}
+}

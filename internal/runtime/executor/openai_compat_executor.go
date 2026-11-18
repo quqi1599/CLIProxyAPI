@@ -1252,6 +1252,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 			return plan, err
 		}
 	}
+	if profile.Kind == "kimi" && plan.endpoint == "/chat/completions" {
+		body, err = helps.NormalizeKimiChatSampling(body, baseModel, baseURL)
+		if err != nil {
+			return plan, err
+		}
+	}
 	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(baseModel) && !bytes.Equal(payloadConfigInput, configuredBody) {
 		body, err = thinking.ApplyThinking(body, baseModel, plan.upstreamFormat.String(), plan.upstreamFormat.String(), "minimax")
 		if err != nil {

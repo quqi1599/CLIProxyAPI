@@ -39,7 +39,7 @@ For native Anthropic Messages, use a `claude-api-key` entry with `base-url: "htt
 
 For K3.1 Pro / Pro Highspeed, a `claude-api-key` entry on either official HTTPS Coding Plan host also sends incoming Chat Completions and Responses requests through that host's matching native API. The selected API key, auth identity, proxy and configured headers are retained; only the request-local base path changes to `/coding/v1`. Incoming Messages remain on `/v1/messages`. This adaptation applies only to the exact `/coding` and `/coding/v1` bases, not third-party gateways, Moonshot's separate platform, OAuth-only credentials, unknown model IDs or `/responses/compact`.
 
-K3.1 Chat requests preserve message-level dynamic tool definitions, 128-character tool names, schema strictness and numeric literals, `response_format`, `stop` and sampling controls. The older shared tool repair and schema/name normalization are bypassed so invalid definitions reach Kimi's validator instead of silently becoming a different request. Kimi Messages routes default to no Anthropic system prompt or synthetic user ID; explicit per-credential cloaking settings retain their precedence. Native K3.1 Messages tool names are also passed through for upstream validation. Upstream usage is reported as returned; no fixed token deduction is applied.
+K3.1 Chat requests preserve message-level dynamic tool definitions, 128-character tool names, schema strictness and numeric literals, `response_format`, `stop` and sampling controls other than the fixed Chat sampling settings below. The older shared tool repair and schema/name normalization are bypassed so invalid definitions reach Kimi's validator instead of silently becoming a different request. Kimi Messages routes default to no Anthropic system prompt or synthetic user ID; explicit per-credential cloaking settings retain their precedence. Native K3.1 Messages tool names are also passed through for upstream validation. Upstream usage is reported as returned; no fixed token deduction is applied.
 
 ## Thinking controls
 
@@ -59,7 +59,11 @@ Missing or duplicate named definitions, unsupported tool types, and dynamic tool
 
 Only root-level thinking controls are normalized. Returned reasoning, encrypted reasoning items, tool history and schema numbers are retained. Legacy `kimi-k3` Moonshot behavior is unchanged; it is not the Coding Plan `k3` ID. Existing K2 sampling compatibility is retained.
 
-Coding Plan `k3` also requires `temperature=1`. Explicit temperature values are normalized after payload overrides, while the requested effort and response format remain intact. A synthetic Coding Plan request confirmed that temperature 0 is rejected and temperature 1 completes successfully. This sampling rule does not change native Responses payloads or infer sampling support for K3.1.
+On official Coding Plan Chat Completions, K3.1 Pro and Pro Highspeed omit numeric `temperature` (0–2) and `top_p` (0–1) after request overrides. Kimi then uses its own sampling settings. Clients that depend on adjustable sampling should account for this behavior. Out-of-range values, invalid types, penalties, tools and response formats retain native validation. This also applies to Chat sent through the official Claude API key configuration. Native Responses retain their sampling fields.
+
+For thinking Chat Completions on Coding Plan `k3` (including `k3[1m]`), the proxy drops the optional root `top_p` after payload overrides so the upstream uses its default. The requested effort stays in effect.
+
+Coding Plan `k3` also requires `temperature=1`. Explicit temperature values are normalized after payload overrides, while the requested effort and response format remain intact. A synthetic Coding Plan request confirmed that temperature 0 is rejected and temperature 1 completes successfully. This sampling rule does not change native Responses payloads.
 
 Known Kimi request rejections now retain fixed reason codes and reviewed field names in failure metadata. Raw upstream prose, tool names, URLs, credentials and client content are not recorded. Unknown errors keep the existing sanitized diagnostics; these labels do not enable retries or credential rotation.
 

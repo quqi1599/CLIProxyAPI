@@ -39,8 +39,8 @@ func TestKimiKVVChatWirePreservesContract(t *testing.T) {
 						}
 						for _, path := range []string{"messages", "tools", "tool_choice", "response_format", "temperature", "top_p", "presence_penalty", "frequency_penalty", "max_completion_tokens", "stop"} {
 							expected := gjson.GetBytes(body, path).Raw
-							if override && path == "temperature" {
-								expected = "2"
+							if path == "temperature" || path == "top_p" {
+								expected = ""
 							}
 							if gjson.GetBytes(wire, path).Raw != expected {
 								t.Errorf("%s changed: got %s", path, gjson.GetBytes(wire, path).Raw)
@@ -74,7 +74,7 @@ func TestKimiKVVClaudeRouteNativeResponses(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			e, auth := kimiKVVExecutor("claude", &config.Config{})
-			body := []byte(`{"model":"k3.1-pro","input":[{"type":"reasoning","encrypted_content":"opaque","summary":[]},{"type":"message","role":"user","content":"hello"}],"reasoning":{"effort":"low"},"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"},"strict":true}}}`)
+			body := []byte(`{"model":"k3.1-pro","temperature":0.8,"top_p":0.9,"input":[{"type":"reasoning","encrypted_content":"opaque","summary":[]},{"type":"message","role":"user","content":"hello"}],"reasoning":{"effort":"low"},"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"},"strict":true}}}`)
 			calls := 0
 			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", miniMaxReceiptRoundTripper(func(r *http.Request) (*http.Response, error) {
 				calls++
@@ -82,7 +82,7 @@ func TestKimiKVVClaudeRouteNativeResponses(t *testing.T) {
 				if r.URL.String() != "https://api.kimi.com/coding/v1/responses" {
 					t.Errorf("wrong native endpoint: %s", r.URL)
 				}
-				for _, path := range []string{"input", "reasoning", "text"} {
+				for _, path := range []string{"input", "reasoning", "text", "temperature", "top_p"} {
 					if gjson.GetBytes(wire, path).Raw != gjson.GetBytes(body, path).Raw {
 						t.Errorf("native %s changed: %s", path, gjson.GetBytes(wire, path))
 					}

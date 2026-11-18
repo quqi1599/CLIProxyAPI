@@ -17,6 +17,9 @@ func TestKimiRejectionDiagnostic(t *testing.T) {
 		{"Invalid request: unsupported image url: https://private-customer.invalid/secret", "kimi_image_url_unsupported", "messages[].content[].image_url"},
 		{"temperature must be 1; private-customer", "kimi_request_parameter_invalid", "temperature"},
 		{"Invalid value for 'response_format': private-customer", "kimi_request_parameter_invalid", "response_format"},
+		{"Invalid value for 'frequency_penalty': private-customer", "kimi_request_parameter_invalid", "frequency_penalty"},
+		{"Invalid request: top_logprobs out of range: private-customer", "kimi_request_parameter_invalid", "top_logprobs"},
+		{"Invalid value for 'nested_customer_field': private-customer", "", ""},
 		{"private-customer mentions temperature and invalid", "", ""},
 		{"temperature documentation is helpful", "", ""},
 	} {
@@ -25,6 +28,9 @@ func TestKimiRejectionDiagnostic(t *testing.T) {
 			code, param, message := KimiRejectionDiagnostic(body)
 			if code != tc.code || param != tc.param || strings.Contains(message, "private-customer") {
 				t.Fatalf("unexpected diagnostic: code=%q param=%q message=%q", code, param, message)
+			}
+			if tc.code == "kimi_request_parameter_invalid" && !strings.Contains(message, tc.param) {
+				t.Fatalf("public message does not identify %q: %q", tc.param, message)
 			}
 			if normalized := (UpstreamErrorDiagnostic{Param: param}).Normalized(); normalized.Param != param {
 				t.Fatalf("parameter lost before usage: %q -> %q", param, normalized.Param)
