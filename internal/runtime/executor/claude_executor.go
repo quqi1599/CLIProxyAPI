@@ -344,6 +344,10 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 		plan.baseURL = "https://api.anthropic.com"
 	}
 	plan.providerIdentity = claudeProviderIdentity(auth, plan.baseURL)
+	if plan.providerIdentity.Kind == "kimi" && helps.IsKimiVideoChat(req, opts) {
+		return plan, statusErr{code: http.StatusBadRequest, errorCode: "request_feature_unsupported",
+			msg: "Kimi video input requires a native Chat Completions route"}
+	}
 
 	from := opts.SourceFormat
 	plan.responseFormat = cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -732,7 +736,7 @@ func rejectDeepSeekFIMForClaudeRoute(model, requestPath string, body []byte) err
 }
 
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req.Model, opts); nativeAuth != nil {
+	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req, opts); nativeAuth != nil {
 		return NewOpenAICompatExecutor(e.Identifier(), e.cfg).Execute(ctx, nativeAuth, req, opts)
 	}
 	if opts.Alt == "responses/compact" {
@@ -814,7 +818,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req.Model, opts); nativeAuth != nil {
+	if nativeAuth := helps.KimiCodeNativeOpenAIAuth(auth, req, opts); nativeAuth != nil {
 		return NewOpenAICompatExecutor(e.Identifier(), e.cfg).ExecuteStream(ctx, nativeAuth, req, opts)
 	}
 	if opts.Alt == "responses/compact" {

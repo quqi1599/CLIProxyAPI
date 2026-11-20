@@ -122,9 +122,16 @@ func resolveKimiBaseURL(auth *cliproxyauth.Auth) string {
 	return baseURL
 }
 
-// nativeResponsesAuth adapts existing Kimi credentials and headers to the shared
-// Responses executor without mutating stored authentication or changing identity.
-func (e *KimiExecutor) nativeResponsesAuth(auth *cliproxyauth.Auth, stream bool) *cliproxyauth.Auth {
+func useKimiNativeOpenAI(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if opts.Alt == "" && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && thinking.IsKimiCodeModel(req.Model) {
+		return true
+	}
+	return helps.IsKimiVideoChat(req, opts) && helps.IsKimiVideoBase(resolveKimiBaseURL(auth))
+}
+
+// nativeOpenAIAuth adapts existing Kimi credentials and headers to the shared
+// native OpenAI executor without mutating stored authentication or changing identity.
+func (e *KimiExecutor) nativeOpenAIAuth(auth *cliproxyauth.Auth, stream bool) *cliproxyauth.Auth {
 	adapted := &cliproxyauth.Auth{Provider: "kimi"}
 	if auth != nil {
 		adapted = auth.Clone()
@@ -151,8 +158,8 @@ func (e *KimiExecutor) nativeResponsesAuth(auth *cliproxyauth.Auth, stream bool)
 
 // Execute performs a non-streaming chat completion request to Kimi.
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if opts.Alt == "" && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && thinking.IsKimiCodeModel(req.Model) {
-		return NewOpenAICompatExecutor("kimi", e.cfg).Execute(ctx, e.nativeResponsesAuth(auth, false), req, opts)
+	if useKimiNativeOpenAI(auth, req, opts) {
+		return NewOpenAICompatExecutor("kimi", e.cfg).Execute(ctx, e.nativeOpenAIAuth(auth, false), req, opts)
 	}
 	originalTransformContext := ctx
 	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))
@@ -286,8 +293,8 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 // ExecuteStream performs a streaming chat completion request to Kimi.
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if opts.Alt == "" && opts.SourceFormat == sdktranslator.FormatOpenAIResponse && thinking.IsKimiCodeModel(req.Model) {
-		return NewOpenAICompatExecutor("kimi", e.cfg).ExecuteStream(ctx, e.nativeResponsesAuth(auth, true), req, opts)
+	if useKimiNativeOpenAI(auth, req, opts) {
+		return NewOpenAICompatExecutor("kimi", e.cfg).ExecuteStream(ctx, e.nativeOpenAIAuth(auth, true), req, opts)
 	}
 	originalTransformContext := ctx
 	ctx, releaseTransform, errAdmission := internalpayload.BeginTransformScope(ctx, int64(max(len(req.Payload), len(opts.OriginalRequest))))

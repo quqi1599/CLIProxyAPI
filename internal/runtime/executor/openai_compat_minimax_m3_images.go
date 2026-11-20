@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime"
-	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"strings"
 
@@ -16,7 +14,6 @@ import (
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -43,25 +40,8 @@ var (
 	fetchMiniMaxM3ImageURL = fetchMiniMaxM3ImageURLDefault
 
 	miniMaxM3ImageHTTPClient = &http.Client{
-		Transport: proxyutil.ApplyHTTPTransportLimits(&http.Transport{
-			Proxy:              nil,
-			DialContext:        miniMaxM3ImageDialContext,
-			ForceAttemptHTTP2:  true,
-			DisableCompression: true,
-		}),
+		Transport:     helps.NewPublicMediaTransport(),
 		CheckRedirect: miniMaxM3ImageCheckRedirect,
-	}
-
-	miniMaxM3BlockedImagePrefixes = []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/8"),
-		netip.MustParsePrefix("100.64.0.0/10"),
-		netip.MustParsePrefix("192.0.0.0/24"),
-		netip.MustParsePrefix("192.0.2.0/24"),
-		netip.MustParsePrefix("198.18.0.0/15"),
-		netip.MustParsePrefix("198.51.100.0/24"),
-		netip.MustParsePrefix("203.0.113.0/24"),
-		netip.MustParsePrefix("240.0.0.0/4"),
-		netip.MustParsePrefix("2001:db8::/32"),
 	}
 )
 
@@ -176,7 +156,7 @@ func (s *miniMaxM3ImageInlineState) inlineURL(rawURL string) (string, bool) {
 
 func fetchMiniMaxM3ImageURLDefault(ctx context.Context, rawURL string) (string, []byte, bool) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || !miniMaxM3ImageURLAllowed(parsed) {
+	if err != nil || !helps.PublicMediaURLAllowed(parsed) {
 		return "", nil, false
 	}
 	if ctx == nil {
@@ -218,91 +198,10 @@ func miniMaxM3ImageCheckRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 3 {
 		return fmt.Errorf("too many redirects")
 	}
-	if req == nil || req.URL == nil || !miniMaxM3ImageURLAllowed(req.URL) {
+	if req == nil || req.URL == nil || !helps.PublicMediaURLAllowed(req.URL) {
 		return fmt.Errorf("blocked image redirect")
 	}
 	return nil
-}
-
-func miniMaxM3ImageURLAllowed(parsed *url.URL) bool {
-	if parsed == nil {
-		return false
-	}
-	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	if scheme != "http" && scheme != "https" {
-		return false
-	}
-	if parsed.User != nil {
-		return false
-	}
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" {
-		return false
-	}
-	lowerHost := strings.ToLower(strings.TrimSuffix(host, "."))
-	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") || strings.HasSuffix(lowerHost, ".local") {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return miniMaxM3ImageIPAllowed(ip)
-	}
-	return true
-}
-
-func miniMaxM3ImageDialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("image host resolved to no addresses")
-	}
-	for _, candidate := range ips {
-		if !miniMaxM3ImageIPAllowed(candidate.IP) {
-			return nil, fmt.Errorf("blocked image host address")
-		}
-	}
-
-	var dialer net.Dialer
-	var lastErr error
-	for _, candidate := range ips {
-		conn, errDial := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.IP.String(), port))
-		if errDial == nil {
-			return conn, nil
-		}
-		lastErr = errDial
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("image host dial failed")
-}
-
-func miniMaxM3ImageIPAllowed(ip net.IP) bool {
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	addr = addr.Unmap()
-	if !addr.IsValid() ||
-		addr.IsUnspecified() ||
-		addr.IsLoopback() ||
-		addr.IsPrivate() ||
-		addr.IsLinkLocalUnicast() ||
-		addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() {
-		return false
-	}
-	for _, prefix := range miniMaxM3BlockedImagePrefixes {
-		if prefix.Contains(addr) {
-			return false
-		}
-	}
-	return true
 }
 
 func miniMaxM3AllowedImageMediaType(contentType string, data []byte) string {

@@ -11,15 +11,18 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// KimiCodeNativeOpenAIAuth keeps K3.1 requests in their original protocol when
+// KimiCodeNativeOpenAIAuth keeps K3.1 requests and K3 video Chat in their original protocol when
 // an official Coding Plan API key was configured under claude-api-key. Both
 // protocol surfaces use the same key and host. Never derive an API key from
 // OAuth metadata or infer an OpenAI endpoint for a third-party gateway.
-func KimiCodeNativeOpenAIAuth(auth *cliproxyauth.Auth, model string, opts cliproxyexecutor.Options) *cliproxyauth.Auth {
-	if auth == nil || !KimiCodeRequiresThinking(model) || opts.Alt != "" {
+func KimiCodeNativeOpenAIAuth(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) *cliproxyauth.Auth {
+	if auth == nil || opts.Alt != "" {
 		return nil
 	}
 	if opts.SourceFormat != sdktranslator.FormatOpenAI && opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
+		return nil
+	}
+	if !KimiCodeRequiresThinking(req.Model) && !(IsKimiVideoChat(req, opts) && IsKimiVideoBase(auth.Attributes["base_url"])) {
 		return nil
 	}
 	if strings.TrimSpace(auth.Attributes["api_key"]) == "" {
@@ -57,11 +60,16 @@ func NormalizeKimiChatSampling(body []byte, baseModel, baseURL string) ([]byte, 
 			return body, nil
 		}
 		for _, field := range []struct {
-			name string
-			max  float64
-		}{{"temperature", 2}, {"top_p", 1}} {
+			name     string
+			min, max float64
+		}{
+			{"temperature", 0, 2},
+			{"top_p", 0, 1},
+			{"presence_penalty", -2, 2},
+			{"frequency_penalty", -2, 2},
+		} {
 			v := gjson.GetBytes(body, field.name)
-			if v.Type == gjson.Number && v.Float() >= 0 && v.Float() <= field.max {
+			if v.Type == gjson.Number && v.Float() >= field.min && v.Float() <= field.max {
 				body, err = sjson.DeleteBytes(body, field.name)
 				if err != nil {
 					return nil, err

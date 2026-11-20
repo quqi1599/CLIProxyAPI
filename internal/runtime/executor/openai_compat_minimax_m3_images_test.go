@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internalpayload "github.com/router-for-me/CLIProxyAPI/v7/internal/payload"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -244,7 +245,7 @@ func TestMiniMaxM3ImageURLAllowedBlocksPrivateTargets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse URL: %v", err)
 			}
-			if got := miniMaxM3ImageURLAllowed(parsed); got != tt.want {
+			if got := helps.PublicMediaURLAllowed(parsed); got != tt.want {
 				t.Fatalf("miniMaxM3ImageURLAllowed(%q) = %v, want %v", tt.raw, got, tt.want)
 			}
 		})

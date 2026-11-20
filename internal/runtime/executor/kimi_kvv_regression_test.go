@@ -26,7 +26,7 @@ func TestKimiKVVChatWirePreservesContract(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/stream=%t/override=%t", kind, stream, override), func(t *testing.T) {
 					cfg := &config.Config{}
 					if override {
-						cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "k3.1-pro"}}, Params: map[string]any{"temperature": 2.0}}}
+						cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "k3.1-pro"}}, Params: map[string]any{"temperature": 2.0, "presence_penalty": -2.0, "frequency_penalty": 2.0}}}
 					}
 					e, auth := kimiKVVExecutor(kind, cfg)
 					calls := 0
@@ -39,7 +39,7 @@ func TestKimiKVVChatWirePreservesContract(t *testing.T) {
 						}
 						for _, path := range []string{"messages", "tools", "tool_choice", "response_format", "temperature", "top_p", "presence_penalty", "frequency_penalty", "max_completion_tokens", "stop"} {
 							expected := gjson.GetBytes(body, path).Raw
-							if path == "temperature" || path == "top_p" {
+							if path == "temperature" || path == "top_p" || path == "presence_penalty" || path == "frequency_penalty" {
 								expected = ""
 							}
 							if gjson.GetBytes(wire, path).Raw != expected {

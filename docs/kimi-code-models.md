@@ -41,6 +41,12 @@ For K3.1 Pro / Pro Highspeed, a `claude-api-key` entry on either official HTTPS 
 
 K3.1 Chat requests preserve message-level dynamic tool definitions, 128-character tool names, schema strictness and numeric literals, `response_format`, `stop` and sampling controls other than the fixed Chat sampling settings below. The older shared tool repair and schema/name normalization are bypassed so invalid definitions reach Kimi's validator instead of silently becoming a different request. Kimi Messages routes default to no Anthropic system prompt or synthetic user ID; explicit per-credential cloaking settings retain their precedence. Native K3.1 Messages tool names are also passed through for upstream validation. Upstream usage is reported as returned; no fixed token deduction is applied.
 
+## Video input in Chat Completions
+
+For `k3`, `k3.1-pro` and `k3.1-pro-highspeed` on the official Coding Plan, send a user message with a `video_url` content part. Put the MP4 in `video_url.url` as a `data:video/mp4;base64,...` URL or a public HTTPS link. K3 video requests using an official `claude-api-key` entry use native Chat Completions so the video survives forwarding. K3 text-only requests keep their configured protocol.
+
+The proxy fetches up to four remote MP4s totaling 8 MiB per request. Each link and redirect must use public HTTPS on port 443. The media host receives a separate GET without the caller's credentials. If the connection closes with EOF before any HTTP response, the proxy retries that GET once. A failed download or invalid MP4 signature returns 400 before calling the model. Exceeding the file count or byte limit returns 413. Inline videos do not need a download. This adaptation applies to Chat Completions.
+
 ## Thinking controls
 
 Chat uses `reasoning_effort`, Responses uses `reasoning.effort`, and Messages uses `output_config.effort`. Original client controls are read before protocol conversion. Model suffixes such as `k3.1-pro(low)` take precedence over body controls; final payload overrides are validated again.
@@ -59,7 +65,7 @@ Missing or duplicate named definitions, unsupported tool types, and dynamic tool
 
 Only root-level thinking controls are normalized. Returned reasoning, encrypted reasoning items, tool history and schema numbers are retained. Legacy `kimi-k3` Moonshot behavior is unchanged; it is not the Coding Plan `k3` ID. Existing K2 sampling compatibility is retained.
 
-On official Coding Plan Chat Completions, K3.1 Pro and Pro Highspeed omit numeric `temperature` (0–2) and `top_p` (0–1) after request overrides. Kimi then uses its own sampling settings. Clients that depend on adjustable sampling should account for this behavior. Out-of-range values, invalid types, penalties, tools and response formats retain native validation. This also applies to Chat sent through the official Claude API key configuration. Native Responses retain their sampling fields.
+On official Coding Plan Chat Completions, K3.1 Pro and Pro Highspeed omit numeric `temperature` (0–2), `top_p` (0–1), and `presence_penalty` / `frequency_penalty` (−2 to 2) after request overrides. Kimi then uses its own sampling settings. Clients that depend on adjustable sampling should account for this behavior. Out-of-range values, invalid types, tools and response formats retain native validation. This also applies to Chat sent through the official Claude API key configuration. Native Responses retain their sampling fields.
 
 For thinking Chat Completions on Coding Plan `k3` (including `k3[1m]`), the proxy drops the optional root `top_p` after payload overrides so the upstream uses its default. The requested effort stays in effect.
 

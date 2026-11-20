@@ -1346,6 +1346,18 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	if inlinedImages {
 		finalPolicies = append(finalPolicies, openAICompatInlineRemoteImagesPolicy)
 	}
+	expansion := miniMaxM3InlineAmplificationOverride(inlinedImages)
+	if profile.Kind == "kimi" && plan.endpoint == "/chat/completions" && helps.KimiVideoModel(baseModel) && helps.IsKimiVideoBase(baseURL) {
+		var videoExpansion internalpayload.AmplificationOverride
+		body, plan.logBody, videoExpansion, err = helps.PrepareKimiChatVideos(ctx, body)
+		if err != nil {
+			return plan, err
+		}
+		if videoExpansion.PolicyID != "" {
+			expansion = videoExpansion
+			finalPolicies = append(finalPolicies, expansion.PolicyID)
+		}
+	}
 	if err = helps.EnforceSemanticTransformStage(
 		ctx,
 		openAICompatFinalSanitizeTransformStage,
@@ -1354,7 +1366,7 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 		finalSanitizeStarted,
 		finalPolicies,
 		nil,
-		miniMaxM3InlineAmplificationOverride(inlinedImages),
+		expansion,
 	); err != nil {
 		return plan, err
 	}
