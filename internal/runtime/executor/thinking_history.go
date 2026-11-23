@@ -202,7 +202,7 @@ func deepSeekInvalidThinkingHistoryMessageForClient(clientProfile string) string
 
 func preservesOnlyRealReasoningHistory(model string) bool {
 	modelName := normalizedOpenAICompatPolicyModelName(model)
-	return strings.HasPrefix(modelName, "qwen") || isXiaomiMimoV25Model(modelName) || isZhipuGLM53Model(modelName)
+	return strings.HasPrefix(modelName, "qwen") || isXiaomiMimoV25Model(modelName) || isZhipuGLM53Model(modelName) || thinking.IsGLM54Model(modelName)
 }
 
 func validateZhipuGLM53PreservedThinkingHistory(body []byte, compatKind, baseURL, model string) error {

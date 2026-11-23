@@ -56,6 +56,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	})
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
+		{ID: "glm-5.4", Created: now},
 	})
 	modelRegistry.RegisterClient("test-request-details-deepseek", "deepseek", []*registry.ModelInfo{
 		{ID: "deepseek-v4-pro", Created: now + 1},
@@ -132,6 +133,12 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			wantProviders: []string{"claude"},
 			wantModel:     "claude-sonnet-4-5(auto)",
 			wantErr:       false,
+		},
+		{
+			name:          "GLM 1M hint uses the configured upstream ID",
+			inputModel:    "glm-5.4[1m](low)",
+			wantProviders: []string{"claude"},
+			wantModel:     "glm-5.4(low)",
 		},
 		{
 			name:          "public model hint preserved while provider lookup falls back to base model",

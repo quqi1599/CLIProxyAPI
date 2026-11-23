@@ -418,3 +418,16 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesInputImag
 		t.Fatalf("messages.0.content.0.image_url.detail = %q, want high; output=%s", got, out)
 	}
 }
+
+func TestGLM54SkipsUnavailableReasoning(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"step 1 "}]},
+		{"type":"reasoning","summary":[],"encrypted_content":"opaque"},
+		{"type":"reasoning","summary":[{"type":"summary_text","text":" step 2"}]},
+		{"type":"function_call","name":"lookup","arguments":"{}","call_id":"c"},
+		{"type":"function_call_output","output":"ok","call_id":"c"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("glm-5.4", raw, false)
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "step 1  step 2" {
+		t.Fatalf("unexpected replayed reasoning %q", got)
+	}
+}

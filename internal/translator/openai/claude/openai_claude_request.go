@@ -166,7 +166,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 							}
 							thinkingText := thinking.GetThinkingText(part)
 							// Skip empty or whitespace-only thinking
-							if strings.TrimSpace(thinkingText) != "" {
+							if strings.TrimSpace(thinkingText) != "" || (thinking.IsGLM54Model(modelName) && thinkingText != "") {
 								reasoningParts = append(reasoningParts, thinkingText)
 							}
 						}
@@ -215,7 +215,11 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				// Build reasoning content string
 				reasoningContent := ""
 				if len(reasoningParts) > 0 {
-					reasoningContent = strings.Join(reasoningParts, "\n\n")
+					separator := "\n\n"
+					if thinking.IsGLM54Model(modelName) {
+						separator = ""
+					}
+					reasoningContent = strings.Join(reasoningParts, separator)
 				}
 
 				hasContent := len(contentItems) > 0

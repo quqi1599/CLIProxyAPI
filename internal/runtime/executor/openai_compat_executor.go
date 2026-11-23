@@ -393,6 +393,12 @@ func sanitizeOpenAICompatHTTPRequestBody(req *http.Request, profile openAICompat
 	if errRead != nil {
 		return errRead
 	}
+	if profile.Kind == "zhipu" && thinking.IsGLM54Model(model) && strings.HasSuffix(path, "/chat/completions") {
+		updated, errRead = thinking.ApplyThinking(updated, model, "openai", "openai", profile.Kind, body)
+		if errRead != nil {
+			return errRead
+		}
+	}
 	if profile.Kind == "minimax" && thinking.IsMiniMaxM31Model(model) {
 		updated, errRead = thinking.ApplyThinking(updated, model, "openai", "openai", "minimax")
 		if errRead != nil {
@@ -465,6 +471,7 @@ func largeOpenAICompatToolHistoryLimits(model string) (payloadBytes int, toolOut
 		strings.HasPrefix(baseModel, "kimi-k3") ||
 		strings.HasPrefix(baseModel, "glm-5.2") ||
 		strings.HasPrefix(baseModel, "glm-5.3") ||
+		thinking.IsGLM54Model(baseModel) ||
 		thinking.IsDeepSeekV4Model(baseModel) {
 		return largeOpenAICompatLongContextToolHistoryPayloadBytes,
 			largeOpenAICompatLongContextToolOutputMessages
@@ -1254,6 +1261,12 @@ func (e *OpenAICompatExecutor) prepareOpenAICompatRequest(ctx context.Context, a
 	}
 	if profile.Kind == "kimi" && plan.endpoint == "/chat/completions" {
 		body, err = helps.NormalizeKimiChatSampling(body, baseModel, baseURL)
+		if err != nil {
+			return plan, err
+		}
+	}
+	if profile.Kind == "zhipu" && thinking.IsGLM54Model(baseModel) && plan.endpoint == "/chat/completions" && !bytes.Equal(payloadConfigInput, configuredBody) {
+		body, err = thinking.ApplyThinking(body, baseModel, "openai", "openai", profile.Kind, configuredBody)
 		if err != nil {
 			return plan, err
 		}
@@ -2247,7 +2260,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	modelForCounting := baseModel
 
 	thinkingProviderKey := profile.KindOrFallback(auth)
-	if openAICompatCountTokensNeedsThinking(req, opts, translated, baseModel) {
+	if (profile.Kind == "zhipu" && thinking.IsGLM54Model(baseModel)) || openAICompatCountTokensNeedsThinking(req, opts, translated, baseModel) {
 		if config.NormalizeOpenAICompatibilityKind(profile.Kind) == "zhipu" {
 			translated = normalizeZhipuGLM53Thinking(translated, modelForCounting)
 		}

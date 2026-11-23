@@ -2029,6 +2029,12 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	if len(providers) == 0 {
 		if hintedBase, _ := NormalizePublicModelHint(baseModel); hintedBase != "" && hintedBase != baseModel {
 			providers = ResolveProvidersForModel(hintedBase, h.AuthManager)
+			if len(providers) > 0 && thinking.IsGLM54Model(baseModel) {
+				resolvedModelName = hintedBase
+				if parsed.HasSuffix {
+					resolvedModelName += "(" + parsed.RawSuffix + ")"
+				}
+			}
 		}
 	}
 	if len(providers) == 0 {

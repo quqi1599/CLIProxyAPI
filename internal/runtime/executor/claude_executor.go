@@ -392,7 +392,12 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	providerConfigStarted := time.Now()
 	providerConfigInput := body
 	body, _ = sjson.SetBytes(body, "model", helps.OfficialDeepSeekModel(baseModel, plan.baseURL))
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), e.Identifier(), payloadSource)
+	thinkingProvider := e.Identifier()
+	glm54 := plan.providerIdentity.Kind == "zhipu" && thinking.IsGLM54Model(baseModel)
+	if glm54 {
+		thinkingProvider = plan.providerIdentity.Kind
+	}
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), plan.upstreamFormat.String(), thinkingProvider, payloadSource)
 	if err != nil {
 		return plan, err
 	}
@@ -409,8 +414,8 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	repairMeta := newCompatRepairLogMeta(opts, requestedModel, baseModel, e.Identifier(), "ClaudeExecutor", requestPath, plan.providerIdentity.Kind, plan.providerIdentity.BaseHost)
 	beforePayloadConfig := body
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, plan.upstreamFormat.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	if thinking.IsKimiCodeModel(baseModel) && !bytes.Equal(beforePayloadConfig, body) {
-		body, err = thinking.ApplyThinking(body, baseModel, "claude", "claude", e.Identifier())
+	if (glm54 || thinking.IsKimiCodeModel(baseModel)) && !bytes.Equal(beforePayloadConfig, body) {
+		body, err = thinking.ApplyThinking(body, baseModel, "claude", "claude", thinkingProvider)
 		if err != nil {
 			return plan, err
 		}
@@ -452,7 +457,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 	kimiCodeThinking := plan.providerIdentity.Kind == "kimi" && helps.KimiCodeRequiresThinking(baseModel)
 	// MiniMax requires thinking and accepts sampling controls while it is active.
 	// Do not apply Anthropic-only restrictions to the M3.1 compatibility endpoint.
-	if !miniMaxM31 && !kimiCodeThinking {
+	if !miniMaxM31 && !kimiCodeThinking && !glm54 {
 		body = disableThinkingIfToolChoiceForced(body)
 	}
 	if plan.providerIdentity.Kind == "deepseek" && requiresReturnedThinkingHistory(baseModel) {
@@ -477,7 +482,7 @@ func (e *ClaudeExecutor) prepareClaudeRequest(ctx context.Context, auth *cliprox
 			return plan, err
 		}
 	}
-	if !miniMaxM31 {
+	if !miniMaxM31 && !glm54 {
 		body = normalizeClaudeTemperatureForThinking(body)
 	}
 	if err = helps.EnforceSemanticTransformStage(
@@ -1161,6 +1166,12 @@ func (e *ClaudeExecutor) countTokens(ctx context.Context, auth *cliproxyauth.Aut
 		body = normalizeClaudeSystemRoleMessages(body)
 	}
 	if useProviderCapabilityPolicies {
+		if identity.Kind == "zhipu" && thinking.IsGLM54Model(baseModel) {
+			body, err = thinking.ApplyThinking(body, req.Model, from.String(), "claude", identity.Kind, req.Payload)
+			if err != nil {
+				return cliproxyexecutor.Response{}, err
+			}
+		}
 		body = scrubDeepSeekThinkingBudgetForCompat(body, baseModel, baseURL, identity.Kind)
 		body = scrubDoubaoClaudeDeepSeekThinkingForCompat(body, baseModel, identity.Kind)
 		if err = rejectDeepSeekAnthropicUnsupportedImageInput(ctx, body, identity.Kind, baseURL, baseModel, executorMetadataStringValue(opts.Metadata, cliproxyexecutor.ClientProfileMetadataKey)); err != nil {
@@ -3812,6 +3823,12 @@ func sanitizeClaudeHTTPRequestToolNamesForCompatKind(req *http.Request, compatKi
 	body, errRead = helps.PreserveMiniMaxM3ThinkingOff(requestURLString(req), model, "claude", body, body)
 	if errRead != nil {
 		return nil, errRead
+	}
+	if compatKind == "zhipu" && thinking.IsGLM54Model(model) && req.URL != nil && strings.HasSuffix(req.URL.Path, "/messages") {
+		body, errRead = thinking.ApplyThinking(body, model, "claude", "claude", compatKind)
+		if errRead != nil {
+			return nil, errRead
+		}
 	}
 	if compatKind == "minimax" && thinking.IsMiniMaxM31Model(model) {
 		body, errRead = thinking.ApplyThinking(body, model, "claude", "claude", "claude")

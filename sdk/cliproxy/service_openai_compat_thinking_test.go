@@ -4,6 +4,7 @@ import (
 	"slices"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -63,5 +64,25 @@ func TestOpenAICompatibilityThinkingSupportKeepsGLM52Defaults(t *testing.T) {
 	support := openAICompatibilityThinkingSupport(&compat, config.OpenAICompatibilityModel{Name: "glm-5.2"})
 	if support == nil || !slices.Equal(support.Levels, []string{"low", "medium", "high"}) {
 		t.Fatalf("GLM-5.2 thinking support = %+v, want generic defaults", support)
+	}
+}
+
+func TestGLM54ConfiguredModelCapabilities(t *testing.T) {
+	chat := buildOpenAICompatibilityConfigModels(&config.OpenAICompatibility{
+		Kind: "zhipu", Models: []config.OpenAICompatibilityModel{{Name: "glm-5.4", Alias: "team-glm"}},
+	})
+	claude := buildClaudeConfigModels(&config.ClaudeKey{
+		BaseURL: "https://api.z.ai/api/anthropic", Models: []internalconfig.ClaudeModel{{Name: "glm-5.4", Alias: "team-glm"}},
+	})
+	for _, models := range [][]*registry.ModelInfo{chat, claude} {
+		if len(models) != 1 {
+			t.Fatalf("models = %+v", models)
+		}
+		info := models[0]
+		if info.ID != "team-glm" || info.ContextLength != 1000000 || info.Thinking == nil ||
+			!slices.Equal(info.Thinking.Levels, []string{"low", "high", "max"}) ||
+			!slices.Equal(info.SupportedInputModalities, []string{"text", "image"}) {
+			t.Fatalf("unexpected capabilities for configured alias: %+v", info)
+		}
 	}
 }

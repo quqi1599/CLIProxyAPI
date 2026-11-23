@@ -1016,3 +1016,16 @@ func TestConvertClaudeRequestToOpenAI_StripsClaudeCodeAttribution(t *testing.T) 
 		t.Fatalf("Unexpected system content: %q", got)
 	}
 }
+
+func TestGLM54ReplaysSignedThinkingWithoutSeparators(t *testing.T) {
+	input := fmt.Sprintf(`{"messages":[{"role":"assistant","content":[
+		{"type":"thinking","thinking":"first","signature":%q},
+		{"type":"thinking","thinking":"  ","signature":%q},
+		{"type":"thinking","thinking":"second","signature":%q},
+		{"type":"thinking","thinking":"unsigned"}]}]}`,
+		syntheticGPTReasoningSignature, syntheticGPTReasoningSignature, syntheticGPTReasoningSignature)
+	out := ConvertClaudeRequestToOpenAI("glm-5.4", []byte(input), false)
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "first  second" {
+		t.Fatalf("unexpected replayed reasoning %q", got)
+	}
+}

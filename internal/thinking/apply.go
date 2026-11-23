@@ -189,6 +189,13 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// 2. Parse suffix and get modelInfo
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
+	if providerKey == "zhipu" && IsGLM54Model(baseModel) && (providerFormat == "openai" || providerFormat == "claude") {
+		var source []byte
+		if len(sourceBodies) > 0 {
+			source = sourceBodies[0]
+		}
+		return applyGLM54Thinking(body, source, suffixResult, fromFormat, providerFormat, applier)
+	}
 	if IsKimiCodeModel(baseModel) && (providerFormat == "openai" || providerFormat == "kimi" || providerFormat == "claude" || providerFormat == "codex") {
 		var sourceBody []byte
 		if len(sourceBodies) > 0 {

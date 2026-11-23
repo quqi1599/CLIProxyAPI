@@ -23,6 +23,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
@@ -2623,8 +2624,7 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		if model.Image {
 			modelType = registry.OpenAIImageModelType
 		}
-		thinking := openAICompatibilityThinkingSupport(compat, model)
-		models = append(models, &ModelInfo{
+		info := &ModelInfo{
 			ID:          modelID,
 			Object:      "model",
 			Created:     now,
@@ -2632,8 +2632,12 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 			Type:        modelType,
 			DisplayName: modelID,
 			UserDefined: false,
-			Thinking:    thinking,
-		})
+			Thinking:    openAICompatibilityThinkingSupport(compat, model),
+		}
+		if !model.Image && isZhipuCompatibility(compat) && thinking.IsGLM54Model(model.Name) {
+			setGLM54Capabilities(info)
+		}
+		models = append(models, info)
 	}
 	return models
 }
@@ -2648,7 +2652,7 @@ func openAICompatibilityThinkingSupport(compat *config.OpenAICompatibility, mode
 		support = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 	}
 
-	if isZhipuGLM53OpenAICompatibility(compat, model) {
+	if isZhipuCompatibility(compat) && isGLM53CompatibilityModel(model.Name) {
 		clone := *support
 		clone.Min = 0
 		clone.Max = 0
@@ -2667,7 +2671,7 @@ func openAICompatibilityThinkingSupport(compat *config.OpenAICompatibility, mode
 	return &clone
 }
 
-func isZhipuGLM53OpenAICompatibility(compat *config.OpenAICompatibility, model config.OpenAICompatibilityModel) bool {
+func isZhipuCompatibility(compat *config.OpenAICompatibility) bool {
 	if compat == nil {
 		return false
 	}
@@ -2675,10 +2679,11 @@ func isZhipuGLM53OpenAICompatibility(compat *config.OpenAICompatibility, model c
 	if kind == "" {
 		kind = internalconfig.InferCompatKindFromBaseURL(compat.BaseURL)
 	}
-	if kind != "zhipu" {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(model.Name)) {
+	return kind == "zhipu"
+}
+
+func isGLM53CompatibilityModel(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "glm-5.3", "glm-5.3-flash":
 		return true
 	default:
@@ -2768,7 +2773,21 @@ func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "anthropic", "claude")
+	models := buildConfigModels(entry.Models, "anthropic", "claude")
+	if internalconfig.InferCompatKindFromBaseURL(entry.BaseURL) == "zhipu" {
+		for _, model := range models {
+			if thinking.IsGLM54Model(model.DisplayName) {
+				setGLM54Capabilities(model)
+			}
+		}
+	}
+	return models
+}
+
+func setGLM54Capabilities(model *ModelInfo) {
+	model.ContextLength = 1000000
+	model.SupportedInputModalities = []string{"text", "image"}
+	model.Thinking = thinking.GLM54ThinkingSupport()
 }
 
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {

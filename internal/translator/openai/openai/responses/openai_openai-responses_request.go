@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/protocol/contentpart"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -223,6 +224,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "reasoning":
 				reasoningContent := parsed.Reasoning.Text
 				if !parsed.Reasoning.Available {
+					if thinking.IsGLM54Model(modelName) {
+						continue
+					}
 					reasoningContent = "[reasoning unavailable]"
 				}
 				if pendingReasoningContent == "" {

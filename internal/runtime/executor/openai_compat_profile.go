@@ -449,13 +449,11 @@ func openAICompatCapabilityProfileForModel(profile openAICompatProfile, model st
 		profile.SupportsStreamUsage = true
 		return profile
 	}
-	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "zhipu" || !isZhipuGLM53Model(model) {
+	if config.NormalizeOpenAICompatibilityKind(profile.Kind) != "zhipu" || !(isZhipuGLM53Model(model) || thinking.IsGLM54Model(model)) {
 		return profile
 	}
 
-	// GLM-5.3 models use native thinking.type and reasoning_effort controls. Keep the
-	// fields until its model-specific compatibility policy canonicalizes them,
-	// and preserve only the real reasoning_content supplied by the client.
+	// Preserve GLM thinking controls and original multi-turn reasoning.
 	profile.SupportsNativeThinking = true
 	profile.PreserveReasoningContent = true
 	return profile
@@ -503,7 +501,7 @@ func scrubOpenAICompatPayloadAfterProviderQuirksMode(payload []byte, profile ope
 	if compatKind == "xiaomi" && !registeredPolicies {
 		payload = scrubXiaomiPayloadForModel(payload, model)
 	}
-	if compatKind == "zhipu" && !isZhipuGLM53FlashModel(model) {
+	if compatKind == "zhipu" && !isZhipuGLM53FlashModel(model) && !thinking.IsGLM54Model(model) {
 		payload = scrubZhipuImageURLDataURLs(payload)
 	}
 	if compatKind == "doubao" && !registeredPolicies {

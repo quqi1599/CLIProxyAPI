@@ -437,6 +437,7 @@ func TestLargeOpenAICompatToolHistoryLimitsByModel(t *testing.T) {
 		{model: "mimo-v2.5-pro", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "vendor/mimo-v2.5(high)", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "kimi-k3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
+		{model: "glm-5.4[1m]", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.2", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.3", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},
 		{model: "glm-5.3-flash", wantPayloadBytes: 30 * 1024 * 1024, wantOutputMessages: 600},

@@ -1941,6 +1941,9 @@ func responsesWebsocketProviderSetForModel(resolvedModelName string, authManager
 	if len(providers) == 0 {
 		if hintedBase, _ := handlers.NormalizePublicModelHint(baseModel); hintedBase != "" && hintedBase != baseModel {
 			providers = handlers.ResolveProvidersForModel(hintedBase, authManager)
+			if len(providers) > 0 && thinking.IsGLM54Model(baseModel) {
+				baseModel = hintedBase
+			}
 		}
 	}
 	if len(providers) == 0 {
