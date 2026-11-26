@@ -12,10 +12,35 @@ import (
 // BuildErrorResponseBodyWithCause preserves typed local error contracts while
 // retaining the caller's normalized error text for all other error families.
 func BuildErrorResponseBodyWithCause(status int, errText string, cause error) []byte {
-	if body, ok := buildRouteUnavailableErrorBody(status, cause); ok {
+	if body, ok := buildTypedRoutingErrorBody(status, errText, cause); ok {
 		return body
 	}
 	return BuildErrorResponseBody(status, errText)
+}
+
+// Preserve explicitly identified quota failures while leaving ordinary 403s
+// as permission errors. Structured upstream envelopes already retain their code.
+func buildTypedRoutingErrorBody(status int, message string, cause error) ([]byte, bool) {
+	if status != http.StatusForbidden {
+		return buildRouteUnavailableErrorBody(status, cause)
+	}
+	if json.Valid([]byte(message)) {
+		return nil, false
+	}
+	if !explicitQuotaFailure(cause) {
+		return nil, false
+	}
+	body, err := json.Marshal(ErrorResponse{Error: ErrorDetail{Message: message, Type: "permission_error", Code: "insufficient_quota"}})
+	return body, err == nil
+}
+
+func explicitQuotaFailure(cause error) bool {
+	var coded interface{ ErrorCode() string }
+	if errors.As(cause, &coded) && coded.ErrorCode() == "insufficient_quota" {
+		return true
+	}
+	f, ok := failurecontract.As(cause)
+	return ok && f.Kind == failurecontract.QuotaExceeded
 }
 
 // buildRouteUnavailableErrorBody preserves the local selection contract across

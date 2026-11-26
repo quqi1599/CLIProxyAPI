@@ -72,6 +72,7 @@ func TestGatewayRetryHeadersUseManagerEvidenceOverHTTP(t *testing.T) {
 					}
 					msg.Addon.Set("X-CPA-Retry-Attempts", "9999")
 					msg.Addon.Set("X-CPA-Retry-Scope", "request")
+					msg.Addon.Set("X-CPA-Pool-Exhausted", "capacity-v1")
 					msg.Addon.Set("X-CPA-Retry-Reason", "forged")
 				}
 				handler.WriteErrorResponse(c, msg)
@@ -91,7 +92,7 @@ func TestGatewayRetryHeadersUseManagerEvidenceOverHTTP(t *testing.T) {
 			if tc.scope != "" {
 				wantAttempts = strconv.Itoa(int(calls.Load()))
 			}
-			if resp.Header.Get("X-CPA-Retry-Scope") != tc.scope || resp.Header.Get("X-CPA-Retry-Reason") != tc.reason || resp.Header.Get("X-CPA-Retry-Attempts") != wantAttempts {
+			if resp.Header.Get("X-CPA-Pool-Exhausted") != "" || resp.Header.Get("X-CPA-Retry-Scope") != tc.scope || resp.Header.Get("X-CPA-Retry-Reason") != tc.reason || resp.Header.Get("X-CPA-Retry-Attempts") != wantAttempts {
 				t.Fatalf("incorrect retry metadata: %v", resp.Header)
 			}
 		})
@@ -121,5 +122,36 @@ func TestGatewayRetryHeadersExcludeLocalCancelledAndWrittenResponses(t *testing.
 				t.Fatal("unproven retry metadata emitted")
 			}
 		})
+	}
+}
+
+func TestKimiZeroDispatchPoolHeaders(t *testing.T) {
+	const model = "kimi-k2.7"
+	executor := &modelExecutionCaptureExecutor{provider: "kimi"}
+	h := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	m := h.AuthManager
+	m.SetRetryConfig(0, 0, 1)
+	m.MarkResult(context.Background(), coreauth.Result{AuthID: "model-execution-" + model, Provider: "kimi", Model: model, Error: &coreauth.Error{HTTPStatus: 403, Code: "permission_error", Message: "permission denied"}})
+	for _, stream := range []bool{false, true} {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ctx, cancel := h.GetContextWithCancel(nil, c, c.Request.Context())
+		req := coreexecutor.Request{Model: model, Payload: []byte(`{"messages":[{"role":"user","content":"test"}]}`)}
+		var err error
+		if stream {
+			_, err = m.ExecuteStream(ctx, []string{"kimi"}, req, coreexecutor.Options{})
+		} else {
+			_, err = m.Execute(ctx, []string{"kimi"}, req, coreexecutor.Options{})
+		}
+		if err == nil {
+			cancel()
+			t.Fatal("cooling pool received a new inference request")
+		}
+		h.WriteErrorResponse(c, executionErrorMessage(err))
+		cancel()
+		if rec.Code != 503 || rec.Header().Get("X-CPA-Pool-Exhausted") != "capacity-v1" || rec.Header().Get("X-CPA-Retry-Attempts") != "" || rec.Header().Get("Retry-After") == "" {
+			t.Fatalf("stream=%v code=%d headers=%v", stream, rec.Code, rec.Header())
+		}
 	}
 }

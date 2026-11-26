@@ -33,7 +33,7 @@ func WriteGatewayRetryHeaders(c *gin.Context, msg *interfaces.ErrorMessage, stat
 		return
 	}
 	headers := c.Writer.Header()
-	for _, key := range []string{"X-CPA-Retry-Scope", "X-CPA-Retry-Attempts", "X-CPA-Retry-Reason"} {
+	for _, key := range []string{"X-CPA-Retry-Scope", "X-CPA-Retry-Attempts", "X-CPA-Retry-Reason", "X-CPA-Pool-Exhausted"} {
 		headers.Del(key)
 	}
 	if c.Request == nil || c.Request.Context().Err() != nil || msg == nil || msg.Error == nil || status < 400 || status > 599 {
@@ -42,6 +42,9 @@ func WriteGatewayRetryHeaders(c *gin.Context, msg *interfaces.ErrorMessage, stat
 	value, _ := c.Get(gatewayRetryEvidenceContextKey)
 	evidence, _ := value.(*coreauth.GatewayRetryEvidence)
 	attempts, reason := evidence.Snapshot(msg.Error)
+	if evidence != nil && status == http.StatusServiceUnavailable && attempts == 0 && reason == "" && coreauth.KimiPoolExhausted(msg.Error) {
+		headers.Set("X-CPA-Pool-Exhausted", "capacity-v1")
+	}
 	if attempts < 1 || attempts > 1<<20 {
 		return
 	}

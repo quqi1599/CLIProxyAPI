@@ -7,6 +7,7 @@ import (
 	"time"
 
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -187,5 +188,70 @@ func TestKimiRuntimeSpreadSharesActiveLoadAndReleases(t *testing.T) {
 		if record.inFlight != 0 {
 			t.Fatal("physical key load leaked after completion")
 		}
+	}
+}
+
+func TestKimiForbiddenCooldownHonoredBySelector(t *testing.T) {
+	now := time.Now()
+	model := "kimi-k2.7"
+	m := NewManager(nil, &SpreadSelector{channelAware: true}, nil)
+	denied := kimiQuotaTestAuth("denied", "claude", "synthetic-a")
+	denied.ModelStates = map[string]*ModelState{model: {
+		Health: HealthState{Observed: true, BreakerState: HealthBreakerOpen, OpenUntil: now.Add(4 * time.Minute), LastStatusCode: 403},
+	}}
+	for _, active := range []bool{false, true} {
+		if active {
+			m.reserveHalfOpenProbe(denied.ID, model, now)
+		}
+		got, err := m.availableAuthsForRouteModel([]*Auth{denied}, "mixed", model, now)
+		if len(got) != 0 || statusCodeFromError(err) != 503 {
+			t.Fatalf("active=%t: reselected a denied credential before its recovery time", active)
+		}
+	}
+	ready := kimiQuotaTestAuth("ready", "kimi", "synthetic-b")
+	got, err := m.availableAuthsForRouteModel([]*Auth{denied, ready}, "mixed", model, now)
+	if err != nil || len(got) != 1 || got[0] != ready {
+		t.Fatal("healthy alternative lost")
+	}
+	got, err = m.availableAuthsForRouteModel([]*Auth{denied}, "mixed", model, now.Add(5*time.Minute))
+	if err != nil || len(got) != 1 {
+		t.Fatal("recovered credential never became eligible")
+	}
+}
+
+func TestKimiPoolProofRequiresEveryEnabledEntrance(t *testing.T) {
+	now := time.Now()
+	m := NewManager(nil, nil, nil)
+	model := "kimi-k2.6"
+	first := kimiQuotaTestAuth("local-pool-proof-1", "claude", "a")
+	second := kimiQuotaTestAuth("local-pool-proof-2", "kimi", "b")
+	reg := registry.GetGlobalRegistry()
+	for _, a := range []*Auth{first, second} {
+		reg.RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { reg.UnregisterClient(a.ID) })
+		m.auths[a.ID] = a
+	}
+	wait := 4 * time.Minute
+	local := newRouteUnavailableError(&wait)
+	var h HealthState
+	applyHealthFailure(&h, now, 403)
+	applyHealthSuccess(&h, now.Add(time.Second))
+	first.ModelStates = map[string]*ModelState{model: {Health: h}}
+	check := func(want bool) {
+		t.Helper()
+		e := m.markKimiPoolExhausted(local, model, now.Add(time.Second))
+		if KimiPoolExhausted(e) != want || statusCodeFromError(e) != 503 {
+			t.Fatalf("verified=%v expected %v", KimiPoolExhausted(e), want)
+		}
+	}
+	check(false)
+	second.Unavailable = true
+	second.NextRetryAfter = now.Add(wait)
+	second.LastError = &Error{HTTPStatus: 403}
+	check(true)
+	second.LastError = &Error{HTTPStatus: 500}
+	check(false)
+	if KimiPoolExhausted(local) {
+		t.Fatal("shared selection failure was mutated")
 	}
 }

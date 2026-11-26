@@ -438,3 +438,16 @@ func requireJSONBoolField(t *testing.T, payload map[string]any, key string, want
 		t.Fatalf("%s = %v, want %t", key, payload[key], want)
 	}
 }
+
+func TestForbiddenFailureMetadataRequiresEvidenceForQuota(t *testing.T) {
+	for _, input := range []string{"", "permission_error", "insufficient_quota"} {
+		want := input
+		if want == "" {
+			want = "permission_error"
+		}
+		status, typ, code := normalizeFailureMetadataError(http.StatusForbidden, input)
+		if status != 403 || typ != "permission_error" || code != want {
+			t.Fatalf("%q: got %d/%s/%s", input, status, typ, code)
+		}
+	}
+}

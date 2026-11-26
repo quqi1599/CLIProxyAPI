@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 func TestRouteUnavailableErrorResponsePreservesCodeAndRetryAfter(t *testing.T) {
@@ -51,6 +52,22 @@ func TestRouteUnavailableBodyDoesNotTrustUpstreamText(t *testing.T) {
 	} {
 		if _, ok := buildRouteUnavailableErrorBody(http.StatusServiceUnavailable, err); ok {
 			t.Fatalf("trusted non-selection error: %T", err)
+		}
+	}
+}
+
+func TestForbiddenResponsesDoNotInferQuotaFromStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		cause      error
+	}{
+		{"generic", "permission_error", nil},
+		{"confirmed", "insufficient_quota", &failurecontract.Failure{Kind: failurecontract.QuotaExceeded, HTTPStatus: 403}},
+	} {
+		for _, body := range [][]byte{BuildErrorResponseBodyWithCause(403, "request denied", tc.cause), BuildOpenAIResponsesStreamErrorChunkWithCause(403, "request denied", 1, tc.cause)} {
+			if got := gjson.GetBytes(body, "error.code").String(); got != tc.want && gjson.GetBytes(body, "code").String() != tc.want {
+				t.Fatalf("%s: %s", tc.name, body)
+			}
 		}
 	}
 }

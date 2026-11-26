@@ -194,6 +194,8 @@ type HealthState struct {
 	LastFailureAt time.Time `json:"-"`
 	// LastStatusCode keeps the latest HTTP status that influenced this score.
 	LastStatusCode int `json:"-"`
+	// Retain the failure behind an open breaker when a concurrent request completes successfully.
+	lastFailureStatus int
 	// LastUpdatedAt is when the score was last adjusted.
 	LastUpdatedAt time.Time `json:"-"`
 	// BreakerState controls whether this auth/model is healthy, fully open, or half-open.

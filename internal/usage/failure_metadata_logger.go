@@ -180,7 +180,10 @@ func normalizeFailureMetadataError(status int, errorCode string) (int, string, s
 	case http.StatusUnauthorized:
 		return status, "authentication_error", "invalid_api_key"
 	case http.StatusForbidden:
-		return status, "permission_error", "insufficient_quota"
+		if code == "" {
+			code = "permission_error"
+		}
+		return status, "permission_error", code
 	case http.StatusTooManyRequests:
 		return status, "rate_limit_error", "rate_limit_exceeded"
 	case http.StatusNotFound:

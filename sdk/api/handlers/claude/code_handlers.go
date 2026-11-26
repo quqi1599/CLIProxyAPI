@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -391,7 +392,11 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	}
 	handlers.WriteGatewayRetryHeaders(c, msg, status)
 
-	body, err := json.Marshal(claudeErrorFromStatusText(status, errText))
+	response := claudeErrorFromStatusText(status, errText)
+	if status == http.StatusServiceUnavailable && msg != nil && coreauth.KimiPoolExhausted(msg.Error) {
+		response.Error.Code = "auth_unavailable"
+	}
+	body, err := json.Marshal(response)
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
 	}

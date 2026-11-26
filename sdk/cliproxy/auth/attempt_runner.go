@@ -259,6 +259,11 @@ func runManagerAttemptOperation[T any](ctx context.Context, manager *Manager, pr
 		trace.configureTotalAttemptBudget(requestRetry, maxRetryCredentials)
 	}
 	outcome = runner.run(ctx, providers, req, opts, maxRetryCredentials, maxWait)
+	if outcome.returnErr != nil && trace.attemptCount() == 0 && !remoteCompaction && !runner.tokenCount && ctx.Err() == nil {
+		if selection := manager.markKimiPoolExhausted(outcome.returnErr, req.Model, time.Now()); KimiPoolExhausted(selection) {
+			outcome.returnErr, outcome.finalErr = selection, selection
+		}
+	}
 	outcome.returnErr = normalizeTerminalManagerError(ctx, outcome.returnErr)
 	outcome.finalErr = normalizeTerminalManagerError(ctx, outcome.finalErr)
 	return outcome.result, outcome.returnErr

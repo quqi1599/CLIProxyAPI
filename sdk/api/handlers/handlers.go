@@ -235,7 +235,7 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		code = "invalid_api_key"
 	case http.StatusForbidden:
 		errType = "permission_error"
-		code = "insufficient_quota"
+		code = "permission_error"
 	case http.StatusTooManyRequests:
 		errType = "rate_limit_error"
 		code = "rate_limit_exceeded"

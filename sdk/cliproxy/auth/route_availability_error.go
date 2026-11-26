@@ -13,6 +13,7 @@ import (
 // auth_unavailable contract used by downstream gateways to avoid empty retries.
 type routeUnavailableError struct {
 	*failurecontract.Failure
+	poolExhausted bool
 }
 
 func (e *routeUnavailableError) Unwrap() error { return e.Failure }

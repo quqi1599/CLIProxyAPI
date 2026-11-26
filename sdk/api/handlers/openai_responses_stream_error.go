@@ -25,7 +25,7 @@ func openAIResponsesStreamErrorCode(status int) string {
 	case http.StatusUnauthorized:
 		return "invalid_api_key"
 	case http.StatusForbidden:
-		return "insufficient_quota"
+		return "permission_error"
 	case http.StatusTooManyRequests:
 		return "rate_limit_exceeded"
 	case http.StatusNotFound:
@@ -49,6 +49,10 @@ func openAIResponsesStreamErrorCode(status int) string {
 // non-streaming responses, but streaming clients validate SSE `data:` payloads against a union
 // of chunks that requires a top-level `type` field.
 func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int) []byte {
+	return buildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber, nil)
+}
+
+func buildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int, cause error) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -63,6 +67,9 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	}
 
 	code := openAIResponsesStreamErrorCode(status)
+	if status == http.StatusForbidden && explicitQuotaFailure(cause) {
+		code = "insufficient_quota"
+	}
 	direction, isContentSafety := contentSafetyDirection(status, errText)
 	if isContentSafety {
 		message = UserFacingContentSafetyMessage(direction)
@@ -185,5 +192,5 @@ func BuildOpenAIResponsesStreamErrorChunkWithCause(status int, errText string, s
 	if body, ok := buildRouteUnavailableErrorBody(status, cause); ok {
 		errText = string(body)
 	}
-	return BuildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber)
+	return buildOpenAIResponsesStreamErrorChunk(status, errText, sequenceNumber, cause)
 }

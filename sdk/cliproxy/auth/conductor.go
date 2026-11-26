@@ -3170,7 +3170,7 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		probeActive := auth != nil && m.halfOpenProbeActive(auth.ID, stateModel, now)
-		if blocked && !probeActive {
+		if !kimiHardCooldownUntil(auth, stateModel, now).IsZero() || blocked && !probeActive {
 			continue
 		}
 		out = append(out, upstreamModel)
@@ -3268,13 +3268,16 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 		priority := effectiveSelectionPriorityForRoute(candidate, checkModel, now, includeHealth)
 		availableByPriority[priority] = append(availableByPriority[priority], candidate)
 	}
-	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota, includeHealth, healthBlocked bool) {
+	recordTemporalBlock := func(candidate *Auth, checkModel string, next time.Time, quota, includeHealth, healthBlocked, allowProbe bool) {
 		temporalBlockCount++
 		if routeTemporalBlockIsRateLimited(candidate, checkModel, now, healthBlocked) {
 			rateLimitedCount++
 		}
 		if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 			earliest = next
+		}
+		if !allowProbe {
+			return
 		}
 		fallbackCandidates = append(fallbackCandidates, cooldownFallbackCandidate{
 			auth:     candidate,
@@ -3288,8 +3291,9 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		includeHealth := gptRoute || !isGPTRetryRoute([]string{candidate.Provider}, checkModel)
 		blocked, reason, next := isAuthBlockedForModelRoute(candidate, checkModel, now, includeHealth)
+		allowProbe := kimiHardCooldownUntil(candidate, checkModel, now).IsZero()
 		if !blocked {
-			if m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
+			if allowProbe && m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
 				(!gptRoute || !m.zeroEligibleProbeBlocksRequest(ctx, routeModel, now)) {
 				activeFallbackAvailable = true
 				recordAvailable(candidate, checkModel, includeHealth)
@@ -3301,14 +3305,14 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			}
 			if healthBlocked {
 				availabilitySummary.skippedBreaker++
-				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth, true)
+				recordTemporalBlock(candidate, checkModel, healthNext, quotaCooldownForModel(candidate, checkModel), includeHealth, true, allowProbe)
 				continue
 			}
 			recordAvailable(candidate, checkModel, includeHealth)
 			continue
 		}
 		if (reason == blockReasonCooldown || reason == blockReasonOther) && !next.IsZero() {
-			if m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
+			if allowProbe && m.halfOpenProbeActive(candidate.ID, checkModel, now) &&
 				(!gptRoute || !m.zeroEligibleProbeBlocksRequest(ctx, routeModel, now)) {
 				activeFallbackAvailable = true
 				recordAvailable(candidate, checkModel, includeHealth)
@@ -3318,7 +3322,7 @@ func (m *Manager) availableAuthsForRouteModelContext(ctx context.Context, auths 
 			if includeHealth {
 				healthBlocked, _ = healthBlockStateForAuth(candidate, checkModel, now)
 			}
-			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth, healthBlocked)
+			recordTemporalBlock(candidate, checkModel, next, reason == blockReasonCooldown, includeHealth, healthBlocked, allowProbe)
 		}
 		switch reason {
 		case blockReasonDisabled:
@@ -9025,6 +9029,7 @@ func applyHealthFailure(health *HealthState, now time.Time, statusCode int) {
 	health.LastFailureAt = now
 	health.LastUpdatedAt = now
 	health.LastStatusCode = statusCode
+	health.lastFailureStatus = statusCode
 	health.HalfOpenSuccesses = 0
 	if shouldOpenHealthCircuit(*health, statusCode) {
 		health.BreakerState = HealthBreakerOpen
