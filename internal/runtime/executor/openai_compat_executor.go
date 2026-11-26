@@ -1903,9 +1903,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		)
 		return nil, err
 	}
+	var kimiStream *helps.KimiChatStream
+	if profile.Kind == "kimi" && plan.endpoint == "/chat/completions" {
+		kimiStream = &helps.KimiChatStream{}
+	}
 	sseStream, errStream := helps.NewBoundedUpstreamHTTPResponseSSEStream(httpResp, 0)
 	if errStream != nil {
 		cancelRequest()
+		if kimiStream != nil {
+			errStream = helps.KimiChatAcceptedFailure(errStream, httpResp.StatusCode)
+		}
 		helps.RecordAPIResponseError(ctx, e.cfg, errStream)
 		return nil, errStream
 	}
@@ -1917,18 +1924,34 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var param any
 		cleanEOF := false
 		var integrity *helps.OpenAIStreamIntegrity
-		var pendingUsage *cliproxyusage.Detail
+		var pendingUsage cliproxyusage.Detail
+		var usageSeen bool
 		if plan.upstreamFormat.String() == "openai" && gjson.GetBytes(plan.body, "stream_options.include_usage").Bool() {
 			integrity = helps.NewAliyunDeepSeekStreamIntegrity(profile.Kind, baseModel)
 		}
-		failIntegrity := func(streamErr error) {
-			helps.LogWithRequestID(ctx).WithField("event", "upstream_stream_integrity_failed").WithField("model", baseModel).WithError(streamErr).Warn("upstream stream did not satisfy the completion and usage contract")
-			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-			reporter.PublishFailure(failureCtx, streamErr)
+		if kimiStream != nil {
+			defer func() {
+				if cancelErr := requestCtx.Err(); cancelErr != nil {
+					reporter.PublishFailureWithUsage(failureCtx, pendingUsage, cancelErr)
+				}
+			}()
+		}
+		failStream := func(streamErr error) {
+			if kimiStream != nil {
+				streamErr = helps.KimiChatAcceptedFailure(streamErr, httpResp.StatusCode)
+				reporter.PublishFailureWithUsage(failureCtx, pendingUsage, streamErr)
+			} else {
+				reporter.PublishFailure(failureCtx, streamErr)
+			}
+			responseLog.RecordError(streamErr)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-requestCtx.Done():
 			}
+		}
+		failIntegrity := func(streamErr error) {
+			helps.LogWithRequestID(ctx).WithField("event", "upstream_stream_integrity_failed").WithField("model", baseModel).WithError(streamErr).Warn("upstream stream did not satisfy the completion and usage contract")
+			failStream(streamErr)
 		}
 		for {
 			event, errRead := sseStream.ReadEvent()
@@ -1940,15 +1963,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					cleanEOF = true
 					break
 				}
-				if responseLog != nil {
-					responseLog.RecordError(errRead)
-				}
-				reporter.PublishFailure(failureCtx, errRead)
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
-				case <-requestCtx.Done():
-				}
-				break
+				failStream(errRead)
+				return
+			}
+			if errIntegrity := kimiStream.Observe(event); errIntegrity != nil {
+				failIntegrity(errIntegrity)
+				return
 			}
 			for _, line := range bytes.FieldsFunc(event, func(value rune) bool { return value == '\r' || value == '\n' }) {
 				trimmedLine := bytes.TrimSpace(line)
@@ -1962,13 +1982,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 						continue
 					}
 					if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
-						streamErr := openAICompatMalformedSSEEventError(trimmedLine)
-						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-						reporter.PublishFailure(failureCtx, streamErr)
-						select {
-						case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-						case <-requestCtx.Done():
-						}
+						failStream(openAICompatMalformedSSEEventError(trimmedLine))
 						return
 					}
 					continue
@@ -1980,10 +1994,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					return
 				}
 				if detail, ok := helps.ParseOpenAIStreamUsage(trimmedLine); ok {
-					if integrity == nil {
+					if integrity == nil && kimiStream == nil {
 						reporter.Publish(ctx, detail)
 					} else {
-						pendingUsage = &detail
+						pendingUsage, usageSeen = detail, true
 					}
 				}
 				chunks := sdktranslator.TranslateStream(ctx, plan.upstreamFormat, plan.responseFormat, req.Model, opts.OriginalRequest, plan.body, plan.namespaceNames.Restore(internalpayload.CloneBytes(trimmedLine)), &param)
@@ -1998,8 +2012,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			if responseLog != nil {
 				responseLog.AppendChunk(event)
 			}
+			if kimiStream.Done() {
+				break
+			}
 		}
 		if cleanEOF && plan.upstreamFormat.String() != "openai-response" {
+			if errIntegrity := kimiStream.Finish(); errIntegrity != nil {
+				failIntegrity(errIntegrity)
+				return
+			}
 			if errIntegrity := integrity.Finish(); errIntegrity != nil {
 				failIntegrity(errIntegrity)
 				return
@@ -2017,8 +2038,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
-		if cleanEOF && pendingUsage != nil {
-			reporter.Publish(ctx, *pendingUsage)
+		if usageSeen && (cleanEOF || kimiStream != nil) {
+			reporter.Publish(ctx, pendingUsage)
 		}
 		reporter.EnsurePublished(ctx)
 	}()
