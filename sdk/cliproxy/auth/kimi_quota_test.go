@@ -241,3 +241,131 @@ func TestManager_KimiInsufficientQuotaFallbackIsBoundedByPhysicalAccount(t *test
 		})
 	}
 }
+
+func TestKimiPermissionFallbackUsesAnotherPhysicalKey(t *testing.T) {
+	const model = "kimi-k3.1-pro"
+	for _, operation := range []string{"execute", "count", "stream"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetRetryConfig(0, time.Minute, 2)
+			first := kimiQuotaTestAuth(operation+"-a-kimi-denied", "claude", "first-key")
+			alias := kimiQuotaTestAuth(operation+"-b-kimi-alias", "kimi", "first-key")
+			second := kimiQuotaTestAuth(operation+"-c-kimi-ready", "kimi", "second-key")
+			auths := []*Auth{first, alias, second}
+			recorder := &kimiQuotaTestRecorder{}
+			failure := &failurecontract.Failure{
+				Kind: failurecontract.UpstreamProtocolError, Scope: failurecontract.ScopeModel,
+				HTTPStatus: http.StatusForbidden, SemanticCode: failurecontract.KimiPermissionUnverified,
+			}
+			for _, provider := range []string{"claude", "kimi"} {
+				manager.RegisterExecutor(&kimiQuotaTestExecutor{id: provider, recorder: recorder, failures: map[string]error{first.ID: failure}})
+			}
+			reg := registry.GetGlobalRegistry()
+			for _, auth := range auths {
+				reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+				if _, err := manager.Register(ctx, auth); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			req := cliproxyexecutor.Request{Model: model}
+			providers := []string{"claude", "kimi"}
+			var err error
+			switch operation {
+			case "execute":
+				_, err = manager.Execute(ctx, providers, req, cliproxyexecutor.Options{})
+			case "count":
+				_, err = manager.ExecuteCount(ctx, providers, req, cliproxyexecutor.Options{})
+			case "stream":
+				var stream *cliproxyexecutor.StreamResult
+				stream, err = manager.ExecuteStream(ctx, providers, req, cliproxyexecutor.Options{})
+				if err == nil {
+					for chunk := range stream.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls := recorder.snapshot(); !slices.Equal(calls, []string{first.ID, second.ID}) {
+				t.Fatalf("same physical key was retried: %v", calls)
+			}
+		})
+	}
+}
+
+func TestKimiSubscriptionDenialCoolsOnlyAliasesOfThatKey(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	first := kimiQuotaTestAuth("service-denied", "claude", "first-key")
+	alias := kimiQuotaTestAuth("service-alias", "kimi", "first-key")
+	other := kimiQuotaTestAuth("service-ready", "kimi", "second-key")
+	for _, auth := range []*Auth{first, alias, other} {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager.MarkResult(context.Background(), Result{AuthID: first.ID, Model: "kimi-k3.1-pro", Cause: &failurecontract.Failure{
+		Kind: failurecontract.AuthenticationFailed, Scope: failurecontract.ScopeCredential,
+		HTTPStatus: http.StatusForbidden, SemanticCode: failurecontract.KimiServiceAccessDenied,
+	}})
+	for _, auth := range []*Auth{first, alias} {
+		current, _ := manager.GetByID(auth.ID)
+		if current.Disabled || !current.Unavailable || !current.NextRetryAfter.After(time.Now()) || current.Quota.Exceeded {
+			t.Fatalf("invalid subscription cooldown: %+v", current)
+		}
+	}
+	current, _ := manager.GetByID(other.ID)
+	if current.Unavailable {
+		t.Fatal("independent key was cooled")
+	}
+}
+
+func TestKimiUnverifiedPermissionHasModelLocalCooldown(t *testing.T) {
+	const model = "kimi-k3.1-pro"
+	now := time.Now()
+	auth := kimiQuotaTestAuth("kimi-temporary-denial", "kimi", "fixture")
+	manager := NewManager(nil, &SpreadSelector{channelAware: true}, nil)
+	failure := &failurecontract.Failure{
+		Kind: failurecontract.UpstreamProtocolError, Scope: failurecontract.ScopeModel,
+		HTTPStatus: http.StatusForbidden, SemanticCode: failurecontract.KimiPermissionUnverified,
+	}
+	applyTypedModelFailureState(auth, model, failure, resultErrorFromCause(failure), now, false, false)
+	state := auth.ModelStates[model]
+	if until := kimiHardCooldownUntil(auth, model, now); !until.Equal(now.Add(30*time.Second)) || auth.Unavailable || state.Quota.Exceeded {
+		t.Fatalf("unexpected ambiguous 403 cooldown: until=%v auth-blocked=%v quota=%+v", until, auth.Unavailable, state.Quota)
+	}
+	if got, _ := manager.availableAuthsForRouteModel([]*Auth{auth}, "mixed", model, now); len(got) != 0 {
+		t.Fatal("selected key before its retry time")
+	}
+	for _, candidate := range []struct {
+		model string
+		at    time.Time
+	}{{"kimi-k2.7", now}, {model, now.Add(31 * time.Second)}} {
+		got, err := manager.availableAuthsForRouteModel([]*Auth{auth}, "mixed", candidate.model, candidate.at)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("eligible model %s was skipped: %v", candidate.model, err)
+		}
+	}
+	retryAfter := 3 * time.Minute
+	failure.RetryAfter = &retryAfter
+	applyTypedModelFailureState(auth, model, failure, resultErrorFromCause(failure), now, false, false)
+	failure.RetryAfter = nil
+	applyTypedModelFailureState(auth, model, failure, resultErrorFromCause(failure), now.Add(time.Second), false, false)
+	if until := kimiHardCooldownUntil(auth, model, now); !until.Equal(now.Add(retryAfter)) {
+		t.Fatalf("upstream retry delay was shortened: %v", until)
+	}
+	denied := &failurecontract.Failure{
+		Kind: failurecontract.ModelUnavailable, Scope: failurecontract.ScopeModel,
+		HTTPStatus: http.StatusForbidden, SemanticCode: failurecontract.KimiModelAccessDenied,
+	}
+	applyTypedModelFailureState(auth, model, denied, resultErrorFromCause(denied), now, false, false)
+	applyTypedModelFailureState(auth, model, failure, resultErrorFromCause(failure), now.Add(time.Second), false, false)
+	if state.LastError.Code != failurecontract.KimiModelAccessDenied || !state.NextRetryAfter.Equal(now.Add(30*time.Minute)) {
+		t.Fatalf("confirmed model denial was replaced: %+v", state)
+	}
+}

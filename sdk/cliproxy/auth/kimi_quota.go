@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strings"
 	"time"
 
@@ -113,6 +114,29 @@ func isKimiInsufficientQuotaError(auth *Auth, err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "insufficient_quota")
 }
 
+func isKimiPermissionRoutingError(auth *Auth, err error) bool {
+	if !isKimiCredentialAuth(auth) || hasCommittedOutput(err) {
+		return false
+	}
+	f, ok := failurecontract.As(err)
+	if !ok || f.StatusCode() != http.StatusForbidden ||
+		(f.Scope != failurecontract.ScopeModel && f.Scope != failurecontract.ScopeCredential) {
+		return false
+	}
+	switch f.SemanticCode {
+	case failurecontract.KimiServiceAccessDenied, failurecontract.KimiModelAccessDenied, failurecontract.KimiPermissionUnverified:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKimiCredentialFallbackError(auth *Auth, err error) bool {
+	// A configured model pool can still try a different model on this key.
+	return isKimiInsufficientQuotaError(auth, err) ||
+		(isKimiPermissionRoutingError(auth, err) && errorCodeFromError(err) == failurecontract.KimiServiceAccessDenied)
+}
+
 func shouldShareKimiAccountQuota(auth *Auth, result Result) bool {
 	if !isKimiCredentialAuth(auth) || result.Success {
 		return false
@@ -126,10 +150,15 @@ func shouldShareKimiAccountQuota(auth *Auth, result Result) bool {
 	return result.Error != nil && strings.EqualFold(strings.TrimSpace(result.Error.Code), "insufficient_quota")
 }
 
-// applyKimiSharedAccountQuotaLocked mirrors an account-wide quota cooldown to
-// protocol aliases backed by the same Kimi secret. The caller must hold m.mu.
-func (m *Manager) applyKimiSharedAccountQuotaLocked(ctx context.Context, selected *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) []*Auth {
-	if m == nil || selected == nil {
+// applyKimiSharedCredentialCooldownLocked mirrors confirmed account-wide
+// failures to protocol aliases for the same secret. The caller holds m.mu.
+func (m *Manager) applyKimiSharedCredentialCooldownLocked(ctx context.Context, selected *Auth, result Result, failure *failurecontract.Failure, now time.Time) []*Auth {
+	if !isKimiCredentialAuth(selected) || result.Success {
+		return nil
+	}
+	quota := shouldShareKimiAccountQuota(selected, result)
+	if !quota && (failure == nil || failure.Scope != failurecontract.ScopeCredential ||
+		failure.SemanticCode != failurecontract.KimiServiceAccessDenied) {
 		return nil
 	}
 	fingerprint := kimiCredentialFingerprint(selected)
@@ -143,9 +172,13 @@ func (m *Manager) applyKimiSharedAccountQuotaLocked(ctx context.Context, selecte
 			kimiCredentialFingerprint(peer) != fingerprint {
 			continue
 		}
-		applyAccountQuotaFailureState(peer, nil, resultErr, retryAfter, now)
+		if quota {
+			applyAccountQuotaFailureState(peer, nil, result.Error, result.RetryAfter, now)
+		} else {
+			applyTypedCredentialFailureState(peer, failure, result.Error, now, m.cooldownDisabledForAuth(peer))
+		}
 		if errPersist := m.persist(ctx, peer); errPersist != nil {
-			logEntryWithRequestID(ctx).WithField("auth_id", peer.ID).Warnf("failed to persist shared Kimi quota state: %v", errPersist)
+			logEntryWithRequestID(ctx).WithField("auth_id", peer.ID).Warnf("failed to persist shared Kimi credential state: %v", errPersist)
 		}
 		snapshots = append(snapshots, peer.Clone())
 	}

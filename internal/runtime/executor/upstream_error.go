@@ -19,7 +19,7 @@ var safeUpstreamErrorIdentifiers = map[string]struct{}{
 	"invalid_grant": {}, "invalid_request": {}, "invalid_request_error": {},
 	"invalid_thinking_history": {}, "invalidargument": {}, "invalid_parameter": {}, "model_not_found": {},
 	"model_not_supported": {}, "not_found": {}, "overloaded": {}, "overloaded_error": {},
-	"permission_denied": {}, "permission_error": {}, "policy_denied": {},
+	"permission_denied": {}, "permission_denied_error": {}, "permission_error": {}, "policy_denied": {},
 	"previous_response_not_found": {}, "quota_exceeded": {}, "quota_exhausted": {}, "rate_limit": {}, "rate_limit_error": {},
 	"rate_limit_exceeded": {}, "request_feature_unsupported": {}, "request_too_large": {}, "resource_exhausted": {},
 	"server_error": {}, "string_above_max_length": {}, "thinking_signature_invalid": {}, "timeout": {}, "unauthenticated": {},
@@ -76,7 +76,65 @@ func newUpstreamStatusErr(statusCode int, headers http.Header, contentType strin
 	}
 	if len(providerKind) > 0 {
 		result = withMiniMaxRejectionDiagnostic(result, providerKind[0], body)
+		result = withKimiAccessDiagnostic(result, providerKind[0], body)
 		return withKimiRejectionDiagnostic(result, providerKind[0], body)
+	}
+	return result
+}
+
+func withKimiAccessDiagnostic(result statusErr, kind string, body []byte) statusErr {
+	if kind != "kimi" || result.code != http.StatusForbidden || result.ProviderStatusCode() != http.StatusForbidden {
+		return result
+	}
+	if f := result.failure; f != nil && (f.Scope == failurecontract.ScopeRequest || f.Scope == failurecontract.ScopeProvider ||
+		f.Kind == failurecontract.QuotaExceeded || f.Kind == failurecontract.RateLimited) {
+		return result
+	}
+	switch result.errorCode {
+	case "invalid_request", "invalid_request_error", "invalid_parameter", "invalid_function_arguments":
+		result.failure = &failurecontract.Failure{
+			Kind: failurecontract.InvalidRequest, Scope: failurecontract.ScopeRequest,
+			HTTPStatus: result.code, OuterStatus: result.ProviderStatusCode(),
+			ProviderCode: result.errorCode, SemanticType: "invalid_request_error", PublicMessage: result.msg,
+		}
+		return result
+	}
+
+	code := failurecontract.KimiAccessDiagnostic(upstreamJSONErrorBody(body))
+	scope, failureKind := failurecontract.ScopeModel, failurecontract.UpstreamProtocolError
+	switch code {
+	case failurecontract.KimiModelAccessDenied:
+		failureKind = failurecontract.ModelUnavailable
+	case failurecontract.KimiServiceAccessDenied:
+		scope, failureKind = failurecontract.ScopeCredential, failurecontract.AuthenticationFailed
+	case failurecontract.KimiContextAccessDenied:
+		scope, failureKind = failurecontract.ScopeRequest, failurecontract.ContextLengthExceeded
+	default:
+		message := strings.ToLower(result.msg)
+		if (result.failure != nil && result.failure.Scope == failurecontract.ScopeCredential) ||
+			openAICompatPaymentLikeMessage(message) || openAICompatQuotaLikeMessage(message) ||
+			strings.Contains(message, "cloudflare challenge") ||
+			openAICompatAuthenticationFailure(message, result.errorCode) {
+			return result
+		}
+		if openAICompatContentSafetyFailure(http.StatusForbidden, message, result.errorCode) {
+			code = "content_policy_violation"
+			scope, failureKind = failurecontract.ScopeRequest, failurecontract.ContentSafetyBlocked
+		} else {
+			code = failurecontract.KimiPermissionUnverified
+		}
+	}
+
+	if result.retryAfter == nil {
+		result.retryAfter = openAICompatRetryAfter(result.headers, body)
+	}
+	providerCode := result.errorCode
+	result.errorCode = code
+	result.msg = code + ": " + result.msg
+	result.failure = &failurecontract.Failure{
+		Kind: failureKind, Scope: scope, HTTPStatus: result.code, OuterStatus: result.ProviderStatusCode(),
+		ProviderCode: providerCode, SemanticCode: code, SemanticType: "permission_error",
+		RetryAfter: result.retryAfter, PublicMessage: result.msg,
 	}
 	return result
 }

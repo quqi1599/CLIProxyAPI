@@ -4067,6 +4067,7 @@ func newOpenAICompatStatusErr(profile openAICompatProfile, auth *cliproxyauth.Au
 		failure:            failure,
 	}
 	result = withMiniMaxRejectionDiagnostic(result, profile.Kind, body)
+	result = withKimiAccessDiagnostic(result, profile.Kind, body)
 	return withKimiRejectionDiagnostic(result, profile.Kind, body)
 }
 

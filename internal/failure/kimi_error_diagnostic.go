@@ -13,20 +13,44 @@ var kimiMissingReasoningError = regexp.MustCompile(`^thinking is enabled but rea
 var kimiDuplicateToolError = regexp.MustCompile(`^function name [^\r\n]{1,128} is duplicated$`)
 var kimiParameterError = regexp.MustCompile("^(?:invalid request: )?(?:invalid value for |unsupported |invalid )?[`'\"]?(temperature|top_p|max_tokens|max_completion_tokens|max_output_tokens|reasoning_effort|response_format|tool_choice|presence_penalty|frequency_penalty|top_logprobs|logprobs|n)[`'\"]?(?:[ .:=]|$)")
 
+const (
+	KimiModelAccessDenied    = "kimi_model_access_denied"
+	KimiServiceAccessDenied  = "kimi_service_access_denied"
+	KimiContextAccessDenied  = "kimi_context_access_denied"
+	KimiPermissionUnverified = "kimi_permission_unverified"
+)
+
+var kimiModelAccessError = regexp.MustCompile(`^your current subscription does not have access to (k3(?:\.1-pro(?:-highspeed)?|-256k)?|kimi-for-coding(?:-highspeed)?)(?:\.(?:\s|$)|$)`)
+var kimiContextAccessError = regexp.MustCompile(`^your current plan supports only (k3|k3\.1-pro) up to 256k context(?:\.(?:\s|$)|$)`)
+
+// KimiAccessDiagnostic recognizes documented permission errors without
+// returning the provider's message or upgrade URL.
+func KimiAccessDiagnostic(body []byte) string {
+	root := kimiErrorObject(body)
+	value := root.Get("message")
+	if value.Type != gjson.String || len(value.Str) > 4096 {
+		return ""
+	}
+	message := strings.ToLower(strings.TrimSpace(value.Str))
+	switch {
+	case kimiModelAccessError.MatchString(message):
+		return KimiModelAccessDenied
+	case strings.HasPrefix(message, "your current subscription does not have access to kimi code right now."),
+		message == "your current subscription does not have access to kimi code":
+		return KimiServiceAccessDenied
+	case kimiContextAccessError.MatchString(message):
+		return KimiContextAccessDenied
+	default:
+		return ""
+	}
+}
+
 // KimiRejectionDiagnostic recognizes request-validation failures from a bounded,
 // unambiguous error envelope. Outputs are fixed labels, not upstream prose,
 // parameter values, function names, request content or credentials. Recognition
 // is diagnostic only; the caller retains request-scoped, non-retryable errors.
 func KimiRejectionDiagnostic(body []byte) (code, param, message string) {
-	if !unambiguousDiagnosticJSON(body) {
-		return "", "", ""
-	}
-	root := gjson.ParseBytes(body)
-	if envelope := root.Get("error"); envelope.Exists() {
-		root = envelope
-	} else if envelope := root.Get("body.error"); envelope.Exists() {
-		root = envelope
-	}
+	root := kimiErrorObject(body)
 	if !root.IsObject() {
 		return "", "", ""
 	}
@@ -68,4 +92,18 @@ func KimiRejectionDiagnostic(body []byte) (code, param, message string) {
 		return "kimi_request_parameter_invalid", match[1], "Kimi rejected the request parameter " + match[1] + "; check the supported values for this model"
 	}
 	return "", "", ""
+}
+
+func kimiErrorObject(body []byte) gjson.Result {
+	if !unambiguousDiagnosticJSON(body) {
+		return gjson.Result{}
+	}
+	root := gjson.ParseBytes(body)
+	if envelope := root.Get("error"); envelope.Exists() {
+		return envelope
+	}
+	if envelope := root.Get("body.error"); envelope.Exists() {
+		return envelope
+	}
+	return root
 }

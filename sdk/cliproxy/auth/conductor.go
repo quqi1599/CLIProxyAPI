@@ -4811,6 +4811,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errStream)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
 				!isTerminalRoutingFailure(routeModel, opts, errStream) &&
+				!isKimiCredentialFallbackError(auth, errStream) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4827,7 +4828,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if isTerminalRoutingFailure(routeModel, opts, errStream) {
 				return nil, errStream
 			}
-			if isKimiInsufficientQuotaError(auth, errStream) {
+			if isKimiCredentialFallbackError(auth, errStream) {
 				return nil, errStream
 			}
 			if channelFailover {
@@ -4955,6 +4956,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, bootstrapErr)
 			result.keepSelectorLease = idx < len(execModels)-1 &&
 				!isTerminalRoutingFailure(routeModel, opts, bootstrapErr) &&
+				!isKimiCredentialFallbackError(auth, bootstrapErr) &&
 				!channelFailover &&
 				!unauthorized &&
 				(!requestInvalid || routeFallback)
@@ -4974,7 +4976,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if isTerminalRoutingFailure(routeModel, opts, bootstrapErr) {
 				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 			}
-			if isKimiInsufficientQuotaError(auth, bootstrapErr) {
+			if isKimiCredentialFallbackError(auth, bootstrapErr) {
 				return nil, newStreamBootstrapError(bootstrapErr, streamResultHeaders(streamResult))
 			}
 			if channelFailover || unauthorized {
@@ -5997,6 +5999,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				routeFallback := requestInvalid && shouldFallbackRequestScopedRouteErrorForRequest(routeModel, opts, errExec)
 				result.keepSelectorLease = idx < len(models)-1 &&
 					!isTerminalRoutingFailure(routeModel, opts, errExec) &&
+					!isKimiCredentialFallbackError(auth, errExec) &&
 					!channelFailover &&
 					!unauthorized &&
 					(!requestInvalid || routeFallback)
@@ -6013,7 +6016,7 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 				}
 				authErr = errExec
 				countAttempt = true
-				if isKimiInsufficientQuotaError(auth, errExec) {
+				if isKimiCredentialFallbackError(auth, errExec) {
 					break modelLoop
 				}
 				if remoteCompaction {
@@ -6076,6 +6079,9 @@ func (m *Manager) executeResponseMixedOnce(ctx context.Context, providers []stri
 					return cliproxyexecutor.Response{}, authErr
 				}
 				kimiQuotaFallback = true
+			}
+			if isKimiPermissionRoutingError(auth, authErr) {
+				m.markKimiCredentialAliasesTried(tried, auth)
 			}
 			channelFailover := shouldFailoverGPTChannel(authErr, providers, routeModel) ||
 				(gptRoute && m.gptChannelBreakerOpen(auth, routeModel, time.Now()))
@@ -6304,6 +6310,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, errStream
 				}
 				kimiQuotaFallback = true
+			}
+			if isKimiPermissionRoutingError(auth, errStream) {
+				m.markKimiCredentialAliasesTried(tried, auth)
 			}
 			if channelFailover || isGPTNetworkRoundFailure(errStream) {
 				m.markRetryChannelTried(ctx, tried, auth, errStream)
@@ -8035,9 +8044,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
 		}
-		if shouldShareKimiAccountQuota(auth, result) {
-			schedulerSnapshots = append(schedulerSnapshots, m.applyKimiSharedAccountQuotaLocked(ctx, auth, result.Error, result.RetryAfter, now)...)
-		}
+		schedulerSnapshots = append(schedulerSnapshots, m.applyKimiSharedCredentialCooldownLocked(ctx, auth, result, typedFailure, now)...)
 		schedulerSnapshots = append(schedulerSnapshots, m.applyChannelBreakerResultLocked(ctx, auth, result, requestedModelAlias, now)...)
 		if slowPenalty > 0 {
 			schedulerSnapshots = append(schedulerSnapshots, m.applySlowRequestGroupPenaltyLocked(auth, result, now, slowPenalty)...)
@@ -9342,6 +9349,13 @@ func applyTypedModelFailureState(auth *Auth, model string, failure *failurecontr
 	}
 	model = canonicalModelKey(model)
 	state := ensureModelState(auth, model)
+	temporaryKimiPermission := isKimiCredentialAuth(auth) && failure.SemanticCode == failurecontract.KimiPermissionUnverified
+	previousRetryAt := laterTime(state.NextRetryAfter, state.Health.OpenUntil)
+	if temporaryKimiPermission && (state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) ||
+		state.LastError != nil && state.LastError.Code != failurecontract.KimiPermissionUnverified && previousRetryAt.After(now)) {
+		// A late ambiguous response must not shorten a confirmed cooldown.
+		return
+	}
 	status := failure.HTTPStatus
 	if status <= 0 {
 		status = statusCodeFromResult(resultErr)
@@ -9359,7 +9373,18 @@ func applyTypedModelFailureState(auth *Auth, model string, failure *failurecontr
 		}
 	}
 	next := time.Time{}
-	if !disableCooling && failure.RetryAfter != nil && *failure.RetryAfter > 0 {
+	if temporaryKimiPermission {
+		state.Quota = QuotaState{}
+		if disableCooling {
+			state.Health.BreakerState = HealthBreakerClosed
+		} else {
+			next = laterTime(previousRetryAt, now.Add(healthOpenCooldown(0, state.Health.ConsecutiveFailures)))
+			if failure.RetryAfter != nil {
+				next = laterTime(next, now.Add(*failure.RetryAfter))
+			}
+		}
+		state.Health.OpenUntil = next
+	} else if !disableCooling && failure.RetryAfter != nil && *failure.RetryAfter > 0 {
 		next = now.Add(*failure.RetryAfter)
 	} else if !disableCooling {
 		switch status {
@@ -10714,6 +10739,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 
 func applyTypedCredentialFailureState(auth *Auth, failure *failurecontract.Failure, resultErr *Error, now time.Time, disableCooling bool) {
 	if auth == nil || failure == nil {
+		return
+	}
+	if failure.SemanticCode == failurecontract.KimiServiceAccessDenied && shouldPreserveAuthLevelCooldown(auth, now) {
 		return
 	}
 	statusCode := failure.HTTPStatus

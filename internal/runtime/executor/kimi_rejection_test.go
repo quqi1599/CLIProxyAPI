@@ -2,11 +2,13 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	failurecontract "github.com/router-for-me/CLIProxyAPI/v7/internal/failure"
@@ -14,6 +16,44 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
+
+func TestKimiForbiddenDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, message, code string
+		kind                failurecontract.Kind
+		scope               failurecontract.Scope
+	}{
+		{"service", "Your current subscription does not have access to Kimi Code right now. private-upstream-text", failurecontract.KimiServiceAccessDenied, failurecontract.AuthenticationFailed, failurecontract.ScopeCredential},
+		{"model", "Your current subscription does not have access to k3.1-pro. private-upstream-text", failurecontract.KimiModelAccessDenied, failurecontract.ModelUnavailable, failurecontract.ScopeModel},
+		{"context", "Your current plan supports only k3.1-pro up to 256K context. private-upstream-text", failurecontract.KimiContextAccessDenied, failurecontract.ContextLengthExceeded, failurecontract.ScopeRequest},
+		{"membership", "Unable to verify your membership benefits: private-upstream-text", failurecontract.KimiPermissionUnverified, failurecontract.UpstreamProtocolError, failurecontract.ScopeModel},
+		{"opaque", "private-upstream-text", failurecontract.KimiPermissionUnverified, failurecontract.UpstreamProtocolError, failurecontract.ScopeModel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, errMarshal := json.Marshal(map[string]any{"error": map[string]string{"type": "permission_denied_error", "message": tc.message}})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			headers := http.Header{"Retry-After": {"75"}}
+			for _, err := range []statusErr{
+				newUpstreamStatusErr(http.StatusForbidden, headers, "application/json", body, "kimi"),
+				newOpenAICompatStatusErr(openAICompatProfile{Kind: "kimi"}, nil, "k3.1-pro", http.StatusForbidden, headers, "application/json", body),
+			} {
+				f := failurecontract.Classify(err)
+				if err.ErrorCode() != tc.code || f.Kind != tc.kind || f.Scope != tc.scope || f.OuterStatus != http.StatusForbidden || f.Retryable {
+					t.Fatalf("wrong Kimi failure: %+v", f)
+				}
+				if f.RetryAfter == nil || *f.RetryAfter != 75*time.Second || strings.Contains(err.Error(), "private-upstream-text") {
+					t.Fatalf("unsafe or incomplete Kimi failure: %+v", f)
+				}
+			}
+			other := newUpstreamStatusErr(http.StatusForbidden, headers, "application/json", body, "claude")
+			if strings.HasPrefix(other.ErrorCode(), "kimi_") {
+				t.Fatalf("changed another provider's failure: %v", other)
+			}
+		})
+	}
+}
 
 func TestKimiRejectionOnChatResponsesAndMessages(t *testing.T) {
 	for _, wire := range []string{"openai", "claude"} {
